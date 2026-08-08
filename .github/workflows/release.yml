@@ -11,6 +11,7 @@ on:
     types: [published]
 
 permissions:
+  actions: read
   contents: read
 
 jobs:
@@ -19,6 +20,9 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.identity.outputs.version }}
+      head_sha: ${{ steps.identity.outputs.head_sha }}
+      quality_run_id: ${{ steps.reuse.outputs.quality_run_id }}
+      release_run_id: ${{ steps.reuse.outputs.release_run_id }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -47,6 +51,7 @@ jobs:
           )"
           test "$RELEASE_TAG" = "v$version"
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           python3 - <<'PY'
           import json
           import os
@@ -79,6 +84,76 @@ jobs:
                   f"release commit {sha} lacks successful workflows: {missing}"
               )
           print(f"validated release commit {sha}: {sorted(required)}")
+          PY
+      - name: Resolve exact reusable GPU artifacts
+        id: reuse
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ steps.identity.outputs.head_sha }}
+          VERSION: ${{ steps.identity.outputs.version }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.parse
+          import urllib.request
+
+          repository = os.environ["GITHUB_REPOSITORY"]
+          token = os.environ["GH_TOKEN"]
+          head_sha = os.environ["HEAD_SHA"]
+          current_run = int(os.environ["GITHUB_RUN_ID"])
+
+          def api(path):
+              request = urllib.request.Request(
+                  f"https://api.github.com/repos/{repository}{path}",
+                  headers={
+                      "Accept": "application/vnd.github+json",
+                      "Authorization": f"Bearer {token}",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                  },
+              )
+              with urllib.request.urlopen(request) as response:
+                  return json.load(response)
+
+          def reusable_run(artifact_name, workflow_name, required_event=None):
+              query = urllib.parse.urlencode(
+                  {"name": artifact_name, "per_page": 100}
+              )
+              artifacts = api(f"/actions/artifacts?{query}").get("artifacts", [])
+              for artifact in sorted(
+                  artifacts, key=lambda row: row["created_at"], reverse=True
+              ):
+                  if artifact.get("expired"):
+                      continue
+                  run_id = artifact.get("workflow_run", {}).get("id")
+                  if not run_id or run_id == current_run:
+                      continue
+                  run = api(f"/actions/runs/{run_id}")
+                  if (
+                      run.get("name") == workflow_name
+                      and run.get("head_sha") == head_sha
+                      and run.get("status") == "completed"
+                      and run.get("conclusion") == "success"
+                      and (required_event is None or run.get("event") == required_event)
+                  ):
+                      return str(run_id)
+              return ""
+
+          quality_name = f"flashrwkv2-sm120-test-{head_sha}"
+          release_name = (
+              f"flashrwkv2-wheel-{os.environ['VERSION']}-{head_sha}"
+          )
+          quality_run = reusable_run(quality_name, "SM120 quality gate")
+          release_run = reusable_run(
+              release_name, "PyPI release", required_event="workflow_dispatch"
+          )
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"quality_run_id={quality_run}\n")
+              output.write(f"release_run_id={release_run}\n")
+          print(json.dumps({
+              "quality_run_id": quality_run or None,
+              "release_run_id": release_run or None,
+          }))
           PY
       - name: Build and inspect source distribution
         run: |
@@ -120,28 +195,95 @@ jobs:
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: false
+      - uses: actions/download-artifact@v4
+        if: needs.prepare.outputs.release_run_id != ''
+        with:
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.prepare.outputs.release_run_id }}
+          name: flashrwkv2-wheel-${{ needs.prepare.outputs.version }}-${{ needs.prepare.outputs.head_sha }}
+          path: reused-release
+      - uses: actions/download-artifact@v4
+        if: needs.prepare.outputs.release_run_id == '' && needs.prepare.outputs.quality_run_id != ''
+        with:
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.prepare.outputs.quality_run_id }}
+          name: flashrwkv2-sm120-test-${{ needs.prepare.outputs.head_sha }}
+          path: reused-quality
       - name: Verify exact tagged source
         env:
           RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
         run: |
           test "$(git rev-parse HEAD)" = "$(git rev-list -n 1 "$RELEASE_TAG")"
           test -z "$(git status --short --untracked-files=no)"
-      - name: Build and repair CPython 3.12 SM120 wheel
+      - name: Resolve or build CPython 3.12 SM120 wheel
+        env:
+          HEAD_SHA: ${{ needs.prepare.outputs.head_sha }}
+          RELEASE_RUN_ID: ${{ needs.prepare.outputs.release_run_id }}
+          QUALITY_RUN_ID: ${{ needs.prepare.outputs.quality_run_id }}
+          VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           mkdir -p dist raw-wheel
-          uv sync --frozen --no-install-project --group dev
-          uv export --frozen --group dev --no-emit-project \
-            --output-file locked-requirements.txt
-          uv build --wheel --out-dir raw-wheel
-          test "$(find raw-wheel -maxdepth 1 -name '*.whl' | wc -l)" -eq 1
-          uv tool run --with patchelf auditwheel repair \
-            --plat manylinux_2_38_x86_64 \
-            --exclude 'libtorch*.so' \
-            --exclude libc10.so \
-            --exclude libc10_cuda.so \
-            --exclude libcudart.so.13 \
-            --wheel-dir dist \
-            raw-wheel/*.whl
+          if [[ -n "$RELEASE_RUN_ID" ]]; then
+            test "$(find reused-release/dist -maxdepth 1 -name '*.whl' | wc -l)" -eq 1
+            test -f reused-release/wheel-identity.json
+            test -f reused-release/locked-requirements.txt
+            python3 - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          identity = json.loads(Path("reused-release/wheel-identity.json").read_text())
+          wheel = next(Path("reused-release/dist").glob("*.whl"))
+          if identity.get("head_sha") != os.environ["HEAD_SHA"]:
+              raise SystemExit("reused release wheel revision mismatch")
+          if identity.get("version") != os.environ["VERSION"]:
+              raise SystemExit("reused release wheel version mismatch")
+          if identity.get("wheel") != wheel.name:
+              raise SystemExit("reused release wheel filename mismatch")
+          if identity.get("wheel_sha256") != hashlib.sha256(wheel.read_bytes()).hexdigest():
+              raise SystemExit("reused release wheel hash mismatch")
+          PY
+            cp reused-release/dist/*.whl dist/
+            cp reused-release/locked-requirements.txt locked-requirements.txt
+            cp reused-release/wheel-audit.txt wheel-audit.txt
+            echo "FLASH_RWKV_RELEASE_WHEEL_SOURCE=manual-release:$RELEASE_RUN_ID" >> "$GITHUB_ENV"
+          else
+            if [[ -n "$QUALITY_RUN_ID" ]]; then
+              test "$(find reused-quality/wheels -maxdepth 1 -name '*.whl' | wc -l)" -eq 1
+              test -f reused-quality/build-identity.json
+              test -f reused-quality/locked-requirements.txt
+              python3 - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          identity = json.loads(Path("reused-quality/build-identity.json").read_text())
+          wheel = next(Path("reused-quality/wheels").glob("*.whl"))
+          if identity.get("head_sha") != os.environ["HEAD_SHA"]:
+              raise SystemExit("reused quality wheel revision mismatch")
+          if identity.get("wheel") != wheel.name:
+              raise SystemExit("reused quality wheel filename mismatch")
+          if identity.get("wheel_sha256") != hashlib.sha256(wheel.read_bytes()).hexdigest():
+              raise SystemExit("reused quality wheel hash mismatch")
+          PY
+              cp reused-quality/wheels/*.whl raw-wheel/
+              cp reused-quality/locked-requirements.txt locked-requirements.txt
+              echo "FLASH_RWKV_RELEASE_WHEEL_SOURCE=quality-gate:$QUALITY_RUN_ID" >> "$GITHUB_ENV"
+            else
+              uv sync --frozen --no-install-project --group dev
+              uv export --frozen --group dev --no-emit-project \
+                --output-file locked-requirements.txt
+              uv build --wheel --out-dir raw-wheel
+              echo "FLASH_RWKV_RELEASE_WHEEL_SOURCE=built:$GITHUB_RUN_ID" >> "$GITHUB_ENV"
+            fi
+            test "$(find raw-wheel -maxdepth 1 -name '*.whl' | wc -l)" -eq 1
+            uv tool run --with patchelf auditwheel repair \
+              --plat manylinux_2_38_x86_64 \
+              --exclude 'libtorch*.so' \
+              --exclude libc10.so \
+              --exclude libc10_cuda.so \
+              --exclude libcudart.so.13 \
+              --wheel-dir dist \
+              raw-wheel/*.whl
+          fi
           test "$(find dist -maxdepth 1 -name '*.whl' | wc -l)" -eq 1
           uvx twine check dist/*
           uv tool run auditwheel show dist/*.whl | tee wheel-audit.txt
@@ -171,10 +313,14 @@ jobs:
           print(flashrwkv2._C.__file__)
           PY
       - name: Record immutable wheel identity
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           .release-runtime/bin/python - <<'PY'
           import hashlib
           import json
+          import os
           import subprocess
           from pathlib import Path
 
@@ -183,6 +329,9 @@ jobs:
               "head_sha": subprocess.check_output(
                   ("git", "rev-parse", "HEAD"), text=True
               ).strip(),
+              "tag": os.environ["RELEASE_TAG"],
+              "version": os.environ["VERSION"],
+              "source": os.environ["FLASH_RWKV_RELEASE_WHEEL_SOURCE"],
               "wheel": wheel.name,
               "wheel_sha256": hashlib.sha256(wheel.read_bytes()).hexdigest(),
           }
@@ -194,8 +343,12 @@ jobs:
       - name: Upload tested SM120 wheel
         uses: actions/upload-artifact@v4
         with:
-          name: flashrwkv2-wheel-${{ needs.prepare.outputs.version }}
-          path: dist/
+          name: flashrwkv2-wheel-${{ needs.prepare.outputs.version }}-${{ needs.prepare.outputs.head_sha }}
+          path: |
+            dist/
+            locked-requirements.txt
+            wheel-audit.txt
+            wheel-identity.json
           if-no-files-found: error
           retention-days: 90
 
@@ -216,11 +369,31 @@ jobs:
           path: dist/
       - uses: actions/download-artifact@v4
         with:
-          name: flashrwkv2-wheel-${{ needs.prepare.outputs.version }}
-          path: dist/
+          name: flashrwkv2-wheel-${{ needs.prepare.outputs.version }}-${{ needs.prepare.outputs.head_sha }}
+          path: release-artifact/
       - name: Verify publish payload
+        env:
+          HEAD_SHA: ${{ needs.prepare.outputs.head_sha }}
+          VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           test "$(find dist -maxdepth 1 -name '*.tar.gz' | wc -l)" -eq 1
+          test "$(find release-artifact/dist -maxdepth 1 -name '*.whl' | wc -l)" -eq 1
+          test -f release-artifact/wheel-identity.json
+          python3 - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          identity = json.loads(Path("release-artifact/wheel-identity.json").read_text())
+          wheel = next(Path("release-artifact/dist").glob("*.whl"))
+          if identity.get("head_sha") != os.environ["HEAD_SHA"]:
+              raise SystemExit("publish wheel revision mismatch")
+          if identity.get("version") != os.environ["VERSION"]:
+              raise SystemExit("publish wheel version mismatch")
+          if identity.get("wheel") != wheel.name:
+              raise SystemExit("publish wheel filename mismatch")
+          if identity.get("wheel_sha256") != hashlib.sha256(wheel.read_bytes()).hexdigest():
+              raise SystemExit("publish wheel hash mismatch")
+          PY
+          cp release-artifact/dist/*.whl dist/
           test "$(find dist -maxdepth 1 -name '*.whl' | wc -l)" -eq 1
       - name: Publish distributions with OIDC
         uses: pypa/gh-action-pypi-publish@release/v1

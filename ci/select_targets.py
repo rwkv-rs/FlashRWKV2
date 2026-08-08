@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
+import re
 import subprocess
 from dataclasses import asdict, dataclass
 from pathlib import Path
+
+import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULES = (
@@ -79,6 +83,7 @@ class Impact:
     run_benchmark: bool
     run_sanitizer: bool
     run_all: bool
+    package_smoke_only: bool
     changed_files: tuple[str, ...]
     reasons: tuple[str, ...]
 
@@ -109,7 +114,13 @@ def validate_layout(root: Path = ROOT) -> None:
         raise SystemExit("active module layout is incomplete: " + ", ".join(missing))
 
 
-def classify(paths: list[str], *, base_sha: str = "", head_sha: str = "") -> Impact:
+def classify(
+    paths: list[str],
+    *,
+    base_sha: str = "",
+    head_sha: str = "",
+    release_metadata_only: bool = False,
+) -> Impact:
     changed = tuple(
         sorted({path.strip().removeprefix("./") for path in paths if path.strip()})
     )
@@ -120,6 +131,21 @@ def classify(paths: list[str], *, base_sha: str = "", head_sha: str = "") -> Imp
     run_sanitizer = False
     run_all = False
     only_docs = bool(changed)
+
+    if release_metadata_only:
+        return Impact(
+            base_sha=base_sha,
+            head_sha=head_sha,
+            change_class="release_metadata",
+            affected_modules=(),
+            run_gpu=True,
+            run_benchmark=False,
+            run_sanitizer=False,
+            run_all=False,
+            package_smoke_only=True,
+            changed_files=changed,
+            reasons=("release-metadata-only",),
+        )
 
     for path in changed:
         suffix = Path(path).suffix.lower()
@@ -190,6 +216,7 @@ def classify(paths: list[str], *, base_sha: str = "", head_sha: str = "") -> Imp
         run_benchmark=run_benchmark,
         run_sanitizer=run_sanitizer,
         run_all=run_all,
+        package_smoke_only=False,
         changed_files=changed,
         reasons=tuple(sorted(set(reasons))),
     )
@@ -204,6 +231,101 @@ def _git_changed_files(base_sha: str, head_sha: str) -> list[str]:
         text=True,
     )
     return result.stdout.splitlines()
+
+
+def _release_metadata_only(
+    paths: list[str], base_sha: str, head_sha: str
+) -> bool:
+    allowed = {"pyproject.toml", "flashrwkv2/__init__.py", "uv.lock"}
+    changed = {path.strip().removeprefix("./") for path in paths if path.strip()}
+    if not base_sha or not head_sha or not changed or not changed <= allowed:
+        return False
+    versions: dict[str, str] = {}
+
+    def revision_text(revision: str, path: str) -> str:
+        return subprocess.run(
+            ("git", "show", f"{revision}:{path}"),
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+
+    if "pyproject.toml" in changed:
+        before = tomllib.loads(revision_text(base_sha, "pyproject.toml"))
+        after = tomllib.loads(revision_text(head_sha, "pyproject.toml"))
+        versions["pyproject.toml"] = str(after["project"]["version"])
+        before_compare = copy.deepcopy(before)
+        after_compare = copy.deepcopy(after)
+        before_compare["project"]["version"] = "<release-version>"
+        after_compare["project"]["version"] = "<release-version>"
+        if before_compare != after_compare:
+            return False
+
+    if "uv.lock" in changed:
+        before = tomllib.loads(revision_text(base_sha, "uv.lock"))
+        after = tomllib.loads(revision_text(head_sha, "uv.lock"))
+
+        def normalize_lock(payload: dict[str, object]) -> tuple[dict[str, object], str]:
+            normalized = copy.deepcopy(payload)
+            roots = [
+                package
+                for package in normalized.get("package", [])
+                if package.get("name") == "flashrwkv2"
+                and package.get("source") == {"editable": "."}
+            ]
+            if len(roots) != 1:
+                raise ValueError("uv.lock must contain one editable flashrwkv2 package")
+            version = str(roots[0]["version"])
+            roots[0]["version"] = "<release-version>"
+            return normalized, version
+
+        try:
+            before_compare, _ = normalize_lock(before)
+            after_compare, version = normalize_lock(after)
+        except (KeyError, TypeError, ValueError):
+            return False
+        versions["uv.lock"] = version
+        if before_compare != after_compare:
+            return False
+
+    result = subprocess.run(
+        (
+            "git",
+            "diff",
+            "--unified=0",
+            base_sha,
+            head_sha,
+            "--",
+            *sorted(changed),
+        ),
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    current = ""
+    saw_change = False
+    patterns = {
+        "pyproject.toml": re.compile(r'version\s*=\s*"[^"]+"'),
+        "flashrwkv2/__init__.py": re.compile(r'__version__\s*=\s*"[^"]+"'),
+        "uv.lock": re.compile(r'version\s*=\s*"[^"]+"'),
+    }
+    for line in result.stdout.splitlines():
+        if line.startswith("+++ b/"):
+            current = line.removeprefix("+++ b/")
+            continue
+        if not line.startswith(("+", "-")) or line.startswith(("+++", "---")):
+            continue
+        content = line[1:].strip()
+        pattern = patterns.get(current)
+        if pattern is None or pattern.fullmatch(content) is None:
+            return False
+        match = re.search(r'"([^"]+)"', content)
+        if line.startswith("+") and current == "flashrwkv2/__init__.py" and match:
+            versions[current] = match.group(1)
+        saw_change = True
+    return saw_change and len(set(versions.values())) == 1
 
 
 def _write_github_outputs(path: Path, impact: Impact, artifact_path: Path) -> None:
@@ -223,6 +345,7 @@ def _write_github_outputs(path: Path, impact: Impact, artifact_path: Path) -> No
         "run_benchmark": str(impact.run_benchmark).lower(),
         "run_sanitizer": str(impact.run_sanitizer).lower(),
         "run_all": str(impact.run_all).lower(),
+        "package_smoke_only": str(impact.package_smoke_only).lower(),
         "impact_artifact": str(artifact_path),
     }
     with path.open("a", encoding="utf-8") as handle:
@@ -251,6 +374,12 @@ def _self_test() -> None:
     assert shared.run_all and shared.affected_modules == tuple(sorted(MODULES))
     unknown = classify(["flashrwkv2/new_family.py"])
     assert unknown.run_all and unknown.run_sanitizer
+    release = classify(
+        ["pyproject.toml", "flashrwkv2/__init__.py", "uv.lock"],
+        release_metadata_only=True,
+    )
+    assert release.package_smoke_only and release.run_gpu
+    assert not release.run_benchmark and not release.affected_modules
 
 
 def main() -> int:
@@ -275,7 +404,15 @@ def main() -> int:
         if args.files is not None
         else _git_changed_files(args.base, args.head)
     )
-    impact = classify(paths, base_sha=args.base, head_sha=args.head)
+    release_metadata_only = (
+        args.files is None and _release_metadata_only(paths, args.base, args.head)
+    )
+    impact = classify(
+        paths,
+        base_sha=args.base,
+        head_sha=args.head,
+        release_metadata_only=release_metadata_only,
+    )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(
         json.dumps(asdict(impact), indent=2) + "\n", encoding="utf-8"

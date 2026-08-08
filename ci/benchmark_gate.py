@@ -302,6 +302,25 @@ def run_benchmark(
     }
 
 
+def environment_contract(python: str) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "target": "sm120",
+        "environment": _environment(python),
+    }
+
+
+def compatibility_candidate(
+    module: str, contract: dict[str, Any]
+) -> dict[str, Any]:
+    return {
+        "schema_version": contract.get("schema_version"),
+        "module": module,
+        "target": contract.get("target"),
+        "environment": contract.get("environment", {}),
+    }
+
+
 def _compatible(baseline: dict[str, Any], head: dict[str, Any]) -> None:
     for key in ("schema_version", "module", "target"):
         if baseline.get(key) != head.get(key):
@@ -427,11 +446,62 @@ def fetch_baseline(
                     continue
                 try:
                     _compatible(payload, head)
-                except SystemExit:
+                except (KeyError, TypeError, SystemExit):
                     continue
                 output.write_bytes(raw)
                 return True
     return False
+
+
+def resolve_baselines(
+    repository: str,
+    modules: list[str],
+    output: Path,
+    token: str,
+    contract: dict[str, Any],
+    base_revision: str,
+) -> dict[str, Any]:
+    output.mkdir(parents=True, exist_ok=True)
+    sources: dict[str, str] = {}
+    measured_base: list[str] = []
+    approved: list[str] = []
+    new_modules: list[str] = []
+    for module in modules:
+        if module not in BENCHMARKS:
+            raise SystemExit(f"no canonical benchmark configured for {module}")
+        candidate = compatibility_candidate(module, contract)
+        baseline_path = output / f"{module.replace('/', '-')}-baseline.json"
+        if fetch_baseline(repository, module, baseline_path, token, candidate):
+            sources[module] = "approved-artifact"
+            approved.append(module)
+            continue
+        benchmark_path = f"benchmarks/{module}/bench.py"
+        exists = subprocess.run(
+            ("git", "cat-file", "-e", f"{base_revision}:{benchmark_path}"),
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+        ).returncode == 0
+        if exists:
+            sources[module] = "measured-base"
+            measured_base.append(module)
+        else:
+            sources[module] = "new-module-bootstrap"
+            new_modules.append(module)
+    plan = {
+        "schema_version": 1,
+        "base_revision": base_revision,
+        "modules": modules,
+        "sources": sources,
+        "approved_modules": approved,
+        "measured_base_modules": measured_base,
+        "new_modules": new_modules,
+        "needs_base_wheel": bool(measured_base),
+    }
+    (output / "plan.json").write_text(
+        json.dumps(plan, indent=2) + "\n", encoding="utf-8"
+    )
+    return plan
 
 
 def approve(
@@ -449,7 +519,13 @@ def approve(
 
 
 def _self_test() -> None:
-    environment = {"gpu": "gpu", "capability": [12, 0], "torch": "x", "torch_cuda": "y"}
+    environment = {
+        "gpu": "gpu",
+        "capability": [12, 0],
+        "torch": "x",
+        "torch_cuda": "y",
+        "driver": "z",
+    }
 
     def payload(value: float) -> dict[str, Any]:
         return {
@@ -474,6 +550,19 @@ def _self_test() -> None:
     assert compare(payload(100.0), payload(100.2))["passed"]
     assert not compare(payload(100.0), payload(100.2000001))["passed"]
     assert statistics.fmean([1.0, 2.0, 6.0]) == 3.0
+    candidate = compatibility_candidate(
+        "tmix/linear",
+        {"schema_version": 1, "target": "sm120", "environment": environment},
+    )
+    _compatible(payload(100.0), candidate)
+    incompatible = dict(candidate)
+    incompatible["environment"] = {**environment, "torch": "different"}
+    try:
+        _compatible(payload(100.0), incompatible)
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("an incompatible environment was accepted")
 
 
 def main() -> int:
@@ -493,7 +582,19 @@ def main() -> int:
     fetch_parser.add_argument("--repository", required=True)
     fetch_parser.add_argument("--module", required=True, choices=sorted(BENCHMARKS))
     fetch_parser.add_argument("--output", type=Path, required=True)
-    fetch_parser.add_argument("--head", type=Path, required=True)
+    fetch_input = fetch_parser.add_mutually_exclusive_group(required=True)
+    fetch_input.add_argument("--head", type=Path)
+    fetch_input.add_argument("--environment", type=Path)
+    probe_parser = subparsers.add_parser("probe-environment")
+    probe_parser.add_argument("--python", default=sys.executable)
+    probe_parser.add_argument("--output", type=Path, required=True)
+    resolve_parser = subparsers.add_parser("resolve-baselines")
+    resolve_parser.add_argument("--repository", required=True)
+    resolve_parser.add_argument("--modules", required=True)
+    resolve_parser.add_argument("--environment", type=Path, required=True)
+    resolve_parser.add_argument("--base-revision", required=True)
+    resolve_parser.add_argument("--output", type=Path, required=True)
+    resolve_parser.add_argument("--github-output", type=Path)
     approve_parser = subparsers.add_parser("approve")
     approve_parser.add_argument("--candidate", type=Path, required=True)
     approve_parser.add_argument("--output", type=Path, required=True)
@@ -512,6 +613,11 @@ def main() -> int:
         payload = run_benchmark(
             args.module, python=args.python, samples=args.samples, revision=revision
         )
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        return 0
+    if args.command == "probe-environment":
+        payload = environment_contract(args.python)
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
         return 0
@@ -536,12 +642,41 @@ def main() -> int:
     token = os.environ.get("GH_TOKEN", "")
     if not token:
         raise SystemExit("GH_TOKEN is required to fetch a baseline artifact")
+    if args.command == "resolve-baselines":
+        modules = json.loads(args.modules)
+        if not isinstance(modules, list) or not all(
+            isinstance(module, str) for module in modules
+        ):
+            raise SystemExit("--modules must be a JSON list of module names")
+        plan = resolve_baselines(
+            args.repository,
+            modules,
+            args.output,
+            token,
+            json.loads(args.environment.read_text()),
+            args.base_revision,
+        )
+        if args.github_output:
+            with args.github_output.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    f"needs_base_wheel={str(plan['needs_base_wheel']).lower()}\n"
+                )
+                handle.write(
+                    "measured_base_modules="
+                    + json.dumps(plan["measured_base_modules"], separators=(",", ":"))
+                    + "\n"
+                )
+        print(json.dumps(plan, separators=(",", ":")))
+        return 0
+    head = json.loads((args.head or args.environment).read_text())
+    if args.environment:
+        head = compatibility_candidate(args.module, head)
     found = fetch_baseline(
         args.repository,
         args.module,
         args.output,
         token,
-        json.loads(args.head.read_text()),
+        head,
     )
     print(json.dumps({"module": args.module, "found": found}))
     return 0 if found else 2

@@ -50,6 +50,7 @@ jobs:
       run_benchmark: ${{ steps.targets.outputs.run_benchmark }}
       run_sanitizer: ${{ steps.targets.outputs.run_sanitizer }}
       run_all: ${{ steps.targets.outputs.run_all }}
+      package_smoke_only: ${{ steps.targets.outputs.package_smoke_only }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -258,6 +259,7 @@ jobs:
           print(flashrwkv2._C.__file__)
           PY
       - name: Run affected GPU correctness tests
+        if: needs.impact.outputs.package_smoke_only != 'true'
         env:
           MODULES_JSON: ${{ needs.impact.outputs.affected_modules }}
         run: |
@@ -294,6 +296,14 @@ jobs:
               if tests - skipped < 1:
                   raise SystemExit(f"{path} executed no non-skipped GPU tests")
           PY
+      - name: Record benchmark environment contract
+        if: needs.impact.outputs.run_benchmark == 'true'
+        run: |
+          wheel_sha="$(sha256sum artifacts/wheels/*.whl | cut -d' ' -f1)"
+          FLASH_RWKV_WHEEL_SHA256="$wheel_sha" \
+            .runtime-venv/bin/python ci/benchmark_gate.py probe-environment \
+            --python .runtime-venv/bin/python \
+            --output artifacts/benchmark-environment.json
       - name: Run affected Compute Sanitizer checks
         if: needs.impact.outputs.run_sanitizer == 'true'
         env:
@@ -345,10 +355,128 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
-  benchmark:
-    name: Benchmark / ${{ matrix.target.module }}
+  benchmark-plan:
+    name: Resolve benchmark baselines
     needs: [impact, gpu-test]
     if: needs.impact.outputs.run_benchmark == 'true' && needs.impact.outputs.trusted == 'true' && needs.gpu-test.result == 'success'
+    runs-on: ubuntu-latest
+    outputs:
+      needs_base_wheel: ${{ steps.resolve.outputs.needs_base_wheel }}
+      measured_base_modules: ${{ steps.resolve.outputs.measured_base_modules }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.impact.outputs.head_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: flashrwkv2-sm120-test-${{ needs.impact.outputs.head_sha }}
+          path: tested-artifact
+      - name: Resolve compatible approved baselines
+        id: resolve
+        env:
+          MODULES_JSON: ${{ needs.impact.outputs.affected_modules }}
+          BASE_SHA: ${{ needs.impact.outputs.base_sha }}
+        run: |
+          python3 ci/benchmark_gate.py resolve-baselines \
+            --repository "$GITHUB_REPOSITORY" \
+            --modules "$MODULES_JSON" \
+            --environment tested-artifact/benchmark-environment.json \
+            --base-revision "$BASE_SHA" \
+            --output artifacts/baseline-plan \
+            --github-output "$GITHUB_OUTPUT"
+      - name: Upload revision-bound baseline plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: flashrwkv2-baseline-plan-${{ needs.impact.outputs.head_sha }}
+          path: artifacts/baseline-plan/
+          if-no-files-found: error
+          retention-days: 90
+
+  base-wheel:
+    name: Build benchmark base wheel once
+    needs: [impact, benchmark-plan]
+    if: needs.benchmark-plan.outputs.needs_base_wheel == 'true'
+    runs-on: [self-hosted, linux, x64, rwkv-sha-pro6000x8]
+    timeout-minutes: 120
+    concurrency:
+      group: flashrwkv2-pro6000-exclusive
+      cancel-in-progress: false
+    env:
+      TORCH_CUDA_ARCH_LIST: "12.0"
+      CUDA_VISIBLE_DEVICES: "0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.impact.outputs.base_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: false
+      - name: Build exact base wheel once
+        env:
+          BASE_SHA: ${{ needs.impact.outputs.base_sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$BASE_SHA"
+          test -z "$(git status --short --untracked-files=no)"
+          mkdir -p artifacts/base-wheels
+          uv sync --frozen --no-install-project --group dev
+          uv export --frozen --group dev --no-emit-project \
+            --output-file artifacts/base-locked-requirements.txt
+          uv build --wheel --out-dir artifacts/base-wheels
+          test "$(find artifacts/base-wheels -maxdepth 1 -name '*.whl' | wc -l)" -eq 1
+      - name: Smoke-test exact base wheel
+        run: |
+          uv venv --python 3.12 .base-smoke-venv
+          uv pip install --python .base-smoke-venv/bin/python \
+            -r artifacts/base-locked-requirements.txt
+          uv pip install --python .base-smoke-venv/bin/python --no-deps \
+            artifacts/base-wheels/*.whl
+          smoke_root="$RUNNER_TEMP/flashrwkv2-base-smoke-$GITHUB_RUN_ID"
+          mkdir -p "$smoke_root"
+          cd "$smoke_root"
+          "$GITHUB_WORKSPACE/.base-smoke-venv/bin/python" - <<'PY'
+          import flashrwkv2
+          import torch
+          if flashrwkv2._C is None:
+              raise SystemExit("base flashrwkv2._C did not load from the wheel")
+          if torch.cuda.get_device_capability(0) != (12, 0):
+              raise SystemExit(f"unexpected capability: {torch.cuda.get_device_capability(0)}")
+          print(flashrwkv2._C.__file__)
+          PY
+      - name: Record immutable base identity
+        env:
+          BASE_SHA: ${{ needs.impact.outputs.base_sha }}
+        run: |
+          .base-smoke-venv/bin/python - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          wheel = next(Path("artifacts/base-wheels").glob("*.whl"))
+          payload = {
+              "base_sha": os.environ["BASE_SHA"],
+              "wheel": wheel.name,
+              "wheel_sha256": hashlib.sha256(wheel.read_bytes()).hexdigest(),
+          }
+          Path("artifacts/base-build-identity.json").write_text(
+              json.dumps(payload, indent=2) + "\n"
+          )
+          PY
+      - name: Upload exact base wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: flashrwkv2-sm120-base-${{ needs.impact.outputs.base_sha }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 7
+
+  benchmark:
+    name: Benchmark / ${{ matrix.target.module }}
+    needs: [impact, gpu-test, benchmark-plan, base-wheel]
+    if: always() && needs.impact.outputs.run_benchmark == 'true' && needs.impact.outputs.trusted == 'true' && needs.gpu-test.result == 'success' && needs.benchmark-plan.result == 'success' && (needs.base-wheel.result == 'success' || needs.base-wheel.result == 'skipped')
     strategy:
       fail-fast: false
       max-parallel: 1
@@ -376,6 +504,15 @@ jobs:
         with:
           name: flashrwkv2-sm120-test-${{ needs.impact.outputs.head_sha }}
           path: tested-artifact
+      - uses: actions/download-artifact@v4
+        with:
+          name: flashrwkv2-baseline-plan-${{ needs.impact.outputs.head_sha }}
+          path: baseline-plan
+      - uses: actions/download-artifact@v4
+        if: needs.benchmark-plan.outputs.needs_base_wheel == 'true'
+        with:
+          name: flashrwkv2-sm120-base-${{ needs.impact.outputs.base_sha }}
+          path: base-artifact
       - name: Prepare benchmark runtime from the tested wheel
         run: |
           uv venv --python 3.12 .benchmark-venv
@@ -386,7 +523,7 @@ jobs:
           echo "FLASH_RWKV_WHEEL_SHA256=$(sha256sum tested-artifact/wheels/*.whl | cut -d' ' -f1)" \
             >> "$GITHUB_ENV"
           mkdir -p artifacts/benchmark
-      - name: Run Head three times and resolve approved baseline
+      - name: Run Head three times and prepare resolved baseline
         id: baseline
         env:
           MODULE: ${{ matrix.target.module }}
@@ -399,49 +536,37 @@ jobs:
             --python .benchmark-venv/bin/python \
             --revision "$HEAD_SHA" \
             --output "artifacts/benchmark/$SAFE_MODULE-head.json"
-          set +e
-          python3 ci/benchmark_gate.py fetch-baseline \
-            --repository "$GITHUB_REPOSITORY" \
-            --module "$MODULE" \
-            --head "artifacts/benchmark/$SAFE_MODULE-head.json" \
-            --output "artifacts/benchmark/$SAFE_MODULE-baseline.json"
-          status=$?
-          set -e
-          if [[ "$status" -eq 0 ]]; then
-            echo "source=approved-artifact" >> "$GITHUB_OUTPUT"
-          elif [[ "$status" -eq 2 ]]; then
-            if ! git cat-file -e "$BASE_SHA:benchmarks/$MODULE/bench.py"; then
-              echo "No base benchmark exists for new module $MODULE; bootstrapping from validated head evidence."
-              echo "source=new-module-bootstrap" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-            echo "No compatible approved artifact was found; measuring the PR base."
-            base_root="$RUNNER_TEMP/flashrwkv2-base-$SAFE_MODULE"
-            git worktree add --detach "$base_root" "$BASE_SHA"
-            (
-              cd "$base_root"
-              uv sync --frozen --no-install-project --group dev
-              uv export --frozen --group dev --no-emit-project \
-                --output-file "$RUNNER_TEMP/base-requirements-$SAFE_MODULE.txt"
-              uv build --wheel --out-dir "$RUNNER_TEMP/base-wheels-$SAFE_MODULE"
-              uv venv --python 3.12 "$RUNNER_TEMP/base-venv-$SAFE_MODULE"
-              uv pip install --python "$RUNNER_TEMP/base-venv-$SAFE_MODULE/bin/python" \
-                -r "$RUNNER_TEMP/base-requirements-$SAFE_MODULE.txt"
-              uv pip install --python "$RUNNER_TEMP/base-venv-$SAFE_MODULE/bin/python" \
-                --no-deps "$RUNNER_TEMP/base-wheels-$SAFE_MODULE"/*.whl
-            )
-            FLASH_RWKV_SOURCE_ROOT="$base_root" \
-              FLASH_RWKV_WHEEL_SHA256="$(sha256sum "$RUNNER_TEMP/base-wheels-$SAFE_MODULE"/*.whl | cut -d' ' -f1)" \
-              python3 ci/benchmark_gate.py run \
-              --module "$MODULE" \
-              --python "$RUNNER_TEMP/base-venv-$SAFE_MODULE/bin/python" \
-              --revision "$BASE_SHA" \
-              --output "artifacts/benchmark/$SAFE_MODULE-baseline.json"
-            git worktree remove "$base_root"
-            echo "source=measured-base" >> "$GITHUB_OUTPUT"
-          else
-            exit "$status"
+          source="$(python3 -c \
+            'import json,os; print(json.load(open("baseline-plan/plan.json"))["sources"][os.environ["MODULE"]])')"
+          echo "source=$source" >> "$GITHUB_OUTPUT"
+          if [[ "$source" = "approved-artifact" ]]; then
+            cp "baseline-plan/$SAFE_MODULE-baseline.json" \
+              "artifacts/benchmark/$SAFE_MODULE-baseline.json"
+            exit 0
           fi
+          if [[ "$source" = "new-module-bootstrap" ]]; then
+            echo "No base benchmark exists for new module $MODULE; bootstrapping from validated head evidence."
+            exit 0
+          fi
+          test "$source" = "measured-base"
+          echo "No compatible approved artifact was found; measuring the base with the shared base wheel."
+          base_root="$RUNNER_TEMP/flashrwkv2-base-$SAFE_MODULE"
+          trap 'git worktree remove --force "$base_root" >/dev/null 2>&1 || true' EXIT
+          git worktree add --detach "$base_root" "$BASE_SHA"
+          uv venv --python 3.12 "$RUNNER_TEMP/base-venv-$SAFE_MODULE"
+          uv pip install --python "$RUNNER_TEMP/base-venv-$SAFE_MODULE/bin/python" \
+            -r base-artifact/base-locked-requirements.txt
+          uv pip install --python "$RUNNER_TEMP/base-venv-$SAFE_MODULE/bin/python" \
+            --no-deps base-artifact/base-wheels/*.whl
+          FLASH_RWKV_SOURCE_ROOT="$base_root" \
+            FLASH_RWKV_WHEEL_SHA256="$(sha256sum base-artifact/base-wheels/*.whl | cut -d' ' -f1)" \
+            python3 ci/benchmark_gate.py run \
+            --module "$MODULE" \
+            --python "$RUNNER_TEMP/base-venv-$SAFE_MODULE/bin/python" \
+            --revision "$BASE_SHA" \
+            --output "artifacts/benchmark/$SAFE_MODULE-baseline.json"
+          git worktree remove "$base_root"
+          trap - EXIT
       - name: Enforce the 0.2 percent regression gate
         id: comparison
         env:
@@ -522,7 +647,7 @@ jobs:
 
   aggregate:
     name: Quality Gate / aggregate
-    needs: [impact, untrusted, gpu-test, benchmark]
+    needs: [impact, untrusted, gpu-test, benchmark-plan, base-wheel, benchmark]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -533,6 +658,9 @@ jobs:
           TRUSTED: ${{ needs.impact.outputs.trusted }}
           IMPACT_RESULT: ${{ needs.impact.result }}
           GPU_RESULT: ${{ needs.gpu-test.result }}
+          BENCHMARK_PLAN_RESULT: ${{ needs.benchmark-plan.result }}
+          BASE_WHEEL_RESULT: ${{ needs.base-wheel.result }}
+          NEEDS_BASE_WHEEL: ${{ needs.benchmark-plan.outputs.needs_base_wheel }}
           BENCHMARK_RESULT: ${{ needs.benchmark.result }}
         run: |
           test "$IMPACT_RESULT" = "success"
@@ -546,6 +674,12 @@ jobs:
           fi
           test "$GPU_RESULT" = "success"
           if [[ "$RUN_BENCHMARK" == "true" ]]; then
+            test "$BENCHMARK_PLAN_RESULT" = "success"
+            if [[ "$NEEDS_BASE_WHEEL" == "true" ]]; then
+              test "$BASE_WHEEL_RESULT" = "success"
+            else
+              test "$BASE_WHEEL_RESULT" = "skipped"
+            fi
             test "$BENCHMARK_RESULT" = "success"
           fi
       - name: Download benchmark reports for the pull request summary

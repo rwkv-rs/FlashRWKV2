@@ -8,6 +8,7 @@
 我们一般参考其它 RWKV 权威实现, 或 Kimi-Delta-Attention 实现进行优化.
 
 ## 权威 RWKV7 实现
+
 (1) https://github.com/BlinkDL/RWKV-LM/blob/main/RWKV-v7/rwkv_v7_numpy.py
 (2) https://github.com/BlinkDL/RWKV-LM/blob/main/RWKV-v7/run_rwkv7_qwen35.py
 (3) https://github.com/BlinkDL/Albatross -- 权威底层推理引擎实现仓库 (cuda, for pro6000, 无调度, 无varlen)
