@@ -77,10 +77,6 @@ torch::Tensor head_last_norm_forward_varlen(
   TORCH_CHECK(last_indices.size(0) > 0, "last_indices must not be empty");
   TORCH_CHECK((x.size(1) % 2) == 0,
               "head last-layer norm requires an even channel count");
-  TORCH_CHECK(
-      last_indices.numel() == 0 ||
-          ((last_indices >= 0) & (last_indices < x.size(0))).all().item<bool>(),
-      "last_indices must be absolute packed-row indices in [0, total_tokens)");
   TORCH_CHECK(residual.device() == x.device() && weight.device() == x.device() &&
                   bias.device() == x.device() && last_indices.device() == x.device(),
               "head tensors must share x's device");

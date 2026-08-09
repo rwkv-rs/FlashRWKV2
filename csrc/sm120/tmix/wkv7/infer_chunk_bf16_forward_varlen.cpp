@@ -87,7 +87,8 @@ py::tuple infer_chunk_bf16_forward_varlen(
     int64_t chunk_size,
     int64_t max_seqlen,
     double scale,
-    std::optional<torch::Tensor> decay_bias) {
+    std::optional<torch::Tensor> decay_bias,
+    py::object validated_metadata) {
   check_bf16(r, r, "r");
   for (const auto& item : {
            std::pair<const torch::Tensor*, const char*>{
@@ -145,11 +146,31 @@ py::tuple infer_chunk_bf16_forward_varlen(
   auto token_transform = torch::empty(
       r.sizes(), r.options().dtype(torch::kFloat32));
   auto token_bias = torch::empty_like(token_transform);
-  auto prepared = prepare_recurrent_metadata_cuda(
-      cu_seqlens, state_indices, r.size(0), state_pool.size(0));
+  torch::Tensor launch_query_start_loc = cu_seqlens;
+  torch::Tensor launch_state_indices = state_indices;
+  torch::Tensor metadata_status;
+  if (!validated_metadata.is_none()) {
+    validated_metadata.attr("_check_compatible")(
+        cu_seqlens, state_indices, r.size(0), state_pool.size(0),
+        max_seqlen);
+    launch_query_start_loc = validated_metadata
+        .attr("_query_start_loc_snapshot")()
+        .cast<torch::Tensor>();
+    launch_state_indices = validated_metadata
+        .attr("_state_indices_snapshot")()
+        .cast<torch::Tensor>();
+    metadata_status = validated_metadata.attr("_status")().cast<torch::Tensor>();
+    max_seqlen = validated_metadata.attr("_max_seqlen")().cast<int64_t>();
+  } else {
+    auto prepared = prepare_recurrent_metadata_cuda(
+        cu_seqlens, state_indices, r.size(0), state_pool.size(0));
+    launch_query_start_loc = std::move(prepared.query_start_loc);
+    launch_state_indices = std::move(prepared.state_indices);
+    metadata_status = std::move(prepared.status);
+  }
   infer_chunk_bf16_forward_varlen_cuda(
-      prepared.query_start_loc,
-      prepared.state_indices,
+      launch_query_start_loc,
+      launch_state_indices,
       state_pool,
       r,
       decay_logits,
@@ -166,7 +187,7 @@ py::tuple infer_chunk_bf16_forward_varlen(
       chunk_size,
       max_seqlen,
       scale,
-      prepared.status);
+      metadata_status);
   return py::make_tuple(output, state_pool);
 }
 
@@ -179,5 +200,6 @@ void register_infer_chunk_bindings(py::module_& module) {
       py::arg("a"), py::arg("b"), py::arg("state_pool"),
       py::arg("cu_seqlens"), py::arg("state_indices"),
       py::arg("chunk_size") = 16, py::arg("max_seqlen") = -1,
-      py::arg("scale") = 1.0, py::arg("decay_bias") = py::none());
+      py::arg("scale") = 1.0, py::arg("decay_bias") = py::none(),
+      py::arg("validated_metadata") = py::none());
 }

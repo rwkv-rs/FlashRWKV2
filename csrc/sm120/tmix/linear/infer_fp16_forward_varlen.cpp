@@ -7,7 +7,9 @@
 
 #include <torch/extension.h>
 
+#include <cmath>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -39,6 +41,12 @@ torch::Tensor tmix_linear_rank_out_dispatch_forward_varlen_cuda(
     torch::Tensor x,
     std::optional<torch::Tensor> weight,
     std::optional<torch::Tensor> weight_t);
+torch::Tensor tmix_linear_attention_c2c_forward_varlen_cuda(
+    torch::Tensor x,
+    torch::Tensor weight,
+    torch::Tensor lora_a,
+    torch::Tensor lora_b,
+    double lora_scale);
 std::vector<torch::Tensor> tmix_lowrank_in_forward_varlen_cuda(
     torch::Tensor x_w,
     torch::Tensor x_a,
@@ -208,8 +216,44 @@ torch::Tensor tmix_linear_forward_varlen(
 }
 
 torch::Tensor tmix_linear_attention_c2c_forward_varlen(
-    torch::Tensor x, torch::Tensor weight) {
-  return tmix_linear_caller_forward_varlen(x, weight, false, 1);
+    torch::Tensor x,
+    torch::Tensor weight,
+    std::optional<torch::Tensor> lora_a,
+    std::optional<torch::Tensor> lora_b,
+    double lora_scale) {
+  check_half(x, "x");
+  check_half(weight, "weight");
+  check_same(x, weight, "weight");
+  TORCH_CHECK(x.dim() == 2 && x.size(0) > 0 && x.size(1) > 0,
+              "x must have packed shape [total_tokens,K]");
+  TORCH_CHECK(weight.dim() == 2 && weight.size(0) > 0 &&
+                  weight.size(1) == x.size(1),
+              "weight must have shape [N,K]");
+  TORCH_CHECK(lora_a.has_value() == lora_b.has_value(),
+              "lora_a and lora_b must be provided together");
+  TORCH_CHECK(std::isfinite(lora_scale) &&
+                  std::abs(lora_scale) <= std::numeric_limits<float>::max(),
+              "lora_scale must be finite and representable as float32");
+  if (!lora_a.has_value()) {
+    return tmix_linear_caller_forward_varlen(x, weight, false, 1);
+  }
+  check_half(*lora_a, "lora_a");
+  check_half(*lora_b, "lora_b");
+  check_same(x, *lora_a, "lora_a");
+  check_same(x, *lora_b, "lora_b");
+  TORCH_CHECK(lora_a->dim() == 2 && lora_a->size(0) > 0 &&
+                  lora_a->size(1) == x.size(1),
+              "lora_a must have shape [R,K]");
+  const int64_t rank = lora_a->size(0);
+  TORCH_CHECK(rank <= 512, "LoRA projection requires R<=512");
+  TORCH_CHECK(lora_b->dim() == 2 && lora_b->size(0) == weight.size(0) &&
+                  lora_b->size(1) == rank,
+              "lora_b must have shape [N,R]");
+  if (static_cast<float>(lora_scale) == 0.0f) {
+    return tmix_linear_caller_forward_varlen(x, weight, false, 1);
+  }
+  return tmix_linear_attention_c2c_forward_varlen_cuda(
+      x, weight, *lora_a, *lora_b, lora_scale);
 }
 
 torch::Tensor tmix_linear_ffn_key_forward_varlen(
@@ -404,7 +448,8 @@ void register_tmix_linear_bindings(py::module_& module) {
   module.def(
       "tmix_linear_attention_c2c_forward_varlen",
       &tmix_linear_attention_c2c_forward_varlen,
-      py::arg("x"), py::arg("weight"));
+      py::arg("x"), py::arg("weight"), py::arg("lora_a") = py::none(),
+      py::arg("lora_b") = py::none(), py::arg("lora_scale") = 1.0);
   module.def(
       "tmix_linear_ffn_key_forward_varlen",
       &tmix_linear_ffn_key_forward_varlen,

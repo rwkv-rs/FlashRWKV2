@@ -160,4 +160,4 @@ __all__ = [
     "statetune_tmix_mix6_bf16",
 ]
 
-__version__ = "0.1.0a5"
+__version__ = "0.1.0a6"

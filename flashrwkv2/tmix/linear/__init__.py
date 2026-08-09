@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import math
+from numbers import Real
+
 import torch
 
 from ..wkv7 import _extension
@@ -45,15 +48,48 @@ def infer_tmix_linear_forward_varlen(
 
 
 def infer_tmix_linear_attention_c2c_forward_varlen(
-    x: torch.Tensor, weight: torch.Tensor
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    *,
+    lora_a: torch.Tensor | None = None,
+    lora_b: torch.Tensor | None = None,
+    lora_scale: float = 1.0,
 ) -> torch.Tensor:
-    """Packed Albatross attention c2c original-layout linear caller path."""
+    """Packed Albatross attention C2C projection with optional vanilla LoRA.
+
+    When both LoRA tensors are supplied, computes
+    ``x @ weight.T + lora_scale * (x @ lora_a.T) @ lora_b.T``.  ``lora_a``
+    uses PEFT layout ``[rank,K]`` and ``lora_b`` uses ``[N,rank]``.
+    """
 
     _check_rows(x, "x")
     _check_rows(weight, "weight")
     if weight.device != x.device or weight.shape[1] != x.shape[1]:
-        raise ValueError("weight must have shape [N,C] and share x's device")
-    return _extension().tmix_linear_attention_c2c_forward_varlen(x, weight)
+        raise ValueError("weight must have shape [N,K] and share x's device")
+    if (lora_a is None) != (lora_b is None):
+        raise ValueError("lora_a and lora_b must be provided together")
+    if isinstance(lora_scale, bool) or not isinstance(lora_scale, Real):
+        raise TypeError("lora_scale must be a finite real number")
+    normalized_scale = float(lora_scale)
+    if (
+        not math.isfinite(normalized_scale)
+        or abs(normalized_scale) > 3.4028234663852886e38
+    ):
+        raise ValueError("lora_scale must be finite and representable as float32")
+    if lora_a is not None and lora_b is not None:
+        _check_rows(lora_a, "lora_a")
+        _check_rows(lora_b, "lora_b")
+        rank = lora_a.shape[0]
+        if lora_a.device != x.device or lora_a.shape[1] != x.shape[1]:
+            raise ValueError("lora_a must have shape [R,K] and share x's device")
+        if rank > 512:
+            raise ValueError("LoRA projection requires R<=512")
+        if lora_b.device != x.device or lora_b.shape != (weight.shape[0], rank):
+            raise ValueError("lora_b must have shape [N,R] and share x's device")
+
+    return _extension().tmix_linear_attention_c2c_forward_varlen(
+        x, weight, lora_a, lora_b, normalized_scale
+    )
 
 
 def infer_tmix_linear_ffn_key_forward_varlen(

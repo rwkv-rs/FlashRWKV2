@@ -118,6 +118,9 @@ void wkv_fp32_v2_kernel(
         block_index, block_count, output_elements, output_ptr);
     return;
   }
+  if (sequence_index >= metadata_status[2]) {
+    return;
+  }
 
   __shared__ int token_start;
   __shared__ int token_end;
@@ -225,6 +228,9 @@ void wkv_fp32_v2_small_warp_kernel(
         block_index, block_count, output_elements, output_ptr);
     return;
   }
+  if (sequence_index >= metadata_status[2]) {
+    return;
+  }
 
   const int token_start = query_start_loc[sequence_index];
   const int token_end = query_start_loc[sequence_index + 1];
@@ -314,6 +320,9 @@ void wkv_fp32_v2_short_block_kernel(
   if (metadata_status[0] != 0) {
     fill_invalid_output(
         block_index, block_count, output_elements, output_ptr);
+    return;
+  }
+  if (sequence_index >= metadata_status[2]) {
     return;
   }
 

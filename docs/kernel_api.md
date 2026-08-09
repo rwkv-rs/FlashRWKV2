@@ -52,11 +52,17 @@ shape `[slots, C]`. Recurrent, chunk, TMix mix6, and stateful CMix inference
 operators update the slots selected by `state_indices` in place. Callers own
 allocation, slot reuse, synchronization, and request lifecycle.
 
-`prepare_recurrent_metadata` returns an opaque native validation ticket. A
-ticket can be reused by operators that accept `validated_metadata`; it is bound
-to the metadata snapshot and launch dimensions used to create it. Reusing a
-ticket after incompatible tensor, value, device, version, or launch changes
-fails closed before the stateful launch.
+`prepare_recurrent_metadata` returns an opaque native validation ticket. The
+legacy static form snapshots fixed metadata. The capacity form can be prepared
+on the consumer stream for a zero-active pre-capture warmup, then prepared
+again with the same buffers during formal capture. It keeps `cu_seqlens`,
+`state_indices`, and two CUDA `int32` active-count scalars live. Both forms are
+bound to the same tensor identities, device, stream, state-pool size, and
+launch capacity.
+Graph validation covers only the active prefix; invalid counts, offsets,
+lengths, slots, or duplicate slots fail closed before any stateful consumer
+reads or writes recurrent state. Inactive capacity-tail rows never access a
+state slot.
 
 The FP16 recurrent operator reads a separate `int32` elapsed-state pool.
 Advancing that pool is explicit through the two `advance_i32` APIs.
@@ -102,9 +108,9 @@ chunk metadata and returns a new final pool rather than mutating the input pool.
 
 - Import: `from flashrwkv2 import prepare_recurrent_metadata`
 - Owner: `flashrwkv2.tmix.wkv7`
-- Signature: `prepare_recurrent_metadata(cu_seqlens, state_indices, *, total_tokens, state_pool_size, max_seqlen=None) -> object`
-- Contract: validates the packed metadata against positive launch sizes and the optional maximum sequence length.
-- Result and mutation: returns an opaque reusable native ticket; it does not mutate the metadata tensors.
+- Signature: `prepare_recurrent_metadata(cu_seqlens, state_indices, *, state_pool_size, total_tokens=None, max_seqlen=None, token_capacity=None, sequence_capacity=None, max_seqlen_capacity=None, num_active_tokens=None, num_active_sequences=None) -> object`
+- Contract: the static form requires `total_tokens` and validates one fixed packed launch. The capacity form requires all four capacity/count arguments, fixed metadata buffer shapes `[sequence_capacity+1]` and `[sequence_capacity]`, and one-element CUDA `int32` active-count tensors. It may run before capture for same-stream warmup or during formal capture.
+- Result and mutation: returns one reusable native ticket. For warmup, set both active counts to zero before preparing and consuming the ticket; capacity may exceed the physical state-pool size because inactive metadata tails are ignored. Prepare the capacity form again with the same tensor addresses inside formal capture, where its validator reads live metadata and active counts on every replay. Callers update buffer contents in place rather than replacing tensors or moving state.
 
 ### `infer_recurrent_fp16_advance_i32`
 
@@ -230,8 +236,9 @@ outputs. `M` denotes packed rows, `K` input features, `N` output features, and
 
 - Import: `from flashrwkv2 import infer_tmix_linear_attention_c2c_forward_varlen`
 - Owner: `flashrwkv2.tmix.linear`
-- Signature: `infer_tmix_linear_attention_c2c_forward_varlen(x, weight) -> torch.Tensor`
-- Contract and result: attention-specific dispatch for `x [M,K]` and original-layout `weight [N,K]`, returning `[M,N]` without mutation.
+- Signature: `infer_tmix_linear_attention_c2c_forward_varlen(x, weight, *, lora_a=None, lora_b=None, lora_scale=1.0) -> torch.Tensor`
+- Contract: attention-specific dispatch for `x [M,K]` and original-layout `weight [N,K]`. Optional vanilla-LoRA tensors must be supplied together in PEFT layout as `lora_a [R,K]` and `lora_b [N,R]`, with `1<=R<=512` and a finite float32-representable scale. Multiple active adapters, bias, dropout, DoRA, QLoRA, and per-sample adapter routing are outside this operator contract.
+- Result: without LoRA, returns the unchanged base path `x @ weight.T`. With LoRA, returns `x @ weight.T + lora_scale * (x @ lora_a.T) @ lora_b.T` as contiguous FP16 `[M,N]`; inputs are immutable. Rank-out accumulates directly into the base output without a full `[M,N]` delta allocation. A validated zero scale reuses the base-only path.
 
 ### `infer_tmix_linear_ffn_key_forward_varlen`
 
@@ -437,7 +444,32 @@ must be rebuilt after weight, device, or dtype changes.
 - Owner: `flashrwkv2.head.linear`
 - Signature: `infer_head_last_norm_forward_varlen(x, residual, last_indices, weight, bias, *, eps=1e-5) -> torch.Tensor`
 - Contract: FP16 `x` and `residual [N,C]` with even `C`; CUDA `int64 last_indices [B]` contains absolute packed-row indices; affine vectors are FP16 `[C]`.
-- Result: returns normalized selected rows `[B,C]`; inputs are not mutated.
+- Result: returns normalized selected rows `[B,C]`; inputs are not mutated. Index bounds are checked on device so the call is Graph-safe; an invalid index produces a NaN output row without an out-of-bounds read.
+
+## Sampling inference
+
+### `setup_sampling_states`
+
+- Import: `from flashrwkv2 import setup_sampling_states`
+- Owner: `flashrwkv2.sampling`
+- Signature: `setup_sampling_states(seed, num_slots) -> torch.Tensor`
+- Contract and result: initializes an explicit CUDA Philox state pool for positive `num_slots`. Callers retain the pool and assign requests through sampling `slot_indices`.
+
+### `infer_sampling_temperature_topk_topp_forward_varlen`
+
+- Import: `from flashrwkv2 import infer_sampling_temperature_topk_topp_forward_varlen`
+- Owner: `flashrwkv2.sampling`
+- Signature: `infer_sampling_temperature_topk_topp_forward_varlen(logits, states, slot_indices, *, temperature=1.0, top_k=-1, top_p=1.0, sample_capacity=None, num_active_samples=None) -> torch.Tensor`
+- Contract: FP32 logits `[capacity,V]`, an explicit Philox state pool, and CUDA `int32 slot_indices [capacity]`; controls may be scalars or same-capacity CUDA vectors. `sample_capacity` and the one-element CUDA `int32 num_active_samples` must be supplied together.
+- Result and mutation: returns CUDA `int32 [capacity]`. Active rows sample and advance their selected RNG slots. Inactive rows return `-1` without reading logits, controls, or RNG state. Invalid active counts, slots, or duplicate active slots make every row return `-1` without RNG mutation.
+
+### `infer_sampling_six_parameter_forward_varlen`
+
+- Import: `from flashrwkv2 import infer_sampling_six_parameter_forward_varlen`
+- Owner: `flashrwkv2.sampling`
+- Signature: `infer_sampling_six_parameter_forward_varlen(logits, penalties, states, slot_indices, *, presence_penalty=0.0, frequency_penalty=0.0, penalty_decay=0.996, temperature=1.0, top_k=-1, top_p=1.0, sample_capacity=None, num_active_samples=None) -> torch.Tensor`
+- Contract: extends temperature/top-k/top-p sampling with FP32 `penalties [num_slots,V]`; each of the six controls may be a scalar or a same-capacity CUDA vector. `frequency_penalty` is Rapid-Sampling's additive repetition increment.
+- Result and mutation: active rows advance their selected RNG and penalty slots. Inactive or invalid launches return the same `-1` sentinel contract and leave every inactive RNG and penalty slot unchanged.
 
 ## Pretraining
 
@@ -622,7 +654,7 @@ column means that the argument is optional.
 | `max_seqlen` | int/None | scalar | Optional positive maximum sequence length. |
 | `scale` | float | scalar | Finite output scale; default `1.0`. |
 | `decay_bias` | bf16/None | `[H,64]` or `[H*64]` | Optional decay-logit bias. |
-| `validated_metadata` | object/None | opaque | Optional metadata ticket; the binding takes its own snapshot. |
+| `validated_metadata` | object/None | opaque | Optional static snapshot or live Graph metadata ticket. |
 
 #### `prepare_recurrent_metadata`
 
@@ -633,6 +665,11 @@ column means that the argument is optional.
 | `total_tokens` | int | scalar | Expected positive packed row count. |
 | `state_pool_size` | int | scalar | Number of available state slots. |
 | `max_seqlen` | int/None | scalar | Optional expected maximum sequence length. |
+| `token_capacity` | int/None | scalar | Fixed Graph token-row capacity. |
+| `sequence_capacity` | int/None | scalar | Fixed Graph sequence capacity. |
+| `max_seqlen_capacity` | int/None | scalar | Positive per-sequence Graph length bound. |
+| `num_active_tokens` | int32/None | one element | Live CUDA Graph active-token count. |
+| `num_active_sequences` | int32/None | one element | Live CUDA Graph active-sequence count. |
 
 #### `infer_recurrent_fp16_advance_i32`
 
@@ -774,7 +811,10 @@ column means that the argument is optional.
 | Parameter | Dtype | Shape | Description |
 | --- | --- | --- | --- |
 | `x` | fp16 | `[M,K]` | Packed attention input. |
-| `weight` | fp16 | `[N,K]` | Original-layout attention projection. |
+| `weight` | fp16 | `[N,K]` | Original-layout base projection. |
+| `lora_a` | fp16/None | `[R,K]` | Optional PEFT-layout rank-in weight; `1<=R<=512`. |
+| `lora_b` | fp16/None | `[N,R]` | Optional rank-out weight; supplied with `lora_a`. |
+| `lora_scale` | float | scalar | Finite float32-representable scale; default `1.0`. |
 
 #### `infer_tmix_linear_ffn_key_forward_varlen`
 
@@ -1000,6 +1040,45 @@ column means that the argument is optional.
 | `last_indices` | int64 | `[B]` | Absolute packed-row indices to select. |
 | `weight`, `bias` | fp16 | `[C]` each | Final normalization affine parameters. |
 | `eps` | float | scalar | Numerical epsilon; default `1e-5`. |
+
+### Sampling parameters
+
+#### `setup_sampling_states`
+
+| Parameter | Dtype | Shape | Description |
+| --- | --- | --- | --- |
+| `seed` | int | scalar | Seed used to initialize every Philox slot deterministically. |
+| `num_slots` | int | scalar | Positive persistent RNG-slot count. |
+
+#### `infer_sampling_temperature_topk_topp_forward_varlen`
+
+| Parameter | Dtype | Shape | Description |
+| --- | --- | --- | --- |
+| `logits` | fp32 | `[capacity,V]` | Compact output-producing request rows; `V` is divisible by four. |
+| `states` | int8 | `[num_slots,state_bytes]` | Philox pool returned by `setup_sampling_states`. |
+| `slot_indices` | int32 | `[capacity]` | RNG slot selected by each row. |
+| `temperature` | float/fp32 | scalar or `[capacity]` | Sampling temperature. |
+| `top_k` | int/int32 | scalar or `[capacity]` | Top-k control. |
+| `top_p` | float/fp32 | scalar or `[capacity]` | Nucleus threshold. |
+| `sample_capacity` | int/None | scalar | Fixed row capacity; supplied with `num_active_samples`. |
+| `num_active_samples` | int32/None | one element | Live active-prefix length, including during Graph replay. |
+
+#### `infer_sampling_six_parameter_forward_varlen`
+
+| Parameter | Dtype | Shape | Description |
+| --- | --- | --- | --- |
+| `logits` | fp32 | `[capacity,V]` | Compact output-producing request rows. |
+| `penalties` | fp32 | `[num_slots,V]` | Per-slot additive penalty state, updated in place. |
+| `states` | int8 | `[num_slots,state_bytes]` | Persistent Philox state pool. |
+| `slot_indices` | int32 | `[capacity]` | RNG and penalty slot selected by each row. |
+| `presence_penalty` | float/fp32 | scalar or `[capacity]` | Penalty applied when a token is present. |
+| `frequency_penalty` | float/fp32 | scalar or `[capacity]` | Additive increment after sampling. |
+| `penalty_decay` | float/fp32 | scalar or `[capacity]` | Existing-penalty decay. |
+| `temperature` | float/fp32 | scalar or `[capacity]` | Sampling temperature. |
+| `top_k` | int/int32 | scalar or `[capacity]` | Top-k control. |
+| `top_p` | float/fp32 | scalar or `[capacity]` | Nucleus threshold. |
+| `sample_capacity` | int/None | scalar | Fixed row capacity; supplied with `num_active_samples`. |
+| `num_active_samples` | int32/None | one element | Live active-prefix length. |
 
 ### Pretraining parameters
 

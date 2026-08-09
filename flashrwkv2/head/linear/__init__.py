@@ -95,8 +95,6 @@ def infer_head_last_norm_forward_varlen(
         raise ValueError("last_indices must be contiguous CUDA int64")
     if last_indices.ndim != 1 or last_indices.numel() == 0:
         raise ValueError("last_indices must have shape [batch] and be non-empty")
-    if torch.any((last_indices < 0) | (last_indices >= x.shape[0])).item():
-        raise ValueError("last_indices must be absolute packed-row indices in [0, rows)")
     if x.shape[1] % 2:
         raise ValueError("head last-layer norm requires an even channel count")
     if weight.shape != (x.shape[1],) or bias.shape != weight.shape:

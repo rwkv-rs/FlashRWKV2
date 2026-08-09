@@ -4,9 +4,10 @@
 // Albatross source revision: ee3308f6922e59f2166c7fac3c5a192340a2b48e
 // Original path: faster3a_2607/cuda/rwkv7_v3a_ops.cu
 // Mechanical migration boundary: exact upstream linear kernel/device bodies and
-// launch dispatch are retained. The only local adaptation is the caller-owned
-// packed [total_tokens,C] binding below; rows are already contiguous and no
-// sequence metadata is needed for this tokenwise operator family.
+// launch dispatch are retained. Local adaptations are the caller-owned packed
+// [total_tokens,C] bindings and the vanilla-LoRA composition/scaled accumulation
+// below; rows are already contiguous and no sequence metadata is needed for this
+// tokenwise operator family.
 // The standalone act_tanh/act_sigmoid bodies are copied from
 // faster3a_2607/cuda/rwkv7_fast_ops_fp16.cu at the same revision because the
 // canonical large-rank lowrank caller reaches those helpers directly.
@@ -413,6 +414,104 @@ __global__ __launch_bounds__(Threads, 2) void linear_t_f16_ntile_scalar_kernel(
       const int n = n0 + j;
       if (n < N) {
         *reinterpret_cast<__half*>(y + static_cast<int64_t>(m) * N + n) = __float2half_rn(sum);
+      }
+    }
+  }
+}
+
+template <int Threads, int OutTile, bool ScalarInput>
+__global__ __launch_bounds__(Threads, 2)
+void linear_t_f16_ntile_scaled_accumulate_kernel(
+    int M,
+    int K,
+    int N,
+    const dtype* __restrict__ x,
+    const dtype* __restrict__ weight_t,
+    dtype* __restrict__ output,
+    float scale) {
+  const int n0 = blockIdx.x * OutTile;
+  const int m = blockIdx.y;
+  if (m >= M) {
+    return;
+  }
+  float acc[OutTile];
+#pragma unroll
+  for (int j = 0; j < OutTile; ++j) {
+    acc[j] = 0.0f;
+  }
+  const dtype* x_row = x + static_cast<int64_t>(m) * K;
+  if constexpr (ScalarInput) {
+    for (int k = threadIdx.x; k < K; k += Threads) {
+      const float xv =
+          __half2float(*reinterpret_cast<const __half*>(x_row + k));
+#pragma unroll
+      for (int j = 0; j < OutTile; ++j) {
+        const int n = n0 + j;
+        if (n < N) {
+          const float wv = __half2float(*reinterpret_cast<const __half*>(
+              weight_t + static_cast<int64_t>(n) * K + k));
+          acc[j] = fmaf(xv, wv, acc[j]);
+        }
+      }
+    }
+  } else {
+    const int K2 = K >> 1;
+    for (int k2 = threadIdx.x; k2 < K2; k2 += Threads) {
+      const int k = k2 << 1;
+      const float2 xv = __half22float2(
+          *reinterpret_cast<const __half2*>(x_row + k));
+#pragma unroll
+      for (int j = 0; j < OutTile; ++j) {
+        const int n = n0 + j;
+        if (n < N) {
+          const float2 wv = __half22float2(
+              *reinterpret_cast<const __half2*>(
+                  weight_t + static_cast<int64_t>(n) * K + k));
+          acc[j] = fmaf(xv.x, wv.x, acc[j]);
+          acc[j] = fmaf(xv.y, wv.y, acc[j]);
+        }
+      }
+    }
+    if ((K & 1) && threadIdx.x == 0) {
+      const float xv = __half2float(
+          *reinterpret_cast<const __half*>(x_row + K - 1));
+#pragma unroll
+      for (int j = 0; j < OutTile; ++j) {
+        const int n = n0 + j;
+        if (n < N) {
+          const float wv = __half2float(*reinterpret_cast<const __half*>(
+              weight_t + static_cast<int64_t>(n) * K + K - 1));
+          acc[j] = fmaf(xv, wv, acc[j]);
+        }
+      }
+    }
+  }
+  __shared__ float partial[Threads / 32][OutTile];
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+#pragma unroll
+  for (int j = 0; j < OutTile; ++j) {
+    acc[j] = warp_sum(acc[j]);
+    if (lane == 0) {
+      partial[warp][j] = acc[j];
+    }
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+#pragma unroll
+    for (int j = 0; j < OutTile; ++j) {
+      float sum = 0.0f;
+#pragma unroll
+      for (int w = 0; w < Threads / 32; ++w) {
+        sum += partial[w][j];
+      }
+      const int n = n0 + j;
+      if (n < N) {
+        const int64_t index = static_cast<int64_t>(m) * N + n;
+        const float base =
+            __half2float(*reinterpret_cast<const __half*>(output + index));
+        *reinterpret_cast<__half*>(output + index) =
+            __float2half_rn(fmaf(scale, sum, base));
       }
     }
   }
@@ -1491,6 +1590,51 @@ at::Tensor linear_f16_orig_cuda(at::Tensor x, at::Tensor weight_orig) {
   return y;
 }
 
+void linear_f16_orig_scaled_accumulate_cuda(
+    at::Tensor x,
+    at::Tensor weight_orig,
+    at::Tensor output,
+    float scale) {
+  const int64_t k64 = x.size(-1);
+  const int64_t n64 = weight_orig.size(0);
+  const int64_t m64 = x.numel() / k64;
+  TORCH_CHECK(k64 <= INT_MAX && n64 <= INT_MAX && m64 <= INT_MAX,
+              "linear_f16_orig_scaled_accumulate shape is too large");
+  const int k = static_cast<int>(k64);
+  const int n = static_cast<int>(n64);
+  const int m = static_cast<int>(m64);
+  TORCH_CHECK(output.dim() == 2 && output.size(0) == m64 &&
+                  output.size(1) == n64,
+              "LoRA accumulation output shape mismatch");
+
+  // Row-major output[M,N] is column-major output^T[N,M].  beta=1 reads the
+  // FP16 base projection into FP32 accumulation, adds the scaled rank-out,
+  // then rounds once back to the same FP16 output buffer.
+  const float beta = 1.0f;
+  cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
+  check_cublas(cublasGemmEx(
+      handle,
+      CUBLAS_OP_T,
+      CUBLAS_OP_N,
+      n,
+      m,
+      k,
+      &scale,
+      weight_orig.data_ptr<dtype>(),
+      CUDA_R_16F,
+      k,
+      x.data_ptr<dtype>(),
+      CUDA_R_16F,
+      k,
+      &beta,
+      output.data_ptr<dtype>(),
+      CUDA_R_16F,
+      n,
+      CUBLAS_COMPUTE_32F,
+      CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+      "linear_f16_orig_scaled_accumulate cublasGemmEx");
+}
+
 template <int RowTile, int OutTile>
 at::Tensor linear_orig_rows_f16_cuda_impl(at::Tensor x, at::Tensor weight_orig) {
   const int64_t k64 = x.size(-1);
@@ -2261,6 +2405,39 @@ at::Tensor linear_t_f16_cuda(at::Tensor x, at::Tensor weight_t) {
   return y;
 }
 
+void linear_t_f16_scaled_accumulate_cuda(
+    at::Tensor x,
+    at::Tensor weight_t,
+    at::Tensor output,
+    float scale) {
+  const int64_t k64 = x.size(-1);
+  const int64_t n64 = weight_t.size(0);
+  const int64_t m64 = x.numel() / k64;
+  TORCH_CHECK(k64 <= 512 && n64 >= 1024 && m64 >= 1 && m64 <= 4,
+              "small-row LoRA accumulation shape is unsupported");
+  TORCH_CHECK(k64 <= INT_MAX && n64 <= INT_MAX,
+              "small-row LoRA accumulation shape is too large");
+  TORCH_CHECK(output.dim() == 2 && output.size(0) == m64 &&
+                  output.size(1) == n64,
+              "LoRA accumulation output shape mismatch");
+  const int K = static_cast<int>(k64);
+  const int N = static_cast<int>(n64);
+  const int M = static_cast<int>(m64);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  if (M == 1) {
+    linear_t_f16_ntile_scaled_accumulate_kernel<128, 2, true>
+        <<<dim3(ceil_div(N, 2), M, 1), 128, 0, stream>>>(
+            M, K, N, x.data_ptr<dtype>(), weight_t.data_ptr<dtype>(),
+            output.data_ptr<dtype>(), scale);
+  } else {
+    linear_t_f16_ntile_scaled_accumulate_kernel<128, 4, false>
+        <<<dim3(ceil_div(N, 4), M, 1), 128, 0, stream>>>(
+            M, K, N, x.data_ptr<dtype>(), weight_t.data_ptr<dtype>(),
+            output.data_ptr<dtype>(), scale);
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 template <int Act>
 at::Tensor linear_t_act_f16_cuda_impl(at::Tensor x, at::Tensor weight_t) {
   const int64_t k64 = x.size(-1);
@@ -2989,6 +3166,30 @@ at::Tensor tmix_linear_rank_out_dispatch_forward_varlen_cuda(
     std::optional<at::Tensor> weight_t) {
   return linear_lowrank_large_dispatch_f16_cuda(
       x, weight, weight_t, false);
+}
+
+at::Tensor tmix_linear_attention_c2c_forward_varlen_cuda(
+    at::Tensor x,
+    at::Tensor weight,
+    at::Tensor lora_a,
+    at::Tensor lora_b,
+    double lora_scale) {
+  auto output = tmix_linear_original_caller_dispatch_cuda(
+      x, weight, static_cast<int64_t>(LinearCallerGroup::kAttentionC2C));
+  const int64_t rows = x.size(0);
+  const float scale = static_cast<float>(lora_scale);
+  auto rank_features = rows <= 7
+      ? linear_t_f16_cuda(x, lora_a)
+      : linear_lowrank_large_dispatch_f16_cuda(
+            x, std::nullopt, lora_a, true);
+  if (rows <= 4 && lora_b.size(0) >= 1024) {
+    linear_t_f16_scaled_accumulate_cuda(
+        rank_features, lora_b, output, scale);
+  } else {
+    linear_f16_orig_scaled_accumulate_cuda(
+        rank_features, lora_b, output, scale);
+  }
+  return output;
 }
 
 std::vector<at::Tensor> tmix_lowrank_in_forward_varlen_cuda(

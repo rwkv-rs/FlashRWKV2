@@ -124,8 +124,11 @@ __global__ void tmix_mix6_kernel(
     fill_invalid(block_index, block_count, elements, out_g);
     return;
   }
+  if (token >= metadata_status[1]) {
+    return;
+  }
 
-  const int sequence = find_sequence(token, batch_size, cu_seqlens);
+  const int sequence = find_sequence(token, metadata_status[2], cu_seqlens);
   const int token_start = cu_seqlens[sequence];
   const int slot = state_indices[sequence];
   const int c = pair << 1;
@@ -176,7 +179,8 @@ __global__ void update_shift_state_last_kernel(
     const int* __restrict__ state_indices,
     const int* __restrict__ metadata_status) {
   const int sequence = static_cast<int>(blockIdx.x);
-  if (sequence >= batch_size || metadata_status[0] != 0) {
+  if (sequence >= batch_size || metadata_status[0] != 0 ||
+      sequence >= metadata_status[2]) {
     return;
   }
   const int token = cu_seqlens[sequence + 1] - 1;

@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+import flashrwkv2
 from flashrwkv2.tmix.linear import (
     infer_tmix_linear_act_sigmoid_forward_varlen,
     infer_tmix_linear_act_tanh_forward_varlen,
@@ -331,6 +332,151 @@ def test_tmix_linear_and_lowrank_families() -> None:
         atol=0.08,
         rtol=0.08,
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize(
+    ("rows", "rank", "channels", "scale"),
+    (
+        (1, 8, 1024, 0.25),
+        (4, 16, 1024, -0.5),
+        (8, 64, 1024, 0.0),
+        (24, 512, 1024, 0.375),
+        (1, 8, 4096, -0.25),
+        (4, 16, 4096, 0.5),
+        (8, 64, 4096, -0.375),
+        (24, 512, 4096, 0.0),
+    ),
+)
+def test_attention_c2c_optional_lora_matches_reference(
+    rows: int, rank: int, channels: int, scale: float
+) -> None:
+    torch.manual_seed(7000 + rows + rank + channels)
+    device = torch.device("cuda")
+    x = torch.randn(rows, channels, device=device, dtype=torch.float16) * 0.25
+    weight = torch.randn(channels, channels, device=device, dtype=torch.float16) * 0.02
+    lora_a = torch.randn(rank, channels, device=device, dtype=torch.float16) * 0.02
+    lora_b = torch.randn(channels, rank, device=device, dtype=torch.float16) * 0.02
+    inputs = (x, weight, lora_a, lora_b)
+    snapshots = tuple(tensor.clone() for tensor in inputs)
+
+    actual = infer_tmix_linear_attention_c2c_forward_varlen(
+        x, weight, lora_a=lora_a, lora_b=lora_b, lora_scale=scale
+    )
+    expected = x.float() @ weight.float().t() + scale * (
+        (x.float() @ lora_a.float().t()) @ lora_b.float().t()
+    )
+
+    assert actual.shape == (rows, channels)
+    assert actual.dtype == torch.float16 and actual.is_contiguous()
+    torch.testing.assert_close(actual.float(), expected, atol=0.02, rtol=0.02)
+    for tensor, snapshot in zip(inputs, snapshots, strict=True):
+        assert torch.equal(tensor, snapshot)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_attention_c2c_optional_lora_preserves_base_path() -> None:
+    torch.manual_seed(7100)
+    device = torch.device("cuda")
+    x = torch.randn(2, 1024, device=device, dtype=torch.float16)
+    weight = torch.randn(1024, 1024, device=device, dtype=torch.float16)
+    lora_a = torch.randn(8, 1024, device=device, dtype=torch.float16)
+    lora_b = torch.randn(1024, 8, device=device, dtype=torch.float16)
+
+    base = infer_tmix_linear_attention_c2c_forward_varlen(x, weight)
+    explicit_none = infer_tmix_linear_attention_c2c_forward_varlen(
+        x, weight, lora_a=None, lora_b=None, lora_scale=1.0
+    )
+    zero_scale = infer_tmix_linear_attention_c2c_forward_varlen(
+        x, weight, lora_a=lora_a, lora_b=lora_b, lora_scale=0.0
+    )
+    assert torch.equal(base, explicit_none)
+    assert torch.equal(base, zero_scale)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_attention_c2c_optional_lora_invalid_contracts_fail_closed() -> None:
+    device = torch.device("cuda")
+    x = torch.randn(2, 1024, device=device, dtype=torch.float16)
+    weight = torch.randn(1024, 1024, device=device, dtype=torch.float16)
+    lora_a = torch.randn(8, 1024, device=device, dtype=torch.float16)
+    lora_b = torch.randn(1024, 8, device=device, dtype=torch.float16)
+
+    with pytest.raises(ValueError, match="provided together"):
+        infer_tmix_linear_attention_c2c_forward_varlen(
+            x, weight, lora_a=lora_a
+        )
+    with pytest.raises(ValueError, match="R<=512"):
+        infer_tmix_linear_attention_c2c_forward_varlen(
+            x,
+            weight,
+            lora_a=torch.empty(513, 1024, device=device, dtype=torch.float16),
+            lora_b=torch.empty(1024, 513, device=device, dtype=torch.float16),
+        )
+    with pytest.raises(ValueError, match=r"lora_b.*\[N,R\]"):
+        infer_tmix_linear_attention_c2c_forward_varlen(
+            x,
+            weight,
+            lora_a=lora_a,
+            lora_b=lora_b[:, :-1].contiguous(),
+        )
+    with pytest.raises(ValueError, match="finite"):
+        infer_tmix_linear_attention_c2c_forward_varlen(
+            x, weight, lora_a=lora_a, lora_b=lora_b, lora_scale=float("nan")
+        )
+    with pytest.raises(TypeError, match="finite real"):
+        infer_tmix_linear_attention_c2c_forward_varlen(
+            x, weight, lora_a=lora_a, lora_b=lora_b, lora_scale=True
+        )
+    with pytest.raises(TypeError, match="torch.float16"):
+        infer_tmix_linear_attention_c2c_forward_varlen(
+            x, weight, lora_a=lora_a.float(), lora_b=lora_b
+        )
+    with pytest.raises(TypeError, match="torch.Tensor"):
+        infer_tmix_linear_attention_c2c_forward_varlen(
+            x, weight, lora_a="invalid", lora_b=lora_b  # type: ignore[arg-type]
+        )
+
+    assert flashrwkv2._C is not None
+    with pytest.raises(RuntimeError, match="lora_a.*float16"):
+        flashrwkv2._C.tmix_linear_attention_c2c_forward_varlen(
+            x, weight, lora_a.float(), lora_b, 1.0
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_attention_c2c_optional_lora_cuda_graph_replay() -> None:
+    torch.manual_seed(7200)
+    device = torch.device("cuda")
+    rows, channels, rank = 4, 1024, 16
+    static_x = torch.randn(rows, channels, device=device, dtype=torch.float16) * 0.25
+    weight = torch.randn(channels, channels, device=device, dtype=torch.float16) * 0.02
+    lora_a = torch.randn(rank, channels, device=device, dtype=torch.float16) * 0.02
+    lora_b = torch.randn(channels, rank, device=device, dtype=torch.float16) * 0.02
+    scale = -0.375
+
+    infer_tmix_linear_attention_c2c_forward_varlen(
+        static_x, weight, lora_a=lora_a, lora_b=lora_b, lora_scale=scale
+    )
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_output = infer_tmix_linear_attention_c2c_forward_varlen(
+            static_x,
+            weight,
+            lora_a=lora_a,
+            lora_b=lora_b,
+            lora_scale=scale,
+        )
+
+    replay_x = torch.randn_like(static_x) * 0.25
+    static_x.copy_(replay_x)
+    graph.replay()
+    torch.cuda.synchronize()
+    expected = replay_x.float() @ weight.float().t() + scale * (
+        (replay_x.float() @ lora_a.float().t()) @ lora_b.float().t()
+    )
+    torch.testing.assert_close(graph_output.float(), expected, atol=0.02, rtol=0.02)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

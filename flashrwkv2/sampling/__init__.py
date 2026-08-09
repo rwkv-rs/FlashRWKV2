@@ -97,6 +97,38 @@ def _validate_hot_inputs(
         raise ValueError("penalties must be contiguous CUDA float32 [num_slots,V]")
 
 
+def _validate_activity(
+    logits: torch.Tensor,
+    sample_capacity: int | None,
+    num_active_samples: torch.Tensor | None,
+) -> tuple[int, torch.Tensor | None]:
+    if sample_capacity is None and num_active_samples is None:
+        return -1, None
+    if sample_capacity is None or num_active_samples is None:
+        raise ValueError(
+            "sample_capacity and num_active_samples must be provided together"
+        )
+    if (
+        not isinstance(sample_capacity, int)
+        or isinstance(sample_capacity, bool)
+        or sample_capacity <= 0
+        or sample_capacity != logits.shape[0]
+    ):
+        raise ValueError("sample_capacity must equal the positive logits row capacity")
+    if (
+        not isinstance(num_active_samples, torch.Tensor)
+        or num_active_samples.dtype != torch.int32
+        or not num_active_samples.is_cuda
+        or not num_active_samples.is_contiguous()
+        or num_active_samples.numel() != 1
+        or num_active_samples.device != logits.device
+    ):
+        raise ValueError(
+            "num_active_samples must be a one-element contiguous CUDA int32 tensor"
+        )
+    return sample_capacity, num_active_samples
+
+
 def setup_sampling_states(seed: int, num_slots: int) -> torch.Tensor:
     """Create an explicit persistent Philox state pool for request slots."""
 
@@ -115,15 +147,20 @@ def infer_sampling_temperature_topk_topp_forward_varlen(
     temperature: float | torch.Tensor = 1.0,
     top_k: int | torch.Tensor = -1,
     top_p: float | torch.Tensor = 1.0,
+    sample_capacity: int | None = None,
+    num_active_samples: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sample one compact logits row per output-producing request.
 
-    ``slot_indices`` is trusted scheduler metadata: values must be unique and
-    in range for ``states``. This keeps the hot path free of device-to-host
-    synchronization.
+    ``slot_indices`` is validated on device. With ``sample_capacity`` and a
+    live ``num_active_samples`` scalar, inactive rows emit ``-1`` without
+    reading logits or advancing their request RNG.
     """
 
     _validate_hot_inputs(logits, states, slot_indices)
+    launch_capacity, active_samples = _validate_activity(
+        logits, sample_capacity, num_active_samples
+    )
     scalar_temperature = _scalar(temperature, "temperature")
     scalar_top_k = _scalar(top_k, "top_k")
     scalar_top_p = _scalar(top_p, "top_p")
@@ -135,6 +172,8 @@ def infer_sampling_temperature_topk_topp_forward_varlen(
             float(scalar_temperature),
             int(scalar_top_k),
             float(scalar_top_p),
+            launch_capacity,
+            active_samples,
         )
     batch_size = logits.shape[0]
     return _extension().sampling_temperature_topk_topp_per_request(
@@ -162,6 +201,8 @@ def infer_sampling_temperature_topk_topp_forward_varlen(
             dtype=torch.float32,
             device=logits.device,
         ),
+        launch_capacity,
+        active_samples,
     )
 
 
@@ -177,6 +218,8 @@ def infer_sampling_six_parameter_forward_varlen(
     temperature: float | torch.Tensor = 1.0,
     top_k: int | torch.Tensor = -1,
     top_p: float | torch.Tensor = 1.0,
+    sample_capacity: int | None = None,
+    num_active_samples: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sample with six controls and update per-slot additive penalties.
 
@@ -186,6 +229,9 @@ def infer_sampling_six_parameter_forward_varlen(
     """
 
     _validate_hot_inputs(logits, states, slot_indices, penalties)
+    launch_capacity, active_samples = _validate_activity(
+        logits, sample_capacity, num_active_samples
+    )
     values = (
         presence_penalty,
         frequency_penalty,
@@ -215,6 +261,8 @@ def infer_sampling_six_parameter_forward_varlen(
             float(scalars[3]),
             int(scalars[4]),
             float(scalars[5]),
+            launch_capacity,
+            active_samples,
         )
 
     batch_size = logits.shape[0]
@@ -229,7 +277,13 @@ def infer_sampling_six_parameter_forward_varlen(
         for value, name in zip(values, names, strict=True)
     )
     return _extension().sampling_six_parameter_per_request(
-        logits, penalties, states, slot_indices, *vectors
+        logits,
+        penalties,
+        states,
+        slot_indices,
+        *vectors,
+        launch_capacity,
+        active_samples,
     )
 
 

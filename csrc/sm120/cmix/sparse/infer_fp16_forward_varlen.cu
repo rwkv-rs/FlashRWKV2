@@ -97,6 +97,9 @@ __global__ void cmix_sparse_up_one_varlen_kernel(
     }
     return;
   }
+  if (metadata_status[1] == 0 || metadata_status[2] == 0) {
+    return;
+  }
 
   const int slot = state_indices[0];
   float acc = 0.0f;
@@ -161,8 +164,11 @@ __global__ void cmix_sparse_up_rows_varlen_kernel(
     }
     return;
   }
+  if (row >= metadata_status[1]) {
+    return;
+  }
 
-  const int sequence = locate_sequence(cu_seqlens, batch_size, row);
+  const int sequence = locate_sequence(cu_seqlens, metadata_status[2], row);
   const int token_start = cu_seqlens[sequence];
   const int slot = state_indices[sequence];
   float acc = 0.0f;
@@ -210,7 +216,8 @@ __global__ void update_shift_state_varlen_kernel(
     const int* __restrict__ metadata_status) {
   const int sequence = blockIdx.x;
   const int c4 = blockIdx.y * blockDim.x + threadIdx.x;
-  if (sequence >= batch_size || c4 >= C / 8 || metadata_status[0] != 0) {
+  if (sequence >= batch_size || c4 >= C / 8 || metadata_status[0] != 0 ||
+      sequence >= metadata_status[2]) {
     return;
   }
   const int token = cu_seqlens[sequence + 1] - 1;

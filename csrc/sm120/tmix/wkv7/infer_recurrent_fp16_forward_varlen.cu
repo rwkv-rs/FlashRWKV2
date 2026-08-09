@@ -72,7 +72,8 @@ __global__ void advance_i32_varlen_kernel(
     int num_sequences) {
   const int sequence_index =
       static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (sequence_index >= num_sequences || metadata_status[0] != 0) {
+  if (sequence_index >= num_sequences || metadata_status[0] != 0 ||
+      sequence_index >= metadata_status[2]) {
     return;
   }
   const int token_count =
@@ -321,6 +322,9 @@ __global__ __launch_bounds__(32, 4) void wkv_fp16_tiled_column_kernel(
         block_index, block_count, output_elements, output_ptr);
     return;
   }
+  if (sequence_index >= metadata_status[2]) {
+    return;
+  }
 
   const int state_slot = state_indices[sequence_index];
   const int token_start = query_start_loc[sequence_index];
@@ -532,6 +536,9 @@ void wkv_fp16_v1_clone_kernel(
     fill_invalid_output(block_index, block_count, output_elements, output_ptr);
     return;
   }
+  if (sequence_index >= metadata_status[2]) {
+    return;
+  }
 
   int token_start = 0;
   int token_end = 0;
@@ -658,6 +665,9 @@ void wkv_fp16_v1_exact_kernel(
     fill_invalid_output(block_index, block_count, output_elements, output_ptr);
     return;
   }
+  if (sequence_index >= metadata_status[2]) {
+    return;
+  }
   int token_start = 0;
   int token_end = 0;
   int state_slot = 0;
@@ -768,6 +778,9 @@ void wkv_fp16_seq_v2_kernel(
   const int64_t block_count = static_cast<int64_t>(gridDim.x) * gridDim.y;
   if (metadata_status[0] != 0) {
     fill_invalid_output(block_index, block_count, output_elements, output_ptr);
+    return;
+  }
+  if (sequence_index >= metadata_status[2]) {
     return;
   }
   int token_start = 0;
@@ -886,6 +899,9 @@ void wkv_fp16_one_cp_kernel(
     fill_invalid_output(block_index, block_count, output_elements, output_ptr);
     return;
   }
+  if (sequence_index >= metadata_status[2]) {
+    return;
+  }
   int token_start = 0;
   int token_end = 0;
   int state_slot = 0;
@@ -989,6 +1005,9 @@ void wkv_fp16_one_direct_kernel(
   const int64_t block_count = static_cast<int64_t>(gridDim.x) * gridDim.y;
   if (metadata_status[0] != 0) {
     fill_invalid_output(block_index, block_count, output_elements, output_ptr);
+    return;
+  }
+  if (sequence_index >= metadata_status[2]) {
     return;
   }
   int token_start = 0;

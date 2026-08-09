@@ -5,7 +5,10 @@ from __future__ import annotations
 import pytest
 import torch
 
-from flashrwkv2.tmix.wkv7 import infer_chunk_bf16_forward_varlen
+from flashrwkv2.tmix.wkv7 import (
+    infer_chunk_bf16_forward_varlen,
+    prepare_recurrent_metadata,
+)
 
 
 def _retention(logits: torch.Tensor) -> torch.Tensor:
@@ -120,3 +123,81 @@ def test_chunk_rejects_non_bf16_and_duplicate_slots() -> None:
             *tensors, state_pool=state, cu_seqlens=cu, state_indices=duplicate,
             max_seqlen=1,
         )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_chunk_cuda_graph_consumes_live_metadata_ticket() -> None:
+    torch.manual_seed(23)
+    device = torch.device("cuda")
+    token_capacity, sequence_capacity, num_slots = 3, 2, 4
+    shape = (token_capacity, 1, 64)
+    inputs = tuple(
+        (torch.randn(shape, device=device) * 0.02).to(torch.bfloat16)
+        for _ in range(6)
+    )
+    initial_state = (
+        torch.randn(num_slots, 1, 64, 64, device=device) * 0.002
+    ).to(torch.bfloat16)
+    state = initial_state.clone()
+    cu_seqlens = torch.tensor([0, 1, 3], device=device, dtype=torch.int32)
+    state_indices = torch.tensor([3, 1], device=device, dtype=torch.int32)
+    num_active_tokens = torch.tensor([3], device=device, dtype=torch.int32)
+    num_active_sequences = torch.tensor([2], device=device, dtype=torch.int32)
+
+    infer_chunk_bf16_forward_varlen(
+        *inputs,
+        state_pool=initial_state.clone(),
+        cu_seqlens=cu_seqlens,
+        state_indices=state_indices,
+        chunk_size=2,
+        max_seqlen=2,
+    )
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        ticket = prepare_recurrent_metadata(
+            cu_seqlens,
+            state_indices,
+            state_pool_size=num_slots,
+            token_capacity=token_capacity,
+            sequence_capacity=sequence_capacity,
+            max_seqlen_capacity=2,
+            num_active_tokens=num_active_tokens,
+            num_active_sequences=num_active_sequences,
+        )
+        output = infer_chunk_bf16_forward_varlen(
+            *inputs,
+            state_pool=state,
+            cu_seqlens=cu_seqlens,
+            state_indices=state_indices,
+            chunk_size=2,
+            validated_metadata=ticket,
+        )
+
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.isfinite(output).all()
+    assert not torch.equal(state[3], initial_state[3])
+    assert not torch.equal(state[1], initial_state[1])
+    assert torch.equal(state[0], initial_state[0])
+    assert torch.equal(state[2], initial_state[2])
+
+    state.copy_(initial_state)
+    cu_seqlens.copy_(torch.tensor([0, 2, -1], device=device, dtype=torch.int32))
+    state_indices.copy_(torch.tensor([2, 99], device=device, dtype=torch.int32))
+    num_active_tokens.fill_(2)
+    num_active_sequences.fill_(1)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert not torch.equal(state[2], initial_state[2])
+    assert torch.equal(state[[0, 1, 3]], initial_state[[0, 1, 3]])
+
+    state.copy_(initial_state)
+    cu_seqlens.copy_(torch.tensor([0, 1, 2], device=device, dtype=torch.int32))
+    state_indices.copy_(torch.tensor([1, 1], device=device, dtype=torch.int32))
+    num_active_tokens.fill_(2)
+    num_active_sequences.fill_(2)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(state, initial_state)

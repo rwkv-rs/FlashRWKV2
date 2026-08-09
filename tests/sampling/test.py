@@ -141,6 +141,118 @@ def test_empirical_distribution_without_scipy() -> None:
     assert torch.max(torch.abs(observed - expected)).item() < 0.035
 
 
+def test_sampling_cuda_graph_dynamic_active_rows_are_side_effect_free() -> None:
+    capacity, vocab_size, num_slots = 4, 8, 5
+    logits = torch.tensor(
+        [
+            [0.0, 8.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0, 0.0, 9.0, 0.0, 0.0],
+            [0.0, 0.0, 7.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [6.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        ],
+        device="cuda",
+        dtype=torch.float32,
+    )
+    slots = _slots([3, 1, 99, 99])
+    active = torch.tensor([2], device="cuda", dtype=torch.int32)
+    states = setup_sampling_states(101, num_slots)
+    penalties = torch.zeros(
+        num_slots, vocab_size, device="cuda", dtype=torch.float32
+    )
+
+    # Warm the exact scalar six-parameter family before capture.
+    warm_states = setup_sampling_states(101, capacity)
+    infer_sampling_six_parameter_forward_varlen(
+        logits,
+        torch.zeros(capacity, vocab_size, device="cuda"),
+        warm_states,
+        torch.arange(capacity, device="cuda", dtype=torch.int32),
+        presence_penalty=0.2,
+        frequency_penalty=0.3,
+        penalty_decay=0.5,
+        top_k=1,
+    )
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = infer_sampling_six_parameter_forward_varlen(
+            logits,
+            penalties,
+            states,
+            slots,
+            presence_penalty=0.2,
+            frequency_penalty=0.3,
+            penalty_decay=0.5,
+            top_k=1,
+            sample_capacity=capacity,
+            num_active_samples=active,
+        )
+
+    initial_states = setup_sampling_states(101, num_slots)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(
+        output,
+        torch.tensor([1, 5, -1, -1], device="cuda", dtype=torch.int32),
+    )
+    assert not torch.equal(states[3], initial_states[3])
+    assert not torch.equal(states[1], initial_states[1])
+    assert torch.equal(states[0], initial_states[0])
+    assert torch.equal(states[2], initial_states[2])
+    assert torch.equal(states[4], initial_states[4])
+    assert penalties[3, 1].item() == pytest.approx(0.5)
+    assert penalties[1, 5].item() == pytest.approx(0.5)
+    assert torch.count_nonzero(penalties[[0, 2, 4]]).item() == 0
+
+    slots.copy_(_slots([2, 99, 99, 99]))
+    active.fill_(1)
+    before_states = states.clone()
+    before_penalties = penalties.clone()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(
+        output,
+        torch.tensor([1, -1, -1, -1], device="cuda", dtype=torch.int32),
+    )
+    assert not torch.equal(states[2], before_states[2])
+    assert torch.equal(states[[0, 1, 3, 4]], before_states[[0, 1, 3, 4]])
+    assert penalties[2, 1].item() == pytest.approx(0.5)
+    assert torch.equal(penalties[[0, 1, 3, 4]], before_penalties[[0, 1, 3, 4]])
+
+    active.zero_()
+    slots.fill_(99)
+    before_states = states.clone()
+    before_penalties = penalties.clone()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(
+        output,
+        torch.full((capacity,), -1, device="cuda", dtype=torch.int32),
+    )
+    assert torch.equal(states, before_states)
+    assert torch.equal(penalties, before_penalties)
+
+    invalid_cases = (
+        ([1, 1, 99, 99], 2),
+        ([8, 1, 99, 99], 2),
+        ([1, 2, 3, 4], 5),
+    )
+    for slot_values, active_count in invalid_cases:
+        slots.copy_(_slots(slot_values))
+        active.fill_(active_count)
+        before_states = states.clone()
+        before_penalties = penalties.clone()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(
+            output,
+            torch.full((capacity,), -1, device="cuda", dtype=torch.int32),
+        )
+        assert torch.equal(states, before_states)
+        assert torch.equal(penalties, before_penalties)
+
+
 def test_rejects_invalid_inputs_before_launch() -> None:
     states = setup_sampling_states(1, 2)
     slots = _slots([0, 1])

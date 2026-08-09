@@ -165,6 +165,81 @@ def test_cmix_sparse_ticket_rejects_metadata_mutation_without_state_write() -> N
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_cmix_sparse_cuda_graph_ignores_inactive_tail_state_slots() -> None:
+    device = torch.device("cuda")
+    token_capacity, sequence_capacity = 3, 2
+    channels, features, num_slots = 16, 8, 4
+    x = torch.randn(token_capacity, channels, device=device, dtype=torch.float16)
+    x_k = torch.randn(channels, device=device, dtype=torch.float16)
+    key_fc = torch.randn(features, channels, device=device, dtype=torch.float16)
+    initial = torch.randn(num_slots, channels, device=device, dtype=torch.float16)
+    shift_state = initial.clone()
+    cu_seqlens = torch.tensor([0, 1, 3], device=device, dtype=torch.int32)
+    state_indices = torch.tensor([3, 1], device=device, dtype=torch.int32)
+    num_active_tokens = torch.tensor([3], device=device, dtype=torch.int32)
+    num_active_sequences = torch.tensor([2], device=device, dtype=torch.int32)
+
+    infer_cmix_sparse_up_forward_varlen(
+        x,
+        x_k,
+        key_fc,
+        shift_state_pool=initial.clone(),
+        cu_seqlens=cu_seqlens,
+        state_indices=state_indices,
+        max_seqlen=2,
+    )
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        ticket = prepare_recurrent_metadata(
+            cu_seqlens,
+            state_indices,
+            state_pool_size=num_slots,
+            token_capacity=token_capacity,
+            sequence_capacity=sequence_capacity,
+            max_seqlen_capacity=2,
+            num_active_tokens=num_active_tokens,
+            num_active_sequences=num_active_sequences,
+        )
+        infer_cmix_sparse_up_forward_varlen(
+            x,
+            x_k,
+            key_fc,
+            shift_state_pool=shift_state,
+            cu_seqlens=cu_seqlens,
+            state_indices=state_indices,
+            validated_metadata=ticket,
+        )
+
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(shift_state[3], x[0])
+    assert torch.equal(shift_state[1], x[2])
+    assert torch.equal(shift_state[0], initial[0])
+    assert torch.equal(shift_state[2], initial[2])
+
+    shift_state.copy_(initial)
+    cu_seqlens.copy_(torch.tensor([0, 2, -1], device=device, dtype=torch.int32))
+    state_indices.copy_(torch.tensor([2, 99], device=device, dtype=torch.int32))
+    num_active_tokens.fill_(2)
+    num_active_sequences.fill_(1)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(shift_state[2], x[1])
+    assert torch.equal(shift_state[[0, 1, 3]], initial[[0, 1, 3]])
+
+    shift_state.copy_(initial)
+    cu_seqlens.copy_(torch.tensor([0, 1, 2], device=device, dtype=torch.int32))
+    state_indices.copy_(torch.tensor([1, 1], device=device, dtype=torch.int32))
+    num_active_tokens.fill_(2)
+    num_active_sequences.fill_(2)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(shift_state, initial)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_cmix_sparse_rejects_wrong_value_layout() -> None:
     device = torch.device("cuda")
     preact = torch.zeros(2, 4, device=device, dtype=torch.float16)

@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import os
+import shutil
 import statistics
 import subprocess
 import sys
@@ -67,6 +68,13 @@ def _git(*arguments: str, cwd: Path = ROOT) -> str:
     ).stdout.strip()
 
 
+def _python_executable(python: str) -> str:
+    executable = shutil.which(python)
+    if executable is None:
+        raise SystemExit(f"benchmark Python executable not found: {python}")
+    return str(Path(executable).absolute())
+
+
 def _environment(python: str) -> dict[str, Any]:
     program = r"""
 import json, platform, torch
@@ -85,7 +93,7 @@ print(json.dumps({
 """
     payload = json.loads(
         subprocess.run(
-            (python, "-c", program),
+            (_python_executable(python), "-c", program),
             cwd=tempfile.gettempdir(),
             check=True,
             capture_output=True,
@@ -519,6 +527,9 @@ def approve(
 
 
 def _self_test() -> None:
+    expected_python = Path(sys.executable).absolute()
+    relative_python = os.path.relpath(expected_python, Path.cwd())
+    assert Path(_python_executable(relative_python)) == expected_python
     environment = {
         "gpu": "gpu",
         "capability": [12, 0],

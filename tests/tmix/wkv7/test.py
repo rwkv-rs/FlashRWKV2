@@ -128,6 +128,106 @@ def test_recurrent_metadata_ticket_supports_same_stream_cuda_graph() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_live_recurrent_metadata_replays_dynamic_active_prefix_fail_closed() -> None:
+    stream = torch.cuda.Stream()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(stream):
+        # Warm the binding and allocator before capture.
+        warm_elapsed = torch.zeros(4, device="cuda", dtype=torch.int32)
+        warm_cu = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
+        warm_slots = torch.tensor([0], device="cuda", dtype=torch.int32)
+        warm_ticket = prepare_recurrent_metadata(
+            warm_cu,
+            warm_slots,
+            total_tokens=1,
+            state_pool_size=4,
+        )
+        infer_recurrent_fp16_advance_i32_varlen(
+            warm_elapsed,
+            warm_cu,
+            warm_slots,
+            total_tokens=1,
+            validated_metadata=warm_ticket,
+        )
+
+        initial = torch.tensor([2, 5, 7, 11], device="cuda", dtype=torch.int32)
+        elapsed = initial.clone()
+        cu_seqlens = torch.tensor([0, 2, 5, -1], device="cuda", dtype=torch.int32)
+        state_indices = torch.tensor([3, 1, 99], device="cuda", dtype=torch.int32)
+        num_active_tokens = torch.tensor([5], device="cuda", dtype=torch.int32)
+        num_active_sequences = torch.tensor([2], device="cuda", dtype=torch.int32)
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+
+    with torch.cuda.graph(graph, stream=stream):
+        ticket = prepare_recurrent_metadata(
+            cu_seqlens,
+            state_indices,
+            state_pool_size=4,
+            token_capacity=5,
+            sequence_capacity=3,
+            max_seqlen_capacity=3,
+            num_active_tokens=num_active_tokens,
+            num_active_sequences=num_active_sequences,
+        )
+        infer_recurrent_fp16_advance_i32_varlen(
+            elapsed,
+            cu_seqlens,
+            state_indices,
+            total_tokens=5,
+            validated_metadata=ticket,
+        )
+    assert ticket._is_graph()
+
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(
+        elapsed,
+        torch.tensor([2, 8, 7, 13], device="cuda", dtype=torch.int32),
+    )
+
+    elapsed.copy_(initial)
+    cu_seqlens.copy_(torch.tensor([0, 3, -7, -9], device="cuda", dtype=torch.int32))
+    state_indices.copy_(torch.tensor([2, 99, 99], device="cuda", dtype=torch.int32))
+    num_active_tokens.fill_(3)
+    num_active_sequences.fill_(1)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(
+        elapsed,
+        torch.tensor([2, 5, 10, 11], device="cuda", dtype=torch.int32),
+    )
+
+    elapsed.copy_(initial)
+    cu_seqlens.fill_(-1)
+    cu_seqlens[0] = 0
+    state_indices.fill_(99)
+    num_active_tokens.zero_()
+    num_active_sequences.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(elapsed, initial)
+
+    invalid_cases = (
+        ([0, 1, 3, -1], [1, 2, 99], 2, 2),  # final endpoint mismatch
+        ([0, 2, 2, -1], [1, 2, 99], 2, 2),  # empty active sequence
+        ([0, 1, 2, -1], [1, 1, 99], 2, 2),  # duplicate active slot
+        ([0, 1, 2, -1], [1, 8, 99], 2, 2),  # out-of-range active slot
+        ([0, 4, -1, -1], [1, 99, 99], 4, 1),  # max length overflow
+        ([0, 1, -1, -1], [1, 99, 99], 6, 1),  # active token overflow
+    )
+    for offsets, slots, active_tokens, active_sequences in invalid_cases:
+        elapsed.copy_(initial)
+        cu_seqlens.copy_(torch.tensor(offsets, device="cuda", dtype=torch.int32))
+        state_indices.copy_(torch.tensor(slots, device="cuda", dtype=torch.int32))
+        num_active_tokens.fill_(active_tokens)
+        num_active_sequences.fill_(active_sequences)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(elapsed, initial)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_albatross_add_vec_flat_and_2d_dispatch() -> None:
     device = torch.device("cuda")
     for rows, channels in ((3, 8), (17, 4096)):
@@ -481,6 +581,123 @@ def _args(case: dict[str, torch.Tensor | None]) -> tuple[torch.Tensor, ...]:
     values = tuple(case[name] for name in ("r", "decay_logits", "k", "v", "a", "b"))
     assert all(isinstance(value, torch.Tensor) for value in values)
     return values  # type: ignore[return-value]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_fp32_wkv_zero_active_precapture_warmup_then_graph_replay() -> None:
+    _require_cuda_extension()
+    torch.manual_seed(20260809)
+    device = torch.device("cuda")
+    token_capacity, sequence_capacity, slots, heads, head_size = 4, 4, 2, 1, 64
+    shape = (token_capacity, heads, head_size)
+    packed = tuple(
+        (torch.randn(shape, device=device) * scale).half()
+        for scale in (0.1, 2.0, 0.05, 0.05, 0.05, 0.05)
+    )
+    initial_state = torch.randn(
+        slots, heads, head_size, head_size, device=device, dtype=torch.float32
+    ).mul_(0.02)
+    state = initial_state.clone()
+    cu_seqlens = torch.tensor([0, -1, -1, -1, -1], device=device, dtype=torch.int32)
+    state_indices = torch.full(
+        (sequence_capacity,), 99, device=device, dtype=torch.int32
+    )
+    num_active_tokens = torch.zeros(1, device=device, dtype=torch.int32)
+    num_active_sequences = torch.zeros(1, device=device, dtype=torch.int32)
+    metadata_addresses = (cu_seqlens.data_ptr(), state_indices.data_ptr())
+    stream = torch.cuda.Stream(device=device)
+
+    # vLLM V2 warms the exact capture shape before torch.cuda.graph().  The
+    # padded sequence capacity can exceed the physical state-pool capacity;
+    # zero active counts must therefore ignore every metadata tail entry.
+    stream.wait_stream(torch.cuda.current_stream(device))
+    with torch.cuda.stream(stream):
+        warmup_ticket = prepare_recurrent_metadata(
+            cu_seqlens,
+            state_indices,
+            state_pool_size=slots,
+            token_capacity=token_capacity,
+            sequence_capacity=sequence_capacity,
+            max_seqlen_capacity=3,
+            num_active_tokens=num_active_tokens,
+            num_active_sequences=num_active_sequences,
+        )
+        infer_recurrent_fp32io16_forward_varlen(
+            *packed,
+            state_pool=state,
+            cu_seqlens=cu_seqlens,
+            state_indices=state_indices,
+            validated_metadata=warmup_ticket,
+        )
+    torch.cuda.current_stream(device).wait_stream(stream)
+    torch.cuda.synchronize()
+    assert warmup_ticket._is_graph()
+    assert sequence_capacity > slots
+    assert torch.equal(state, initial_state)
+    assert metadata_addresses == (cu_seqlens.data_ptr(), state_indices.data_ptr())
+
+    cu_seqlens.copy_(
+        torch.tensor([0, 1, 4, -1, -1], device=device, dtype=torch.int32)
+    )
+    state_indices.copy_(
+        torch.tensor([1, 0, 99, 99], device=device, dtype=torch.int32)
+    )
+    num_active_tokens.fill_(4)
+    num_active_sequences.fill_(2)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        ticket = prepare_recurrent_metadata(
+            cu_seqlens,
+            state_indices,
+            state_pool_size=slots,
+            token_capacity=token_capacity,
+            sequence_capacity=sequence_capacity,
+            max_seqlen_capacity=3,
+            num_active_tokens=num_active_tokens,
+            num_active_sequences=num_active_sequences,
+        )
+        graph_output = infer_recurrent_fp32io16_forward_varlen(
+            *packed,
+            state_pool=state,
+            cu_seqlens=cu_seqlens,
+            state_indices=state_indices,
+            validated_metadata=ticket,
+        )
+
+    graph.replay()
+    torch.cuda.synchronize()
+    assert metadata_addresses == (cu_seqlens.data_ptr(), state_indices.data_ptr())
+    assert torch.isfinite(graph_output).all()
+    assert not torch.equal(state[1], initial_state[1])
+    assert not torch.equal(state[0], initial_state[0])
+
+    state.copy_(initial_state)
+    cu_seqlens.copy_(
+        torch.tensor([0, 2, -1, -1, -1], device=device, dtype=torch.int32)
+    )
+    state_indices.copy_(
+        torch.tensor([0, 99, 99, 99], device=device, dtype=torch.int32)
+    )
+    num_active_tokens.fill_(2)
+    num_active_sequences.fill_(1)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert not torch.equal(state[0], initial_state[0])
+    assert torch.equal(state[1], initial_state[1])
+
+    state.copy_(initial_state)
+    cu_seqlens.copy_(
+        torch.tensor([0, 1, 2, -1, -1], device=device, dtype=torch.int32)
+    )
+    state_indices.copy_(
+        torch.tensor([1, 1, 99, 99], device=device, dtype=torch.int32)
+    )
+    num_active_tokens.fill_(2)
+    num_active_sequences.fill_(2)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(state, initial_state)
 
 
 def test_public_signature_is_raw_only_and_old_symbols_are_absent() -> None:

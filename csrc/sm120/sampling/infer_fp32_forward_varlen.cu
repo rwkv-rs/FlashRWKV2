@@ -12,6 +12,7 @@
 #include <cuda_fp16.h>
 #include <curand_kernel.h>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 typedef curandStatePhilox4_32_10_t RAND;
 
@@ -171,6 +172,46 @@ static void check_cuda_contiguous_1d(const at::Tensor& tensor, const char* name,
   }
 }
 
+__global__ void validate_sampling_metadata_kernel(
+    const int* __restrict__ slot_indices,
+    const int* __restrict__ num_active_samples,
+    int sample_capacity,
+    int num_slots,
+    int* __restrict__ status,
+    int* __restrict__ seen_slots) {
+  __shared__ int active_samples;
+  __shared__ int error;
+  if (threadIdx.x == 0) {
+    active_samples = num_active_samples == nullptr
+        ? sample_capacity
+        : num_active_samples[0];
+    error = active_samples < 0 || active_samples > sample_capacity ? 1 : 0;
+    if (error != 0) {
+      active_samples = 0;
+    }
+  }
+  __syncthreads();
+  for (int slot = static_cast<int>(threadIdx.x); slot < num_slots;
+       slot += static_cast<int>(blockDim.x)) {
+    seen_slots[slot] = -1;
+  }
+  __syncthreads();
+  for (int row = static_cast<int>(threadIdx.x);
+       row < active_samples;
+       row += static_cast<int>(blockDim.x)) {
+    const int slot = slot_indices[row];
+    if (slot < 0 || slot >= num_slots ||
+        atomicCAS(seen_slots + slot, -1, row) != -1) {
+      atomicExch(&error, 1);
+    }
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    status[0] = error;
+    status[1] = error == 0 ? active_samples : 0;
+  }
+}
+
 #define BLOCKDIM_X_SAMPLE 1024
 __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1)
     batch_sampling_repetition_temperature_topk_topp_kernel(
@@ -197,12 +238,23 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1)
         const float* __restrict__ top_ps, const float scalar_presence_penalty,
         const float scalar_repetition_penalty, const float scalar_penalty_decay,
         const float scalar_temperature, const int scalar_top_k,
-        const float scalar_top_p) {
+        const float scalar_top_p,
+        const int* __restrict__ sampling_status) {
   const int b = blockIdx.x;
   const int d = blockDim.x;
   const int t = threadIdx.x;
   const int w = t / 32;
   const int l = t % 32;
+  if (sampling_status != nullptr &&
+      (sampling_status[0] != 0 || b >= sampling_status[1])) {
+    if (t == 0) {
+      outputs[b] = -1;
+      if (output_logprobs != nullptr) {
+        output_logprobs[b] = -INFINITY;
+      }
+    }
+    return;
+  }
   // constexpr int W = (BLOCKDIM_X_SAMPLE + 31) / 32;
   __shared__ __align__(256) char reduce_buf[256];
   __builtin_assume(BLOCKDIM_X_SAMPLE == d);
@@ -580,7 +632,8 @@ std::vector<at::Tensor> batch_sampling_repetition_temperature_topk_topp(
       (int*)out.data_ptr(), output_logprobs, (RAND*)states.data_ptr(),
       (float*)probs.data_ptr(), nullptr, nullptr, nullptr, nullptr, nullptr,
       nullptr, (float)presence_penalty, (float)repetition_penalty,
-      (float)penalty_decay, (float)temperature, (int)top_k, (float)top_p);
+      (float)penalty_decay, (float)temperature, (int)top_k, (float)top_p,
+      nullptr);
   return outputs;
 }
 
@@ -675,7 +728,7 @@ std::vector<at::Tensor> batch_sampling_repetition_temperature_topk_topp_indexed(
       (RAND*)states.data_ptr(), (float*)probs.data_ptr(), nullptr, nullptr,
       nullptr, nullptr, nullptr, nullptr, (float)presence_penalty,
       (float)repetition_penalty, (float)penalty_decay, (float)temperature,
-      (int)top_k, (float)top_p);
+      (int)top_k, (float)top_p, nullptr);
   return outputs;
 }
 
@@ -730,7 +783,7 @@ batch_sampling_repetition_temperature_topk_topp_per_request_indexed(
       (float*)repetition_penalties.data_ptr(),
       (float*)penalty_decays.data_ptr(), (float*)temperatures.data_ptr(),
       (int*)top_ks.data_ptr(), (float*)top_ps.data_ptr(), 0.0f, 0.0f, 1.0f,
-      1.0f, V, 1.0f);
+      1.0f, V, 1.0f, nullptr);
   return outputs;
 }
 
@@ -749,12 +802,23 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1)
                                     // curandStatePhilox4_32_10_t RAND;
         float* __restrict__ probs,  // probs (in L2 cache)
         const int* __restrict__ slot_indices,
-        const float log2e_inv_temp, const int top_k, const float top_p) {
+        const float log2e_inv_temp, const int top_k, const float top_p,
+        const int* __restrict__ sampling_status) {
   const int b = blockIdx.x;
   const int d = blockDim.x;
   const int t = threadIdx.x;
   const int w = t / 32;
   const int l = t % 32;
+  if (sampling_status != nullptr &&
+      (sampling_status[0] != 0 || b >= sampling_status[1])) {
+    if (t == 0) {
+      outputs[b] = -1;
+      if (output_logprobs != nullptr) {
+        output_logprobs[b] = -INFINITY;
+      }
+    }
+    return;
+  }
   __shared__ __align__(256) char reduce_buf[256];
   __builtin_assume(BLOCKDIM_X_SAMPLE == d);
   __builtin_assume(V % 4 == 0);
@@ -1022,12 +1086,23 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1)
                                     // curandStatePhilox4_32_10_t RAND;
         float* __restrict__ probs,  // probs (in L2 cache)
         const int* __restrict__ slot_indices,
-        const float top_p) {
+        const float top_p,
+        const int* __restrict__ sampling_status) {
   const int b = blockIdx.x;
   const int d = blockDim.x;
   const int t = threadIdx.x;
   const int w = t / 32;
   const int l = t % 32;
+  if (sampling_status != nullptr &&
+      (sampling_status[0] != 0 || b >= sampling_status[1])) {
+    if (t == 0) {
+      outputs[b] = -1;
+      if (output_logprobs != nullptr) {
+        output_logprobs[b] = -INFINITY;
+      }
+    }
+    return;
+  }
   __shared__ __align__(256) char reduce_buf[256];
   __builtin_assume(BLOCKDIM_X_SAMPLE == d);
   __builtin_assume(V % 4 == 0);
@@ -1303,12 +1378,12 @@ std::vector<at::Tensor> batch_sampling_temperature_topk_topp(
     batch_sampling_topp_kernel<<<B, 1024, 0, stream>>>(
         B, T, V, (float*)logits.data_ptr(), (int*)out.data_ptr(),
         output_logprobs, (RAND*)states.data_ptr(), (float*)probs.data_ptr(),
-        nullptr, (float)top_p);
+        nullptr, (float)top_p, nullptr);
   else
     batch_sampling_temperature_topk_topp_kernel<<<B, 1024, 0, stream>>>(
         B, T, V, (float*)logits.data_ptr(), (int*)out.data_ptr(),
         output_logprobs, (RAND*)states.data_ptr(), (float*)probs.data_ptr(),
-        nullptr, (float)log2e_inv_temp, (int)top_k, (float)top_p);
+        nullptr, (float)log2e_inv_temp, (int)top_k, (float)top_p, nullptr);
   return outputs;
 }
 
@@ -1319,20 +1394,48 @@ at::Tensor sampling_probs_workspace(const at::Tensor& logits) {
   auto probs = at::empty(logits.sizes(), logits.options().dtype(at::kFloat));
   if (bytes <= 4194304) {
     auto stream = at::cuda::getCurrentCUDAStream();
-    cudaStreamAttrValue attribute{};
-    attribute.accessPolicyWindow.base_ptr = probs.data_ptr();
-    attribute.accessPolicyWindow.num_bytes = static_cast<size_t>(bytes);
-    attribute.accessPolicyWindow.hitRatio = 1.0f;
-    attribute.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
-    attribute.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
-    C10_CUDA_CHECK(cudaStreamSetAttribute(
-        stream, cudaStreamAttributeAccessPolicyWindow, &attribute));
+    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+    C10_CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
+    if (capture_status == cudaStreamCaptureStatusNone) {
+      cudaStreamAttrValue attribute{};
+      attribute.accessPolicyWindow.base_ptr = probs.data_ptr();
+      attribute.accessPolicyWindow.num_bytes = static_cast<size_t>(bytes);
+      attribute.accessPolicyWindow.hitRatio = 1.0f;
+      attribute.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
+      attribute.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
+      C10_CUDA_CHECK(cudaStreamSetAttribute(
+          stream, cudaStreamAttributeAccessPolicyWindow, &attribute));
+    }
   }
   return probs;
 }
 
 at::Tensor sampling_output(const at::Tensor& logits) {
   return at::empty({logits.size(0)}, logits.options().dtype(at::kInt));
+}
+
+struct SamplingMetadata {
+  at::Tensor status;
+  at::Tensor workspace;
+};
+
+SamplingMetadata prepare_sampling_metadata(
+    const at::Tensor& logits,
+    const at::Tensor& states,
+    const at::Tensor& slot_indices,
+    const at::Tensor& num_active_samples) {
+  auto status = at::empty({2}, slot_indices.options());
+  auto workspace = at::empty({states.size(0)}, slot_indices.options());
+  validate_sampling_metadata_kernel<<<
+      1, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+      slot_indices.data_ptr<int>(),
+      num_active_samples.defined()
+          ? num_active_samples.data_ptr<int>()
+          : nullptr,
+      static_cast<int>(logits.size(0)), static_cast<int>(states.size(0)),
+      status.data_ptr<int>(), workspace.data_ptr<int>());
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return SamplingMetadata{std::move(status), std::move(workspace)};
 }
 
 void normalize_sampling_controls(
@@ -1350,18 +1453,22 @@ void normalize_sampling_controls(
 
 at::Tensor sampling_temperature_topk_topp_scalar_cuda(
     at::Tensor logits, at::Tensor states, at::Tensor slot_indices,
-    double temperature, int64_t top_k, double top_p) {
+    double temperature, int64_t top_k, double top_p,
+    at::Tensor num_active_samples) {
   const int B = static_cast<int>(logits.size(0));
   const int V = static_cast<int>(logits.size(1));
   normalize_sampling_controls(V, temperature, top_k, top_p);
   auto probs = sampling_probs_workspace(logits);
   auto output = sampling_output(logits);
+  auto metadata = prepare_sampling_metadata(
+      logits, states, slot_indices, num_active_samples);
   auto stream = at::cuda::getCurrentCUDAStream();
   if (temperature == 1.0 && top_k == V) {
     batch_sampling_topp_kernel<<<B, BLOCKDIM_X_SAMPLE, 0, stream>>>(
         B, 1, V, logits.data_ptr<float>(), output.data_ptr<int>(), nullptr,
         reinterpret_cast<RAND*>(states.data_ptr()), probs.data_ptr<float>(),
-        slot_indices.data_ptr<int>(), static_cast<float>(top_p));
+        slot_indices.data_ptr<int>(), static_cast<float>(top_p),
+        metadata.status.data_ptr<int>());
   } else {
     batch_sampling_temperature_topk_topp_kernel
         <<<B, BLOCKDIM_X_SAMPLE, 0, stream>>>(
@@ -1369,7 +1476,8 @@ at::Tensor sampling_temperature_topk_topp_scalar_cuda(
             reinterpret_cast<RAND*>(states.data_ptr()), probs.data_ptr<float>(),
             slot_indices.data_ptr<int>(),
             static_cast<float>(M_LOG2E / temperature),
-            static_cast<int>(top_k), static_cast<float>(top_p));
+            static_cast<int>(top_k), static_cast<float>(top_p),
+            metadata.status.data_ptr<int>());
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return output;
@@ -1377,11 +1485,14 @@ at::Tensor sampling_temperature_topk_topp_scalar_cuda(
 
 at::Tensor sampling_temperature_topk_topp_per_request_cuda(
     at::Tensor logits, at::Tensor states, at::Tensor slot_indices,
-    at::Tensor temperatures, at::Tensor top_ks, at::Tensor top_ps) {
+    at::Tensor temperatures, at::Tensor top_ks, at::Tensor top_ps,
+    at::Tensor num_active_samples) {
   const int B = static_cast<int>(logits.size(0));
   const int V = static_cast<int>(logits.size(1));
   auto probs = sampling_probs_workspace(logits);
   auto output = sampling_output(logits);
+  auto metadata = prepare_sampling_metadata(
+      logits, states, slot_indices, num_active_samples);
   auto stream = at::cuda::getCurrentCUDAStream();
   batch_sampling_repetition_temperature_topk_topp_kernel
       <<<B, BLOCKDIM_X_SAMPLE, 0, stream>>>(
@@ -1390,7 +1501,7 @@ at::Tensor sampling_temperature_topk_topp_per_request_cuda(
           reinterpret_cast<RAND*>(states.data_ptr()), probs.data_ptr<float>(),
           nullptr, nullptr, nullptr, temperatures.data_ptr<float>(),
           top_ks.data_ptr<int>(), top_ps.data_ptr<float>(), 0.0f, 0.0f, 1.0f,
-          1.0f, V, 1.0f);
+          1.0f, V, 1.0f, metadata.status.data_ptr<int>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return output;
 }
@@ -1398,12 +1509,15 @@ at::Tensor sampling_temperature_topk_topp_per_request_cuda(
 at::Tensor sampling_six_parameter_scalar_cuda(
     at::Tensor logits, at::Tensor penalties, at::Tensor states,
     at::Tensor slot_indices, double presence_penalty, double frequency_penalty,
-    double penalty_decay, double temperature, int64_t top_k, double top_p) {
+    double penalty_decay, double temperature, int64_t top_k, double top_p,
+    at::Tensor num_active_samples) {
   const int B = static_cast<int>(logits.size(0));
   const int V = static_cast<int>(logits.size(1));
   normalize_sampling_controls(V, temperature, top_k, top_p);
   auto probs = sampling_probs_workspace(logits);
   auto output = sampling_output(logits);
+  auto metadata = prepare_sampling_metadata(
+      logits, states, slot_indices, num_active_samples);
   auto stream = at::cuda::getCurrentCUDAStream();
   batch_sampling_repetition_temperature_topk_topp_kernel
       <<<B, BLOCKDIM_X_SAMPLE, 0, stream>>>(
@@ -1414,7 +1528,8 @@ at::Tensor sampling_six_parameter_scalar_cuda(
           static_cast<float>(presence_penalty),
           static_cast<float>(frequency_penalty),
           static_cast<float>(penalty_decay), static_cast<float>(temperature),
-          static_cast<int>(top_k), static_cast<float>(top_p));
+          static_cast<int>(top_k), static_cast<float>(top_p),
+          metadata.status.data_ptr<int>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return output;
 }
@@ -1423,11 +1538,14 @@ at::Tensor sampling_six_parameter_per_request_cuda(
     at::Tensor logits, at::Tensor penalties, at::Tensor states,
     at::Tensor slot_indices, at::Tensor presence_penalties,
     at::Tensor frequency_penalties, at::Tensor penalty_decays,
-    at::Tensor temperatures, at::Tensor top_ks, at::Tensor top_ps) {
+    at::Tensor temperatures, at::Tensor top_ks, at::Tensor top_ps,
+    at::Tensor num_active_samples) {
   const int B = static_cast<int>(logits.size(0));
   const int V = static_cast<int>(logits.size(1));
   auto probs = sampling_probs_workspace(logits);
   auto output = sampling_output(logits);
+  auto metadata = prepare_sampling_metadata(
+      logits, states, slot_indices, num_active_samples);
   auto stream = at::cuda::getCurrentCUDAStream();
   batch_sampling_repetition_temperature_topk_topp_kernel
       <<<B, BLOCKDIM_X_SAMPLE, 0, stream>>>(
@@ -1437,7 +1555,8 @@ at::Tensor sampling_six_parameter_per_request_cuda(
           presence_penalties.data_ptr<float>(),
           frequency_penalties.data_ptr<float>(), penalty_decays.data_ptr<float>(),
           temperatures.data_ptr<float>(), top_ks.data_ptr<int>(),
-          top_ps.data_ptr<float>(), 0.0f, 0.0f, 1.0f, 1.0f, V, 1.0f);
+          top_ps.data_ptr<float>(), 0.0f, 0.0f, 1.0f, 1.0f, V, 1.0f,
+          metadata.status.data_ptr<int>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return output;
 }

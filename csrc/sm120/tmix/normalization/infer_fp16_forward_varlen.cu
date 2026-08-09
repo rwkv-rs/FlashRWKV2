@@ -849,6 +849,9 @@ __global__ __launch_bounds__(256, 1) void add_layer_norm_cmix_mix_f16_packed_wel
     }
     return;
   }
+  if (row >= metadata_status[2]) {
+    return;
+  }
 
   constexpr int Threads = 256;
   constexpr int PairsPerThread = (LN_SMALL_C / 2) / Threads;
@@ -942,6 +945,9 @@ __global__ __launch_bounds__(Threads, 1) void add_layer_norm_cmix_mix_f16_packed
       reinterpret_cast<__half*>(x_out + row * LN_SMALL_C)[c] = invalid;
       reinterpret_cast<__half*>(mixed + row * LN_SMALL_C)[c] = invalid;
     }
+    return;
+  }
+  if (row >= metadata_status[2]) {
     return;
   }
 
@@ -1052,6 +1058,9 @@ __global__ __launch_bounds__(Threads, 1) void add_layer_norm_tmix_mix6_f16_packe
       reinterpret_cast<__half*>(out_a)[output_index] = invalid;
       reinterpret_cast<__half*>(out_g)[output_index] = invalid;
     }
+    return;
+  }
+  if (row >= metadata_status[2]) {
     return;
   }
 

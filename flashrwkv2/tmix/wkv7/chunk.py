@@ -85,7 +85,10 @@ def infer_chunk_bf16_forward_varlen(
         or state_indices.device != r.device
     ):
         raise ValueError("chunk metadata must be contiguous CUDA int32")
-    launch_max_seqlen = _resolve_max_seqlen(cu_seqlens, max_seqlen)
+    if validated_metadata is not None and max_seqlen is None:
+        launch_max_seqlen = int(validated_metadata._max_seqlen())
+    else:
+        launch_max_seqlen = _resolve_max_seqlen(cu_seqlens, max_seqlen)
     ticket = (
         validated_metadata
         if validated_metadata is not None
@@ -97,7 +100,6 @@ def infer_chunk_bf16_forward_varlen(
             max_seqlen=launch_max_seqlen,
         )
     )
-    del ticket  # the native K1/K2 binding takes its own immutable snapshot
     if decay_bias is not None:
         if (
             decay_bias.dtype != torch.bfloat16
@@ -121,6 +123,7 @@ def infer_chunk_bf16_forward_varlen(
         int(launch_max_seqlen),
         float(scale),
         decay_bias=decay_bias,
+        validated_metadata=ticket,
     )
     return output
 

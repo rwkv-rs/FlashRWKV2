@@ -64,6 +64,9 @@ void infer_chunk_bf16_k1_kernel(
   }
   const int linear_block = static_cast<int>(blockIdx.x);
   const int sequence_index = linear_block / num_heads;
+  if (sequence_index >= metadata_status[2]) {
+    return;
+  }
   const int head_index = linear_block % num_heads;
   const int column = static_cast<int>(threadIdx.x);
   __shared__ K1Shared shared;
@@ -182,6 +185,9 @@ void infer_chunk_bf16_k2_kernel(
   }
   const int linear_block = static_cast<int>(blockIdx.x);
   const int sequence_index = linear_block / num_heads;
+  if (sequence_index >= metadata_status[2]) {
+    return;
+  }
   const int head_index = linear_block % num_heads;
   const int value_index = static_cast<int>(threadIdx.x);
   __shared__ K2Shared shared;

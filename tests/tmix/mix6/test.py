@@ -309,6 +309,80 @@ def test_infer_mix6_ticket_rejects_metadata_mutation_without_state_write() -> No
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_infer_mix6_cuda_graph_ignores_inactive_tail_state_slots() -> None:
+    device = torch.device("cuda")
+    token_capacity, sequence_capacity, channels, num_slots = 3, 2, 8, 4
+    x = torch.randn(token_capacity, channels, device=device, dtype=torch.float16)
+    params = [
+        torch.randn(channels, device=device, dtype=torch.float16)
+        for _ in range(6)
+    ]
+    initial = torch.randn(num_slots, channels, device=device, dtype=torch.float16)
+    shift_state = initial.clone()
+    cu_seqlens = torch.tensor([0, 1, 3], device=device, dtype=torch.int32)
+    state_indices = torch.tensor([3, 1], device=device, dtype=torch.int32)
+    num_active_tokens = torch.tensor([3], device=device, dtype=torch.int32)
+    num_active_sequences = torch.tensor([2], device=device, dtype=torch.int32)
+
+    infer_tmix_mix6_forward_varlen(
+        x,
+        *params,
+        shift_state_pool=initial.clone(),
+        cu_seqlens=cu_seqlens,
+        state_indices=state_indices,
+        max_seqlen=2,
+    )
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        ticket = prepare_recurrent_metadata(
+            cu_seqlens,
+            state_indices,
+            state_pool_size=num_slots,
+            token_capacity=token_capacity,
+            sequence_capacity=sequence_capacity,
+            max_seqlen_capacity=2,
+            num_active_tokens=num_active_tokens,
+            num_active_sequences=num_active_sequences,
+        )
+        infer_tmix_mix6_forward_varlen(
+            x,
+            *params,
+            shift_state_pool=shift_state,
+            cu_seqlens=cu_seqlens,
+            state_indices=state_indices,
+            validated_metadata=ticket,
+        )
+
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(shift_state[3], x[0])
+    assert torch.equal(shift_state[1], x[2])
+    assert torch.equal(shift_state[0], initial[0])
+    assert torch.equal(shift_state[2], initial[2])
+
+    shift_state.copy_(initial)
+    cu_seqlens.copy_(torch.tensor([0, 2, -1], device=device, dtype=torch.int32))
+    state_indices.copy_(torch.tensor([2, 99], device=device, dtype=torch.int32))
+    num_active_tokens.fill_(2)
+    num_active_sequences.fill_(1)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(shift_state[2], x[1])
+    assert torch.equal(shift_state[[0, 1, 3]], initial[[0, 1, 3]])
+
+    shift_state.copy_(initial)
+    cu_seqlens.copy_(torch.tensor([0, 1, 2], device=device, dtype=torch.int32))
+    state_indices.copy_(torch.tensor([1, 1], device=device, dtype=torch.int32))
+    num_active_tokens.fill_(2)
+    num_active_sequences.fill_(2)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(shift_state, initial)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_infer_mix6_fused_add_layer_norm_matches_albatross_t1_path() -> None:
     torch.manual_seed(19)
     device = torch.device("cuda")
@@ -365,6 +439,79 @@ def test_infer_mix6_fused_add_layer_norm_matches_albatross_t1_path() -> None:
     expected_state[3] = normalized[0]
     assert torch.allclose(shift_state, expected_state, atol=0.01, rtol=0.01)
     assert torch.equal(shift_state[[0, 1, 2, 4]], initial[[0, 1, 2, 4]])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_infer_mix6_fused_cuda_graph_zero_active_has_no_state_side_effect() -> None:
+    torch.manual_seed(20260809)
+    device = torch.device("cuda")
+    channels, num_slots = 4096, 4
+    x = torch.randn(1, channels, device=device, dtype=torch.float16)
+    residual = torch.randn_like(x)
+    weight = torch.randn(channels, device=device, dtype=torch.float16)
+    bias = torch.randn(channels, device=device, dtype=torch.float16)
+    params = [
+        torch.randn(channels, device=device, dtype=torch.float16)
+        for _ in range(6)
+    ]
+    initial = torch.randn(num_slots, channels, device=device, dtype=torch.float16)
+    shift_state = initial.clone()
+    cu_seqlens = torch.tensor([0, 1], device=device, dtype=torch.int32)
+    state_indices = torch.tensor([3], device=device, dtype=torch.int32)
+    num_active_tokens = torch.tensor([1], device=device, dtype=torch.int32)
+    num_active_sequences = torch.tensor([1], device=device, dtype=torch.int32)
+
+    infer_tmix_mix6_add_layer_norm_forward_varlen(
+        x,
+        residual,
+        weight,
+        bias,
+        *params,
+        shift_state_pool=initial.clone(),
+        cu_seqlens=cu_seqlens,
+        state_indices=state_indices,
+        max_seqlen=1,
+    )
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        ticket = prepare_recurrent_metadata(
+            cu_seqlens,
+            state_indices,
+            state_pool_size=num_slots,
+            token_capacity=1,
+            sequence_capacity=1,
+            max_seqlen_capacity=1,
+            num_active_tokens=num_active_tokens,
+            num_active_sequences=num_active_sequences,
+        )
+        infer_tmix_mix6_add_layer_norm_forward_varlen(
+            x,
+            residual,
+            weight,
+            bias,
+            *params,
+            shift_state_pool=shift_state,
+            cu_seqlens=cu_seqlens,
+            state_indices=state_indices,
+            validated_metadata=ticket,
+        )
+
+    shift_state.copy_(initial)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert not torch.equal(shift_state[3], initial[3])
+    assert torch.equal(shift_state[[0, 1, 2]], initial[[0, 1, 2]])
+
+    shift_state.copy_(initial)
+    cu_seqlens.zero_()
+    state_indices.fill_(99)
+    num_active_tokens.zero_()
+    num_active_sequences.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(shift_state, initial)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

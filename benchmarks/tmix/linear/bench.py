@@ -12,6 +12,7 @@ from pathlib import Path
 import torch
 
 from flashrwkv2.tmix.linear import (
+    infer_tmix_linear_attention_c2c_forward_varlen,
     infer_tmix_linear_rank_in_forward_varlen,
     infer_tmix_linear_rank_out_forward_varlen,
     infer_tmix_linear_rank_out_sigmoid_forward_varlen,
@@ -137,7 +138,47 @@ def _case(
     value_bias = torch.randn(channels, device=device, dtype=torch.float16)
 
     individual_call: Callable[[], tuple[torch.Tensor, ...]]
-    if operator == "rank-in":
+    if operator == "lora":
+        inputs[0].mul_(0.25)
+        base_weight = torch.randn(
+            channels, channels, device=device, dtype=torch.float16
+        ) * 0.02
+        adapter_a = rank_in_runtime[0].t().contiguous().mul_(0.02)
+        adapter_b = rank_out_runtime[0].t().contiguous().mul_(0.02)
+        scale = 0.25
+        call = lambda: (
+            infer_tmix_linear_attention_c2c_forward_varlen(
+                inputs[0],
+                base_weight,
+                lora_a=adapter_a,
+                lora_b=adapter_b,
+                lora_scale=scale,
+            ),
+        )
+
+        def composed_lora_call() -> tuple[torch.Tensor, ...]:
+            base = infer_tmix_linear_attention_c2c_forward_varlen(
+                inputs[0], base_weight
+            )
+            rank_features = infer_tmix_linear_rank_in_forward_varlen(
+                inputs[0], weight_t=adapter_a
+            )
+            delta = infer_tmix_linear_rank_out_forward_varlen(
+                rank_features, weight_t=adapter_b
+            )
+            return (base + delta * scale,)
+
+        expected = (
+            inputs[0].float() @ base_weight.float().t()
+            + scale
+            * (
+                (inputs[0].float() @ adapter_a.float().t())
+                @ adapter_b.float().t()
+            ),
+        )
+        individual_call = composed_lora_call
+        dispatch = "attention-c2c+rank-auto+direct-accumulate"
+    elif operator == "rank-in":
         call = lambda: (
             infer_tmix_linear_rank_in_forward_varlen(
                 inputs[0], weight=rank_in_layouts[0][1], weight_t=rank_in_layouts[0][0]
@@ -332,14 +373,23 @@ def _case(
     correctness = _metrics(actual, tuple(expected))
     if not all(torch.isfinite(tensor).all().item() for tensor in actual):
         raise RuntimeError("non-finite output")
+    tolerance = 0.02 if operator == "lora" else 0.08
     if not all(
-        torch.allclose(left.float(), right.float(), atol=0.08, rtol=0.08)
+        torch.allclose(
+            left.float(), right.float(), atol=tolerance, rtol=tolerance
+        )
         for left, right in zip(actual, expected, strict=True)
     ):
         raise RuntimeError(f"correctness gate failed: {correctness}")
     individual_actual = tuple(individual_call())
+    comparison_tolerance = 0.02 if operator == "lora" else 0.04
     if not all(
-        torch.allclose(left.float(), right.float(), atol=0.04, rtol=0.04)
+        torch.allclose(
+            left.float(),
+            right.float(),
+            atol=comparison_tolerance,
+            rtol=comparison_tolerance,
+        )
         for left, right in zip(actual, individual_actual, strict=True)
     ):
         raise RuntimeError("public composite and individual canonical paths disagree")
@@ -347,7 +397,10 @@ def _case(
     raw_latency_us = _time(call, warmup, samples)
     public_peak_allocated = torch.cuda.max_memory_allocated()
     public_peak_reserved = torch.cuda.max_memory_reserved()
+    torch.cuda.reset_peak_memory_stats()
     individual_latency_us = _time(individual_call, warmup, samples)
+    individual_peak_allocated = torch.cuda.max_memory_allocated()
+    individual_peak_reserved = torch.cuda.max_memory_reserved()
     return {
         "operator": operator,
         "rows": rows,
@@ -368,6 +421,8 @@ def _case(
         "correctness": correctness,
         "peak_allocated_bytes": public_peak_allocated,
         "peak_reserved_bytes": public_peak_reserved,
+        "individual_peak_allocated_bytes": individual_peak_allocated,
+        "individual_peak_reserved_bytes": individual_peak_reserved,
     }
 
 
@@ -378,6 +433,7 @@ def main() -> None:
         choices=(
             "rank-in",
             "rank-out",
+            "lora",
             "wag",
             "wagv",
             "rank-out-group",

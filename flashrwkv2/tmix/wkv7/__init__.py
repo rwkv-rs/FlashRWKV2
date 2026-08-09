@@ -181,13 +181,81 @@ def prepare_recurrent_metadata(
     cu_seqlens: torch.Tensor,
     state_indices: torch.Tensor,
     *,
-    total_tokens: int,
     state_pool_size: int,
+    total_tokens: int | None = None,
     max_seqlen: int | None = None,
+    token_capacity: int | None = None,
+    sequence_capacity: int | None = None,
+    max_seqlen_capacity: int | None = None,
+    num_active_tokens: torch.Tensor | None = None,
+    num_active_sequences: torch.Tensor | None = None,
 ) -> object:
-    """Validate packed metadata and create a reusable native ticket."""
+    """Create a static ticket or a live capacity ticket.
+
+    The legacy ``total_tokens`` form snapshots and validates fixed metadata.
+    The capacity form keeps metadata and the two scalar active counts live;
+    use it with zero active counts for same-stream pre-capture warmup, then
+    call it again with the same buffers inside capture and reuse that ticket
+    for every stateful operator in the graph.
+    """
 
     _check_metadata_inputs(cu_seqlens, state_indices)
+    graph_values = (
+        token_capacity,
+        sequence_capacity,
+        max_seqlen_capacity,
+        num_active_tokens,
+        num_active_sequences,
+    )
+    graph_mode = any(value is not None for value in graph_values)
+    if graph_mode:
+        if total_tokens is not None or max_seqlen is not None:
+            raise ValueError(
+                "graph metadata uses capacity arguments, not total_tokens/max_seqlen"
+            )
+        if any(value is None for value in graph_values):
+            raise ValueError("all graph metadata capacity and active-count arguments are required")
+        assert token_capacity is not None
+        assert sequence_capacity is not None
+        assert max_seqlen_capacity is not None
+        assert num_active_tokens is not None
+        assert num_active_sequences is not None
+        for name, value in (
+            ("token_capacity", token_capacity),
+            ("sequence_capacity", sequence_capacity),
+            ("state_pool_size", state_pool_size),
+            ("max_seqlen_capacity", max_seqlen_capacity),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        for name, value in (
+            ("num_active_tokens", num_active_tokens),
+            ("num_active_sequences", num_active_sequences),
+        ):
+            if (
+                not isinstance(value, torch.Tensor)
+                or value.dtype != torch.int32
+                or not value.is_cuda
+                or not value.is_contiguous()
+                or value.numel() != 1
+                or value.device != cu_seqlens.device
+            ):
+                raise ValueError(
+                    f"{name} must be a one-element contiguous CUDA int32 tensor"
+                )
+        return _extension().prepare_recurrent_graph_metadata(
+            cu_seqlens,
+            state_indices,
+            num_active_tokens,
+            num_active_sequences,
+            token_capacity,
+            sequence_capacity,
+            state_pool_size,
+            max_seqlen_capacity,
+        )
+
+    if total_tokens is None:
+        raise ValueError("total_tokens is required for static recurrent metadata")
     return _extension().prepare_recurrent_metadata(
         cu_seqlens,
         state_indices,
