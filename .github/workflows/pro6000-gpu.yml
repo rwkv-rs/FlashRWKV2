@@ -318,7 +318,7 @@ jobs:
               .runtime-venv/bin/python -m pytest -q "tests/$module" -x \
               2>&1 | tee "artifacts/sanitizer/$safe-memcheck.log"
             case "$module" in
-              cmix/mix|cmix/sparse|rl_infctx/wkv7|sampling|tmix/mix6|tmix/wkv7)
+              cmix/mix|cmix/sparse|sampling|tmix/mix6|tmix/wkv7|tmix/wkv7/rl_infctx)
                 compute-sanitizer --tool racecheck --target-processes all \
                   --error-exitcode 98 \
                   .runtime-venv/bin/python -m pytest -q "tests/$module" -x \

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: Copyright contributors to the FlashRWKV2 project
+// Canonical module owner: tmix/wkv7; RL/Infctx is the workload.
 // Mechanically migrated from the RL/Infctx chunk replay source retained in
 // the pre-refactor tree; raw-decay-only adaptation for this public contract.
 

@@ -20,7 +20,6 @@ MODULES = (
     "head/l2wrap_ce",
     "head/linear",
     "loss/l2wrap_ce",
-    "rl_infctx/wkv7",
     "sampling",
     "tmix/a_gate",
     "tmix/kk_a_gate",
@@ -32,6 +31,8 @@ MODULES = (
     "tmix/vres_gate",
     "tmix/wkv7",
 )
+WORKLOAD_TARGETS = ("tmix/wkv7/rl_infctx",)
+TARGETS = MODULES + WORKLOAD_TARGETS
 SHARED_FILES = {
     "setup.py",
     "pyproject.toml",
@@ -88,13 +89,18 @@ class Impact:
     reasons: tuple[str, ...]
 
 
-def _module_from_path(path: str, prefix: str) -> str | None:
+def _target_from_path(path: str, prefix: str) -> str | None:
     if not path.startswith(prefix):
         return None
     relative = path.removeprefix(prefix)
-    for module in sorted(MODULES, key=len, reverse=True):
-        if relative == module or relative.startswith(f"{module}/"):
-            return module
+    for target in sorted(TARGETS, key=len, reverse=True):
+        if (
+            relative == target
+            or relative == f"{target}.py"
+            or relative.startswith(f"{target}/")
+            or relative.startswith(f"{target}_")
+        ):
+            return target
     return None
 
 
@@ -110,6 +116,17 @@ def validate_layout(root: Path = ROOT) -> None:
             for architecture in ("sm90", "sm120")
         ):
             missing.append(f"csrc/sm{{90,120}}/{module}")
+    for candidate in (
+        root / "flashrwkv2/tmix/wkv7/rl_infctx.py",
+        root / "tests/tmix/wkv7/rl_infctx/test.py",
+        root / "benchmarks/tmix/wkv7/rl_infctx/bench.py",
+        root / "csrc/sm90/tmix/wkv7/rl_infctx_chunk_fp32io16_forward.cpp",
+        root / "csrc/sm90/tmix/wkv7/rl_infctx_chunk_fp32io16_forward.cu",
+        root / "csrc/sm90/tmix/wkv7/rl_infctx_chunk_fp32io16_backward.cpp",
+        root / "csrc/sm90/tmix/wkv7/rl_infctx_chunk_fp32io16_backward.cu",
+    ):
+        if not candidate.exists():
+            missing.append(str(candidate.relative_to(root)))
     if missing:
         raise SystemExit("active module layout is incomplete: " + ", ".join(missing))
 
@@ -162,14 +179,14 @@ def classify(
         module = None
         owner = None
         for candidate_owner in ("flashrwkv2", "tests", "benchmarks"):
-            module = _module_from_path(path, f"{candidate_owner}/")
+            module = _target_from_path(path, f"{candidate_owner}/")
             if module:
                 owner = candidate_owner
                 break
         if module is None and path.startswith("csrc/sm"):
             parts = path.split("/", 2)
             if len(parts) == 3:
-                module = _module_from_path(parts[2], "")
+                module = _target_from_path(parts[2], "")
                 owner = "csrc"
 
         if module:
@@ -191,7 +208,7 @@ def classify(
             reasons.append(f"metadata:{path}")
 
     if run_all:
-        modules = set(MODULES)
+        modules = set(TARGETS)
     if not changed:
         change_class = "empty"
     elif only_docs and not run_gpu:
@@ -370,8 +387,13 @@ def _self_test() -> None:
     )
     benchmark = classify(["benchmarks/cmix/sparse/bench.py"])
     assert benchmark.affected_modules == ("cmix/sparse",) and benchmark.run_benchmark
+    rl_infctx = classify(
+        ["csrc/sm90/tmix/wkv7/rl_infctx_chunk_fp32io16_forward.cu"]
+    )
+    assert rl_infctx.affected_modules == ("tmix/wkv7/rl_infctx",)
+    assert rl_infctx.run_benchmark and rl_infctx.run_sanitizer
     shared = classify(["setup.py"])
-    assert shared.run_all and shared.affected_modules == tuple(sorted(MODULES))
+    assert shared.run_all and shared.affected_modules == tuple(sorted(TARGETS))
     unknown = classify(["flashrwkv2/new_family.py"])
     assert unknown.run_all and unknown.run_sanitizer
     release = classify(

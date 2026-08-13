@@ -30,7 +30,6 @@ BENCHMARKS = {
     "head/l2wrap_ce": ("benchmarks/head/l2wrap_ce/bench.py", "samples"),
     "head/linear": ("benchmarks/head/linear/bench.py", "samples"),
     "loss/l2wrap_ce": ("benchmarks/loss/l2wrap_ce/bench.py", "samples"),
-    "rl_infctx/wkv7": ("benchmarks/rl_infctx/wkv7/bench.py", "samples"),
     "sampling": ("benchmarks/sampling/bench.py", "samples"),
     "tmix/a_gate": ("benchmarks/tmix/a_gate/bench.py", "iters"),
     "tmix/kk_a_gate": ("benchmarks/tmix/kk_a_gate/bench.py", "samples"),
@@ -41,6 +40,10 @@ BENCHMARKS = {
     "tmix/normalization": ("benchmarks/tmix/normalization/bench.py", "samples"),
     "tmix/vres_gate": ("benchmarks/tmix/vres_gate/bench.py", "samples"),
     "tmix/wkv7": ("benchmarks/tmix/wkv7/bench.py", "wkv7"),
+    "tmix/wkv7/rl_infctx": (
+        "benchmarks/tmix/wkv7/rl_infctx/bench.py",
+        "samples",
+    ),
 }
 
 

@@ -8,7 +8,7 @@ import time
 
 import torch
 
-from flashrwkv2.rl_infctx.wkv7 import rl_infctx_chunk_fp32io16
+from flashrwkv2.tmix.wkv7 import rl_infctx_chunk_fp32io16
 
 
 def main() -> None:

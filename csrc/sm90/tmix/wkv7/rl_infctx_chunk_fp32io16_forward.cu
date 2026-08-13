@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: Copyright contributors to the FlashRWKV2 project
+// Canonical module owner: tmix/wkv7; RL/Infctx is the workload.
 // Source revision: FlashRWKV2 pre-refactor retained RL/Infctx local snapshot
 // Original path: retained RL/Infctx materialized/recompute CUDA family
 // D64 is mechanically migrated from the retained RL/Infctx materialized and

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: Copyright contributors to the FlashRWKV2 project
+// Canonical module owner: tmix/wkv7; RL/Infctx is the workload.
 // RL/Infctx binding restores the retained D64 materialized and factor-recompute
 // families and dispatches D128/256 to the local 64-wide tiled recurrence. The
 // public decay boundary is raw logits.

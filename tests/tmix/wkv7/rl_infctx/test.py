@@ -6,7 +6,7 @@ import pytest
 import torch
 
 import flashrwkv2
-from flashrwkv2.rl_infctx.wkv7 import rl_infctx_chunk_fp32io16
+from flashrwkv2.tmix.wkv7 import rl_infctx_chunk_fp32io16
 
 
 def _reference(

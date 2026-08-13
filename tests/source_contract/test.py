@@ -22,7 +22,6 @@ MIRRORED_MODULES = (
     "head/l2wrap_ce",
     "head/linear",
     "loss/l2wrap_ce",
-    "rl_infctx/wkv7",
     "sampling",
     "tmix/a_gate",
     "tmix/kk_a_gate",
@@ -59,7 +58,6 @@ PUBLIC_TRAINING_MODULES = (
     "flashrwkv2.cmix.mix",
     "flashrwkv2.loss.l2wrap_ce",
     "flashrwkv2.head.l2wrap_ce",
-    "flashrwkv2.rl_infctx.wkv7",
 )
 PUBLIC_TRAINING_PREFIXES = ("pretrain_", "statetune_", "rl_infctx_")
 
@@ -115,11 +113,26 @@ def test_module_paths_are_mirrored() -> None:
             module
         )
 
+    wkv7_workload_layout = {
+        "pretrain": "pretrain.py",
+        "rl_infctx": "rl_infctx.py",
+        "statetune": "statetune.py",
+    }
+    for workload, python_file in wkv7_workload_layout.items():
+        assert (ROOT / "flashrwkv2/tmix/wkv7" / python_file).is_file()
+        assert (ROOT / "tests/tmix/wkv7" / workload / "test.py").is_file()
+        assert (ROOT / "benchmarks/tmix/wkv7" / workload / "bench.py").is_file()
+
 
 def test_forbidden_global_and_legacy_paths_are_absent_from_active_tree() -> None:
     assert not (ROOT / "csrc" / "common").exists()
     assert not (ROOT / "flashrwkv2" / "elementwise").exists()
     assert not (ROOT / "csrc" / "elementwise").exists()
+    assert not (ROOT / "flashrwkv2" / "rl_infctx").exists()
+    assert not (ROOT / "tests" / "rl_infctx").exists()
+    assert not (ROOT / "benchmarks" / "rl_infctx").exists()
+    for native_root in NATIVE_ROOTS:
+        assert not (native_root / "rl_infctx").exists()
 
     active_paths = {
         path.relative_to(ROOT)

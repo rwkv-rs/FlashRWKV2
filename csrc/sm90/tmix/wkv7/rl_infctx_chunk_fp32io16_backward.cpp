@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: Copyright contributors to the FlashRWKV2 project
+// Canonical module owner: tmix/wkv7; RL/Infctx is the workload.
 // This binding exposes the mechanically migrated RL/Infctx output replay
 // stage.  It is not a train_temp backward alias.
 

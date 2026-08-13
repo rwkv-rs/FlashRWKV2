@@ -578,7 +578,7 @@ outputs for their floating-point inputs unless an entry states otherwise.
 ### `rl_infctx_chunk_fp32io16`
 
 - Import: `from flashrwkv2 import rl_infctx_chunk_fp32io16`
-- Owner: `flashrwkv2.rl_infctx.wkv7`
+- Owner: `flashrwkv2.tmix.wkv7` (`rl_infctx` workload)
 - Signature: `rl_infctx_chunk_fp32io16(r, decay_logits, k, v, a, b, *, state_pool=None, cu_seqlens, state_indices=None, chunk_size=16, strategy='recompute', scale=1.0, decay_bias=None)`
 - Contract: matching FP16 or BF16 packed tensors `[N,H,D]`, with `D` in `{64,128,256}`; packed offsets; `chunk_size` in `{16,32,64}`; strategy `materialized` or `recompute`; finite scale. Optional decay bias matches token dtype and is `[H,D]` or `[H*D]`. Missing state indices default to `0..B-1`; missing state pool allocates zero FP32 state. D64 retains the existing chunk selection. D128/D256 use 64-wide state tiles for boundary/state propagation and backward replay; no D256-by-D256 shared allocation is used.
 - Result and mutation: returns `(output, final_pool)`. The output matches token shape; `final_pool` is a cloned FP32 pool with selected slots replaced. The input `state_pool` is not mutated. This forward-only wrapper does not define custom autograd.
@@ -586,7 +586,7 @@ outputs for their floating-point inputs unless an entry states otherwise.
 ### `rl_infctx_chunk_fp32io16_factor_recompute`
 
 - Import: `from flashrwkv2 import rl_infctx_chunk_fp32io16_factor_recompute`
-- Owner: `flashrwkv2.rl_infctx.wkv7`
+- Owner: `flashrwkv2.tmix.wkv7` (`rl_infctx` workload)
 - Signature: `rl_infctx_chunk_fp32io16_factor_recompute(*args, **kwargs)`
 - Contract: accepts the same arguments as `rl_infctx_chunk_fp32io16` and forces `strategy='recompute'`, overriding a supplied strategy keyword.
 - Result and mutation: returns the same `(output, final_pool)` pair and preserves the input state pool.
