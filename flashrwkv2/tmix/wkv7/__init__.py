@@ -418,5 +418,16 @@ __all__ = [
 
 from .pretrain import pretrain_recurrent_bf16
 from .chunk import infer_chunk_bf16_forward_varlen
+from .rl_infctx import (
+    rl_infctx_chunk_fp32io16,
+    rl_infctx_chunk_fp32io16_factor_recompute,
+)
 
-__all__.extend(["pretrain_recurrent_bf16", "infer_chunk_bf16_forward_varlen"])
+__all__.extend(
+    [
+        "pretrain_recurrent_bf16",
+        "infer_chunk_bf16_forward_varlen",
+        "rl_infctx_chunk_fp32io16",
+        "rl_infctx_chunk_fp32io16_factor_recompute",
+    ]
+)

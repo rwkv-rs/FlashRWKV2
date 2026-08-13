@@ -6,7 +6,7 @@ import math
 
 import torch
 
-from ...tmix.wkv7 import _extension
+from . import _extension
 
 
 def _check_tensor(tensor, name, dtype=None):

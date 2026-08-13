@@ -32,10 +32,6 @@ from .head.linear import (
     infer_head_linear_last_forward_varlen,
 )
 from .loss.l2wrap_ce import pretrain_l2wrap_ce_bf16
-from .rl_infctx.wkv7 import (
-    rl_infctx_chunk_fp32io16,
-    rl_infctx_chunk_fp32io16_factor_recompute,
-)
 from .sampling import (
     infer_sampling_six_parameter_forward_varlen,
     infer_sampling_temperature_topk_topp_forward_varlen,
@@ -92,6 +88,8 @@ from .tmix.wkv7 import (
     infer_recurrent_fp32io16_forward_varlen,
     prepare_recurrent_metadata,
     pretrain_recurrent_bf16,
+    rl_infctx_chunk_fp32io16,
+    rl_infctx_chunk_fp32io16_factor_recompute,
 )
 from .tmix.wkv7.statetune import statetune_recurrent_fp32io16
 

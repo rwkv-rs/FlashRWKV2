@@ -46,7 +46,7 @@ C++/CUDA：  ./csrc/sm{60|75|80|90|120}/<module_name>[/<sub_module_name>]/
   没有子模块时，省略整个 `[/<sub_module_name>]`。
 - CUDA 源码的第一层目录必须是 `sm60`、`sm75`、`sm80`、`sm90` 或 `sm120`，
   不要使用未列出的架构名称。
-- CUDA 文件名依次表示工作负载、算法、数值模式和执行方向；工作负载只能是
+- CUDA 文件名依次表示使用场景、算法、数值模式和执行方向；使用场景只能是
   `pretrain`、`rl_infctx`、`statetune` 或 `infer`，(如果是wkv7 kernel, 算法只能是 `recurrent`、
   `recurrent_kda` 或 `chunk`)方向只能是 `forward` 或 `backward`，
   `_varlen` 表示可变长输入，扩展名只能是 `.cpp` 或 `.cu`, 两文件同名。
