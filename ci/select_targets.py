@@ -14,25 +14,40 @@ import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULES = (
-    "cmix/mix",
-    "cmix/sparse",
+    "cmix",
     "embedding",
     "head/l2wrap_ce",
     "head/linear",
     "loss/l2wrap_ce",
     "sampling",
     "tmix/a_gate",
-    "tmix/kk_a_gate",
     "tmix/kk_pre",
-    "tmix/linear",
-    "tmix/lnx_rkvres_xg",
-    "tmix/mix6",
-    "tmix/normalization",
+    "tmix/readout",
+    "tmix/tokenshift",
+    "post_norm",
     "tmix/vres_gate",
+    "tmix/wkv_prepare",
     "tmix/wkv7",
 )
 WORKLOAD_TARGETS = ("tmix/wkv7/rl_infctx",)
 TARGETS = MODULES + WORKLOAD_TARGETS
+BACKENDS_BY_TARGET = {
+    "cmix": ("sm90", "sm120"),
+    "embedding": ("sm120",),
+    "head/l2wrap_ce": ("sm90",),
+    "head/linear": ("sm120",),
+    "loss/l2wrap_ce": ("sm90",),
+    "sampling": ("sm120",),
+    "tmix/a_gate": ("sm90",),
+    "tmix/kk_pre": ("sm90",),
+    "tmix/readout": ("sm90", "sm120"),
+    "tmix/tokenshift": ("sm90", "sm120"),
+    "post_norm": ("sm120",),
+    "tmix/vres_gate": ("sm90",),
+    "tmix/wkv_prepare": ("sm120",),
+    "tmix/wkv7": ("sm90", "sm120"),
+    "tmix/wkv7/rl_infctx": ("sm90",),
+}
 SHARED_FILES = {
     "setup.py",
     "pyproject.toml",
@@ -47,7 +62,6 @@ SHARED_PREFIXES = (
     "csrc/registration.cpp",
     "csrc/validation.cpp",
     "csrc/validation/",
-    "tests/source_contract/",
 )
 DOC_PREFIXES = ("docs/",)
 DOC_FILES = {
@@ -80,6 +94,8 @@ class Impact:
     head_sha: str
     change_class: str
     affected_modules: tuple[str, ...]
+    affected_sm90_modules: tuple[str, ...]
+    affected_sm120_modules: tuple[str, ...]
     run_gpu: bool
     run_benchmark: bool
     run_sanitizer: bool
@@ -95,10 +111,8 @@ def _target_from_path(path: str, prefix: str) -> str | None:
     relative = path.removeprefix(prefix)
     for target in sorted(TARGETS, key=len, reverse=True):
         if (
-            relative == target
-            or relative == f"{target}.py"
-            or relative.startswith(f"{target}/")
-            or relative.startswith(f"{target}_")
+            relative in {target, f"{target}.py"}
+            or relative.startswith((f"{target}/", f"{target}_"))
         ):
             return target
     return None
@@ -106,16 +120,30 @@ def _target_from_path(path: str, prefix: str) -> str | None:
 
 def validate_layout(root: Path = ROOT) -> None:
     missing: list[str] = []
+    backend_mismatches: list[str] = []
     for module in MODULES:
-        for owner in ("flashrwkv2", "tests", "benchmarks"):
-            candidate = root / owner / module
-            if not candidate.exists():
-                missing.append(str(candidate.relative_to(root)))
-        if not any(
-            (root / "csrc" / architecture / module).exists()
-            for architecture in ("sm90", "sm120")
+        for owner, filename in (
+            ("flashrwkv2", "__init__.py"),
+            ("tests", "test.py"),
+            ("benchmarks", "bench.py"),
         ):
-            missing.append(f"csrc/sm{{90,120}}/{module}")
+            candidate = root / owner / module / filename
+            if not candidate.is_file():
+                missing.append(str(candidate.relative_to(root)))
+        for architecture in ("sm90", "sm120"):
+            source_root = root / "csrc" / architecture / module
+            has_sources = source_root.is_dir() and any(
+                path.suffix in {".cpp", ".cu"}
+                for path in source_root.rglob("*")
+                if path.is_file()
+            )
+            expected = architecture in BACKENDS_BY_TARGET[module]
+            if has_sources != expected:
+                backend_mismatches.append(
+                    f"{module}/{architecture}: expected_sources={expected}, "
+                    f"actual_sources={has_sources}"
+                )
+
     for candidate in (
         root / "flashrwkv2/tmix/wkv7/rl_infctx.py",
         root / "tests/tmix/wkv7/rl_infctx/test.py",
@@ -125,10 +153,37 @@ def validate_layout(root: Path = ROOT) -> None:
         root / "csrc/sm90/tmix/wkv7/rl_infctx_chunk_fp32io16_backward.cpp",
         root / "csrc/sm90/tmix/wkv7/rl_infctx_chunk_fp32io16_backward.cu",
     ):
-        if not candidate.exists():
+        if not candidate.is_file():
             missing.append(str(candidate.relative_to(root)))
+
+    source_stems = {
+        path.relative_to(root / "csrc").with_suffix("")
+        for path in (root / "csrc").rglob("*")
+        if path.is_file() and path.suffix in {".cpp", ".cu"}
+    }
+    docs_root = root / "docs/dev/csrc"
+    document_stems = {
+        path.relative_to(docs_root).with_suffix("")
+        for path in docs_root.rglob("*.md")
+    }
+    missing_docs = sorted(source_stems - document_stems)
+    extra_docs = sorted(document_stems - source_stems)
+
+    errors = []
     if missing:
-        raise SystemExit("active module layout is incomplete: " + ", ".join(missing))
+        errors.append("missing paths: " + ", ".join(missing))
+    if backend_mismatches:
+        errors.append("backend ownership: " + ", ".join(backend_mismatches))
+    if missing_docs:
+        errors.append(
+            "missing csrc docs: " + ", ".join(map(str, missing_docs))
+        )
+    if extra_docs:
+        errors.append("orphan csrc docs: " + ", ".join(map(str, extra_docs)))
+    if errors:
+        raise SystemExit("active module layout is incomplete: " + "; ".join(errors))
+
+
 
 
 def classify(
@@ -155,6 +210,8 @@ def classify(
             head_sha=head_sha,
             change_class="release_metadata",
             affected_modules=(),
+            affected_sm90_modules=(),
+            affected_sm120_modules=(),
             run_gpu=True,
             run_benchmark=False,
             run_sanitizer=False,
@@ -169,6 +226,13 @@ def classify(
         if path in DOC_FILES or path.startswith(DOC_PREFIXES):
             continue
         only_docs = False
+        if path == "tests/test_runtime.py":
+            reasons.append("runtime-behavior-tests")
+            continue
+        if path == "tests/utils.py":
+            run_all = run_gpu = run_sanitizer = True
+            reasons.append("shared-test-behavior")
+            continue
         if path in SHARED_FILES or path.startswith(SHARED_PREFIXES):
             run_all = run_gpu = run_benchmark = True
             if path.startswith(("csrc/", "ci/", ".github/workflows/")):
@@ -209,6 +273,17 @@ def classify(
 
     if run_all:
         modules = set(TARGETS)
+    affected_modules = tuple(sorted(modules))
+    affected_sm90_modules = tuple(
+        module
+        for module in affected_modules
+        if "sm90" in BACKENDS_BY_TARGET[module]
+    )
+    affected_sm120_modules = tuple(
+        module
+        for module in affected_modules
+        if "sm120" in BACKENDS_BY_TARGET[module]
+    )
     if not changed:
         change_class = "empty"
     elif only_docs and not run_gpu:
@@ -228,7 +303,9 @@ def classify(
         base_sha=base_sha,
         head_sha=head_sha,
         change_class=change_class,
-        affected_modules=tuple(sorted(modules)),
+        affected_modules=affected_modules,
+        affected_sm90_modules=affected_sm90_modules,
+        affected_sm120_modules=affected_sm120_modules,
         run_gpu=run_gpu,
         run_benchmark=run_benchmark,
         run_sanitizer=run_sanitizer,
@@ -351,10 +428,16 @@ def _write_github_outputs(path: Path, impact: Impact, artifact_path: Path) -> No
         "head_sha": impact.head_sha,
         "change_class": impact.change_class,
         "affected_modules": json.dumps(impact.affected_modules, separators=(",", ":")),
+        "affected_sm90_modules": json.dumps(
+            impact.affected_sm90_modules, separators=(",", ":")
+        ),
+        "affected_sm120_modules": json.dumps(
+            impact.affected_sm120_modules, separators=(",", ":")
+        ),
         "benchmark_matrix": json.dumps(
             [
                 {"module": module, "safe": module.replace("/", "-")}
-                for module in impact.affected_modules
+                for module in impact.affected_sm120_modules
             ],
             separators=(",", ":"),
         ),
@@ -371,29 +454,41 @@ def _write_github_outputs(path: Path, impact: Impact, artifact_path: Path) -> No
 
 
 def _self_test() -> None:
+    validate_layout()
     doc = classify(["README.md"])
     assert doc.change_class == "documentation" and not doc.run_gpu
-    test = classify(["tests/tmix/linear/test.py"])
+    test = classify(["tests/tmix/wkv_prepare/test.py"])
     assert (
-        test.affected_modules == ("tmix/linear",)
+        test.affected_modules == ("tmix/wkv_prepare",)
         and test.run_gpu
         and not test.run_benchmark
     )
+    assert test.affected_sm90_modules == ()
+    assert test.affected_sm120_modules == ("tmix/wkv_prepare",)
     native = classify(["csrc/sm120/tmix/wkv7/infer_recurrent_fp16_forward_varlen.cu"])
     assert (
         native.affected_modules == ("tmix/wkv7",)
         and native.run_sanitizer
         and native.run_benchmark
     )
-    benchmark = classify(["benchmarks/cmix/sparse/bench.py"])
-    assert benchmark.affected_modules == ("cmix/sparse",) and benchmark.run_benchmark
+    benchmark = classify(["benchmarks/cmix/bench.py"])
+    assert benchmark.affected_modules == ("cmix",) and benchmark.run_benchmark
     rl_infctx = classify(
         ["csrc/sm90/tmix/wkv7/rl_infctx_chunk_fp32io16_forward.cu"]
     )
     assert rl_infctx.affected_modules == ("tmix/wkv7/rl_infctx",)
+    assert rl_infctx.affected_sm90_modules == ("tmix/wkv7/rl_infctx",)
+    assert rl_infctx.affected_sm120_modules == ()
     assert rl_infctx.run_benchmark and rl_infctx.run_sanitizer
     shared = classify(["setup.py"])
     assert shared.run_all and shared.affected_modules == tuple(sorted(TARGETS))
+    assert "embedding" not in shared.affected_sm90_modules
+    assert "head/l2wrap_ce" not in shared.affected_sm120_modules
+    test_utils = classify(["tests/utils.py"])
+    assert test_utils.run_all and test_utils.run_gpu and test_utils.run_sanitizer
+    assert not test_utils.run_benchmark
+    runtime = classify(["tests/test_runtime.py"])
+    assert not runtime.run_gpu and runtime.change_class == "metadata"
     unknown = classify(["flashrwkv2/new_family.py"])
     assert unknown.run_all and unknown.run_sanitizer
     release = classify(
@@ -415,12 +510,10 @@ def main() -> int:
     args = parser.parse_args()
     if args.self_test:
         _self_test()
-        validate_layout()
         print("select_targets self-test passed")
         return 0
     if args.files is None and not (args.base and args.head):
         parser.error("provide --files or both --base and --head")
-    validate_layout()
     paths = (
         args.files
         if args.files is not None

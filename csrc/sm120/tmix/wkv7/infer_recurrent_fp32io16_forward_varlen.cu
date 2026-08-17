@@ -454,7 +454,7 @@ void launch_recurrent_fp32(
 
 }  // namespace
 
-void recurrent_fp32_from_decay_logits_cuda(
+void tmix_wkv7_recurrent_fp32_from_decay_logits_cuda(
     torch::Tensor query_start_loc,
     torch::Tensor state_indices,
     torch::Tensor state,
@@ -485,7 +485,7 @@ void recurrent_fp32_from_decay_logits_cuda(
       at::ScalarType::Half,
       at::ScalarType::BFloat16,
       r.scalar_type(),
-      "flashrwkv2_recurrent_fp32_from_decay_logits",
+      "flashrwkv2_tmix_wkv7_recurrent_fp32_from_decay_logits",
       [&] {
         switch (state.size(2)) {
           case 64:

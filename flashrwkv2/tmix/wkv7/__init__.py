@@ -62,95 +62,6 @@ def _validate_fp16_elapsed_state(
         raise ValueError("elapsed_state_pool must have shape [state_pool_slots]")
 
 
-def infer_recurrent_fp16_advance_i32(
-    elapsed_state: torch.Tensor, amount: int
-) -> None:
-    """Advance the Albatross FP16 elapsed/dither state in place."""
-
-    if not isinstance(elapsed_state, torch.Tensor):
-        raise TypeError("elapsed_state must be a torch.Tensor")
-    if elapsed_state.dtype != torch.int32:
-        raise TypeError("elapsed_state must have dtype torch.int32")
-    if not elapsed_state.is_cuda or not elapsed_state.is_contiguous():
-        raise ValueError("elapsed_state must be contiguous CUDA int32")
-    if elapsed_state.numel() == 0:
-        raise ValueError("elapsed_state must be non-empty")
-    if not isinstance(amount, int) or isinstance(amount, bool):
-        raise TypeError("amount must be an int")
-    _extension().recurrent_fp16_advance_i32(elapsed_state, amount)
-
-
-def infer_recurrent_fp16_advance_i32_varlen(
-    elapsed_state_pool: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    state_indices: torch.Tensor,
-    *,
-    total_tokens: int,
-    validated_metadata: object | None = None,
-) -> None:
-    """Advance selected Albatross elapsed slots by their packed lengths."""
-
-    if not isinstance(elapsed_state_pool, torch.Tensor):
-        raise TypeError("elapsed_state_pool must be a torch.Tensor")
-    if (
-        elapsed_state_pool.dtype != torch.int32
-        or not elapsed_state_pool.is_cuda
-        or not elapsed_state_pool.is_contiguous()
-        or elapsed_state_pool.ndim != 1
-        or elapsed_state_pool.numel() == 0
-    ):
-        raise ValueError("elapsed_state_pool must be non-empty contiguous CUDA int32")
-    _check_metadata_inputs(cu_seqlens, state_indices)
-    if cu_seqlens.dtype != torch.int32 or not cu_seqlens.is_cuda or not cu_seqlens.is_contiguous():
-        raise ValueError("cu_seqlens must be contiguous CUDA int32")
-    if state_indices.dtype != torch.int32 or not state_indices.is_cuda or not state_indices.is_contiguous():
-        raise ValueError("state_indices must be contiguous CUDA int32")
-    if cu_seqlens.device != elapsed_state_pool.device or state_indices.device != elapsed_state_pool.device:
-        raise ValueError("elapsed metadata tensors must share a CUDA device")
-    if cu_seqlens.ndim != 1 or state_indices.ndim != 1 or cu_seqlens.numel() != state_indices.numel() + 1:
-        raise ValueError("cu_seqlens must have shape [B+1] and state_indices shape [B]")
-    if not isinstance(total_tokens, int) or isinstance(total_tokens, bool) or total_tokens <= 0:
-        raise ValueError("total_tokens must be a positive integer")
-    ticket = (
-        validated_metadata
-        if validated_metadata is not None
-        else prepare_recurrent_metadata(
-            cu_seqlens,
-            state_indices,
-            total_tokens=total_tokens,
-            state_pool_size=elapsed_state_pool.shape[0],
-        )
-    )
-    _extension().recurrent_fp16_advance_i32_varlen(
-        cu_seqlens,
-        state_indices,
-        elapsed_state_pool,
-        total_tokens,
-        ticket,
-    )
-
-
-def infer_recurrent_add_vec_forward_varlen(
-    x: torch.Tensor, vec: torch.Tensor
-) -> torch.Tensor:
-    """Run Albatross's packed WKV pre-add-vector helper."""
-
-    for name, tensor in (("x", x), ("vec", vec)):
-        if not isinstance(tensor, torch.Tensor):
-            raise TypeError(f"{name} must be a torch.Tensor")
-        if tensor.dtype != torch.float16:
-            raise TypeError(f"{name} must have dtype torch.float16")
-        if not tensor.is_cuda or not tensor.is_contiguous():
-            raise ValueError(f"{name} must be contiguous CUDA float16")
-        if tensor.device != x.device:
-            raise ValueError(f"{name} must share x's device")
-    if x.ndim != 2 or x.shape[0] <= 0 or x.shape[1] <= 0 or x.shape[1] % 2:
-        raise ValueError("x must have packed shape [total_tokens,C] with even C")
-    if vec.shape != (x.shape[1],):
-        raise ValueError("vec must have shape [C]")
-    return _extension().recurrent_add_vec_forward_varlen(x, vec)
-
-
 def _check_metadata_inputs(
     cu_seqlens: torch.Tensor,
     state_indices: torch.Tensor,
@@ -177,7 +88,7 @@ def _resolve_max_seqlen(
     return int((cu_seqlens[1:] - cu_seqlens[:-1]).max().item())
 
 
-def prepare_recurrent_metadata(
+def prepare_tmix_wkv7_recurrent_metadata(
     cu_seqlens: torch.Tensor,
     state_indices: torch.Tensor,
     *,
@@ -243,7 +154,7 @@ def prepare_recurrent_metadata(
                 raise ValueError(
                     f"{name} must be a one-element contiguous CUDA int32 tensor"
                 )
-        return _extension().prepare_recurrent_graph_metadata(
+        return _extension().prepare_tmix_wkv7_recurrent_graph_metadata(
             cu_seqlens,
             state_indices,
             num_active_tokens,
@@ -256,7 +167,7 @@ def prepare_recurrent_metadata(
 
     if total_tokens is None:
         raise ValueError("total_tokens is required for static recurrent metadata")
-    return _extension().prepare_recurrent_metadata(
+    return _extension().prepare_tmix_wkv7_recurrent_metadata(
         cu_seqlens,
         state_indices,
         total_tokens,
@@ -287,7 +198,7 @@ def _run(
     ticket = (
         validated_metadata
         if validated_metadata is not None
-        else prepare_recurrent_metadata(
+        else prepare_tmix_wkv7_recurrent_metadata(
             cu_seqlens,
             state_indices,
             total_tokens=r.shape[0],
@@ -296,7 +207,7 @@ def _run(
         )
     )
     output = torch.empty_like(packed[3])
-    _extension().recurrent_fp32_from_decay_logits(
+    _extension().tmix_wkv7_recurrent_fp32_from_decay_logits(
         cu_seqlens,
         state_indices,
         state,
@@ -310,7 +221,7 @@ def _run(
     return output
 
 
-def infer_recurrent_fp32io16_forward_varlen(
+def infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
     r: torch.Tensor,
     decay_logits: torch.Tensor,
     k: torch.Tensor,
@@ -345,7 +256,7 @@ def infer_recurrent_fp32io16_forward_varlen(
     )
 
 
-def infer_recurrent_fp16_forward_varlen(
+def infer_tmix_wkv7_recurrent_fp16_forward_varlen(
     r: torch.Tensor,
     decay_logits: torch.Tensor,
     k: torch.Tensor,
@@ -383,7 +294,7 @@ def infer_recurrent_fp16_forward_varlen(
     ticket = (
         validated_metadata
         if validated_metadata is not None
-        else prepare_recurrent_metadata(
+        else prepare_tmix_wkv7_recurrent_metadata(
             cu_seqlens,
             state_indices,
             total_tokens=r.shape[0],
@@ -392,7 +303,7 @@ def infer_recurrent_fp16_forward_varlen(
         )
     )
     output = torch.empty_like(packed[3])
-    _extension().recurrent_fp16_from_decay_logits(
+    _extension().tmix_wkv7_recurrent_fp16_from_decay_logits(
         cu_seqlens,
         state_indices,
         elapsed_state_pool,
@@ -408,26 +319,23 @@ def infer_recurrent_fp16_forward_varlen(
 
 
 __all__ = [
-    "infer_recurrent_fp16_advance_i32",
-    "infer_recurrent_fp16_advance_i32_varlen",
-    "infer_recurrent_add_vec_forward_varlen",
-    "infer_recurrent_fp32io16_forward_varlen",
-    "infer_recurrent_fp16_forward_varlen",
-    "prepare_recurrent_metadata",
+    "infer_tmix_wkv7_recurrent_fp32io16_forward_varlen",
+    "infer_tmix_wkv7_recurrent_fp16_forward_varlen",
+    "prepare_tmix_wkv7_recurrent_metadata",
 ]
 
-from .pretrain import pretrain_recurrent_bf16
-from .chunk import infer_chunk_bf16_forward_varlen
+from .pretrain import pretrain_tmix_wkv7_recurrent_bf16
+from .chunk import infer_tmix_wkv7_chunk_bf16_forward_varlen
 from .rl_infctx import (
-    rl_infctx_chunk_fp32io16,
-    rl_infctx_chunk_fp32io16_factor_recompute,
+    rl_infctx_tmix_wkv7_chunk_fp32io16,
+    rl_infctx_tmix_wkv7_chunk_fp32io16_factor_recompute,
 )
 
 __all__.extend(
     [
-        "pretrain_recurrent_bf16",
-        "infer_chunk_bf16_forward_varlen",
-        "rl_infctx_chunk_fp32io16",
-        "rl_infctx_chunk_fp32io16_factor_recompute",
+        "pretrain_tmix_wkv7_recurrent_bf16",
+        "infer_tmix_wkv7_chunk_bf16_forward_varlen",
+        "rl_infctx_tmix_wkv7_chunk_fp32io16",
+        "rl_infctx_tmix_wkv7_chunk_fp32io16_factor_recompute",
     ]
 )

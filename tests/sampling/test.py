@@ -16,23 +16,17 @@ from flashrwkv2 import (
     setup_sampling_states,
 )
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+pytestmark = [
+    pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required"),
+    pytest.mark.sm120,
+]
 
 
 def _slots(values: list[int]) -> torch.Tensor:
     return torch.tensor(values, dtype=torch.int32, device="cuda")
 
 
-def test_root_exports_and_reproducible_state_pool() -> None:
-    assert flashrwkv2.setup_sampling_states is setup_sampling_states
-    assert (
-        flashrwkv2.infer_sampling_temperature_topk_topp_forward_varlen
-        is infer_sampling_temperature_topk_topp_forward_varlen
-    )
-    assert (
-        flashrwkv2.infer_sampling_six_parameter_forward_varlen
-        is infer_sampling_six_parameter_forward_varlen
-    )
+def test_reproducible_state_pool() -> None:
     first = setup_sampling_states(1234, 4)
     second = setup_sampling_states(1234, 4)
     assert first.dtype == torch.int8 and first.shape[0] == 4 and first.ndim == 2
@@ -141,6 +135,7 @@ def test_empirical_distribution_without_scipy() -> None:
     assert torch.max(torch.abs(observed - expected)).item() < 0.035
 
 
+@pytest.mark.cuda_graph
 def test_sampling_cuda_graph_dynamic_active_rows_are_side_effect_free() -> None:
     capacity, vocab_size, num_slots = 4, 8, 5
     logits = torch.tensor(
@@ -298,12 +293,15 @@ def test_rejects_invalid_inputs_before_launch() -> None:
         )
 
 
+@pytest.mark.resource
 def test_sm120_sampling_resource_usage() -> None:
-    if torch.cuda.get_device_capability() != (12, 0):
-        pytest.skip("exact resource gate requires SM120")
+    if torch.cuda.get_device_capability()[0] != 12:
+        pytest.skip("resource gate requires the SM120 backend")
     tool = shutil.which("cuobjdump")
     if tool is None:
         pytest.fail("cuobjdump is required for the SM120 sampling resource gate")
+    assert flashrwkv2._C is not None
+    assert flashrwkv2._C.__name__ == "flashrwkv2._C_sm120"
     extension_path = flashrwkv2._C.__file__
     output = subprocess.run(
         (tool, "--dump-resource-usage", extension_path),

@@ -7,7 +7,7 @@
 
 #include <optional>
 
-void statetune_recurrent_fp32io16_backward_cuda(
+void statetune_tmix_wkv7_recurrent_fp32io16_backward_cuda(
     torch::Tensor sequence_chunk_offsets,
     torch::Tensor chunk_token_starts,
     torch::Tensor chunk_token_ends,
@@ -31,7 +31,7 @@ void statetune_recurrent_fp32io16_backward_cuda(
     torch::Tensor grad_initial_state,
     double scale);
 
-void statetune_recurrent_fp32io16_backward(
+void statetune_tmix_wkv7_recurrent_fp32io16_backward(
     torch::Tensor sequence_chunk_offsets,
     torch::Tensor chunk_token_starts,
     torch::Tensor chunk_token_ends,
@@ -54,7 +54,7 @@ void statetune_recurrent_fp32io16_backward(
     std::optional<torch::Tensor> grad_b,
     std::optional<torch::Tensor> grad_initial_state,
     double scale) {
-  statetune_recurrent_fp32io16_backward_cuda(
+  statetune_tmix_wkv7_recurrent_fp32io16_backward_cuda(
       sequence_chunk_offsets, chunk_token_starts, chunk_token_ends, final_state,
       r, decay_logits, k, v, a, b, state_dot_a,
       grad_output.value_or(torch::Tensor()),
@@ -66,10 +66,10 @@ void statetune_recurrent_fp32io16_backward(
       grad_initial_state.value_or(torch::Tensor()), scale);
 }
 
-void register_statetune_recurrent_backward_bindings(py::module_& module) {
+void register_statetune_tmix_wkv7_recurrent_backward_bindings(py::module_& module) {
   module.def(
-      "statetune_recurrent_fp32io16_backward",
-      &statetune_recurrent_fp32io16_backward,
+      "statetune_tmix_wkv7_recurrent_fp32io16_backward",
+      &statetune_tmix_wkv7_recurrent_fp32io16_backward,
       "StateTune recurrent backward with initial-state gradient",
       py::arg("sequence_chunk_offsets"), py::arg("chunk_token_starts"),
       py::arg("chunk_token_ends"), py::arg("final_state"), py::arg("r"),

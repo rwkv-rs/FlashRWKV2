@@ -61,37 +61,43 @@ jobs:
           fi
           echo "base=$base" >> "$GITHUB_OUTPUT"
           echo "head=$head" >> "$GITHUB_OUTPUT"
+      - name: Select affected validation targets
+        id: impact
+        run: |
+          python3 ci/select_targets.py \
+            --base '${{ steps.revision.outputs.base }}' \
+            --head '${{ steps.revision.outputs.head }}' \
+            --output artifacts/impact.json \
+            --github-output "$GITHUB_OUTPUT"
       - name: Synchronize locked CPU environment
+        if: steps.impact.outputs.change_class != 'documentation'
         env:
           CUDA_VISIBLE_DEVICES: ""
         run: uv sync --frozen --no-install-project --group dev
+      - name: Check changed-file whitespace
+        run: >-
+          git diff --check '${{ steps.revision.outputs.base }}'
+          '${{ steps.revision.outputs.head }}' --
       - name: Check maintained Python and repository whitespace
+        if: steps.impact.outputs.change_class != 'documentation'
         run: |
           .venv/bin/ruff check --select E9,F63,F7,F82 \
             flashrwkv2 tests benchmarks setup.py
           .venv/bin/ruff check ci
-          git diff --check
-      - name: Validate CI helpers and active source contract
+      - name: Validate CI helpers
+        if: steps.impact.outputs.change_class != 'documentation'
         env:
           CUDA_VISIBLE_DEVICES: ""
           PYTHONPATH: ${{ github.workspace }}
         run: |
           .venv/bin/python ci/select_targets.py --self-test
           .venv/bin/python ci/benchmark_gate.py self-test
-          .venv/bin/python -m pytest -q tests/source_contract
       - name: Run CPU-visible API and validation tests
+        if: steps.impact.outputs.change_class != 'documentation'
         env:
           CUDA_VISIBLE_DEVICES: ""
           PYTHONPATH: ${{ github.workspace }}
-        run: .venv/bin/python -m pytest -q --ignore=tests/source_contract
-      - name: Select affected validation targets
-        id: impact
-        run: |
-          .venv/bin/python ci/select_targets.py \
-            --base '${{ steps.revision.outputs.base }}' \
-            --head '${{ steps.revision.outputs.head }}' \
-            --output artifacts/impact.json \
-            --github-output "$GITHUB_OUTPUT"
+        run: .venv/bin/python -m pytest -q -m 'not sm90 and not sm120'
       - name: Upload revision-bound impact contract
         uses: actions/upload-artifact@v4
         with:

@@ -5,19 +5,23 @@ from __future__ import annotations
 import pytest
 import torch
 
-from flashrwkv2.tmix.wkv7.statetune import statetune_recurrent_fp32io16
+from flashrwkv2.tmix.wkv7.statetune import statetune_tmix_wkv7_recurrent_fp32io16
 
 
-def _case(requires_grad: bool = False) -> tuple[torch.Tensor, ...]:
-    torch.manual_seed(20260805)
+def _case(
+    dtype: torch.dtype,
+    head_size: int,
+    requires_grad: bool = False,
+) -> tuple[torch.Tensor, ...]:
+    torch.manual_seed(20260805 + head_size)
     device = torch.device("cuda")
-    batch, heads, head_size, total_tokens = 2, 1, 64, 5
+    batch, heads, total_tokens = 2, 1, 5
     state = torch.randn(
         batch, heads, head_size, head_size, device=device
     ).mul_(0.01)
     values = [
         torch.randn(
-            total_tokens, heads, head_size, device=device, dtype=torch.float16
+            total_tokens, heads, head_size, device=device, dtype=dtype
         ).mul_(0.01)
         for _ in range(6)
     ]
@@ -88,11 +92,16 @@ def _reference(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_statetune_matches_train_temp_recurrence_and_initial_gradient() -> None:
-    case = _case(requires_grad=True)
+@pytest.mark.sm90
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
+@pytest.mark.parametrize("head_size", (64, 128, 256))
+def test_statetune_matches_train_temp_recurrence_and_initial_gradient(
+    dtype: torch.dtype, head_size: int
+) -> None:
+    case = _case(dtype, head_size, requires_grad=True)
     state, sequence, starts, ends, r, decay_logits, k, v, a, b = case
     initial_state = state.detach().clone()
-    actual = statetune_recurrent_fp32io16(
+    actual = statetune_tmix_wkv7_recurrent_fp32io16(
         state, sequence, starts, ends, r, decay_logits, k, v, a, b, scale=0.75
     )
 
@@ -103,8 +112,11 @@ def test_statetune_matches_train_temp_recurrence_and_initial_gradient() -> None:
         for value in case
     )
     expected = _reference(reference_case, 0.75)
+    tolerance = 8e-3 if dtype == torch.bfloat16 else 3e-4
     for actual_value, expected_value in zip(actual, expected, strict=True):
-        assert torch.allclose(actual_value, expected_value, atol=3e-4, rtol=3e-4)
+        assert torch.allclose(
+            actual_value, expected_value, atol=tolerance, rtol=tolerance
+        )
 
     (actual[0].float().square().sum() + actual[1].square().sum()).backward()
     actual_gradients = [
@@ -120,7 +132,12 @@ def test_statetune_matches_train_temp_recurrence_and_initial_gradient() -> None:
     for actual_gradient, expected_gradient in zip(
         actual_gradients, expected_gradients, strict=True
     ):
-        assert torch.allclose(actual_gradient, expected_gradient, atol=3e-4, rtol=3e-3)
+        assert torch.allclose(
+            actual_gradient,
+            expected_gradient,
+            atol=8e-3 if dtype == torch.bfloat16 else 3e-4,
+            rtol=1e-2 if dtype == torch.bfloat16 else 3e-3,
+        )
         assert torch.isfinite(actual_gradient).all()
 
     # StateTune must not mutate the caller-owned initial state during forward.

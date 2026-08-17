@@ -63,7 +63,7 @@ def _make_chunk_metadata(cu_seqlens: torch.Tensor, chunk_size: int):
     )
 
 
-def rl_infctx_chunk_fp32io16(
+def rl_infctx_tmix_wkv7_chunk_fp32io16(
     r,
     decay_logits,
     k,
@@ -135,7 +135,7 @@ def rl_infctx_chunk_fp32io16(
         raise ValueError("state_indices must be within state_pool")
     chunk_metadata = _make_chunk_metadata(cu_seqlens, chunk_size)
     working = state_pool.index_select(0, state_indices.to(torch.int64))
-    output, final_working = _extension().rl_infctx_chunk_fp32io16_forward(
+    output, final_working = _extension().rl_infctx_tmix_wkv7_chunk_fp32io16_forward(
         *chunk_metadata,
         working,
         r,
@@ -152,11 +152,11 @@ def rl_infctx_chunk_fp32io16(
     return output, final_pool
 
 
-def rl_infctx_chunk_fp32io16_factor_recompute(*args, **kwargs):
+def rl_infctx_tmix_wkv7_chunk_fp32io16_factor_recompute(*args, **kwargs):
     """Explicit recompute entry for the RL/Infctx operator family."""
 
     kwargs["strategy"] = "recompute"
-    return rl_infctx_chunk_fp32io16(*args, **kwargs)
+    return rl_infctx_tmix_wkv7_chunk_fp32io16(*args, **kwargs)
 
 
-__all__ = ["rl_infctx_chunk_fp32io16", "rl_infctx_chunk_fp32io16_factor_recompute"]
+__all__ = ["rl_infctx_tmix_wkv7_chunk_fp32io16", "rl_infctx_tmix_wkv7_chunk_fp32io16_factor_recompute"]

@@ -222,19 +222,19 @@ torch::Tensor sampling_six_parameter_per_request(
 void register_sampling_bindings(py::module_& module) {
   module.def("setup_sampling_states", &setup_sampling_states, py::arg("seed"),
              py::arg("num_slots"));
-  module.def("sampling_temperature_topk_topp_scalar",
+  module.def("sampling_temperature_topk_topp_forward_varlen",
              &sampling_temperature_topk_topp_scalar, py::arg("logits"),
              py::arg("states"), py::arg("slot_indices"),
              py::arg("temperature"), py::arg("top_k"), py::arg("top_p"),
              py::arg("sample_capacity") = -1,
              py::arg("num_active_samples") = py::none());
-  module.def("sampling_temperature_topk_topp_per_request",
+  module.def("sampling_temperature_topk_topp_forward_varlen",
              &sampling_temperature_topk_topp_per_request,
              py::arg("logits"), py::arg("states"), py::arg("slot_indices"),
              py::arg("temperatures"), py::arg("top_ks"), py::arg("top_ps"),
              py::arg("sample_capacity") = -1,
              py::arg("num_active_samples") = py::none());
-  module.def("sampling_six_parameter_scalar",
+  module.def("sampling_six_parameter_forward_varlen",
              &sampling_six_parameter_scalar, py::arg("logits"),
              py::arg("penalties"), py::arg("states"),
              py::arg("slot_indices"), py::arg("presence_penalty"),
@@ -242,7 +242,7 @@ void register_sampling_bindings(py::module_& module) {
              py::arg("temperature"), py::arg("top_k"), py::arg("top_p"),
              py::arg("sample_capacity") = -1,
              py::arg("num_active_samples") = py::none());
-  module.def("sampling_six_parameter_per_request",
+  module.def("sampling_six_parameter_forward_varlen",
              &sampling_six_parameter_per_request, py::arg("logits"),
              py::arg("penalties"), py::arg("states"),
              py::arg("slot_indices"), py::arg("presence_penalties"),

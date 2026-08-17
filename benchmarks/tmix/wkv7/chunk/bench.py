@@ -8,7 +8,7 @@ import time
 
 import torch
 
-from flashrwkv2.tmix.wkv7 import infer_chunk_bf16_forward_varlen
+from flashrwkv2.tmix.wkv7 import infer_tmix_wkv7_chunk_bf16_forward_varlen
 
 
 def main() -> None:
@@ -32,7 +32,7 @@ def main() -> None:
     )
     state_indices = torch.arange(args.batch, device=device, dtype=torch.int32)
     for _ in range(10):
-        infer_chunk_bf16_forward_varlen(
+        infer_tmix_wkv7_chunk_bf16_forward_varlen(
             *inputs,
             state_pool=state_pool,
             cu_seqlens=cu_seqlens,
@@ -44,7 +44,7 @@ def main() -> None:
     samples = []
     for _ in range(args.iters):
         start = time.perf_counter()
-        infer_chunk_bf16_forward_varlen(
+        infer_tmix_wkv7_chunk_bf16_forward_varlen(
             *inputs,
             state_pool=state_pool,
             cu_seqlens=cu_seqlens,
@@ -56,7 +56,7 @@ def main() -> None:
         samples.append((time.perf_counter() - start) * 1e6)
     samples.sort()
     print(json.dumps({
-        "operator": "infer_chunk_bf16_forward_varlen",
+        "operator": "infer_tmix_wkv7_chunk_bf16_forward_varlen",
         "batch": args.batch,
         "seqlen": args.seqlen,
         "raw_latency_us": samples,

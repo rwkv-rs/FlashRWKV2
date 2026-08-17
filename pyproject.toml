@@ -9,7 +9,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "FlashRWKV2"
-version = "0.1.0a6"
+version = "0.1.0a7"
 description = "High-performance CUDA operator library for RWKV-7"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -32,6 +32,13 @@ Repository = "https://github.com/rwkv-rs/FlashRWKV2"
 include = ["flashrwkv2", "flashrwkv2.*"]
 
 [tool.pytest.ini_options]
-pythonpath = ["."]
+addopts = ["--import-mode=importlib", "--strict-markers"]
+pythonpath = [".", "tests"]
 norecursedirs = ["tests_old", "benchmarks_old"]
 python_files = ["test.py", "test_*.py"]
+markers = [
+  "sm90: requires the FlashRWKV2 SM90 native backend",
+  "sm120: requires the FlashRWKV2 SM120 native backend",
+  "cuda_graph: captures and replays a real CUDA Graph",
+  "resource: validates compiled CUDA binary resource usage",
+]

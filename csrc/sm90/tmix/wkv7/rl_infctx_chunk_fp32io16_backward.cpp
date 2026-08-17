@@ -100,7 +100,7 @@ void check_replay_inputs(
 
 }  // namespace
 
-void rl_infctx_chunk_fp32io16_backward_replay(
+void rl_infctx_tmix_wkv7_chunk_fp32io16_backward_replay(
     torch::Tensor chunk_token_starts,
     torch::Tensor chunk_token_ends,
     torch::Tensor boundary,
@@ -117,16 +117,16 @@ void rl_infctx_chunk_fp32io16_backward_replay(
   check_replay_inputs(
       chunk_token_starts, chunk_token_ends, boundary, r, decay_logits, k, v,
       a, b, output, state_dot_a, scale, decay_bias);
-  rl_infctx_chunk_fp32io16_backward_replay_cuda(
+  rl_infctx_tmix_wkv7_chunk_fp32io16_backward_replay_cuda(
       chunk_token_starts, chunk_token_ends, boundary, r, decay_logits,
       decay_bias.value_or(torch::Tensor()), k, v, a, b, output, state_dot_a,
       scale);
 }
 
-void register_rl_infctx_backward_bindings(py::module_& module) {
+void register_rl_infctx_tmix_wkv7_chunk_backward_bindings(py::module_& module) {
   module.def(
-      "rl_infctx_chunk_fp32io16_backward_replay",
-      &rl_infctx_chunk_fp32io16_backward_replay,
+      "rl_infctx_tmix_wkv7_chunk_fp32io16_backward_replay",
+      &rl_infctx_tmix_wkv7_chunk_fp32io16_backward_replay,
       "RL/Infctx mechanically migrated output replay stage",
       py::arg("chunk_token_starts"), py::arg("chunk_token_ends"),
       py::arg("boundary"), py::arg("r"), py::arg("decay_logits"),

@@ -6,7 +6,7 @@ import json
 
 import torch
 
-from flashrwkv2 import pretrain_recurrent_bf16
+from flashrwkv2 import pretrain_tmix_wkv7_recurrent_bf16
 
 
 SOURCE_REVISION = "952102498e9ed367ea0a59ee64106916d474d30f"
@@ -26,7 +26,7 @@ def run(*, warmup: int = 5, iterations: int = 50) -> dict[str, object]:
     grad_output = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
 
     def step() -> None:
-        output = pretrain_recurrent_bf16(*values)
+        output = pretrain_tmix_wkv7_recurrent_bf16(*values)
         torch.autograd.grad(output, values, grad_output, retain_graph=False)
 
     for _ in range(warmup):
@@ -43,7 +43,7 @@ def run(*, warmup: int = 5, iterations: int = 50) -> dict[str, object]:
     device = torch.cuda.current_device()
     return {
         "source_revision": SOURCE_REVISION,
-        "operator": "tmix/wkv7/pretrain_recurrent_bf16",
+        "operator": "pretrain_tmix_wkv7_recurrent_bf16",
         "native_namespace": NATIVE_NAMESPACE,
         "native_namespace_loaded": hasattr(torch.ops.rwkv7_clampw_v3, "forward"),
         "gpu": torch.cuda.get_device_name(device),

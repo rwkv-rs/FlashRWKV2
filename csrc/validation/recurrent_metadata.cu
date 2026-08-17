@@ -81,10 +81,13 @@ __global__ void validate_recurrent_metadata_kernel(
       ? state_indices_snapshot
       : state_indices;
 
-  if (shared_status == 0 && threadIdx.x == 0 &&
-      (validated_query_start_loc[0] != 0 ||
-       validated_query_start_loc[active_sequences] != active_tokens)) {
-    shared_status |= kInvalidEndpoint;
+  if (threadIdx.x == 0) {
+    const int current_status = atomicAdd(&shared_status, 0);
+    if (current_status == 0 &&
+        (validated_query_start_loc[0] != 0 ||
+         validated_query_start_loc[active_sequences] != active_tokens)) {
+      atomicOr(&shared_status, kInvalidEndpoint);
+    }
   }
   __syncthreads();
 

@@ -50,8 +50,12 @@ def test_l2wrap_rejects_unsupported_logits_dtype() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_l2wrap_forward_backward_matches_train_temp_contract() -> None:
-    logits, targets = _inputs(device="cuda")
+@pytest.mark.sm90
+@pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float32))
+def test_l2wrap_forward_backward_matches_train_temp_contract(
+    dtype: torch.dtype,
+) -> None:
+    logits, targets = _inputs(device="cuda", dtype=dtype)
     logits.requires_grad_(True)
 
     loss = pretrain_l2wrap_ce_bf16(logits, targets)
@@ -67,12 +71,13 @@ def test_l2wrap_forward_backward_matches_train_temp_contract() -> None:
     torch.testing.assert_close(
         logits.grad,
         _expected_gradient(logits.detach(), targets),
-        atol=0.002,
+        atol=0.002 if dtype == torch.bfloat16 else 2.0e-5,
         rtol=0.01,
     )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.sm90
 def test_l2wrap_rejects_target_shape_and_range_without_launching() -> None:
     logits, targets = _inputs(device="cuda")
     with pytest.raises(ValueError, match="one entry"):

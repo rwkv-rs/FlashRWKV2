@@ -13,7 +13,7 @@
 #include <utility>
 #include <vector>
 
-void infer_chunk_bf16_forward_varlen_cuda(
+void infer_tmix_wkv7_chunk_bf16_forward_varlen_cuda(
     torch::Tensor query_start_loc,
     torch::Tensor state_indices,
     torch::Tensor state_pool,
@@ -74,7 +74,7 @@ void check_metadata(
 
 }  // namespace
 
-py::tuple infer_chunk_bf16_forward_varlen(
+py::tuple infer_tmix_wkv7_chunk_bf16_forward_varlen(
     torch::Tensor r,
     torch::Tensor decay_logits,
     torch::Tensor k,
@@ -168,7 +168,7 @@ py::tuple infer_chunk_bf16_forward_varlen(
     launch_state_indices = std::move(prepared.state_indices);
     metadata_status = std::move(prepared.status);
   }
-  infer_chunk_bf16_forward_varlen_cuda(
+  infer_tmix_wkv7_chunk_bf16_forward_varlen_cuda(
       launch_query_start_loc,
       launch_state_indices,
       state_pool,
@@ -191,10 +191,10 @@ py::tuple infer_chunk_bf16_forward_varlen(
   return py::make_tuple(output, state_pool);
 }
 
-void register_infer_chunk_bindings(py::module_& module) {
+void register_infer_tmix_wkv7_chunk_bindings(py::module_& module) {
   module.def(
-      "infer_chunk_bf16_forward_varlen",
-      &infer_chunk_bf16_forward_varlen,
+      "infer_tmix_wkv7_chunk_bf16_forward_varlen",
+      &infer_tmix_wkv7_chunk_bf16_forward_varlen,
       "Packed RWKV-7 BF16 K1/K2 chunk inference",
       py::arg("r"), py::arg("decay_logits"), py::arg("k"), py::arg("v"),
       py::arg("a"), py::arg("b"), py::arg("state_pool"),

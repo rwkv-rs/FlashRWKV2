@@ -27,7 +27,7 @@ void launch_rl_infctx_chunk_replay_fp32_from_decay_logits(
     float scale,
     cudaStream_t stream);
 
-void rl_infctx_chunk_fp32io16_backward_replay_cuda(
+void rl_infctx_tmix_wkv7_chunk_fp32io16_backward_replay_cuda(
     torch::Tensor chunk_token_starts,
     torch::Tensor chunk_token_ends,
     torch::Tensor boundary,

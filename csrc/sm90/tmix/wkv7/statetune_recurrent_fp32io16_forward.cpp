@@ -7,7 +7,7 @@
 
 #include <torch/extension.h>
 
-void statetune_recurrent_fp32io16_forward_cuda(
+void statetune_tmix_wkv7_recurrent_fp32io16_forward_cuda(
     torch::Tensor sequence_chunk_offsets,
     torch::Tensor chunk_token_starts,
     torch::Tensor chunk_token_ends,
@@ -23,7 +23,7 @@ void statetune_recurrent_fp32io16_forward_cuda(
     torch::Tensor state_dot_a,
     double scale);
 
-void statetune_recurrent_fp32io16_forward(
+void statetune_tmix_wkv7_recurrent_fp32io16_forward(
     torch::Tensor sequence_chunk_offsets,
     torch::Tensor chunk_token_starts,
     torch::Tensor chunk_token_ends,
@@ -38,15 +38,15 @@ void statetune_recurrent_fp32io16_forward(
     torch::Tensor boundary,
     torch::Tensor state_dot_a,
     double scale) {
-  statetune_recurrent_fp32io16_forward_cuda(
+  statetune_tmix_wkv7_recurrent_fp32io16_forward_cuda(
       sequence_chunk_offsets, chunk_token_starts, chunk_token_ends, state, r,
       decay_logits, k, v, a, b, output, boundary, state_dot_a, scale);
 }
 
-void register_statetune_recurrent_forward_bindings(py::module_& module) {
+void register_statetune_tmix_wkv7_recurrent_forward_bindings(py::module_& module) {
   module.def(
-      "statetune_recurrent_fp32io16_forward",
-      &statetune_recurrent_fp32io16_forward,
+      "statetune_tmix_wkv7_recurrent_fp32io16_forward",
+      &statetune_tmix_wkv7_recurrent_fp32io16_forward,
       "StateTune recurrent forward with nonzero initial state",
       py::arg("sequence_chunk_offsets"), py::arg("chunk_token_starts"),
       py::arg("chunk_token_ends"), py::arg("state"), py::arg("r"),

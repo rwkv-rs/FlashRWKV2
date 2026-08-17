@@ -273,7 +273,7 @@ void infer_chunk_bf16_k2_kernel(
 
 }  // namespace
 
-void infer_chunk_bf16_forward_varlen_cuda(
+void infer_tmix_wkv7_chunk_bf16_forward_varlen_cuda(
     torch::Tensor query_start_loc,
     torch::Tensor state_indices,
     torch::Tensor state_pool,

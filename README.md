@@ -1,36 +1,42 @@
 # FlashRWKV2
 
-FlashRWKV2 is a high-performance CUDA operator library for RWKV-7. It provides
-composable inference and training operators; complete models, schedulers, and
-training frameworks remain the responsibility of downstream projects.
+FlashRWKV2 is a high-performance CUDA operator library for RWKV-7. Its public
+inference API exposes the highest semantic fusion islands used by the model;
+kernel composition and shape-dependent dispatch remain internal. Complete
+models, schedulers, and training frameworks remain the responsibility of
+downstream projects.
 
 ## Requirements
 
 - Python 3.10 or newer
 - An NVIDIA CUDA build environment and a supported CUDA device
 - `uv`, using the repository-local `./.venv`
-- SM120 or newer for the current native build
+- A CUDA GPU binary-compatible with the native SM90 or SM120 backends
 
 The runtime and reproducible source-build contracts currently pin PyTorch
-2.13.0. When the build cannot detect a local GPU, set
-`TORCH_CUDA_ARCH_LIST=12.0` explicitly.
+2.13.0. Native builds always compile separate SM90 and SM120 private extensions;
+the active extension is selected at runtime. A backend suffix is its minimum
+native cubin target, not an exact-device allowlist: `_C_sm90` serves compatible
+SM9.x devices and `_C_sm120` serves compatible SM12.x devices whose minor
+compute capability is at least the compiled target.
 
 ## Installation
 
-The current alpha publishes a prebuilt CPython 3.12 Linux x86_64 wheel for
-SM120 GPUs. The wheel requires glibc 2.38 or newer, PyTorch 2.13.0, and a CUDA
-13 runtime supplied through PyTorch's dependencies:
+The current alpha publishes a prebuilt CPython 3.12 Linux x86_64 wheel. Its
+currently validated product is the RTX PRO 6000 at SM120; binary compatibility
+does not by itself constitute a product-level correctness or CUDA Graph claim.
+The wheel requires glibc 2.38 or newer, PyTorch 2.13.0, and a CUDA 13 runtime
+supplied through PyTorch's dependencies:
 
 ```bash
 python -m pip install --pre FlashRWKV2
 ```
 
 Other Python or platform combinations install from the source distribution and
-build the CUDA extension on the target machine:
+build both CUDA extensions on the target machine:
 
 ```bash
-TORCH_CUDA_ARCH_LIST=12.0 \
-  python -m pip install --pre FlashRWKV2
+python -m pip install --pre FlashRWKV2
 ```
 
 For development from a checkout:
@@ -39,8 +45,7 @@ For development from a checkout:
 git clone https://github.com/rwkv-rs/FlashRWKV2.git
 cd FlashRWKV2
 uv sync
-TORCH_CUDA_ARCH_LIST=12.0 \
-  ./.venv/bin/python -m pip install -v --no-build-isolation -e .
+./.venv/bin/python -m pip install -v --no-build-isolation -e .
 ```
 
 ## Kernel API
@@ -83,13 +88,9 @@ Both layouts must be prepared outside the timed forward region and retained for
 the lifetime of the inference weights; FlashRWKV2 never transposes or copies a
 missing layout during dispatch.
 
-The existing low-rank operator benchmark reports correctness and latency as
-JSON without adding a model-level benchmark:
-
-```bash
-./.venv/bin/python benchmarks/tmix/linear/bench.py \
-  --operator projection-group --layout both --channels 4096
-```
+TMix inference benchmarks are owned by the public `wkv_prepare` and `readout`
+modules. Native-private Linear, activation, VRes, gate and sparse helpers do
+not have standalone public benchmark entry points.
 
 ## License
 

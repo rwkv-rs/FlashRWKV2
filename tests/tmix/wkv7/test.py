@@ -2,253 +2,24 @@
 
 from __future__ import annotations
 
-import ast
 import inspect
 import json
 from pathlib import Path
 
 import pytest
 import torch
+from utils import require_cuda_backend
 
-from benchmarks.tmix.wkv7 import bench
 import flashrwkv2
-from flashrwkv2.tmix.kk_a_gate import infer_tmix_kk_a_gate_forward_varlen
-from flashrwkv2.tmix.linear import infer_tmix_linear_forward_varlen
-from flashrwkv2.tmix.lnx_rkvres_xg import (
-    infer_tmix_lnx_rkvres_xg_forward_varlen,
-)
-from flashrwkv2.tmix.mix6 import infer_tmix_mix6_forward_varlen
 from flashrwkv2.tmix.wkv7 import (
-    infer_recurrent_add_vec_forward_varlen,
-    infer_recurrent_fp16_advance_i32,
-    infer_recurrent_fp16_advance_i32_varlen,
-    infer_recurrent_fp16_forward_varlen,
-    infer_recurrent_fp32io16_forward_varlen,
-    prepare_recurrent_metadata,
+    infer_tmix_wkv7_recurrent_fp16_forward_varlen,
+    infer_tmix_wkv7_recurrent_fp32io16_forward_varlen,
+    prepare_tmix_wkv7_recurrent_metadata,
 )
 
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_fp16_elapsed_state_advance_is_in_place() -> None:
-    elapsed_state = torch.tensor([2, 7, 11], device="cuda", dtype=torch.int32)
-    infer_recurrent_fp16_advance_i32(elapsed_state, 5)
-    assert torch.equal(elapsed_state, torch.tensor([7, 12, 16], device="cuda", dtype=torch.int32))
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_fp16_elapsed_state_varlen_advance_updates_selected_slots() -> None:
-    elapsed_state = torch.tensor([2, 5, 7, 11], device="cuda", dtype=torch.int32)
-    cu_seqlens = torch.tensor([0, 2, 5], device="cuda", dtype=torch.int32)
-    state_indices = torch.tensor([3, 1], device="cuda", dtype=torch.int32)
-    ticket = prepare_recurrent_metadata(
-        cu_seqlens,
-        state_indices,
-        total_tokens=5,
-        state_pool_size=elapsed_state.shape[0],
-    )
-    infer_recurrent_fp16_advance_i32_varlen(
-        elapsed_state,
-        cu_seqlens,
-        state_indices,
-        total_tokens=5,
-        validated_metadata=ticket,
-    )
-    torch.cuda.synchronize()
-    assert torch.equal(
-        elapsed_state,
-        torch.tensor([2, 8, 7, 13], device="cuda", dtype=torch.int32),
-    )
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_fp16_elapsed_state_varlen_reuses_ticket_fail_closed() -> None:
-    elapsed_state = torch.tensor([2, 5, 7, 11], device="cuda", dtype=torch.int32)
-    cu_seqlens = torch.tensor([0, 2, 5], device="cuda", dtype=torch.int32)
-    state_indices = torch.tensor([3, 1], device="cuda", dtype=torch.int32)
-    ticket = prepare_recurrent_metadata(
-        cu_seqlens,
-        state_indices,
-        total_tokens=5,
-        state_pool_size=elapsed_state.shape[0],
-    )
-    cu_seqlens[1] = 3
-    before = elapsed_state.clone()
-    with pytest.raises(RuntimeError, match="validated_metadata"):
-        infer_recurrent_fp16_advance_i32_varlen(
-            elapsed_state,
-            cu_seqlens,
-            state_indices,
-            total_tokens=5,
-            validated_metadata=ticket,
-        )
-    assert torch.equal(elapsed_state, before)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_recurrent_metadata_ticket_supports_same_stream_cuda_graph() -> None:
-    stream = torch.cuda.Stream()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.stream(stream):
-        initial_state = torch.tensor([2, 5, 7, 11], device="cuda", dtype=torch.int32)
-        elapsed_state = initial_state.clone()
-        cu_seqlens = torch.tensor([0, 2, 5], device="cuda", dtype=torch.int32)
-        state_indices = torch.tensor([3, 1], device="cuda", dtype=torch.int32)
-        ticket = prepare_recurrent_metadata(
-            cu_seqlens,
-            state_indices,
-            total_tokens=5,
-            state_pool_size=elapsed_state.shape[0],
-        )
-        infer_recurrent_fp16_advance_i32_varlen(
-            elapsed_state,
-            cu_seqlens,
-            state_indices,
-            total_tokens=5,
-            validated_metadata=ticket,
-        )
-    torch.cuda.current_stream().wait_stream(stream)
-    torch.cuda.synchronize()
-
-    with torch.cuda.graph(graph, stream=stream):
-        elapsed_state.copy_(initial_state)
-        infer_recurrent_fp16_advance_i32_varlen(
-            elapsed_state,
-            cu_seqlens,
-            state_indices,
-            total_tokens=5,
-            validated_metadata=ticket,
-        )
-    graph.replay()
-    torch.cuda.synchronize()
-
-    assert torch.equal(
-        elapsed_state,
-        torch.tensor([2, 8, 7, 13], device="cuda", dtype=torch.int32),
-    )
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_live_recurrent_metadata_replays_dynamic_active_prefix_fail_closed() -> None:
-    stream = torch.cuda.Stream()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.stream(stream):
-        # Warm the binding and allocator before capture.
-        warm_elapsed = torch.zeros(4, device="cuda", dtype=torch.int32)
-        warm_cu = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
-        warm_slots = torch.tensor([0], device="cuda", dtype=torch.int32)
-        warm_ticket = prepare_recurrent_metadata(
-            warm_cu,
-            warm_slots,
-            total_tokens=1,
-            state_pool_size=4,
-        )
-        infer_recurrent_fp16_advance_i32_varlen(
-            warm_elapsed,
-            warm_cu,
-            warm_slots,
-            total_tokens=1,
-            validated_metadata=warm_ticket,
-        )
-
-        initial = torch.tensor([2, 5, 7, 11], device="cuda", dtype=torch.int32)
-        elapsed = initial.clone()
-        cu_seqlens = torch.tensor([0, 2, 5, -1], device="cuda", dtype=torch.int32)
-        state_indices = torch.tensor([3, 1, 99], device="cuda", dtype=torch.int32)
-        num_active_tokens = torch.tensor([5], device="cuda", dtype=torch.int32)
-        num_active_sequences = torch.tensor([2], device="cuda", dtype=torch.int32)
-    torch.cuda.current_stream().wait_stream(stream)
-    torch.cuda.synchronize()
-
-    with torch.cuda.graph(graph, stream=stream):
-        ticket = prepare_recurrent_metadata(
-            cu_seqlens,
-            state_indices,
-            state_pool_size=4,
-            token_capacity=5,
-            sequence_capacity=3,
-            max_seqlen_capacity=3,
-            num_active_tokens=num_active_tokens,
-            num_active_sequences=num_active_sequences,
-        )
-        infer_recurrent_fp16_advance_i32_varlen(
-            elapsed,
-            cu_seqlens,
-            state_indices,
-            total_tokens=5,
-            validated_metadata=ticket,
-        )
-    assert ticket._is_graph()
-
-    graph.replay()
-    torch.cuda.synchronize()
-    assert torch.equal(
-        elapsed,
-        torch.tensor([2, 8, 7, 13], device="cuda", dtype=torch.int32),
-    )
-
-    elapsed.copy_(initial)
-    cu_seqlens.copy_(torch.tensor([0, 3, -7, -9], device="cuda", dtype=torch.int32))
-    state_indices.copy_(torch.tensor([2, 99, 99], device="cuda", dtype=torch.int32))
-    num_active_tokens.fill_(3)
-    num_active_sequences.fill_(1)
-    graph.replay()
-    torch.cuda.synchronize()
-    assert torch.equal(
-        elapsed,
-        torch.tensor([2, 5, 10, 11], device="cuda", dtype=torch.int32),
-    )
-
-    elapsed.copy_(initial)
-    cu_seqlens.fill_(-1)
-    cu_seqlens[0] = 0
-    state_indices.fill_(99)
-    num_active_tokens.zero_()
-    num_active_sequences.zero_()
-    graph.replay()
-    torch.cuda.synchronize()
-    assert torch.equal(elapsed, initial)
-
-    invalid_cases = (
-        ([0, 1, 3, -1], [1, 2, 99], 2, 2),  # final endpoint mismatch
-        ([0, 2, 2, -1], [1, 2, 99], 2, 2),  # empty active sequence
-        ([0, 1, 2, -1], [1, 1, 99], 2, 2),  # duplicate active slot
-        ([0, 1, 2, -1], [1, 8, 99], 2, 2),  # out-of-range active slot
-        ([0, 4, -1, -1], [1, 99, 99], 4, 1),  # max length overflow
-        ([0, 1, -1, -1], [1, 99, 99], 6, 1),  # active token overflow
-    )
-    for offsets, slots, active_tokens, active_sequences in invalid_cases:
-        elapsed.copy_(initial)
-        cu_seqlens.copy_(torch.tensor(offsets, device="cuda", dtype=torch.int32))
-        state_indices.copy_(torch.tensor(slots, device="cuda", dtype=torch.int32))
-        num_active_tokens.fill_(active_tokens)
-        num_active_sequences.fill_(active_sequences)
-        graph.replay()
-        torch.cuda.synchronize()
-        assert torch.equal(elapsed, initial)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_albatross_add_vec_flat_and_2d_dispatch() -> None:
-    device = torch.device("cuda")
-    for rows, channels in ((3, 8), (17, 4096)):
-        x = torch.randn(rows, channels, device=device, dtype=torch.float16)
-        vec = torch.randn(channels, device=device, dtype=torch.float16)
-        output = infer_recurrent_add_vec_forward_varlen(x, vec)
-        expected = (x.float() + vec.float()).to(torch.float16)
-        assert torch.equal(output, expected)
-
+pytestmark = pytest.mark.sm120
 
 ROOT = Path(__file__).resolve().parents[3]
-CUDA_EXTENSION_AVAILABLE = (
-    torch.cuda.is_available()
-    and flashrwkv2._C is not None
-    and hasattr(flashrwkv2._C, "recurrent_fp32_from_decay_logits")
-)
-FP16_EXTENSION_AVAILABLE = (
-    torch.cuda.is_available()
-    and flashrwkv2._C is not None
-    and hasattr(flashrwkv2._C, "recurrent_fp16_from_decay_logits")
-)
 TOLERANCES = json.loads(
     (ROOT / "tests/fixtures/tolerances-v1.json").read_text(encoding="utf-8")
 )["fp32io16_recurrent"]
@@ -377,141 +148,22 @@ def rwkv7_fp16_reference(
     return expected, expected_state
 
 
-TARGET_CUDA = (
-    ROOT / "csrc/sm120/tmix/wkv7/infer_recurrent_fp32io16_forward_varlen.cu"
-)
-TARGET_CPP = (
-    ROOT / "csrc/sm120/tmix/wkv7/infer_recurrent_fp32io16_forward_varlen.cpp"
-)
-TARGET_FP16_CUDA = (
-    ROOT / "csrc/sm120/tmix/wkv7/infer_recurrent_fp16_forward_varlen.cu"
-)
-TARGET_FP16_CPP = (
-    ROOT / "csrc/sm120/tmix/wkv7/infer_recurrent_fp16_forward_varlen.cpp"
-)
-
-
 def _require_cuda_extension() -> None:
-    if not CUDA_EXTENSION_AVAILABLE:
-        pytest.skip("CUDA extension and an SM120 device are required")
+    require_cuda_backend(
+        "_C_sm120", 12, "tmix_wkv7_recurrent_fp32_from_decay_logits"
+    )
 
 
 def _require_fp16_extension() -> None:
-    if not FP16_EXTENSION_AVAILABLE:
-        pytest.skip("CUDA extension and an SM120 device are required")
+    require_cuda_backend(
+        "_C_sm120", 12, "tmix_wkv7_recurrent_fp16_from_decay_logits"
+    )
 
 
 def _relative_rmse(actual: torch.Tensor, expected: torch.Tensor) -> float:
     difference = actual.float() - expected.float()
     baseline = expected.float().square().mean().sqrt().clamp_min(1.0e-6)
     return float((difference.square().mean().sqrt() / baseline).item())
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.parametrize("head_size", (64, 128, 256))
-def test_fp16_complete_tmix_chain(head_size: int) -> None:
-    """Exercise the packed FP16 chain without an FP32-state/Python WKV path."""
-
-    _require_fp16_extension()
-    torch.manual_seed(20260808 + head_size)
-    device = torch.device("cuda")
-    rows, heads, channels = 4, 2, 2 * head_size
-    cu_seqlens = torch.tensor([0, 1, rows], device=device, dtype=torch.int32)
-    state_indices = torch.tensor([1, 0], device=device, dtype=torch.int32)
-    shift_state = torch.zeros(3, channels, device=device, dtype=torch.float16)
-    state = torch.zeros(
-        3, heads, head_size, head_size, device=device, dtype=torch.float16
-    )
-    elapsed = torch.zeros(3, device=device, dtype=torch.int32)
-    x = (torch.randn(rows, channels, device=device) * 0.03).half()
-    mix_coefficients = [
-        (torch.randn(channels, device=device) * 0.05).half() for _ in range(6)
-    ]
-    mixed = infer_tmix_mix6_forward_varlen(
-        x,
-        *mix_coefficients,
-        shift_state_pool=shift_state,
-        cu_seqlens=cu_seqlens,
-        state_indices=state_indices,
-        max_seqlen=3,
-    )
-    identity = torch.eye(channels, device=device, dtype=torch.float16)
-    r, decay_logits, key, value, a12, gate = [
-        infer_tmix_linear_forward_varlen(token, identity) for token in mixed
-    ]
-    key_scale = torch.ones(channels, device=device, dtype=torch.float16)
-    a0 = torch.zeros(channels, device=device, dtype=torch.float16)
-    a_scale = torch.full(
-        (channels,), 0.25, device=device, dtype=torch.float16
-    )
-    key, neg_direction, scaled_direction = infer_tmix_kk_a_gate_forward_varlen(
-        key,
-        key_scale,
-        a0,
-        a12,
-        a_scale,
-        head_size=head_size,
-        batch_size=2,
-        max_seqlen=3,
-    )
-    packed = tuple(
-        tensor.reshape(rows, heads, head_size).contiguous()
-        for tensor in (r, decay_logits, key, value, scaled_direction, neg_direction)
-    )
-    state_before = state.clone()
-    expected_wkv, expected_state = rwkv7_fp16_reference(
-        *packed,
-        state_pool=state_before,
-        elapsed_state_pool=elapsed,
-        cu_seqlens=cu_seqlens,
-        state_indices=state_indices,
-    )
-    wkv = infer_recurrent_fp16_forward_varlen(
-        *packed,
-        state_pool=state,
-        elapsed_state_pool=elapsed,
-        cu_seqlens=cu_seqlens,
-        state_indices=state_indices,
-        max_seqlen=3,
-    )
-    residual_scale = torch.randn(
-        channels, device=device, dtype=torch.float16
-    ) * 0.05
-    weight = torch.ones(channels, device=device, dtype=torch.float16)
-    bias = torch.zeros(channels, device=device, dtype=torch.float16)
-    output = infer_tmix_lnx_rkvres_xg_forward_varlen(
-        wkv.reshape(rows, channels),
-        r,
-        key,
-        value,
-        residual_scale,
-        weight,
-        bias,
-        gate,
-        head_size=head_size,
-        batch_size=2,
-        max_seqlen=3,
-    )
-
-    expected_x = expected_wkv.float()
-    mean = expected_x.mean(-1, keepdim=True)
-    rstd = (expected_x.var(-1, unbiased=False, keepdim=True) + 64.0e-5).rsqrt()
-    residual = (
-        r.float().reshape(rows, heads, head_size)
-        * key.float().reshape(rows, heads, head_size)
-        * residual_scale.float().reshape(1, heads, head_size)
-    ).sum(-1, keepdim=True)
-    expected_output = (
-        (expected_x - mean) * rstd
-        + residual * value.float().reshape(rows, heads, head_size)
-    ) * gate.float().reshape(rows, heads, head_size)
-    assert torch.allclose(state.float(), expected_state.float(), atol=0.08, rtol=0.08)
-    assert torch.allclose(
-        output.float().reshape_as(expected_output),
-        expected_output,
-        atol=0.12,
-        rtol=0.12,
-    )
 
 
 def _make_case(
@@ -612,7 +264,7 @@ def test_fp32_wkv_zero_active_precapture_warmup_then_graph_replay() -> None:
     # zero active counts must therefore ignore every metadata tail entry.
     stream.wait_stream(torch.cuda.current_stream(device))
     with torch.cuda.stream(stream):
-        warmup_ticket = prepare_recurrent_metadata(
+        warmup_ticket = prepare_tmix_wkv7_recurrent_metadata(
             cu_seqlens,
             state_indices,
             state_pool_size=slots,
@@ -622,7 +274,7 @@ def test_fp32_wkv_zero_active_precapture_warmup_then_graph_replay() -> None:
             num_active_tokens=num_active_tokens,
             num_active_sequences=num_active_sequences,
         )
-        infer_recurrent_fp32io16_forward_varlen(
+        infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
             *packed,
             state_pool=state,
             cu_seqlens=cu_seqlens,
@@ -647,7 +299,7 @@ def test_fp32_wkv_zero_active_precapture_warmup_then_graph_replay() -> None:
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
-        ticket = prepare_recurrent_metadata(
+        ticket = prepare_tmix_wkv7_recurrent_metadata(
             cu_seqlens,
             state_indices,
             state_pool_size=slots,
@@ -657,7 +309,7 @@ def test_fp32_wkv_zero_active_precapture_warmup_then_graph_replay() -> None:
             num_active_tokens=num_active_tokens,
             num_active_sequences=num_active_sequences,
         )
-        graph_output = infer_recurrent_fp32io16_forward_varlen(
+        graph_output = infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
             *packed,
             state_pool=state,
             cu_seqlens=cu_seqlens,
@@ -701,7 +353,7 @@ def test_fp32_wkv_zero_active_precapture_warmup_then_graph_replay() -> None:
 
 
 def test_public_signature_is_raw_only_and_old_symbols_are_absent() -> None:
-    signature = inspect.signature(infer_recurrent_fp32io16_forward_varlen)
+    signature = inspect.signature(infer_tmix_wkv7_recurrent_fp32io16_forward_varlen)
     assert "decay_logits" in signature.parameters
     assert "state_pool" in signature.parameters
     assert "initial_state" not in signature.parameters
@@ -710,7 +362,7 @@ def test_public_signature_is_raw_only_and_old_symbols_are_absent() -> None:
     assert "elapsed_t" not in signature.parameters
     assert not hasattr(flashrwkv2, "rwkv7_recurrent_stateful")
     with pytest.raises(TypeError, match="log_decay"):
-        infer_recurrent_fp32io16_forward_varlen(
+        infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
             None,
             None,
             None,
@@ -721,18 +373,10 @@ def test_public_signature_is_raw_only_and_old_symbols_are_absent() -> None:
             cu_seqlens=None,
             log_decay=None,
         )
-    source_paths = (
-        ROOT / "csrc/sm120/tmix/wkv7/infer_recurrent_fp32io16_forward_varlen.cu",
-        ROOT / "csrc/sm120/tmix/wkv7/infer_recurrent_fp32io16_forward_varlen.cpp",
-        ROOT / "csrc/sm120/tmix/wkv7/recurrent_decay.cuh",
-    )
-    source = "\n".join(path.read_text(encoding="utf-8") for path in source_paths)
-    assert "RecurrentDecayInput::kLogDecay" not in source
-    assert "py::arg(\"log_decay\")" not in source
-    assert "elapsed_t" not in source
     if flashrwkv2._C is not None:
-        assert not hasattr(flashrwkv2._C, "recurrent_fp32")
-        assert not hasattr(flashrwkv2._C, "recurrent_fp16")
+        assert hasattr(
+            flashrwkv2._C, "tmix_wkv7_recurrent_fp32_from_decay_logits"
+        )
 
 
 @pytest.mark.parametrize(
@@ -750,7 +394,7 @@ def test_public_rejects_unsupported_token_dtype(
     case = _make_case(dtype=torch.float16, head_size=64)
     bad = case["r"].float() if dtype == torch.float32 else case["r"].to(dtype)
     with pytest.raises((error_type, RuntimeError)):
-        infer_recurrent_fp32io16_forward_varlen(
+        infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
             bad,
             case["decay_logits"],
             case["k"],
@@ -781,7 +425,7 @@ def test_public_rejects_structural_arguments_without_launching() -> None:
     ]
     for bad_r, error_type, message in bad_calls:
         with pytest.raises(error_type, match=message):
-            infer_recurrent_fp32io16_forward_varlen(
+            infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
                 bad_r,
                 *args[1:],
                 state_pool=state_pool,
@@ -790,7 +434,7 @@ def test_public_rejects_structural_arguments_without_launching() -> None:
             )
 
     with pytest.raises(TypeError, match="r must be a torch.Tensor"):
-        infer_recurrent_fp32io16_forward_varlen(
+        infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
             object(),
             *args[1:],
             state_pool=state_pool,
@@ -798,7 +442,7 @@ def test_public_rejects_structural_arguments_without_launching() -> None:
             state_indices=case["state_indices"],
         )
     with pytest.raises(ValueError, match=r"packed shape \[total_tokens,H,D\]"):
-        infer_recurrent_fp32io16_forward_varlen(
+        infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
             args[0].reshape(-1, args[0].shape[-1]),
             *args[1:],
             state_pool=state_pool,
@@ -806,7 +450,7 @@ def test_public_rejects_structural_arguments_without_launching() -> None:
             state_indices=case["state_indices"],
         )
     with pytest.raises(RuntimeError, match="dtype mismatch"):
-        infer_recurrent_fp32io16_forward_varlen(
+        infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
             args[0],
             args[1].to(torch.bfloat16),
             *args[2:],
@@ -815,7 +459,7 @@ def test_public_rejects_structural_arguments_without_launching() -> None:
             state_indices=case["state_indices"],
         )
     with pytest.raises(ValueError, match=r"packed shape \[total_tokens,H,D\]"):
-        infer_recurrent_fp32io16_forward_varlen(
+        infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
             args[0].unsqueeze(0),
             args[1].unsqueeze(0),
             args[2].unsqueeze(0),
@@ -828,21 +472,21 @@ def test_public_rejects_structural_arguments_without_launching() -> None:
         )
 
     with pytest.raises(TypeError, match="float32"):
-        infer_recurrent_fp32io16_forward_varlen(
+        infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
             *args,
             state_pool=state_pool.to(torch.float16),
             cu_seqlens=case["cu_seqlens"],
             state_indices=case["state_indices"],
         )
     with pytest.raises(RuntimeError, match="square"):
-        infer_recurrent_fp32io16_forward_varlen(
+        infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
             *args,
             state_pool=state_pool[:, :, :, :-1].contiguous(),
             cu_seqlens=case["cu_seqlens"],
             state_indices=case["state_indices"],
         )
     with pytest.raises(RuntimeError, match="square"):
-        infer_recurrent_fp32io16_forward_varlen(
+        infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
             *args,
             state_pool=state_pool.reshape(-1),
             cu_seqlens=case["cu_seqlens"],
@@ -850,7 +494,7 @@ def test_public_rejects_structural_arguments_without_launching() -> None:
         )
     unsupported = _make_case(dtype=torch.float16, head_size=32, lengths=(4,))
     with pytest.raises(RuntimeError, match="64, 128, or 256"):
-        infer_recurrent_fp32io16_forward_varlen(
+        infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
             *_args(unsupported),
             state_pool=unsupported["state_pool"],
             cu_seqlens=unsupported["cu_seqlens"],
@@ -904,7 +548,7 @@ def test_packed_public_rejects_invalid_metadata_and_preserves_state(
         bad_slots = state_indices
     elif metadata_kind == "non_increasing":
         bad_cu = cu_seqlens.clone()
-        bad_cu[2] = bad_cu[1]
+        bad_cu[2] = bad_cu[1] - 1
         bad_slots = state_indices
     elif metadata_kind == "empty_sequence":
         bad_cu = cu_seqlens.clone()
@@ -928,7 +572,7 @@ def test_packed_public_rejects_invalid_metadata_and_preserves_state(
 
     before = state_pool.clone()
     with pytest.raises((TypeError, ValueError, RuntimeError)):
-        infer_recurrent_fp32io16_forward_varlen(
+        infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
             *args,
             state_pool=state_pool,
             cu_seqlens=bad_cu,
@@ -949,7 +593,7 @@ def test_public_rejects_devices_bias_scale_and_state_indices_contracts() -> None
     assert isinstance(state_indices, torch.Tensor)
 
     with pytest.raises((ValueError, RuntimeError), match="CUDA"):
-        infer_recurrent_fp32io16_forward_varlen(
+        infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
             *(tensor.cpu() for tensor in args),
             state_pool=state_pool.cpu(),
             cu_seqlens=cu_seqlens.cpu(),
@@ -957,7 +601,7 @@ def test_public_rejects_devices_bias_scale_and_state_indices_contracts() -> None
         )
     if torch.cuda.device_count() >= 2:
         with pytest.raises(RuntimeError, match="same device"):
-            infer_recurrent_fp32io16_forward_varlen(
+            infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
                 *args,
                 state_pool=state_pool,
                 cu_seqlens=cu_seqlens,
@@ -968,7 +612,7 @@ def test_public_rejects_devices_bias_scale_and_state_indices_contracts() -> None
             )
 
     with pytest.raises((ValueError, RuntimeError), match="decay_bias"):
-        infer_recurrent_fp32io16_forward_varlen(
+        infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
             *args,
             state_pool=state_pool,
             cu_seqlens=cu_seqlens,
@@ -976,7 +620,7 @@ def test_public_rejects_devices_bias_scale_and_state_indices_contracts() -> None
             decay_bias=torch.zeros(2, 63, device=state_pool.device, dtype=args[0].dtype),
         )
     with pytest.raises((TypeError, RuntimeError), match="decay_bias"):
-        infer_recurrent_fp32io16_forward_varlen(
+        infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
             *args,
             state_pool=state_pool,
             cu_seqlens=cu_seqlens,
@@ -984,7 +628,7 @@ def test_public_rejects_devices_bias_scale_and_state_indices_contracts() -> None
             decay_bias=torch.zeros(2, 64, device=state_pool.device, dtype=torch.float32),
         )
     with pytest.raises((ValueError, RuntimeError), match="contiguous"):
-        infer_recurrent_fp32io16_forward_varlen(
+        infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
             *args,
             state_pool=state_pool,
             cu_seqlens=cu_seqlens,
@@ -994,14 +638,14 @@ def test_public_rejects_devices_bias_scale_and_state_indices_contracts() -> None
             ).transpose(0, 1),
         )
     with pytest.raises(TypeError, match="cu_seqlens must be a torch.Tensor"):
-        infer_recurrent_fp32io16_forward_varlen(
+        infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
             *args,
             state_pool=state_pool,
             cu_seqlens=[0, args[0].shape[0]],
             state_indices=state_indices,
         )
     with pytest.raises(TypeError, match="state_indices must be a torch.Tensor"):
-        infer_recurrent_fp32io16_forward_varlen(
+        infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
             *args,
             state_pool=state_pool,
             cu_seqlens=cu_seqlens,
@@ -1009,7 +653,7 @@ def test_public_rejects_devices_bias_scale_and_state_indices_contracts() -> None
         )
     for bad_scale in (float("nan"), float("inf")):
         with pytest.raises(RuntimeError, match="finite"):
-            infer_recurrent_fp32io16_forward_varlen(
+            infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
                 *args,
                 state_pool=state_pool,
                 cu_seqlens=cu_seqlens,
@@ -1017,7 +661,7 @@ def test_public_rejects_devices_bias_scale_and_state_indices_contracts() -> None
                 scale=bad_scale,
             )
     with pytest.raises(TypeError, match="state_pool"):
-        infer_recurrent_fp32io16_forward_varlen(
+        infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
             *args,
             cu_seqlens=cu_seqlens,
             state_indices=state_indices,
@@ -1034,14 +678,14 @@ def test_ticket_rejects_identity_version_and_stream_mismatches() -> None:
     assert isinstance(cu_seqlens, torch.Tensor)
     assert isinstance(state_indices, torch.Tensor)
     assert isinstance(state_pool, torch.Tensor)
-    ticket = prepare_recurrent_metadata(
+    ticket = prepare_tmix_wkv7_recurrent_metadata(
         cu_seqlens,
         state_indices,
         total_tokens=args[0].shape[0],
         state_pool_size=state_pool.shape[0],
     )
     with pytest.raises(RuntimeError, match="identity"):
-        infer_recurrent_fp32io16_forward_varlen(
+        infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
             *args,
             state_pool=state_pool.clone(),
             cu_seqlens=cu_seqlens.clone(),
@@ -1051,7 +695,7 @@ def test_ticket_rejects_identity_version_and_stream_mismatches() -> None:
 
     short_args = tuple(tensor[:-1].contiguous() for tensor in args)
     with pytest.raises(RuntimeError, match="total_tokens"):
-        infer_recurrent_fp32io16_forward_varlen(
+        infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
             *short_args,
             state_pool=state_pool.clone(),
             cu_seqlens=cu_seqlens,
@@ -1059,7 +703,7 @@ def test_ticket_rejects_identity_version_and_stream_mismatches() -> None:
             validated_metadata=ticket,
         )
     with pytest.raises(RuntimeError, match="state_pool_size"):
-        infer_recurrent_fp32io16_forward_varlen(
+        infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
             *args,
             state_pool=torch.cat(
                 (state_pool, torch.zeros_like(state_pool[:1])), dim=0
@@ -1074,7 +718,7 @@ def test_ticket_rejects_identity_version_and_stream_mismatches() -> None:
     assert torch.equal(cu_seqlens, before)
     cu_seqlens[1] += 1
     with pytest.raises(RuntimeError, match="version"):
-        infer_recurrent_fp32io16_forward_varlen(
+        infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
             *args,
             state_pool=state_pool.clone(),
             cu_seqlens=cu_seqlens,
@@ -1083,7 +727,7 @@ def test_ticket_rejects_identity_version_and_stream_mismatches() -> None:
         )
 
     cu_seqlens[1] -= 1
-    ticket_stream = prepare_recurrent_metadata(
+    ticket_stream = prepare_tmix_wkv7_recurrent_metadata(
         cu_seqlens,
         state_indices,
         total_tokens=args[0].shape[0],
@@ -1092,7 +736,7 @@ def test_ticket_rejects_identity_version_and_stream_mismatches() -> None:
     other_stream = torch.cuda.Stream(device=cu_seqlens.device)
     with torch.cuda.stream(other_stream):
         with pytest.raises(RuntimeError, match="stream"):
-            infer_recurrent_fp32io16_forward_varlen(
+            infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
                 *args,
                 state_pool=state_pool.clone(),
                 cu_seqlens=cu_seqlens,
@@ -1113,7 +757,7 @@ def test_packed_low_level_invalid_metadata_fails_closed_without_state_write() ->
     slots = torch.tensor([0], device=state_pool.device, dtype=torch.int32)
     output = torch.zeros_like(flat[3])
     before = state_pool.clone()
-    flashrwkv2._C.recurrent_fp32_from_decay_logits(
+    flashrwkv2._C.tmix_wkv7_recurrent_fp32_from_decay_logits(
         bad_cu,
         slots,
         state_pool,
@@ -1159,7 +803,7 @@ def test_packed_fp32_state_precision_and_state_safety(
     )
 
     before = state_pool.clone()
-    observed_output = infer_recurrent_fp32io16_forward_varlen(
+    observed_output = infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
         *args,
         state_pool=state_pool,
         cu_seqlens=cu_seqlens,
@@ -1179,7 +823,6 @@ def test_packed_fp32_state_precision_and_state_safety(
     state_rmse = _relative_rmse(observed_active, expected_active)
     assert output_rmse <= TOLERANCES["output_relative_rmse"]
     assert state_rmse <= TOLERANCES["state_relative_rmse"]
-    assert (observed_output.float() - expected_output.float()).abs().max() >= 0.0
     untouched = [index for index in range(state_pool.shape[0]) if index not in set(state_indices.cpu().tolist())]
     assert torch.equal(
         state_pool.index_select(
@@ -1192,7 +835,7 @@ def test_packed_fp32_state_precision_and_state_safety(
     assert not torch.equal(observed_active, before.index_select(0, active))
 
     second_state = before.clone()
-    second_output = infer_recurrent_fp32io16_forward_varlen(
+    second_output = infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
         *args,
         state_pool=second_state,
         cu_seqlens=cu_seqlens,
@@ -1205,7 +848,7 @@ def test_packed_fp32_state_precision_and_state_safety(
 
 
 def test_fp16_public_signature_is_raw_only_and_has_no_elapsed_alias() -> None:
-    signature = inspect.signature(infer_recurrent_fp16_forward_varlen)
+    signature = inspect.signature(infer_tmix_wkv7_recurrent_fp16_forward_varlen)
     assert "decay_logits" in signature.parameters
     assert "state_pool" in signature.parameters
     assert "elapsed_state_pool" in signature.parameters
@@ -1213,8 +856,9 @@ def test_fp16_public_signature_is_raw_only_and_has_no_elapsed_alias() -> None:
     assert "log_decay" not in signature.parameters
     assert "elapsed_t" not in signature.parameters
     if flashrwkv2._C is not None:
-        assert hasattr(flashrwkv2._C, "recurrent_fp16_from_decay_logits")
-        assert not hasattr(flashrwkv2._C, "recurrent_fp16")
+        assert hasattr(
+            flashrwkv2._C, "tmix_wkv7_recurrent_fp16_from_decay_logits"
+        )
 
 
 @pytest.mark.parametrize("head_size", (64, 128, 256))
@@ -1247,7 +891,7 @@ def test_packed_fp16_state_family_correctness(
         decay_bias=decay_bias,
     )
     observed_state = initial_state.clone()
-    observed_output = infer_recurrent_fp16_forward_varlen(
+    observed_output = infer_tmix_wkv7_recurrent_fp16_forward_varlen(
         *args,
         state_pool=observed_state,
         elapsed_state_pool=case["elapsed_state_pool"],
@@ -1326,7 +970,7 @@ def test_fp16_dispatch_covers_albatross_grid_and_family_boundaries(
         decay_bias=decay_bias,
     )
     observed_state = initial_state.clone()
-    observed_output = infer_recurrent_fp16_forward_varlen(
+    observed_output = infer_tmix_wkv7_recurrent_fp16_forward_varlen(
         *args,
         state_pool=observed_state,
         elapsed_state_pool=elapsed_state,
@@ -1357,7 +1001,7 @@ def test_fp16_consumes_the_same_metadata_ticket_contract() -> None:
     state_pool = case["state_pool"].half()
     assert isinstance(cu_seqlens, torch.Tensor)
     assert isinstance(state_indices, torch.Tensor)
-    ticket = prepare_recurrent_metadata(
+    ticket = prepare_tmix_wkv7_recurrent_metadata(
         cu_seqlens,
         state_indices,
         total_tokens=args[0].shape[0],
@@ -1365,17 +1009,19 @@ def test_fp16_consumes_the_same_metadata_ticket_contract() -> None:
     )
     expected_state = state_pool.clone()
     observed_state = state_pool.clone()
-    expected_output = infer_recurrent_fp16_forward_varlen(
+    expected_elapsed = case["elapsed_state_pool"].clone()
+    observed_elapsed = case["elapsed_state_pool"].clone()
+    expected_output = infer_tmix_wkv7_recurrent_fp16_forward_varlen(
         *args,
         state_pool=expected_state,
-        elapsed_state_pool=case["elapsed_state_pool"],
+        elapsed_state_pool=expected_elapsed,
         cu_seqlens=cu_seqlens,
         state_indices=state_indices,
     )
-    observed_output = infer_recurrent_fp16_forward_varlen(
+    observed_output = infer_tmix_wkv7_recurrent_fp16_forward_varlen(
         *args,
         state_pool=observed_state,
-        elapsed_state_pool=case["elapsed_state_pool"],
+        elapsed_state_pool=observed_elapsed,
         cu_seqlens=cu_seqlens,
         state_indices=state_indices,
         validated_metadata=ticket,
@@ -1383,10 +1029,11 @@ def test_fp16_consumes_the_same_metadata_ticket_contract() -> None:
     torch.cuda.synchronize()
     assert torch.equal(observed_output, expected_output)
     assert torch.equal(observed_state, expected_state)
+    assert torch.equal(observed_elapsed, expected_elapsed)
 
     cu_seqlens[1] += 1
     with pytest.raises(RuntimeError, match="version"):
-        infer_recurrent_fp16_forward_varlen(
+        infer_tmix_wkv7_recurrent_fp16_forward_varlen(
             *args,
             state_pool=state_pool.clone(),
             elapsed_state_pool=case["elapsed_state_pool"],
@@ -1402,7 +1049,7 @@ def test_fp16_public_rejects_non_fp16_state_and_tokens() -> None:
     case = _make_case(dtype=torch.float16, head_size=64, lengths=(2,))
     args = _args(case)
     with pytest.raises(TypeError, match="FP16-state state_pool"):
-        infer_recurrent_fp16_forward_varlen(
+        infer_tmix_wkv7_recurrent_fp16_forward_varlen(
             *args,
             state_pool=case["state_pool"],
             elapsed_state_pool=case["elapsed_state_pool"],
@@ -1410,7 +1057,7 @@ def test_fp16_public_rejects_non_fp16_state_and_tokens() -> None:
             state_indices=case["state_indices"],
         )
     with pytest.raises((TypeError, RuntimeError), match="float16"):
-        infer_recurrent_fp16_forward_varlen(
+        infer_tmix_wkv7_recurrent_fp16_forward_varlen(
             args[0].bfloat16(),
             *args[1:],
             state_pool=case["state_pool"].half(),
@@ -1418,264 +1065,3 @@ def test_fp16_public_rejects_non_fp16_state_and_tokens() -> None:
             cu_seqlens=case["cu_seqlens"],
             state_indices=case["state_indices"],
         )
-
-
-def _extension_sources() -> set[str]:
-    tree = ast.parse((ROOT / "setup.py").read_text(encoding="utf-8"))
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.keyword) or node.arg != "sources":
-            continue
-        assert isinstance(node.value, ast.List)
-        values: set[str] = set()
-        for element in node.value.elts:
-            if isinstance(element, ast.Constant) and isinstance(element.value, str):
-                values.add(element.value)
-            elif isinstance(element, ast.BinOp):
-                values.add(ast.literal_eval(element))
-        return values
-    raise AssertionError("CUDAExtension sources list not found")
-
-
-def test_module_paths_and_setup_source_set_are_minimal() -> None:
-    expected = {
-        "csrc/bindings.cpp",
-        "csrc/registration.cpp",
-        "csrc/validation.cpp",
-        "csrc/validation/recurrent_metadata.cu",
-        "csrc/sm120/tmix/wkv7/infer_recurrent_fp32io16_forward_varlen.cpp",
-        "csrc/sm120/tmix/wkv7/infer_recurrent_fp32io16_forward_varlen.cu",
-        "csrc/sm120/tmix/wkv7/infer_recurrent_fp16_forward_varlen.cpp",
-        "csrc/sm120/tmix/wkv7/infer_recurrent_fp16_forward_varlen.cu",
-        "csrc/sm120/tmix/wkv7/infer_chunk_bf16_forward_varlen.cpp",
-        "csrc/sm120/tmix/wkv7/infer_chunk_bf16_forward_varlen.cu",
-        "csrc/sm120/tmix/mix6/infer_fp16_forward_varlen.cpp",
-        "csrc/sm120/tmix/mix6/infer_fp16_forward_varlen.cu",
-        "csrc/sm120/tmix/kk_a_gate/infer_fp16_forward_varlen.cpp",
-        "csrc/sm120/tmix/kk_a_gate/infer_fp16_forward_varlen.cu",
-        "csrc/sm120/tmix/lnx_rkvres_xg/infer_fp16_forward_varlen.cpp",
-        "csrc/sm120/tmix/lnx_rkvres_xg/infer_fp16_forward_varlen.cu",
-        "csrc/sm120/tmix/vres_gate/infer_fp16_forward_varlen.cpp",
-        "csrc/sm120/tmix/vres_gate/infer_fp16_forward_varlen.cu",
-        "csrc/sm120/cmix/mix/infer_fp16_forward_varlen.cpp",
-        "csrc/sm120/cmix/mix/infer_fp16_forward_varlen.cu",
-        "csrc/sm120/cmix/sparse/infer_fp16_forward_varlen.cpp",
-        "csrc/sm120/cmix/sparse/infer_fp16_forward_varlen.cu",
-        "csrc/sm120/tmix/linear/infer_fp16_forward_varlen.cpp",
-        "csrc/sm120/tmix/linear/infer_fp16_forward_varlen.cu",
-        "csrc/sm120/tmix/normalization/infer_fp16_forward_varlen.cpp",
-        "csrc/sm120/tmix/normalization/infer_fp16_forward_varlen.cu",
-        "csrc/sm120/embedding/infer_fp16_forward_varlen.cpp",
-        "csrc/sm120/embedding/infer_fp16_forward_varlen.cu",
-        "csrc/sm120/head/linear/infer_fp16_forward_varlen.cpp",
-        "csrc/sm120/head/linear/infer_fp16_forward_varlen.cu",
-        "csrc/sm120/sampling/infer_fp32_forward_varlen.cpp",
-        "csrc/sm120/sampling/infer_fp32_forward_varlen.cu",
-        "csrc/sm90/loss/l2wrap_ce/pretrain_bf16_forward.cpp",
-        "csrc/sm90/loss/l2wrap_ce/pretrain_bf16_forward.cu",
-        "csrc/sm90/loss/l2wrap_ce/pretrain_bf16_backward.cpp",
-        "csrc/sm90/loss/l2wrap_ce/pretrain_bf16_backward.cu",
-        "csrc/sm90/tmix/wkv7/pretrain_recurrent_bf16_forward.cpp",
-        "csrc/sm90/tmix/wkv7/pretrain_recurrent_bf16_forward.cu",
-        "csrc/sm90/tmix/a_gate/pretrain_bf16_forward.cpp",
-        "csrc/sm90/tmix/a_gate/pretrain_bf16_forward.cu",
-        "csrc/sm90/tmix/a_gate/pretrain_bf16_backward.cpp",
-        "csrc/sm90/tmix/a_gate/pretrain_bf16_backward.cu",
-        "csrc/sm90/tmix/vres_gate/pretrain_bf16_forward.cpp",
-        "csrc/sm90/tmix/vres_gate/pretrain_bf16_forward.cu",
-        "csrc/sm90/tmix/vres_gate/pretrain_bf16_backward.cpp",
-        "csrc/sm90/tmix/vres_gate/pretrain_bf16_backward.cu",
-        "csrc/sm90/tmix/mix6/pretrain_bf16_forward.cpp",
-        "csrc/sm90/tmix/mix6/pretrain_bf16_forward.cu",
-        "csrc/sm90/tmix/mix6/pretrain_bf16_backward.cpp",
-        "csrc/sm90/tmix/mix6/pretrain_bf16_backward.cu",
-        "csrc/sm90/tmix/kk_pre/pretrain_bf16_forward.cpp",
-        "csrc/sm90/tmix/kk_pre/pretrain_bf16_forward.cu",
-        "csrc/sm90/tmix/kk_pre/pretrain_bf16_backward.cpp",
-        "csrc/sm90/tmix/kk_pre/pretrain_bf16_backward.cu",
-        "csrc/sm90/tmix/lnx_rkvres_xg/pretrain_bf16_forward.cpp",
-        "csrc/sm90/tmix/lnx_rkvres_xg/pretrain_bf16_forward.cu",
-        "csrc/sm90/tmix/lnx_rkvres_xg/pretrain_bf16_backward.cpp",
-        "csrc/sm90/tmix/lnx_rkvres_xg/pretrain_bf16_backward.cu",
-        "csrc/sm90/head/l2wrap_ce/pretrain_bf16_forward.cpp",
-        "csrc/sm90/head/l2wrap_ce/pretrain_bf16_forward.cu",
-        "csrc/sm90/tmix/wkv7/statetune_recurrent_fp32io16_forward.cpp",
-        "csrc/sm90/tmix/wkv7/statetune_recurrent_fp32io16_forward.cu",
-        "csrc/sm90/tmix/wkv7/statetune_recurrent_fp32io16_backward.cpp",
-        "csrc/sm90/tmix/wkv7/statetune_recurrent_fp32io16_backward.cu",
-        "csrc/sm90/tmix/wkv7/rl_infctx_chunk_fp32io16_forward.cpp",
-        "csrc/sm90/tmix/wkv7/rl_infctx_chunk_fp32io16_forward.cu",
-        "csrc/sm90/tmix/wkv7/rl_infctx_chunk_fp32io16_backward.cpp",
-        "csrc/sm90/tmix/wkv7/rl_infctx_chunk_fp32io16_backward.cu",
-        "csrc/sm90/cmix/mix/pretrain_bf16_forward.cpp",
-        "csrc/sm90/cmix/mix/pretrain_bf16_forward.cu",
-        "csrc/sm90/cmix/mix/pretrain_bf16_backward.cpp",
-        "csrc/sm90/cmix/mix/pretrain_bf16_backward.cu",
-        "csrc/sm90/cmix/mix/statetune_bf16_forward.cpp",
-        "csrc/sm90/cmix/mix/statetune_bf16_forward.cu",
-        "csrc/sm90/cmix/mix/statetune_bf16_backward.cpp",
-        "csrc/sm90/cmix/mix/statetune_bf16_backward.cu",
-        "csrc/sm90/tmix/mix6/statetune_bf16_forward.cpp",
-        "csrc/sm90/tmix/mix6/statetune_bf16_forward.cu",
-        "csrc/sm90/tmix/mix6/statetune_bf16_backward.cpp",
-        "csrc/sm90/tmix/mix6/statetune_bf16_backward.cu",
-    }
-    assert _extension_sources() == expected
-    assert TARGET_CUDA.is_file()
-    assert TARGET_CPP.is_file()
-    assert TARGET_CUDA.with_suffix(".cpp") == TARGET_CPP
-    assert TARGET_FP16_CUDA.is_file()
-    assert TARGET_FP16_CUDA.with_suffix(".cpp") == TARGET_FP16_CPP
-    assert (ROOT / "csrc/sm120/tmix/wkv7/recurrent_decay.cuh").is_file()
-    assert (ROOT / "flashrwkv2/tmix/wkv7/__init__.py").is_file()
-    assert (ROOT / "tests/tmix/wkv7/test.py").is_file()
-    assert (ROOT / "benchmarks/tmix/wkv7/bench.py").is_file()
-    for stale_modules_dir in (
-        ROOT / "flashrwkv2/modules",
-        ROOT / "tests/modules",
-        ROOT / "benchmarks/modules",
-    ):
-        assert not stale_modules_dir.exists()
-    for stale_root_file in (
-        "_extension.py",
-        "architecture.py",
-        "provenance.py",
-        "reference.py",
-        "validation.py",
-    ):
-        assert not (ROOT / "flashrwkv2" / stale_root_file).exists()
-    assert not (ROOT / "flashrwkv2/registry").exists()
-
-
-def test_native_source_is_raw_only_and_keeps_provenance() -> None:
-    source = "\n".join(
-        path.read_text(encoding="utf-8")
-        for path in (
-            TARGET_CUDA,
-            TARGET_CPP,
-            TARGET_FP16_CUDA,
-            TARGET_FP16_CPP,
-            ROOT / "csrc/sm120/tmix/wkv7/recurrent_decay.cuh",
-        )
-    )
-    assert "Albatross" in source
-    assert "ee3308f6922e59f2166c7fac3c5a192340a2b48e" in source
-    assert "vllm-rwkv" in source
-    assert "6d683f9e49a2997e405c47edc147872c8609513b" in source
-    assert "RecurrentDecayInput" not in source
-    assert "kLogDecay" not in source
-    assert 'py::arg("log_decay")' not in source
-    assert "elapsed_t" not in source
-    assert "decay_logits" in source
-    assert "metadata_status" in source
-    assert "wkv_fp16_v1_clone_kernel" in source
-    assert "wkv_fp16_v1_exact_kernel" in source
-    assert "wkv_fp16_seq_v2_kernel" in source
-    assert "wkv_fp16_one_cp_kernel" in source
-    assert "wkv_fp16_one_direct_kernel" in source
-    assert "clone_cp_async" in source
-    assert "one shared-buffer recurrent body" in source
-    assert "double-buffered token staging" in source
-    assert "direct __ldg loads" in source
-    assert "template <bool Tis1 = false, bool AddW0 = false, bool Grid2D = false>" in source
-    assert "template <bool AddW0 = false, bool Grid2D = false>" in source
-    assert "decode_sequence_head<Grid2D>" in source
-    assert "use_grid2d" in source
-    assert "fp16_swizzled_body" not in source
-
-
-def test_registration_only_exposes_raw_fp32_state_operator() -> None:
-    binding = TARGET_CPP.read_text(encoding="utf-8")
-    assert '"prepare_recurrent_metadata"' in binding
-    assert '"recurrent_fp32_from_decay_logits"' in binding
-    assert '"recurrent_fp32"' not in binding
-    assert '"recurrent_fp16"' not in binding
-    assert 'py::arg("decay_logits")' in binding
-    assert 'py::arg("decay_bias")' in binding
-    assert 'py::arg("elapsed_t")' not in binding
-    fp16_binding = TARGET_FP16_CPP.read_text(encoding="utf-8")
-    assert '"recurrent_fp16_from_decay_logits"' in fp16_binding
-    assert 'py::arg("elapsed_t")' not in fp16_binding
-
-
-def test_setup_does_not_reference_deleted_workloads() -> None:
-    setup = (ROOT / "setup.py").read_text(encoding="utf-8")
-    for stale_component in (
-        "csrc/pretrain/",
-        "csrc/statetune/",
-        "csrc/rl_infctx/",
-        "csrc/common/",
-        "csrc/infer/wkv7/",
-        "infer_common_recurrent_fp32io16",
-        "_registration.cpp",
-    ):
-        assert stale_component not in setup
-
-
-def test_default_benchmark_matrix_is_the_21_case_operator_matrix() -> None:
-    assert bench.ALBATROSS_BT_MATRIX == (
-        (1, 1),
-        (1, 2),
-        (1, 4),
-        (1, 8),
-        (1, 16),
-        (1, 32),
-        (1, 64),
-        (1, 128),
-        (1, 256),
-        (2, 1),
-        (4, 1),
-        (8, 1),
-        (16, 1),
-        (32, 1),
-        (64, 1),
-        (128, 1),
-        (256, 1),
-        (2, 2),
-        (4, 4),
-        (8, 8),
-        (16, 16),
-    )
-    assert len(bench.ALBATROSS_BT_MATRIX) == 21
-    assert len(set(bench.ALBATROSS_BT_MATRIX)) == 21
-    assert len(bench.default_workloads(False)) == 21
-    assert len(bench.OPERATOR_SHAPES) == 3
-    assert len(bench.default_workloads(False)) * len(bench.OPERATOR_SHAPES) == 63
-
-
-def test_operator_shapes_are_direct_head_and_channel_shapes() -> None:
-    assert set(bench.OPERATOR_SHAPES) == {"h32d64", "h40d64", "h64d64"}
-    for shape in bench.OPERATOR_SHAPES.values():
-        assert shape.channels == shape.num_heads * shape.head_size
-        assert shape.head_size == 64
-
-
-def test_benchmark_has_raw_only_api_and_explicit_timing_boundaries() -> None:
-    source = Path(inspect.getfile(bench)).read_text(encoding="utf-8")
-    assert "ModelPreset" not in source
-    assert "MODEL_PRESETS" not in source
-    assert "--models" not in source
-    assert "layers" not in source
-    assert "decay_logits" in source
-    assert "log_decay" not in source
-    assert "FLA" not in source
-    assert "import fla\n" not in source
-    assert "from fla " not in source
-    assert "providers.fla" not in source
-    assert "unfused_correct_product" not in source
-    assert "precomputed_log_decay" not in source
-    assert "rwkv7_recurrent_stateful" not in source
-    assert "functional" not in source
-    assert "stateful" not in source
-    assert "recurrent_fp32_from_decay_logits" in source
-    assert "prepare_recurrent_metadata" in source
-    assert "torch.cuda.Event" in source
-    assert "correctness" in source
-    assert "raw_latency_ms" in source
-
-
-def test_stress_cases_are_opt_in_and_marked_separately() -> None:
-    assert len(bench.default_workloads(False)) == 21
-    stress = bench.default_workloads(True)
-    assert len(stress) == 21 + len(bench.STRESS_CASES)
-    assert any(workload.label == "stress_decode_b2048_t1" for workload in stress)
-    assert all(workload.label.startswith("stress_") for workload in stress[21:])

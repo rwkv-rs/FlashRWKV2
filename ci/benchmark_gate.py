@@ -24,21 +24,19 @@ ROOT = Path(
 RUNS = 3
 REGRESSION_LIMIT = 0.002
 BENCHMARKS = {
-    "cmix/mix": ("benchmarks/cmix/mix/bench.py", "iters"),
-    "cmix/sparse": ("benchmarks/cmix/sparse/bench.py", "samples"),
+    "cmix": ("benchmarks/cmix/bench.py", "iters"),
     "embedding": ("benchmarks/embedding/bench.py", "samples"),
     "head/l2wrap_ce": ("benchmarks/head/l2wrap_ce/bench.py", "samples"),
     "head/linear": ("benchmarks/head/linear/bench.py", "samples"),
     "loss/l2wrap_ce": ("benchmarks/loss/l2wrap_ce/bench.py", "samples"),
     "sampling": ("benchmarks/sampling/bench.py", "samples"),
     "tmix/a_gate": ("benchmarks/tmix/a_gate/bench.py", "iters"),
-    "tmix/kk_a_gate": ("benchmarks/tmix/kk_a_gate/bench.py", "samples"),
     "tmix/kk_pre": ("benchmarks/tmix/kk_pre/bench.py", "samples"),
-    "tmix/linear": ("benchmarks/tmix/linear/bench.py", "samples"),
-    "tmix/lnx_rkvres_xg": ("benchmarks/tmix/lnx_rkvres_xg/bench.py", "samples"),
-    "tmix/mix6": ("benchmarks/tmix/mix6/bench.py", "iters"),
-    "tmix/normalization": ("benchmarks/tmix/normalization/bench.py", "samples"),
+    "tmix/readout": ("benchmarks/tmix/readout/bench.py", "samples"),
+    "tmix/tokenshift": ("benchmarks/tmix/tokenshift/bench.py", "iters"),
+    "post_norm": ("benchmarks/post_norm/bench.py", "samples"),
     "tmix/vres_gate": ("benchmarks/tmix/vres_gate/bench.py", "samples"),
+    "tmix/wkv_prepare": ("benchmarks/tmix/wkv_prepare/bench.py", "samples"),
     "tmix/wkv7": ("benchmarks/tmix/wkv7/bench.py", "wkv7"),
     "tmix/wkv7/rl_infctx": (
         "benchmarks/tmix/wkv7/rl_infctx/bench.py",
@@ -544,7 +542,7 @@ def _self_test() -> None:
     def payload(value: float) -> dict[str, Any]:
         return {
             "schema_version": 1,
-            "module": "tmix/linear",
+            "module": "tmix/wkv_prepare",
             "target": "sm120",
             "revision": str(value),
             "environment": environment,
@@ -565,7 +563,7 @@ def _self_test() -> None:
     assert not compare(payload(100.0), payload(100.2000001))["passed"]
     assert statistics.fmean([1.0, 2.0, 6.0]) == 3.0
     candidate = compatibility_candidate(
-        "tmix/linear",
+        "tmix/wkv_prepare",
         {"schema_version": 1, "target": "sm120", "environment": environment},
     )
     _compatible(payload(100.0), candidate)

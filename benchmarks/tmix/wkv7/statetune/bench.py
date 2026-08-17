@@ -8,7 +8,7 @@ import time
 
 import torch
 
-from flashrwkv2.tmix.wkv7.statetune import statetune_recurrent_fp32io16
+from flashrwkv2.tmix.wkv7.statetune import statetune_tmix_wkv7_recurrent_fp32io16
 
 
 def main() -> None:
@@ -28,15 +28,15 @@ def main() -> None:
     starts = torch.tensor([0], device=device, dtype=torch.int32)
     ends = torch.tensor([args.tokens], device=device, dtype=torch.int32)
     for _ in range(args.warmup):
-        statetune_recurrent_fp32io16(state, offsets, starts, ends, *values)
+        statetune_tmix_wkv7_recurrent_fp32io16(state, offsets, starts, ends, *values)
     torch.cuda.synchronize()
     samples = []
     for _ in range(args.samples):
         start = time.perf_counter()
-        statetune_recurrent_fp32io16(state, offsets, starts, ends, *values)
+        statetune_tmix_wkv7_recurrent_fp32io16(state, offsets, starts, ends, *values)
         torch.cuda.synchronize()
         samples.append((time.perf_counter() - start) * 1e6)
-    result = {"operator": "statetune_recurrent_fp32io16", "latency_us": samples, "correctness": "passed-before-timing"}
+    result = {"operator": "statetune_tmix_wkv7_recurrent_fp32io16", "latency_us": samples, "correctness": "passed-before-timing"}
     with open(args.output, "w", encoding="utf-8") as handle:
         json.dump(result, handle, indent=2)
     print(json.dumps(result))

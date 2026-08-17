@@ -139,7 +139,7 @@ jobs:
                       return str(run_id)
               return ""
 
-          quality_name = f"flashrwkv2-sm120-test-{head_sha}"
+          quality_name = f"flashrwkv2-multi-sm-test-{head_sha}"
           release_name = (
               f"flashrwkv2-wheel-{os.environ['VERSION']}-{head_sha}"
           )
@@ -176,7 +176,7 @@ jobs:
           retention-days: 90
 
   wheel:
-    name: Build tested SM120 wheel
+    name: Build tested multi-SM wheel
     needs: prepare
     runs-on: [self-hosted, linux, x64, rwkv-sha-pro6000x8]
     timeout-minutes: 120
@@ -184,7 +184,6 @@ jobs:
       group: flashrwkv2-pro6000-exclusive
       cancel-in-progress: false
     env:
-      TORCH_CUDA_ARCH_LIST: "12.0"
       CUDA_VISIBLE_DEVICES: "0"
     steps:
       - uses: actions/checkout@v4
@@ -209,7 +208,7 @@ jobs:
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}
           run-id: ${{ needs.prepare.outputs.quality_run_id }}
-          name: flashrwkv2-sm120-test-${{ needs.prepare.outputs.head_sha }}
+          name: flashrwkv2-multi-sm-test-${{ needs.prepare.outputs.head_sha }}
           path: reused-quality
       - name: Verify exact tagged source
         env:
@@ -217,7 +216,7 @@ jobs:
         run: |
           test "$(git rev-parse HEAD)" = "$(git rev-list -n 1 "$RELEASE_TAG")"
           test -z "$(git status --short --untracked-files=no)"
-      - name: Resolve or build CPython 3.12 SM120 wheel
+      - name: Resolve or build CPython 3.12 multi-SM wheel
         env:
           HEAD_SHA: ${{ needs.prepare.outputs.head_sha }}
           RELEASE_RUN_ID: ${{ needs.prepare.outputs.release_run_id }}
@@ -340,7 +339,7 @@ jobs:
           )
           print(json.dumps(identity, indent=2))
           PY
-      - name: Upload tested SM120 wheel
+      - name: Upload tested multi-SM wheel
         uses: actions/upload-artifact@v4
         with:
           name: flashrwkv2-wheel-${{ needs.prepare.outputs.version }}-${{ needs.prepare.outputs.head_sha }}

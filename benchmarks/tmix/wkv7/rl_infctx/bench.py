@@ -8,7 +8,7 @@ import time
 
 import torch
 
-from flashrwkv2.tmix.wkv7 import rl_infctx_chunk_fp32io16
+from flashrwkv2.tmix.wkv7 import rl_infctx_tmix_wkv7_chunk_fp32io16
 
 
 def main() -> None:
@@ -29,15 +29,15 @@ def main() -> None:
     cu = torch.arange(0, total + 1, args.tokens, device=device, dtype=torch.int32)
     slots = torch.arange(args.batch, device=device, dtype=torch.int32)
     for _ in range(args.warmup):
-        rl_infctx_chunk_fp32io16(*values, state_pool=pool, cu_seqlens=cu, state_indices=slots)
+        rl_infctx_tmix_wkv7_chunk_fp32io16(*values, state_pool=pool, cu_seqlens=cu, state_indices=slots)
     torch.cuda.synchronize()
     samples = []
     for _ in range(args.samples):
         start = time.perf_counter()
-        rl_infctx_chunk_fp32io16(*values, state_pool=pool, cu_seqlens=cu, state_indices=slots)
+        rl_infctx_tmix_wkv7_chunk_fp32io16(*values, state_pool=pool, cu_seqlens=cu, state_indices=slots)
         torch.cuda.synchronize()
         samples.append((time.perf_counter() - start) * 1e6)
-    result = {"operator": "rl_infctx_chunk_fp32io16", "strategy": "recompute", "latency_us": samples, "correctness": "passed-before-timing"}
+    result = {"operator": "rl_infctx_tmix_wkv7_chunk_fp32io16", "strategy": "recompute", "latency_us": samples, "correctness": "passed-before-timing"}
     with open(args.output, "w", encoding="utf-8") as handle:
         json.dump(result, handle, indent=2)
     print(json.dumps(result))

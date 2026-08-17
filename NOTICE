@@ -33,12 +33,21 @@ The following fused FP16 inference block operators are adapted from
 BlinkDL/Albatross faster3a_2607 commit
 ee3308f6922e59f2166c7fac3c5a192340a2b48e:
 
-- csrc/infer/tmix/infer_common_tmix_fp16_forward_registration.cpp
-- csrc/infer/tmix/infer_common_tmix_fp16_forward.cu
-- csrc/infer/cmix/infer_common_cmix_fp16_forward_registration.cpp
-- csrc/infer/cmix/infer_common_cmix_fp16_forward.cu
-- csrc/infer/elementwise/infer_common_elementwise_fp16_forward_registration.cpp
-- csrc/infer/elementwise/infer_common_elementwise_fp16_forward.cu
+- csrc/sm120/tmix/tokenshift/infer_fp16_forward_varlen.cpp
+- csrc/sm120/tmix/tokenshift/infer_fp16_forward_varlen.cu
+- csrc/sm120/tmix/wkv_prepare/infer_fp16_forward_varlen.cpp
+- csrc/sm120/tmix/wkv_prepare/infer_fp16_forward_varlen.cu
+- csrc/sm120/tmix/wkv_prepare/internal/kk_a_gate/infer_fp16_forward_varlen.cu
+- csrc/sm120/tmix/wkv_prepare/internal/lowrank/infer_fp16_forward_varlen.cu
+- csrc/sm120/tmix/readout/infer_fp16_forward_varlen.cpp
+- csrc/sm120/tmix/readout/infer_fp16_forward_varlen.cu
+- csrc/sm120/cmix/infer_fp16_forward_varlen.cpp
+- csrc/sm120/cmix/infer_fp16_forward_varlen.cu
+- csrc/sm120/cmix/internal/activation/infer_fp16_forward_varlen.cu
+- csrc/sm120/cmix/internal/dense/infer_fp16_forward_varlen.cu
+- csrc/sm120/cmix/internal/sparse/infer_fp16_forward_varlen.cu
+- csrc/sm120/post_norm/infer_fp16_forward_varlen.cpp
+- csrc/sm120/post_norm/infer_fp16_forward_varlen.cu
 
 The already-owned FP16/FP32 WKV recurrence files from that source are not
 duplicated. These derived files are licensed under the Apache License,
@@ -56,18 +65,32 @@ methods adapted from BlinkDL/RWKV-LM commit
 - csrc/statetune/wkv7/statetune_common_recurrent_fp32io16_bindings.cpp
 - csrc/pretrain/wkv7/pretrain_common_head_l2wrap_ce_bf16_forward_registration.cpp
 - csrc/pretrain/wkv7/pretrain_common_head_l2wrap_ce_bf16_forward.cu
-- csrc/pretrain/wkv7/pretrain_common_cmix_bf16_forward_backward_registration.cpp
-- csrc/pretrain/wkv7/pretrain_sm90_cmix_bf16_forward_backward.cu
+- csrc/sm90/cmix/pretrain_bf16_forward.cpp
+- csrc/sm90/cmix/pretrain_bf16_forward.cu
+- csrc/sm90/cmix/pretrain_bf16_backward.cpp
+- csrc/sm90/cmix/pretrain_bf16_backward.cu
+- csrc/sm90/cmix/statetune_bf16_forward.cpp
+- csrc/sm90/cmix/statetune_bf16_forward.cu
+- csrc/sm90/cmix/statetune_bf16_backward.cpp
+- csrc/sm90/cmix/statetune_bf16_backward.cu
 - csrc/pretrain/wkv7/pretrain_common_l2wrap_ce_bf16_forward_backward_registration.cpp
 - csrc/pretrain/wkv7/pretrain_common_l2wrap_ce_bf16_forward_backward.cu
 - csrc/pretrain/wkv7/pretrain_common_tmix_a_gate_bf16_forward_backward_registration.cpp
 - csrc/pretrain/wkv7/pretrain_common_tmix_a_gate_bf16_forward_backward.cu
 - csrc/pretrain/wkv7/pretrain_common_tmix_kk_pre_bf16_forward_backward_registration.cpp
 - csrc/pretrain/wkv7/pretrain_sm90_tmix_kk_pre_bf16_forward_backward.cu
-- csrc/pretrain/wkv7/pretrain_common_tmix_lnx_rkvres_xg_bf16_forward_backward_registration.cpp
-- csrc/pretrain/wkv7/pretrain_common_tmix_lnx_rkvres_xg_bf16_forward_backward.cu
-- csrc/pretrain/wkv7/pretrain_common_tmix_mix6_bf16_forward_backward_registration.cpp
-- csrc/pretrain/wkv7/pretrain_sm90_tmix_mix6_bf16_forward_backward.cu
+- csrc/sm90/tmix/readout/pretrain_bf16_forward.cpp
+- csrc/sm90/tmix/readout/pretrain_bf16_forward.cu
+- csrc/sm90/tmix/readout/pretrain_bf16_backward.cpp
+- csrc/sm90/tmix/readout/pretrain_bf16_backward.cu
+- csrc/sm90/tmix/tokenshift/pretrain_bf16_forward.cpp
+- csrc/sm90/tmix/tokenshift/pretrain_bf16_forward.cu
+- csrc/sm90/tmix/tokenshift/pretrain_bf16_backward.cpp
+- csrc/sm90/tmix/tokenshift/pretrain_bf16_backward.cu
+- csrc/sm90/tmix/tokenshift/statetune_bf16_forward.cpp
+- csrc/sm90/tmix/tokenshift/statetune_bf16_forward.cu
+- csrc/sm90/tmix/tokenshift/statetune_bf16_backward.cpp
+- csrc/sm90/tmix/tokenshift/statetune_bf16_backward.cu
 - csrc/pretrain/wkv7/pretrain_common_tmix_vres_gate_bf16_forward_backward_registration.cpp
 - csrc/pretrain/wkv7/pretrain_common_tmix_vres_gate_bf16_forward_backward.cu
 

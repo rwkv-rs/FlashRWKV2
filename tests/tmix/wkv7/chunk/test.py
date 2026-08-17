@@ -6,8 +6,8 @@ import pytest
 import torch
 
 from flashrwkv2.tmix.wkv7 import (
-    infer_chunk_bf16_forward_varlen,
-    prepare_recurrent_metadata,
+    infer_tmix_wkv7_chunk_bf16_forward_varlen,
+    prepare_tmix_wkv7_recurrent_metadata,
 )
 
 
@@ -53,6 +53,7 @@ def _reference(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.sm120
 def test_chunk_ragged_tail_and_slot_update() -> None:
     torch.manual_seed(11)
     lengths = [1, 9, 17]
@@ -83,7 +84,7 @@ def test_chunk_ragged_tail_and_slot_update() -> None:
         state_indices,
         0.5,
     )
-    output = infer_chunk_bf16_forward_varlen(
+    output = infer_tmix_wkv7_chunk_bf16_forward_varlen(
         r,
         decay_logits,
         k,
@@ -106,26 +107,42 @@ def test_chunk_ragged_tail_and_slot_update() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_chunk_rejects_non_bf16_and_duplicate_slots() -> None:
+@pytest.mark.sm120
+def test_chunk_rejects_non_bf16() -> None:
     device = torch.device("cuda")
     shape = (1, 1, 64)
     tensors = [torch.zeros(shape, device=device, dtype=torch.bfloat16) for _ in range(6)]
     state = torch.zeros((2, 1, 64, 64), device=device, dtype=torch.bfloat16)
-    cu = torch.tensor([0, 1, 2], device=device, dtype=torch.int32)
-    duplicate = torch.tensor([0, 0], device=device, dtype=torch.int32)
+    cu = torch.tensor([0, 1], device=device, dtype=torch.int32)
     with pytest.raises(ValueError, match="bfloat16"):
-        infer_chunk_bf16_forward_varlen(
+        infer_tmix_wkv7_chunk_bf16_forward_varlen(
             tensors[0].float(), *tensors[1:], state_pool=state,
-            cu_seqlens=cu, state_indices=torch.tensor([0, 1], device=device, dtype=torch.int32),
-        )
-    with pytest.raises(RuntimeError):
-        infer_chunk_bf16_forward_varlen(
-            *tensors, state_pool=state, cu_seqlens=cu, state_indices=duplicate,
-            max_seqlen=1,
+            cu_seqlens=cu,
+            state_indices=torch.tensor([0], device=device, dtype=torch.int32),
         )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.sm120
+def test_chunk_rejects_duplicate_slots_without_state_write() -> None:
+    device = torch.device("cuda")
+    shape = (2, 1, 64)
+    tensors = [torch.zeros(shape, device=device, dtype=torch.bfloat16) for _ in range(6)]
+    state = torch.randn((2, 1, 64, 64), device=device, dtype=torch.bfloat16)
+    before = state.clone()
+    cu = torch.tensor([0, 1, 2], device=device, dtype=torch.int32)
+    duplicate = torch.tensor([0, 0], device=device, dtype=torch.int32)
+    with pytest.raises(RuntimeError, match="unique"):
+        infer_tmix_wkv7_chunk_bf16_forward_varlen(
+            *tensors, state_pool=state, cu_seqlens=cu, state_indices=duplicate,
+            max_seqlen=1,
+        )
+    assert torch.equal(state, before)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.sm120
+@pytest.mark.cuda_graph
 def test_chunk_cuda_graph_consumes_live_metadata_ticket() -> None:
     torch.manual_seed(23)
     device = torch.device("cuda")
@@ -144,7 +161,7 @@ def test_chunk_cuda_graph_consumes_live_metadata_ticket() -> None:
     num_active_tokens = torch.tensor([3], device=device, dtype=torch.int32)
     num_active_sequences = torch.tensor([2], device=device, dtype=torch.int32)
 
-    infer_chunk_bf16_forward_varlen(
+    infer_tmix_wkv7_chunk_bf16_forward_varlen(
         *inputs,
         state_pool=initial_state.clone(),
         cu_seqlens=cu_seqlens,
@@ -156,7 +173,7 @@ def test_chunk_cuda_graph_consumes_live_metadata_ticket() -> None:
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        ticket = prepare_recurrent_metadata(
+        ticket = prepare_tmix_wkv7_recurrent_metadata(
             cu_seqlens,
             state_indices,
             state_pool_size=num_slots,
@@ -166,7 +183,7 @@ def test_chunk_cuda_graph_consumes_live_metadata_ticket() -> None:
             num_active_tokens=num_active_tokens,
             num_active_sequences=num_active_sequences,
         )
-        output = infer_chunk_bf16_forward_varlen(
+        output = infer_tmix_wkv7_chunk_bf16_forward_varlen(
             *inputs,
             state_pool=state,
             cu_seqlens=cu_seqlens,

@@ -165,7 +165,7 @@ def infer_sampling_temperature_topk_topp_forward_varlen(
     scalar_top_k = _scalar(top_k, "top_k")
     scalar_top_p = _scalar(top_p, "top_p")
     if None not in (scalar_temperature, scalar_top_k, scalar_top_p):
-        return _extension().sampling_temperature_topk_topp_scalar(
+        return _extension().sampling_temperature_topk_topp_forward_varlen(
             logits,
             states,
             slot_indices,
@@ -176,7 +176,7 @@ def infer_sampling_temperature_topk_topp_forward_varlen(
             active_samples,
         )
     batch_size = logits.shape[0]
-    return _extension().sampling_temperature_topk_topp_per_request(
+    return _extension().sampling_temperature_topk_topp_forward_varlen(
         logits,
         states,
         slot_indices,
@@ -250,7 +250,7 @@ def infer_sampling_six_parameter_forward_varlen(
     )
     scalars = tuple(_scalar(value, name) for value, name in zip(values, names, strict=True))
     if all(value is not None for value in scalars):
-        return _extension().sampling_six_parameter_scalar(
+        return _extension().sampling_six_parameter_forward_varlen(
             logits,
             penalties,
             states,
@@ -276,7 +276,7 @@ def infer_sampling_six_parameter_forward_varlen(
         )
         for value, name in zip(values, names, strict=True)
     )
-    return _extension().sampling_six_parameter_per_request(
+    return _extension().sampling_six_parameter_forward_varlen(
         logits,
         penalties,
         states,

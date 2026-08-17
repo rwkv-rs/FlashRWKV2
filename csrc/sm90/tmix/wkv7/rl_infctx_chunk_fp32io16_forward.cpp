@@ -155,7 +155,7 @@ void check_decay_bias(
 
 }  // namespace
 
-py::tuple rl_infctx_chunk_fp32io16_forward(
+py::tuple rl_infctx_tmix_wkv7_chunk_fp32io16_forward(
     torch::Tensor sequence_chunk_offsets,
     torch::Tensor chunk_token_starts,
     torch::Tensor chunk_token_ends,
@@ -229,10 +229,10 @@ py::tuple rl_infctx_chunk_fp32io16_forward(
   return py::make_tuple(output, working_state);
 }
 
-void register_rl_infctx_forward_bindings(py::module_& module) {
+void register_rl_infctx_tmix_wkv7_chunk_forward_bindings(py::module_& module) {
   module.def(
-      "rl_infctx_chunk_fp32io16_forward",
-      &rl_infctx_chunk_fp32io16_forward,
+      "rl_infctx_tmix_wkv7_chunk_fp32io16_forward",
+      &rl_infctx_tmix_wkv7_chunk_fp32io16_forward,
       "RL/Infctx raw-decay chunk forward",
       py::arg("sequence_chunk_offsets"), py::arg("chunk_token_starts"),
       py::arg("chunk_token_ends"), py::arg("state"), py::arg("r"),

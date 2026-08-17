@@ -62,7 +62,7 @@ class KernelSpec:
 
 KERNEL_SPEC = KernelSpec(
     provider="Albatross",
-    name="infer_recurrent_fp32io16_forward_varlen",
+    name="infer_tmix_wkv7_recurrent_fp32io16_forward_varlen",
     layouts=("packed",),
     state_dtype="float32",
     token_dtypes=("float16", "bfloat16"),
@@ -408,14 +408,14 @@ def _run_public_correctness(
         state_indices=state_indices,
         decay_bias=decay_bias,
     )
-    ticket = flashrwkv2.prepare_recurrent_metadata(
+    ticket = flashrwkv2.prepare_tmix_wkv7_recurrent_metadata(
         cu_seqlens,
         state_indices,
         total_tokens=r.shape[0],
         state_pool_size=state_pool.shape[0],
     )
     observed_state = state_pool.clone()
-    observed_output = flashrwkv2.infer_recurrent_fp32io16_forward_varlen(
+    observed_output = flashrwkv2.infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
         r,
         decay_logits,
         k,
@@ -460,7 +460,7 @@ def _run_public_correctness(
 
     # A second launch with an identical reset state is the deterministic check.
     deterministic_state = state_pool.clone()
-    deterministic_output = flashrwkv2.infer_recurrent_fp32io16_forward_varlen(
+    deterministic_output = flashrwkv2.infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
         r,
         decay_logits,
         k,
@@ -527,7 +527,7 @@ def _timed_native_launch(
     extension = flashrwkv2._C
     if extension is None:
         raise RuntimeError("flashrwkv2._C is not loaded")
-    extension.recurrent_fp32_from_decay_logits(
+    extension.tmix_wkv7_recurrent_fp32_from_decay_logits(
         cu_seqlens,
         state_indices,
         state,
@@ -783,7 +783,7 @@ def main(argv: list[str] | None = None) -> int:
                     r = inputs["r"]
                     assert isinstance(state_pool, torch.Tensor)
                     assert isinstance(r, torch.Tensor)
-                    ticket = flashrwkv2.prepare_recurrent_metadata(
+                    ticket = flashrwkv2.prepare_tmix_wkv7_recurrent_metadata(
                         inputs["cu_seqlens"],
                         inputs["state_indices"],
                         total_tokens=r.shape[0],

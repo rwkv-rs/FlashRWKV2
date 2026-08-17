@@ -54,13 +54,6 @@ inline int64_t ceil_div(int64_t n, int64_t d) {
   return (n + d - 1) / d;
 }
 
-__global__ void advance_i32_kernel(int* __restrict__ x, int amount, int64_t n) {
-  const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (i < n) {
-    x[i] += amount;
-  }
-}
-
 // Varlen adaptation of the same Albatross advance_i32 body.  Metadata
 // validation is produced on the same stream; an invalid ticket leaves every
 // elapsed slot untouched, just like the recurrent output/state kernels.
@@ -79,48 +72,6 @@ __global__ void advance_i32_varlen_kernel(
   const int token_count =
       query_start_loc[sequence_index + 1] - query_start_loc[sequence_index];
   elapsed_state[state_indices[sequence_index]] += token_count;
-}
-
-// Exact Albatross add_vec_kernel.  This helper is tokenwise, so packed rows
-// are already the complete varlen adaptation and no request metadata is read.
-__global__ void recurrent_add_vec_kernel(
-    int C,
-    const half* __restrict__ x,
-    const half* __restrict__ vec,
-    half* __restrict__ out,
-    int64_t total_pairs) {
-  const int64_t pair_idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (pair_idx >= total_pairs) {
-    return;
-  }
-  const int c = static_cast<int>((pair_idx % (C >> 1)) << 1);
-  const int64_t idx = pair_idx * 2;
-  const float2 x_value = __half22float2(*reinterpret_cast<const half2*>(x + idx));
-  const float2 vec_value = __half22float2(*reinterpret_cast<const half2*>(vec + c));
-  *reinterpret_cast<half2*>(out + idx) =
-      __floats2half2_rn(x_value.x + vec_value.x, x_value.y + vec_value.y);
-}
-
-// Exact Albatross add_vec_2d_kernel.  The row index removes the flat modulo
-// from each half2 owner; the caller-owned tuned guard below admits only the
-// canonical C=4096,row window.
-__global__ void recurrent_add_vec_2d_kernel(
-    int C,
-    const half* __restrict__ x,
-    const half* __restrict__ vec,
-    half* __restrict__ out) {
-  const int c_pair = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const int c_pairs = C >> 1;
-  if (c_pair >= c_pairs) {
-    return;
-  }
-  const int64_t row = blockIdx.y;
-  const int c = c_pair << 1;
-  const int64_t idx = row * C + c;
-  const float2 x_value = __half22float2(*reinterpret_cast<const half2*>(x + idx));
-  const float2 vec_value = __half22float2(*reinterpret_cast<const half2*>(vec + c));
-  *reinterpret_cast<half2*>(out + idx) =
-      __floats2half2_rn(x_value.x + vec_value.x, x_value.y + vec_value.y);
 }
 
 template <int Bytes>
@@ -1233,19 +1184,6 @@ void dispatch_fp16_family(
 
 }  // namespace
 
-void recurrent_fp16_advance_i32_cuda(torch::Tensor x, int64_t amount) {
-  TORCH_CHECK(amount >= INT_MIN && amount <= INT_MAX,
-              "advance_i32 amount out of int range");
-  constexpr int threads = 256;
-  const int64_t n = x.numel();
-  TORCH_CHECK(n > 0, "advance_i32 requires a non-empty state tensor");
-  const c10::cuda::CUDAGuard device_guard(x.device());
-  auto stream = at::cuda::getCurrentCUDAStream();
-  advance_i32_kernel<<<static_cast<int>(ceil_div(n, threads)), threads, 0, stream>>>(
-      x.data_ptr<int>(), static_cast<int>(amount), n);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-}
-
 void recurrent_fp16_advance_i32_varlen_cuda(
     torch::Tensor query_start_loc,
     torch::Tensor state_indices,
@@ -1263,43 +1201,7 @@ void recurrent_fp16_advance_i32_varlen_cuda(
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-torch::Tensor recurrent_add_vec_forward_varlen_cuda(
-    torch::Tensor x, torch::Tensor vec) {
-  const int C = static_cast<int>(x.size(1));
-  const int64_t rows = x.size(0);
-  auto out = at::empty_like(x);
-  constexpr int threads = 256;
-  auto stream = at::cuda::getCurrentCUDAStream();
-  if (C == 4096 && rows >= 17 && rows <= 65535) {
-    recurrent_add_vec_2d_kernel<<<
-        dim3(static_cast<unsigned int>((C / 2 + threads - 1) / threads),
-             static_cast<unsigned int>(rows),
-        1),
-        threads,
-        0,
-        stream>>>(
-        C,
-        reinterpret_cast<const half*>(x.data_ptr()),
-        reinterpret_cast<const half*>(vec.data_ptr()),
-        reinterpret_cast<half*>(out.data_ptr()));
-  } else {
-    const int64_t total_pairs = x.numel() / 2;
-    recurrent_add_vec_kernel<<<
-        static_cast<int>((total_pairs + threads - 1) / threads),
-        threads,
-        0,
-        stream>>>(
-        C,
-        reinterpret_cast<const half*>(x.data_ptr()),
-        reinterpret_cast<const half*>(vec.data_ptr()),
-        reinterpret_cast<half*>(out.data_ptr()),
-        total_pairs);
-  }
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-  return out;
-}
-
-void recurrent_fp16_from_decay_logits_cuda(
+void tmix_wkv7_recurrent_fp16_from_decay_logits_cuda(
     torch::Tensor query_start_loc,
     torch::Tensor state_indices,
     torch::Tensor elapsed_state,

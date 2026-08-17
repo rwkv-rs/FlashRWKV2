@@ -10,11 +10,11 @@ from . import (
     _check_metadata_inputs,
     _extension,
     _resolve_max_seqlen,
-    prepare_recurrent_metadata,
+    prepare_tmix_wkv7_recurrent_metadata,
 )
 
 
-def infer_chunk_bf16_forward_varlen(
+def infer_tmix_wkv7_chunk_bf16_forward_varlen(
     r: torch.Tensor,
     decay_logits: torch.Tensor,
     k: torch.Tensor,
@@ -92,7 +92,7 @@ def infer_chunk_bf16_forward_varlen(
     ticket = (
         validated_metadata
         if validated_metadata is not None
-        else prepare_recurrent_metadata(
+        else prepare_tmix_wkv7_recurrent_metadata(
             cu_seqlens,
             state_indices,
             total_tokens=r.shape[0],
@@ -109,7 +109,7 @@ def infer_chunk_bf16_forward_varlen(
             or decay_bias.shape not in {(r.shape[1], 64), (r.shape[1] * 64,)}
         ):
             raise ValueError("decay_bias must be contiguous CUDA bfloat16 [H,64] or [H*64]")
-    output, _ = _extension().infer_chunk_bf16_forward_varlen(
+    output, _ = _extension().infer_tmix_wkv7_chunk_bf16_forward_varlen(
         r,
         decay_logits,
         k,
@@ -128,4 +128,4 @@ def infer_chunk_bf16_forward_varlen(
     return output
 
 
-__all__ = ["infer_chunk_bf16_forward_varlen"]
+__all__ = ["infer_tmix_wkv7_chunk_bf16_forward_varlen"]

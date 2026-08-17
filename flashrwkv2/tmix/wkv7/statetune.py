@@ -100,7 +100,7 @@ class _StateTune(torch.autograd.Function):
             dtype=torch.float32,
         )
         state_dot_a = torch.empty_like(r, dtype=torch.float32)
-        _extension().statetune_recurrent_fp32io16_forward(
+        _extension().statetune_tmix_wkv7_recurrent_fp32io16_forward(
             sequence_chunk_offsets,
             chunk_token_starts,
             chunk_token_ends,
@@ -160,7 +160,7 @@ class _StateTune(torch.autograd.Function):
             torch.empty_like(b),
             torch.empty_like(final_state),
         ]
-        _extension().statetune_recurrent_fp32io16_backward(
+        _extension().statetune_tmix_wkv7_recurrent_fp32io16_backward(
             sequence_chunk_offsets,
             chunk_token_starts,
             chunk_token_ends,
@@ -199,7 +199,7 @@ class _StateTune(torch.autograd.Function):
         )
 
 
-def statetune_recurrent_fp32io16(
+def statetune_tmix_wkv7_recurrent_fp32io16(
     initial_state,
     sequence_chunk_offsets,
     chunk_token_starts,
@@ -236,4 +236,4 @@ def statetune_recurrent_fp32io16(
     )
 
 
-__all__ = ["statetune_recurrent_fp32io16"]
+__all__ = ["statetune_tmix_wkv7_recurrent_fp32io16"]

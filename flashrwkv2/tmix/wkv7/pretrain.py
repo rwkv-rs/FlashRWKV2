@@ -113,7 +113,7 @@ class _PretrainRecurrent(torch.autograd.Function):
         return tuple(gradient.view(batch, tokens, channels) for gradient in gradients) + (None,)
 
 
-def pretrain_recurrent_bf16(
+def pretrain_tmix_wkv7_recurrent_bf16(
     r: torch.Tensor,
     w: torch.Tensor,
     k: torch.Tensor,
@@ -129,4 +129,4 @@ def pretrain_recurrent_bf16(
     return _PretrainRecurrent.apply(r, w, k, v, a, b, head_size)
 
 
-__all__ = ["pretrain_recurrent_bf16"]
+__all__ = ["pretrain_tmix_wkv7_recurrent_bf16"]

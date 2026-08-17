@@ -48,7 +48,7 @@ struct BackwardShared {
 
 template <typename io_t>
 __global__ __launch_bounds__(kHeadSize, 1)
-void statetune_recurrent_fp32io16_backward_kernel(
+void statetune_tmix_wkv7_recurrent_fp32io16_backward_kernel(
     int num_heads,
     const int* __restrict__ sequence_chunk_offsets,
     const int* __restrict__ chunk_token_starts,
@@ -316,7 +316,7 @@ __device__ __forceinline__ Reduction3 block_sum3(
 
 template <int HeadSize, typename io_t>
 __global__ __launch_bounds__(HeadSize, 1)
-void statetune_recurrent_fp32io16_backward_large_kernel(
+void statetune_tmix_wkv7_recurrent_fp32io16_backward_large_kernel(
     int num_heads,
     const int* __restrict__ sequence_chunk_offsets,
     const int* __restrict__ chunk_token_starts,
@@ -502,7 +502,7 @@ void statetune_recurrent_fp32io16_backward_large_kernel(
 }
 
 template <int HeadSize, typename io_t>
-void launch_statetune_recurrent_fp32io16_backward(
+void launch_statetune_tmix_wkv7_recurrent_fp32io16_backward(
     int num_sequences,
     int num_heads,
     const torch::Tensor& sequence_chunk_offsets,
@@ -529,7 +529,7 @@ void launch_statetune_recurrent_fp32io16_backward(
     float scale,
     cudaStream_t stream) {
   if constexpr (HeadSize == kHeadSize) {
-    statetune_recurrent_fp32io16_backward_kernel<io_t>
+    statetune_tmix_wkv7_recurrent_fp32io16_backward_kernel<io_t>
         <<<dim3(num_heads, num_sequences), HeadSize, 0, stream>>>(
             num_heads,
             sequence_chunk_offsets.data_ptr<int>(),
@@ -561,7 +561,7 @@ void launch_statetune_recurrent_fp32io16_backward(
                 : nullptr,
             scale);
   } else {
-    statetune_recurrent_fp32io16_backward_large_kernel<HeadSize, io_t>
+    statetune_tmix_wkv7_recurrent_fp32io16_backward_large_kernel<HeadSize, io_t>
         <<<dim3(num_heads, num_sequences), HeadSize, 0, stream>>>(
             num_heads,
             sequence_chunk_offsets.data_ptr<int>(),
@@ -597,7 +597,7 @@ void launch_statetune_recurrent_fp32io16_backward(
 
 }  // namespace
 
-void statetune_recurrent_fp32io16_backward_cuda_impl(
+void statetune_tmix_wkv7_recurrent_fp32io16_backward_cuda_impl(
     torch::Tensor sequence_chunk_offsets,
     torch::Tensor chunk_token_starts,
     torch::Tensor chunk_token_ends,
@@ -630,10 +630,10 @@ void statetune_recurrent_fp32io16_backward_cuda_impl(
       at::ScalarType::Half,
       at::ScalarType::BFloat16,
       r.scalar_type(),
-      "flashrwkv2_statetune_recurrent_fp32io16_backward",
+      "flashrwkv2_statetune_tmix_wkv7_recurrent_fp32io16_backward",
       [&] {
         const auto launch = [&]<int HeadSize>() {
-          launch_statetune_recurrent_fp32io16_backward<HeadSize, scalar_t>(
+          launch_statetune_tmix_wkv7_recurrent_fp32io16_backward<HeadSize, scalar_t>(
               num_sequences,
               num_heads,
               sequence_chunk_offsets,
@@ -675,7 +675,7 @@ void statetune_recurrent_fp32io16_backward_cuda_impl(
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-void statetune_recurrent_fp32io16_backward_cuda(
+void statetune_tmix_wkv7_recurrent_fp32io16_backward_cuda(
     torch::Tensor sequence_chunk_offsets,
     torch::Tensor chunk_token_starts,
     torch::Tensor chunk_token_ends,
@@ -698,7 +698,7 @@ void statetune_recurrent_fp32io16_backward_cuda(
     torch::Tensor grad_b,
     torch::Tensor grad_initial_state,
     double scale) {
-  statetune_recurrent_fp32io16_backward_cuda_impl(
+  statetune_tmix_wkv7_recurrent_fp32io16_backward_cuda_impl(
       sequence_chunk_offsets, chunk_token_starts, chunk_token_ends,
       final_state, r, decay_logits, k, v, a, b, state_dot_a, grad_output,
       grad_final_state, boundary, grad_r, grad_decay_logits, grad_k, grad_v,

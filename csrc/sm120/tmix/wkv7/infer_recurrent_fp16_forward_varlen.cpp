@@ -12,11 +12,10 @@
 
 #include <cstdint>
 #include <cmath>
-#include <limits>
 #include <optional>
 #include <utility>
 
-void recurrent_fp16_from_decay_logits_cuda(
+void tmix_wkv7_recurrent_fp16_from_decay_logits_cuda(
     torch::Tensor query_start_loc,
     torch::Tensor state_indices,
     torch::Tensor elapsed_state,
@@ -32,15 +31,11 @@ void recurrent_fp16_from_decay_logits_cuda(
     torch::Tensor metadata_status,
     double scale,
     int64_t max_seqlen);
-void recurrent_fp16_advance_i32_cuda(torch::Tensor x, int64_t amount);
 void recurrent_fp16_advance_i32_varlen_cuda(
     torch::Tensor query_start_loc,
     torch::Tensor state_indices,
     torch::Tensor elapsed_state,
     torch::Tensor metadata_status);
-torch::Tensor recurrent_add_vec_forward_varlen_cuda(
-    torch::Tensor x, torch::Tensor vec);
-
 using flashrwkv2::validation::check_cuda_contiguous;
 using flashrwkv2::validation::check_same_device;
 using flashrwkv2::validation::prepare_recurrent_metadata_cuda;
@@ -126,88 +121,7 @@ void check_fp16_recurrent_layout(
 
 }  // namespace
 
-void recurrent_fp16_advance_i32(torch::Tensor x, int64_t amount) {
-  check_cuda_contiguous(x, "elapsed state");
-  TORCH_CHECK(x.scalar_type() == torch::kInt32,
-              "elapsed state must be contiguous CUDA int32");
-  TORCH_CHECK(x.numel() > 0, "elapsed state must be non-empty");
-  recurrent_fp16_advance_i32_cuda(x, amount);
-}
-
-void recurrent_fp16_advance_i32_varlen(
-    torch::Tensor query_start_loc,
-    torch::Tensor state_indices,
-    torch::Tensor elapsed_state,
-    int64_t total_tokens,
-    py::object validated_metadata) {
-  check_cuda_contiguous(query_start_loc, "query_start_loc");
-  check_cuda_contiguous(state_indices, "state_indices");
-  check_cuda_contiguous(elapsed_state, "elapsed_state_pool");
-  check_same_device(elapsed_state, query_start_loc, "query_start_loc");
-  check_same_device(elapsed_state, state_indices, "state_indices");
-  TORCH_CHECK(
-      query_start_loc.scalar_type() == torch::kInt32 &&
-          state_indices.scalar_type() == torch::kInt32 &&
-          elapsed_state.scalar_type() == torch::kInt32,
-      "varlen elapsed metadata must be contiguous CUDA int32");
-  TORCH_CHECK(
-      query_start_loc.dim() == 1 && state_indices.dim() == 1 &&
-          state_indices.numel() > 0 &&
-          query_start_loc.numel() == state_indices.numel() + 1,
-      "query_start_loc must have shape [B+1] and state_indices shape [B]");
-  TORCH_CHECK(
-      state_indices.numel() <= 65535,
-      "state_indices must contain at most 65535 sequences");
-  TORCH_CHECK(
-      elapsed_state.dim() == 1 && elapsed_state.size(0) > 0 &&
-          total_tokens > 0 &&
-          total_tokens <= std::numeric_limits<int32_t>::max(),
-      "invalid varlen elapsed state or total_tokens");
-
-  torch::Tensor launch_query_start_loc = query_start_loc;
-  torch::Tensor launch_state_indices = state_indices;
-  torch::Tensor metadata_status;
-  if (!validated_metadata.is_none()) {
-    validated_metadata.attr("_check_compatible")(
-        query_start_loc, state_indices, total_tokens, elapsed_state.size(0),
-        -1);
-    launch_query_start_loc = validated_metadata
-        .attr("_query_start_loc_snapshot")()
-        .cast<torch::Tensor>();
-    launch_state_indices = validated_metadata
-        .attr("_state_indices_snapshot")()
-        .cast<torch::Tensor>();
-    metadata_status = validated_metadata.attr("_status")().cast<torch::Tensor>();
-  } else {
-    auto prepared = prepare_recurrent_metadata_cuda(
-        query_start_loc, state_indices, total_tokens, elapsed_state.size(0));
-    launch_query_start_loc = std::move(prepared.query_start_loc);
-    launch_state_indices = std::move(prepared.state_indices);
-    metadata_status = std::move(prepared.status);
-  }
-  recurrent_fp16_advance_i32_varlen_cuda(
-      launch_query_start_loc, launch_state_indices, elapsed_state,
-      metadata_status);
-}
-
-torch::Tensor recurrent_add_vec_forward_varlen(
-    torch::Tensor x, torch::Tensor vec) {
-  check_cuda_contiguous(x, "x");
-  check_cuda_contiguous(vec, "vec");
-  check_same_device(x, vec, "vec");
-  TORCH_CHECK(
-      x.scalar_type() == torch::kFloat16 && vec.scalar_type() == torch::kFloat16,
-      "x and vec must be float16");
-  TORCH_CHECK(
-      x.dim() == 2 && x.size(0) > 0 && x.size(1) > 0 && (x.size(1) % 2) == 0,
-      "x must have packed shape [total_tokens,C] with even C");
-  TORCH_CHECK(
-      vec.dim() == 1 && vec.size(0) == x.size(1),
-      "vec must have shape [C]");
-  return recurrent_add_vec_forward_varlen_cuda(x, vec);
-}
-
-void recurrent_fp16_from_decay_logits(
+void tmix_wkv7_recurrent_fp16_from_decay_logits(
     torch::Tensor query_start_loc,
     torch::Tensor state_indices,
     torch::Tensor elapsed_state,
@@ -263,33 +177,19 @@ void recurrent_fp16_from_decay_logits(
     launch_state_indices = std::move(prepared.state_indices);
     metadata_status = std::move(prepared.status);
   }
-  recurrent_fp16_from_decay_logits_cuda(
+  tmix_wkv7_recurrent_fp16_from_decay_logits_cuda(
       launch_query_start_loc, launch_state_indices, elapsed_state, state, r,
       decay_logits, decay_bias.value_or(torch::Tensor()), k, v, a, b, output,
       metadata_status, scale, max_seqlen);
+  recurrent_fp16_advance_i32_varlen_cuda(
+      launch_query_start_loc, launch_state_indices, elapsed_state,
+      metadata_status);
 }
 
-void register_infer_recurrent_fp16_bindings(py::module_& module) {
+void register_infer_tmix_wkv7_recurrent_fp16_bindings(py::module_& module) {
   module.def(
-      "recurrent_fp16_advance_i32",
-      &recurrent_fp16_advance_i32,
-      "Advance the canonical FP16 recurrent elapsed/dither state",
-      py::arg("elapsed_state"), py::arg("amount"));
-  module.def(
-      "recurrent_fp16_advance_i32_varlen",
-      &recurrent_fp16_advance_i32_varlen,
-      "Advance selected FP16 recurrent elapsed/dither slots by packed lengths",
-      py::arg("query_start_loc"), py::arg("state_indices"),
-      py::arg("elapsed_state_pool"), py::arg("total_tokens"),
-      py::arg("validated_metadata") = py::none());
-  module.def(
-      "recurrent_add_vec_forward_varlen",
-      &recurrent_add_vec_forward_varlen,
-      "Packed Albatross WKV pre-add-vector helper",
-      py::arg("x"), py::arg("vec"));
-  module.def(
-      "recurrent_fp16_from_decay_logits",
-      &recurrent_fp16_from_decay_logits,
+      "tmix_wkv7_recurrent_fp16_from_decay_logits",
+      &tmix_wkv7_recurrent_fp16_from_decay_logits,
       "Albatross-first packed recurrent forward with FP16 state",
       py::arg("query_start_loc"), py::arg("state_indices"),
       py::arg("elapsed_state_pool"), py::arg("state"), py::arg("r"),

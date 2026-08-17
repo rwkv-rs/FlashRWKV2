@@ -18,7 +18,7 @@
 #include <utility>
 #include <vector>
 
-void recurrent_fp32_from_decay_logits_cuda(
+void tmix_wkv7_recurrent_fp32_from_decay_logits_cuda(
     torch::Tensor query_start_loc,
     torch::Tensor state_indices,
     torch::Tensor state,
@@ -224,7 +224,7 @@ class RecurrentMetadataTicket final {
   cudaStream_t stream_;
 };
 
-std::shared_ptr<RecurrentMetadataTicket> prepare_recurrent_metadata(
+std::shared_ptr<RecurrentMetadataTicket> prepare_tmix_wkv7_recurrent_metadata(
     torch::Tensor query_start_loc,
     torch::Tensor state_indices,
     int64_t total_tokens,
@@ -274,7 +274,7 @@ std::shared_ptr<RecurrentMetadataTicket> prepare_recurrent_metadata(
       total_tokens, state_pool_size, max_seqlen, false, stream);
 }
 
-std::shared_ptr<RecurrentMetadataTicket> prepare_recurrent_graph_metadata(
+std::shared_ptr<RecurrentMetadataTicket> prepare_tmix_wkv7_recurrent_graph_metadata(
     torch::Tensor query_start_loc,
     torch::Tensor state_indices,
     torch::Tensor num_active_tokens,
@@ -327,7 +327,7 @@ std::shared_ptr<RecurrentMetadataTicket> prepare_recurrent_graph_metadata(
 
 }  // namespace
 
-void recurrent_fp32_from_decay_logits(
+void tmix_wkv7_recurrent_fp32_from_decay_logits(
     torch::Tensor query_start_loc,
     torch::Tensor state_indices,
     torch::Tensor state,
@@ -380,13 +380,13 @@ void recurrent_fp32_from_decay_logits(
     metadata_status = std::move(prepared.status);
   }
 
-  recurrent_fp32_from_decay_logits_cuda(
+  tmix_wkv7_recurrent_fp32_from_decay_logits_cuda(
       launch_query_start_loc, launch_state_indices, state, r, decay_logits,
       decay_bias.value_or(torch::Tensor()), k, v, a, b, output,
       metadata_status, scale, max_seqlen);
 }
 
-void register_infer_recurrent_bindings(py::module_& module) {
+void register_infer_tmix_wkv7_recurrent_fp32io16_bindings(py::module_& module) {
   py::class_<
       RecurrentMetadataTicket,
       std::shared_ptr<RecurrentMetadataTicket>>(
@@ -433,21 +433,21 @@ void register_infer_recurrent_bindings(py::module_& module) {
             return ticket->num_active_sequences();
           });
   module.def(
-      "prepare_recurrent_metadata", &prepare_recurrent_metadata,
+      "prepare_tmix_wkv7_recurrent_metadata", &prepare_tmix_wkv7_recurrent_metadata,
       "Prepare packed recurrent metadata for same-stream reuse",
       py::arg("query_start_loc"), py::arg("state_indices"),
       py::arg("total_tokens"), py::arg("state_pool_size"),
       py::arg("max_seqlen") = -1);
   module.def(
-      "prepare_recurrent_graph_metadata", &prepare_recurrent_graph_metadata,
+      "prepare_tmix_wkv7_recurrent_graph_metadata", &prepare_tmix_wkv7_recurrent_graph_metadata,
       "Prepare live packed recurrent metadata for warmup or CUDA Graph capture",
       py::arg("query_start_loc"), py::arg("state_indices"),
       py::arg("num_active_tokens"), py::arg("num_active_sequences"),
       py::arg("token_capacity"), py::arg("sequence_capacity"),
       py::arg("state_pool_size"), py::arg("max_seqlen_capacity"));
   module.def(
-      "recurrent_fp32_from_decay_logits",
-      &recurrent_fp32_from_decay_logits,
+      "tmix_wkv7_recurrent_fp32_from_decay_logits",
+      &tmix_wkv7_recurrent_fp32_from_decay_logits,
       "FlashRWKV2 recurrent forward with fused raw decay logits and FP32 state",
       py::arg("query_start_loc"), py::arg("state_indices"),
       py::arg("state"), py::arg("r"), py::arg("decay_logits"),
