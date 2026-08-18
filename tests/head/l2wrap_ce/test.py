@@ -11,6 +11,7 @@ from flashrwkv2.head.l2wrap_ce import pretrain_head_l2wrap_ce_bf16
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.sm90
+@pytest.mark.memcheck
 @pytest.mark.parametrize("chunk_rows", (1, 2))
 def test_head_l2wrap_forward_backward(chunk_rows: int) -> None:
     torch.manual_seed(29)

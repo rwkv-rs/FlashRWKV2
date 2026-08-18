@@ -54,6 +54,8 @@ def _reference(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.sm120
+@pytest.mark.memcheck
+@pytest.mark.racecheck
 def test_chunk_ragged_tail_and_slot_update() -> None:
     torch.manual_seed(11)
     lengths = [1, 9, 17]
@@ -171,6 +173,17 @@ def test_chunk_cuda_graph_consumes_live_metadata_ticket() -> None:
     )
     torch.cuda.synchronize()
 
+    expected_state = initial_state.clone()
+    expected_output = infer_tmix_wkv7_chunk_bf16_forward_varlen(
+        *inputs,
+        state_pool=expected_state,
+        cu_seqlens=cu_seqlens,
+        state_indices=state_indices,
+        chunk_size=2,
+        max_seqlen=2,
+    )
+    torch.cuda.synchronize()
+
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         ticket = prepare_tmix_wkv7_recurrent_metadata(
@@ -194,11 +207,8 @@ def test_chunk_cuda_graph_consumes_live_metadata_ticket() -> None:
 
     graph.replay()
     torch.cuda.synchronize()
-    assert torch.isfinite(output).all()
-    assert not torch.equal(state[3], initial_state[3])
-    assert not torch.equal(state[1], initial_state[1])
-    assert torch.equal(state[0], initial_state[0])
-    assert torch.equal(state[2], initial_state[2])
+    assert torch.equal(output, expected_output)
+    assert torch.equal(state, expected_state)
 
     state.copy_(initial_state)
     cu_seqlens.copy_(torch.tensor([0, 2, -1], device=device, dtype=torch.int32))

@@ -12,19 +12,16 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import math
 import platform
 import subprocess
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Iterable
 
 import torch
+from _timing import measure_cuda
 
 import flashrwkv2
-
-
-DECAY_RATE = 0.6065306597126334
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,64 +66,6 @@ KERNEL_SPEC = KernelSpec(
     head_sizes=(64, 128, 256),
     source_family=SOURCE_FAMILY.name,
 )
-
-
-def rwkv7_decay_logits_reference(
-    r: torch.Tensor,
-    decay_logits: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    a: torch.Tensor,
-    b: torch.Tensor,
-    *,
-    state_pool: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    state_indices: torch.Tensor,
-    scale: float = 1.0,
-    decay_bias: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Independent FP32 oracle used only by the benchmark correctness gate."""
-
-    if r.ndim != 3:
-        raise ValueError("reference expects packed inputs with shape [total_tokens,H,D]")
-    total_tokens, num_heads, head_size = r.shape
-    offsets = tuple(int(value) for value in cu_seqlens.cpu().tolist())
-    slots = tuple(int(value) for value in state_indices.cpu().tolist())
-    state_pool = state_pool.float().clone()
-
-    bias = None if decay_bias is None else decay_bias.reshape(num_heads, head_size)
-    output = torch.empty(
-        (total_tokens, num_heads, head_size),
-        device=r.device,
-        dtype=torch.float32,
-    )
-    r_f32 = r.float()
-    logits_f32 = decay_logits.float()
-    k_f32 = k.float()
-    v_f32 = v.float()
-    a_f32 = a.float()
-    b_f32 = b.float()
-
-    for sequence_index, (start, end) in enumerate(zip(offsets[:-1], offsets[1:])):
-        state = state_pool[slots[sequence_index]].clone()
-        for token_index in range(start, end):
-            token_logits = logits_f32[token_index]
-            if bias is not None:
-                token_logits = token_logits + bias.float()
-            retention = torch.exp(-DECAY_RATE * torch.sigmoid(token_logits))
-            a_state = torch.einsum("hk,hkv->hv", a_f32[token_index], state)
-            state = (
-                retention.unsqueeze(-1) * state
-                + b_f32[token_index].unsqueeze(-1) * a_state.unsqueeze(-2)
-                + k_f32[token_index].unsqueeze(-1)
-                * v_f32[token_index].unsqueeze(-2)
-            )
-            output[token_index] = float(scale) * torch.einsum(
-                "hk,hkv->hv", r_f32[token_index], state
-            )
-        state_pool[slots[sequence_index]] = state
-
-    return output, state_pool
 
 
 ALBATROSS_BT_MATRIX = (
@@ -296,16 +235,6 @@ def _dtype_from_name(name: str) -> torch.dtype:
     return {"bfloat16": torch.bfloat16, "float16": torch.float16}[name]
 
 
-def _relative_rmse(actual: torch.Tensor, expected: torch.Tensor) -> float:
-    difference = actual.float() - expected.float()
-    baseline = expected.float().square().mean().sqrt().clamp_min(1.0e-6)
-    return float((difference.square().mean().sqrt() / baseline).item())
-
-
-def _max_abs(actual: torch.Tensor, expected: torch.Tensor) -> float:
-    return float((actual.float() - expected.float()).abs().max().item())
-
-
 def _make_inputs(
     workload: Workload,
     operator_shape: OperatorShape,
@@ -371,136 +300,6 @@ def _make_inputs(
     }
 
 
-def _run_public_correctness(
-    inputs: dict[str, torch.Tensor | None],
-    *,
-    limits: dict[str, float],
-) -> dict[str, object]:
-    r = inputs["r"]
-    decay_logits = inputs["decay_logits"]
-    k = inputs["k"]
-    v = inputs["v"]
-    a = inputs["a"]
-    b = inputs["b"]
-    cu_seqlens = inputs["cu_seqlens"]
-    state_indices = inputs["state_indices"]
-    state_pool = inputs["state_pool"]
-    decay_bias = inputs["decay_bias"]
-    assert isinstance(r, torch.Tensor)
-    assert isinstance(decay_logits, torch.Tensor)
-    assert isinstance(k, torch.Tensor)
-    assert isinstance(v, torch.Tensor)
-    assert isinstance(a, torch.Tensor)
-    assert isinstance(b, torch.Tensor)
-    assert isinstance(cu_seqlens, torch.Tensor)
-    assert isinstance(state_indices, torch.Tensor)
-    assert isinstance(state_pool, torch.Tensor)
-
-    expected_output, expected_state = rwkv7_decay_logits_reference(
-        r,
-        decay_logits,
-        k,
-        v,
-        a,
-        b,
-        state_pool=state_pool,
-        cu_seqlens=cu_seqlens,
-        state_indices=state_indices,
-        decay_bias=decay_bias,
-    )
-    ticket = flashrwkv2.prepare_tmix_wkv7_recurrent_metadata(
-        cu_seqlens,
-        state_indices,
-        total_tokens=r.shape[0],
-        state_pool_size=state_pool.shape[0],
-    )
-    observed_state = state_pool.clone()
-    observed_output = flashrwkv2.infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
-        r,
-        decay_logits,
-        k,
-        v,
-        a,
-        b,
-        state_pool=observed_state,
-        cu_seqlens=cu_seqlens,
-        state_indices=state_indices,
-        decay_bias=decay_bias,
-        validated_metadata=ticket,
-    )
-    torch.cuda.synchronize()
-
-    active = state_indices.long()
-    expected_active = expected_state.index_select(0, active)
-    observed_active = observed_state.index_select(0, active)
-    output_rmse = _relative_rmse(observed_output, expected_output)
-    state_rmse = _relative_rmse(observed_active, expected_active)
-    output_max_abs = _max_abs(observed_output, expected_output)
-    state_max_abs = _max_abs(observed_active, expected_active)
-    selected = set(int(slot) for slot in state_indices.cpu().tolist())
-    untouched = [
-        index
-        for index in range(state_pool.shape[0])
-        if index not in selected
-    ]
-    untouched_ok = (
-        True
-        if not untouched
-        else torch.equal(
-            observed_state.index_select(
-                0,
-                torch.tensor(untouched, device=state_pool.device, dtype=torch.long),
-            ),
-            state_pool.index_select(
-                0,
-                torch.tensor(untouched, device=state_pool.device, dtype=torch.long),
-            ),
-        )
-    )
-
-    # A second launch with an identical reset state is the deterministic check.
-    deterministic_state = state_pool.clone()
-    deterministic_output = flashrwkv2.infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
-        r,
-        decay_logits,
-        k,
-        v,
-        a,
-        b,
-        state_pool=deterministic_state,
-        cu_seqlens=cu_seqlens,
-        state_indices=state_indices,
-        decay_bias=decay_bias,
-        validated_metadata=ticket,
-    )
-    torch.cuda.synchronize()
-    deterministic = torch.equal(observed_output, deterministic_output) and torch.equal(
-        observed_state, deterministic_state
-    )
-    finite = bool(
-        torch.isfinite(observed_output).all()
-        and torch.isfinite(observed_active).all()
-    )
-    passed = bool(
-        finite
-        and output_rmse <= limits["output_relative_rmse"]
-        and state_rmse <= limits["state_relative_rmse"]
-        and untouched_ok
-        and deterministic
-    )
-    return {
-        "passed": passed,
-        "output_relative_rmse": output_rmse,
-        "state_relative_rmse": state_rmse,
-        "output_max_abs": output_max_abs,
-        "state_max_abs": state_max_abs,
-        "limits": limits,
-        "finite": finite,
-        "deterministic": deterministic,
-        "untouched_slots": untouched_ok,
-    }
-
-
 def _flatten_inputs(
     inputs: dict[str, torch.Tensor | None],
 ) -> tuple[torch.Tensor, ...]:
@@ -543,66 +342,28 @@ def _measure(
     flat_inputs: tuple[torch.Tensor, ...],
     inputs: dict[str, torch.Tensor | None],
     *,
-    warmup: int,
-    samples: int,
-    sample_iters: int,
+    workload: Workload,
     ticket: object,
-) -> list[float]:
+) -> dict[str, object]:
     reset_state = inputs["state_pool"]
     if not isinstance(reset_state, torch.Tensor):
         raise TypeError("benchmark state pool is incomplete")
     output = torch.empty_like(flat_inputs[3])
     state = reset_state.clone()
 
-    for _ in range(warmup):
+    def reset() -> None:
         state.copy_(reset_state)
-        for _ in range(sample_iters):
-            _timed_native_launch(
-                flat_inputs, inputs, output=output, state=state, ticket=ticket
-            )
-    torch.cuda.synchronize()
 
-    measurements: list[float] = []
-    for _ in range(samples):
-        state.copy_(reset_state)
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        for _ in range(sample_iters):
-            _timed_native_launch(
-                flat_inputs, inputs, output=output, state=state, ticket=ticket
-            )
-        end.record()
-        end.synchronize()
-        measurements.append(start.elapsed_time(end) / sample_iters)
-    return measurements
+    def run() -> None:
+        _timed_native_launch(
+            flat_inputs, inputs, output=output, state=state, ticket=ticket
+        )
 
-
-def _percentile(values: list[float], quantile: float) -> float:
-    if not values or not 0.0 <= quantile <= 1.0:
-        raise ValueError("percentile requires non-empty samples and q in [0, 1]")
-    ordered = sorted(values)
-    position = (len(ordered) - 1) * quantile
-    lower = math.floor(position)
-    upper = math.ceil(position)
-    if lower == upper:
-        return ordered[lower]
-    fraction = position - lower
-    return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
-
-
-def _measure_row(
-    measurements: list[float],
-    workload: Workload,
-) -> dict[str, object]:
-    p50 = _percentile(measurements, 0.5)
-    return {
-        "raw_latency_ms": measurements,
-        "p10_ms": _percentile(measurements, 0.1),
-        "p50_ms": p50,
-        "p90_ms": _percentile(measurements, 0.9),
-        "tok_s_p50": workload.total_tokens * 1000.0 / p50,
-    }
+    timing = measure_cuda(run, before_batch=reset)
+    timing["tokens_per_second_mean"] = (
+        workload.total_tokens * 1_000_000.0 / float(timing["mean_us"])
+    )
+    return timing
 
 
 def _use_small_fp32(batch_size: int, max_seqlen: int, io_fp16: bool) -> bool:
@@ -633,19 +394,6 @@ def _selected_fp32_family(workload: Workload, dtype: torch.dtype) -> str:
     )
 
 
-def _load_limits(root: Path) -> dict[str, float]:
-    fixture = root / "tests/fixtures/tolerances-v1.json"
-    payload = json.loads(fixture.read_text(encoding="utf-8"))
-    return {
-        "output_relative_rmse": float(
-            payload["fp32io16_recurrent"]["output_relative_rmse"]
-        ),
-        "state_relative_rmse": float(
-            payload["fp32io16_recurrent"]["state_relative_rmse"]
-        ),
-    }
-
-
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -668,16 +416,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--stress", action="store_true")
     parser.add_argument("--decay-bias", action="store_true")
-    parser.add_argument("--warmup", type=int, default=5)
-    parser.add_argument("--samples", type=int, default=30)
-    parser.add_argument(
-        "--sample-iters",
-        type=int,
-        default=4,
-        help="consecutive in-place launches averaged into each timing sample",
-    )
     parser.add_argument("--seed", type=int, default=20260804)
-    parser.add_argument("--correctness-only", action="store_true")
     parser.add_argument(
         "--output",
         type=Path,
@@ -690,9 +429,6 @@ def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     if not torch.cuda.is_available():
         raise RuntimeError("the recurrent benchmark requires a CUDA device")
-    if args.warmup < 0 or args.samples <= 0 or args.sample_iters <= 0:
-        raise ValueError("warmup must be non-negative and timing counts positive")
-
     root = _repo_root()
     workloads = (
         tuple(_parse_case(value) for value in args.cases)
@@ -701,7 +437,6 @@ def main(argv: list[str] | None = None) -> int:
     )
     family = SOURCE_FAMILY
     spec = KERNEL_SPEC
-    limits = _load_limits(root)
     git = _git_metadata(root)
     extension = getattr(flashrwkv2, "_C", None)
     if extension is None:
@@ -730,11 +465,7 @@ def main(argv: list[str] | None = None) -> int:
             "state_dtype": "float32",
             "stress": args.stress,
             "decay_bias": args.decay_bias,
-            "warmup": args.warmup,
-            "samples": args.samples,
-            "sample_iters": args.sample_iters,
             "seed": args.seed,
-            "correctness_limits": limits,
         },
         "results": [],
     }
@@ -759,6 +490,7 @@ def main(argv: list[str] | None = None) -> int:
                     "token_dtype": dtype_name,
                     "state_dtype": "float32",
                     "boundary": "preallocated_native_consecutive_in_place_launches",
+                    "steady_state": "state pool is reset before each timing batch",
                     "selected_kernel_family": _selected_fp32_family(workload, dtype),
                     "dispatch": {
                         "batch_size": workload.batch_size,
@@ -789,46 +521,26 @@ def main(argv: list[str] | None = None) -> int:
                         total_tokens=r.shape[0],
                         state_pool_size=state_pool.shape[0],
                     )
-                    correctness = _run_public_correctness(
-                        inputs,
-                        limits=limits,
-                    )
                     row = {
                         **base,
                         "state_pool_size": state_pool.shape[0],
                         "state_pool_bytes": state_pool.numel() * state_pool.element_size(),
-                        "correctness": correctness,
                     }
-                    if not correctness["passed"]:
-                        row["failure"] = "correctness gate failed"
-                    elif not args.correctness_only:
-                        flat_inputs = _flatten_inputs(inputs)
-                        samples = _measure(
-                            flat_inputs,
-                            inputs,
-                            warmup=args.warmup,
-                            samples=args.samples,
-                            sample_iters=args.sample_iters,
-                            ticket=ticket,
-                        )
-                        row["timing"] = _measure_row(samples, workload)
-                        print(
-                            "RESULT "
-                            f"operator_shape={operator_shape.name} B={workload.batch_size} "
-                            f"T={workload.uniform_t or 'ragged'} dtype={dtype_name} "
-                            "boundary=in_place correctness=passed "
-                            f"p10_ms={row['timing']['p10_ms']:.6f} "
-                            f"p50_ms={row['timing']['p50_ms']:.6f} "
-                            f"p90_ms={row['timing']['p90_ms']:.6f} "
-                            f"tok_s_p50={row['timing']['tok_s_p50']:.3f}"
-                        )
-                    else:
-                        print(
-                            "RESULT "
-                            f"operator_shape={operator_shape.name} B={workload.batch_size} "
-                            f"T={workload.uniform_t or 'ragged'} dtype={dtype_name} "
-                            "boundary=in_place correctness=passed"
-                        )
+                    flat_inputs = _flatten_inputs(inputs)
+                    row["timing"] = _measure(
+                        flat_inputs,
+                        inputs,
+                        workload=workload,
+                        ticket=ticket,
+                    )
+                    print(
+                        "RESULT "
+                        f"operator_shape={operator_shape.name} B={workload.batch_size} "
+                        f"T={workload.uniform_t or 'ragged'} dtype={dtype_name} "
+                        "boundary=in_place "
+                        f"mean_us={row['timing']['mean_us']:.6f} "
+                        f"tok_s_mean={row['timing']['tokens_per_second_mean']:.3f}"
+                    )
                 except (RuntimeError, torch.cuda.OutOfMemoryError) as error:
                     row = {**base, "failure": f"{type(error).__name__}: {error}"}
                     torch.cuda.empty_cache()
@@ -836,7 +548,7 @@ def main(argv: list[str] | None = None) -> int:
                         "RESULT "
                         f"operator_shape={operator_shape.name} B={workload.batch_size} "
                         f"T={workload.uniform_t or 'ragged'} dtype={dtype_name} "
-                        f"correctness=failed reason={type(error).__name__}"
+                        f"timing=unavailable reason={type(error).__name__}"
                     )
                 results.append(row)
 

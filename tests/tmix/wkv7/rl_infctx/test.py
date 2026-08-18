@@ -54,6 +54,8 @@ def _reference(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.sm90
+@pytest.mark.memcheck
+@pytest.mark.racecheck
 @pytest.mark.parametrize("d", (64, 128, 256))
 def test_rl_infctx_ragged_materialized_and_recompute(d: int) -> None:
     torch.manual_seed(37)

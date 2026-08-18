@@ -68,7 +68,18 @@ def test_public_contract_matches_clampw_v3() -> None:
     assert signature.parameters["head_size"].default == 64
 
 
-@pytest.mark.parametrize("batch,tokens,heads", [(1, 16, 1), (2, 32, 2)])
+@pytest.mark.parametrize(
+    "batch,tokens,heads",
+    [
+        pytest.param(
+            1,
+            16,
+            1,
+            marks=(pytest.mark.memcheck, pytest.mark.racecheck),
+        ),
+        (2, 32, 2),
+    ],
+)
 @pytest.mark.sm90
 def test_forward_matches_clampw_recurrence(
     batch: int, tokens: int, heads: int

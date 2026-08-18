@@ -51,6 +51,7 @@ def test_l2wrap_rejects_unsupported_logits_dtype() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.sm90
+@pytest.mark.memcheck
 @pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float32))
 def test_l2wrap_forward_backward_matches_train_temp_contract(
     dtype: torch.dtype,

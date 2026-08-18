@@ -93,8 +93,21 @@ def _reference(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.sm90
-@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
-@pytest.mark.parametrize("head_size", (64, 128, 256))
+@pytest.mark.parametrize(
+    "dtype,head_size",
+    [
+        pytest.param(
+            torch.float16,
+            64,
+            marks=(pytest.mark.memcheck, pytest.mark.racecheck),
+        ),
+        (torch.float16, 128),
+        (torch.float16, 256),
+        (torch.bfloat16, 64),
+        (torch.bfloat16, 128),
+        (torch.bfloat16, 256),
+    ],
+)
 def test_statetune_matches_train_temp_recurrence_and_initial_gradient(
     dtype: torch.dtype, head_size: int
 ) -> None:

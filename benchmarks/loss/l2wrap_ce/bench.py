@@ -12,10 +12,9 @@ import subprocess
 from pathlib import Path
 
 import torch
+from _timing import measure_cuda
 
-from flashrwkv2.loss.l2wrap_ce import pretrain_l2wrap_ce_bf16
 from flashrwkv2.tmix.wkv7 import _extension
-
 
 SOURCE_REVISION = "952102498e9ed367ea0a59ee64106916d474d30f"
 SOURCE_PATHS = (
@@ -52,12 +51,6 @@ def _git_metadata(root: Path) -> dict[str, str]:
     }
 
 
-def _percentile(samples: list[float], fraction: float) -> float:
-    ordered = sorted(samples)
-    index = min(len(ordered) - 1, int(fraction * len(ordered)))
-    return ordered[index]
-
-
 def _metadata() -> dict[str, object]:
     capability = torch.cuda.get_device_capability()
     properties = torch.cuda.get_device_properties(torch.cuda.current_device())
@@ -75,8 +68,6 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--rows", type=int, default=8)
     parser.add_argument("--vocab", type=int, default=128)
-    parser.add_argument("--warmup", type=int, default=10)
-    parser.add_argument("--samples", type=int, default=30)
     parser.add_argument(
         "--output", type=str, default="/tmp/flashrwkv2-l2wrap-ce.json"
     )
@@ -95,18 +86,6 @@ def main() -> None:
         args.vocab, (args.rows,), device=device, dtype=torch.int64
     )
 
-    # Public correctness gate, including the autograd boundary.
-    public_logits = logits.detach().clone().requires_grad_(True)
-    public_loss = pretrain_l2wrap_ce_bf16(public_logits, targets)
-    reference = torch.nn.functional.cross_entropy(
-        public_logits.float(), targets
-    )
-    public_loss.backward()
-    max_error = float((public_loss - reference).abs().item())
-    correctness = "passed" if max_error <= 2.0e-4 else "failed"
-    if correctness != "passed":
-        raise RuntimeError(f"correctness gate failed: max_error={max_error}")
-
     extension = _extension()
     grad_loss = torch.ones((), device=device, dtype=torch.float32)
 
@@ -119,32 +98,17 @@ def main() -> None:
         )
         del loss
 
-    for _ in range(args.warmup):
-        launch()
-    torch.cuda.synchronize()
-    samples: list[float] = []
-    for _ in range(args.samples):
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        launch()
-        end.record()
-        end.synchronize()
-        samples.append(float(start.elapsed_time(end) * 1000.0))
+    timing = measure_cuda(launch)
 
     root = _repo_root()
     result = {
         "operator": "pretrain_l2wrap_ce_bf16",
         "rows": args.rows,
         "vocab": args.vocab,
+        "profile": f"rows={args.rows}/vocab={args.vocab}",
         "timing_boundary": "native_forward_backward",
-        "latency_us": samples,
-        "p10_us": _percentile(samples, 0.10),
-        "p50_us": _percentile(samples, 0.50),
-        "p90_us": _percentile(samples, 0.90),
-        "throughput_rows_per_second": args.rows / (_percentile(samples, 0.50) * 1.0e-6),
-        "correctness": correctness,
-        "max_abs_error": max_error,
+        "steady_state": "native intermediates are recreated for each launch",
+        **timing,
         "source_repository": "https://github.com/BlinkDL/RWKV-LM",
         "source_revision": SOURCE_REVISION,
         "source_paths": SOURCE_PATHS,

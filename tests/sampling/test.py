@@ -34,6 +34,8 @@ def test_reproducible_state_pool() -> None:
     assert torch.equal(first, second)
 
 
+@pytest.mark.memcheck
+@pytest.mark.racecheck
 def test_scalar_and_per_request_top1_match_with_indexed_slots() -> None:
     logits = torch.tensor(
         [[0.0, 4.0, 1.0, -2.0, 0.5, 0.0, -1.0, 2.0],

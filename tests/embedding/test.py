@@ -11,7 +11,16 @@ from flashrwkv2.embedding import infer_embedding_ln0_forward_varlen
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.sm120
-@pytest.mark.parametrize("channels", (8, 4096))
+@pytest.mark.parametrize(
+    "channels",
+    (
+        8,
+        pytest.param(
+            4096,
+            marks=(pytest.mark.memcheck, pytest.mark.racecheck),
+        ),
+    ),
+)
 def test_embedding_ln0_packed(channels: int) -> None:
     torch.manual_seed(57)
     device = torch.device("cuda")

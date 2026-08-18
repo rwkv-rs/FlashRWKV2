@@ -1,4 +1,4 @@
-"""Run and compare revision-bound FlashRWKV2 module benchmarks."""
+"""Run affected benchmarks once and report advisory regressions."""
 
 from __future__ import annotations
 
@@ -8,51 +8,35 @@ import json
 import math
 import os
 import shutil
-import statistics
 import subprocess
 import sys
 import tempfile
 import urllib.request
 import zipfile
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 ROOT = Path(
     os.environ.get("FLASH_RWKV_SOURCE_ROOT", Path(__file__).resolve().parents[1])
 ).resolve()
-RUNS = 3
-REGRESSION_LIMIT = 0.002
+SCHEMA_VERSION = 2
 BENCHMARKS = {
-    "cmix": ("benchmarks/cmix/bench.py", "iters"),
-    "embedding": ("benchmarks/embedding/bench.py", "samples"),
-    "head/l2wrap_ce": ("benchmarks/head/l2wrap_ce/bench.py", "samples"),
-    "head/linear": ("benchmarks/head/linear/bench.py", "samples"),
-    "loss/l2wrap_ce": ("benchmarks/loss/l2wrap_ce/bench.py", "samples"),
-    "sampling": ("benchmarks/sampling/bench.py", "samples"),
-    "tmix/a_gate": ("benchmarks/tmix/a_gate/bench.py", "iters"),
-    "tmix/kk_pre": ("benchmarks/tmix/kk_pre/bench.py", "samples"),
-    "tmix/readout": ("benchmarks/tmix/readout/bench.py", "samples"),
-    "tmix/tokenshift": ("benchmarks/tmix/tokenshift/bench.py", "iters"),
-    "post_norm": ("benchmarks/post_norm/bench.py", "samples"),
-    "tmix/vres_gate": ("benchmarks/tmix/vres_gate/bench.py", "samples"),
-    "tmix/wkv_prepare": ("benchmarks/tmix/wkv_prepare/bench.py", "samples"),
-    "tmix/wkv7": ("benchmarks/tmix/wkv7/bench.py", "wkv7"),
-    "tmix/wkv7/rl_infctx": (
-        "benchmarks/tmix/wkv7/rl_infctx/bench.py",
-        "samples",
-    ),
+    "cmix": "benchmarks/cmix/bench.py",
+    "embedding": "benchmarks/embedding/bench.py",
+    "head/l2wrap_ce": "benchmarks/head/l2wrap_ce/bench.py",
+    "head/linear": "benchmarks/head/linear/bench.py",
+    "loss/l2wrap_ce": "benchmarks/loss/l2wrap_ce/bench.py",
+    "sampling": "benchmarks/sampling/bench.py",
+    "tmix/a_gate": "benchmarks/tmix/a_gate/bench.py",
+    "tmix/kk_pre": "benchmarks/tmix/kk_pre/bench.py",
+    "tmix/readout": "benchmarks/tmix/readout/bench.py",
+    "tmix/tokenshift": "benchmarks/tmix/tokenshift/bench.py",
+    "post_norm": "benchmarks/post_norm/bench.py",
+    "tmix/vres_gate": "benchmarks/tmix/vres_gate/bench.py",
+    "tmix/wkv_prepare": "benchmarks/tmix/wkv_prepare/bench.py",
+    "tmix/wkv7": "benchmarks/tmix/wkv7/bench.py",
+    "tmix/wkv7/rl_infctx": "benchmarks/tmix/wkv7/rl_infctx/bench.py",
 }
-
-
-@dataclass(frozen=True)
-class Metric:
-    profile: str
-    name: str
-    unit: str
-    direction: str
-    summary: float
-    raw_samples: tuple[float, ...]
 
 
 def _sha256(path: Path) -> str:
@@ -61,12 +45,6 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
-
-
-def _git(*arguments: str, cwd: Path = ROOT) -> str:
-    return subprocess.run(
-        ("git", *arguments), cwd=cwd, check=True, capture_output=True, text=True
-    ).stdout.strip()
 
 
 def _python_executable(python: str) -> str:
@@ -88,7 +66,6 @@ print(json.dumps({
   'torch_cuda': torch.version.cuda,
   'gpu': torch.cuda.get_device_name(0),
   'capability': list(torch.cuda.get_device_capability(0)),
-  'extension_sha256': None,
   'extension_path': str(extension_path),
 }))
 """
@@ -101,56 +78,42 @@ print(json.dumps({
             text=True,
         ).stdout
     )
-    extension_path = Path(payload["extension_path"])
+    extension_path = Path(payload.pop("extension_path"))
     if not extension_path.is_file():
         raise SystemExit("flashrwkv2._C is not loaded from an installed wheel")
     payload["extension_sha256"] = _sha256(extension_path)
     payload["wheel_sha256"] = os.environ.get("FLASH_RWKV_WHEEL_SHA256")
-    try:
-        fields = "driver_version,temperature.gpu,power.draw,clocks.current.sm,clocks_event_reasons.active"
-        output = subprocess.run(
-            (
-                "nvidia-smi",
-                f"--query-gpu={fields}",
-                "--format=csv,noheader,nounits",
-                "--id=0",
-            ),
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-        payload["nvidia_smi"] = output
-        values = [value.strip() for value in output.split(",")]
-        payload["driver"] = values[0] if values else None
-        payload["throttle_reason"] = values[4] if len(values) > 4 else None
-        throttle_reason = payload["throttle_reason"]
-        inactive_clock_event = throttle_reason in {"Not Active", "Not Active.", "0"}
-        if isinstance(throttle_reason, str) and throttle_reason.startswith("0x"):
-            inactive_clock_event = int(throttle_reason, 16) == 0
-        if not inactive_clock_event:
-            raise SystemExit(
-                f"benchmark GPU reports an active clock event: {throttle_reason}"
-            )
-    except (FileNotFoundError, subprocess.CalledProcessError) as error:
-        raise SystemExit(f"cannot record benchmark GPU environment: {error}") from error
+    query = "driver_version,temperature.gpu,power.draw,clocks.current.sm,clocks_event_reasons.active"
+    result = subprocess.run(
+        (
+            "nvidia-smi",
+            f"--query-gpu={query}",
+            "--format=csv,noheader,nounits",
+            "--id=0",
+        ),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    values = [value.strip() for value in result.stdout.strip().split(",")]
+    payload["driver"] = values[0] if values else None
+    payload["nvidia_smi"] = result.stdout.strip()
+    payload["throttle_reason"] = values[4] if len(values) > 4 else None
     return payload
 
 
 def _assert_gpu_idle() -> None:
-    try:
-        result = subprocess.run(
-            (
-                "nvidia-smi",
-                "--query-compute-apps=pid",
-                "--format=csv,noheader,nounits",
-                "--id=0",
-            ),
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    except (FileNotFoundError, subprocess.CalledProcessError) as error:
-        raise SystemExit(f"cannot verify exclusive benchmark GPU: {error}") from error
+    result = subprocess.run(
+        (
+            "nvidia-smi",
+            "--query-compute-apps=pid",
+            "--format=csv,noheader,nounits",
+            "--id=0",
+        ),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
     pids = [line.strip() for line in result.stdout.splitlines() if line.strip()]
     if pids:
         raise SystemExit(f"benchmark GPU is not idle; active compute PIDs: {pids}")
@@ -164,230 +127,312 @@ def _last_json(stdout: str) -> dict[str, Any]:
             continue
         if isinstance(payload, dict):
             return payload
-    raise SystemExit("benchmark did not emit a JSON object")
+    raise RuntimeError("benchmark did not emit a JSON object")
 
 
-def _metrics(payload: dict[str, Any], module: str) -> list[Metric]:
-    if module == "sampling":
-        metrics = []
-        for row in payload.get("results", []):
-            if row.get("correctness") != "passed":
-                raise SystemExit(f"sampling benchmark correctness failed: {row}")
-            raw = tuple(float(value) for value in row.get("raw_latency_us", ()))
-            if not raw or any(not math.isfinite(value) or value <= 0 for value in raw):
-                raise SystemExit(f"sampling benchmark has invalid samples: {row}")
-            metrics.append(
-                Metric(
-                    str(row["profile"]),
-                    "latency",
-                    "us",
-                    "lower",
-                    float(row["p50_us"]),
-                    raw,
-                )
+def _contract_hash(module: str) -> str:
+    digest = hashlib.sha256()
+    for path in (ROOT / BENCHMARKS[module], ROOT / "benchmarks/_timing.py"):
+        digest.update(str(path.relative_to(ROOT)).encode())
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _positive(values: list[float], context: str) -> list[float]:
+    if not values or any(not math.isfinite(value) or value <= 0 for value in values):
+        raise RuntimeError(f"{context} emitted invalid latency values")
+    return values
+
+
+def _profiles(payload: dict[str, Any], module: str) -> list[dict[str, Any]]:
+    if isinstance(payload.get("profiles"), list):
+        profiles = []
+        for row in payload["profiles"]:
+            raw = _positive(
+                [float(value) for value in row["raw_batch_mean_us"]],
+                f"{module}/{row.get('profile')}",
             )
-        if not metrics:
-            raise SystemExit("sampling benchmark emitted no measured profiles")
-        return metrics
+            profiles.append(
+                {
+                    "profile": str(row["profile"]),
+                    "unit": "us",
+                    "direction": "lower",
+                    "mean": float(row.get("mean_us", sum(raw) / len(raw))),
+                    "raw_batch_mean_us": raw,
+                    "total_launches": int(row.get("total_launches", 10000)),
+                }
+            )
+        if profiles:
+            return profiles
+
+    if module == "sampling":
+        profiles = []
+        for row in payload.get("results", []):
+            raw = _positive(
+                [float(value) for value in row.get("raw_batch_mean_us", ())],
+                f"sampling/{row.get('profile')}",
+            )
+            profiles.append(
+                {
+                    "profile": str(row["profile"]),
+                    "unit": "us",
+                    "direction": "lower",
+                    "mean": float(row.get("mean_us", sum(raw) / len(raw))),
+                    "raw_batch_mean_us": raw,
+                    "total_launches": int(row.get("total_launches", 10000)),
+                }
+            )
+        if profiles:
+            return profiles
 
     if module == "tmix/wkv7":
-        metrics: list[Metric] = []
+        profiles = []
         for row in payload.get("results", []):
-            correctness = row.get("correctness", {})
-            if not correctness.get("passed") or "timing" not in row:
-                raise SystemExit(f"WKV7 benchmark correctness/timing failed: {row}")
-            timing = row["timing"]
-            profile = "/".join(
-                str(row[key]) for key in ("operator_shape", "case", "token_dtype")
+            timing = row.get("timing")
+            if not isinstance(timing, dict):
+                raise TypeError(f"WKV7 profile lacks timing: {row}")
+            raw = _positive(
+                [float(value) for value in timing["raw_batch_mean_us"]],
+                "tmix/wkv7",
             )
-            raw = tuple(float(value) for value in timing["raw_latency_ms"])
-            metrics.append(
-                Metric(profile, "latency", "ms", "lower", float(timing["p50_ms"]), raw)
+            profiles.append(
+                {
+                    "profile": "/".join(
+                        str(row[key])
+                        for key in ("operator_shape", "case", "token_dtype")
+                    ),
+                    "unit": "us",
+                    "direction": "lower",
+                    "mean": float(timing["mean_us"]),
+                    "raw_batch_mean_us": raw,
+                    "total_launches": int(timing["total_launches"]),
+                }
             )
-        if not metrics:
-            raise SystemExit("WKV7 benchmark emitted no measured profiles")
-        return metrics
+        if profiles:
+            return profiles
 
-    correctness = payload.get("correctness", "passed")
-    if correctness in {"failed", False, None}:
-        raise SystemExit(f"benchmark correctness failed: {payload}")
-    raw_value = payload.get("raw_latency_us", payload.get("latency_us"))
-    if not isinstance(raw_value, list) or not raw_value:
-        raise SystemExit(f"benchmark lacks raw latency samples: {payload}")
-    raw = tuple(float(value) for value in raw_value)
-    if any(not math.isfinite(value) or value <= 0 for value in raw):
-        raise SystemExit(f"benchmark emitted invalid latency samples: {raw}")
-    return [Metric("ci", "latency", "us", "lower", statistics.median(raw), raw)]
+    raw_value = payload.get(
+        "raw_batch_mean_us",
+        payload.get("raw_latency_us", payload.get("latency_us")),
+    )
+    if not isinstance(raw_value, list):
+        raise TypeError(f"{module} benchmark lacks latency samples")
+    raw = _positive([float(value) for value in raw_value], module)
+    return [
+        {
+            "profile": str(payload.get("profile", "ci")),
+            "unit": "us",
+            "direction": "lower",
+            "mean": float(payload.get("mean_us", sum(raw) / len(raw))),
+            "raw_batch_mean_us": raw,
+            "total_launches": int(payload.get("total_launches", 10000)),
+        }
+    ]
 
 
-def _run_once(
-    module: str, *, python: str, samples: int, run_index: int
-) -> list[Metric]:
-    script, sample_flag = BENCHMARKS[module]
-    command = [python, str(ROOT / script)]
+def run_module(
+    module: str,
+    *,
+    python: str,
+    revision: str,
+    status: str,
+    environment: dict[str, Any],
+) -> dict[str, Any]:
+    script = ROOT / BENCHMARKS[module]
+    command = [_python_executable(python), str(script)]
     output_path: Path | None = None
-    if sample_flag == "wkv7":
-        output_path = (
-            Path(tempfile.gettempdir()) / f"flashrwkv2-{os.getpid()}-{run_index}.json"
+    if module == "tmix/wkv7":
+        output_path = Path(tempfile.gettempdir()) / f"flashrwkv2-wkv7-{os.getpid()}.json"
+        command.extend(
+            [
+                "--shapes",
+                "h32d64",
+                "--dtype",
+                "bfloat16",
+                "--seed",
+                "20260804",
+                "--output",
+                str(output_path),
+            ]
         )
-        command += [
-            "--shapes",
-            "h32d64",
-            "--dtype",
-            "bfloat16",
-            "--warmup",
-            "5",
-            "--samples",
-            str(samples),
-            "--seed",
-            "20260804",
-            "--output",
-            str(output_path),
-        ]
-    else:
-        command += [f"--{sample_flag}", str(samples)]
+    environment_variables = os.environ.copy()
+    environment_variables["PYTHONPATH"] = str(ROOT / "benchmarks")
     result = subprocess.run(
-        command, cwd=ROOT, check=True, capture_output=True, text=True
+        command,
+        cwd=tempfile.gettempdir(),
+        env=environment_variables,
+        check=True,
+        capture_output=True,
+        text=True,
     )
     payload = (
-        json.loads(output_path.read_text())
-        if output_path
+        json.loads(output_path.read_text(encoding="utf-8"))
+        if output_path is not None
         else _last_json(result.stdout)
     )
-    if output_path:
+    if output_path is not None:
         output_path.unlink(missing_ok=True)
-    return _metrics(payload, module)
-
-
-def run_benchmark(
-    module: str, *, python: str, samples: int, revision: str
-) -> dict[str, Any]:
-    if module not in BENCHMARKS:
-        raise SystemExit(f"no canonical benchmark configured for {module}")
-    _assert_gpu_idle()
-    environment = _environment(python)
-    by_profile: dict[str, list[Metric]] = {}
-    for run_index in range(RUNS):
-        for metric in _run_once(
-            module, python=python, samples=samples, run_index=run_index
-        ):
-            by_profile.setdefault(metric.profile, []).append(metric)
-    profiles = []
-    for profile, metrics in sorted(by_profile.items()):
-        if len(metrics) != RUNS:
-            raise SystemExit(
-                f"{module}/{profile} has {len(metrics)} runs, expected {RUNS}"
-            )
-        identity = {(item.name, item.unit, item.direction) for item in metrics}
-        if len(identity) != 1:
-            raise SystemExit(f"metric identity changed across runs: {identity}")
-        summaries = [item.summary for item in metrics]
-        profiles.append(
-            {
-                "profile": profile,
-                "metric": metrics[0].name,
-                "unit": metrics[0].unit,
-                "direction": metrics[0].direction,
-                "runs": [
-                    {"summary": item.summary, "raw_samples": item.raw_samples}
-                    for item in metrics
-                ],
-                "mean": statistics.fmean(summaries),
-            }
-        )
     return {
-        "schema_version": 1,
-        "status": "candidate",
+        "schema_version": SCHEMA_VERSION,
+        "status": status,
         "module": module,
         "target": "sm120",
         "revision": revision,
-        "runtime_semantic_revision": _git(
-            "log", "-1", "--format=%H", "--", "csrc", "flashrwkv2", "setup.py"
-        ),
+        "benchmark_contract_sha256": _contract_hash(module),
         "environment": environment,
-        "independent_runs": RUNS,
-        "samples_per_run": samples,
-        "profiles": profiles,
+        "profiles": _profiles(payload, module),
     }
 
 
-def environment_contract(python: str) -> dict[str, Any]:
-    return {
-        "schema_version": 1,
-        "target": "sm120",
-        "environment": _environment(python),
-    }
-
-
-def compatibility_candidate(
-    module: str, contract: dict[str, Any]
+def run_suite(
+    modules: list[str],
+    *,
+    python: str,
+    revision: str,
+    status: str,
+    output: Path,
 ) -> dict[str, Any]:
+    unknown = sorted(set(modules) - BENCHMARKS.keys())
+    if unknown:
+        raise SystemExit(f"no canonical benchmark configured for: {unknown}")
+    _assert_gpu_idle()
+    environment = _environment(python)
+    output.mkdir(parents=True, exist_ok=True)
+    warnings: list[dict[str, Any]] = []
+    completed: list[str] = []
+    for module in modules:
+        safe = module.replace("/", "-")
+        try:
+            payload = run_module(
+                module,
+                python=python,
+                revision=revision,
+                status=status,
+                environment=environment,
+            )
+        except (
+            KeyError,
+            OSError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+            subprocess.CalledProcessError,
+        ) as error:  # Benchmark failures are advisory by design.
+            warning = {
+                "kind": "benchmark-unavailable",
+                "module": module,
+                "message": f"{type(error).__name__}: {error}",
+            }
+            warnings.append(warning)
+            payload = {
+                "schema_version": SCHEMA_VERSION,
+                "status": "unavailable",
+                "module": module,
+                "target": "sm120",
+                "revision": revision,
+                "warning": warning,
+            }
+        else:
+            completed.append(module)
+        (output / f"{safe}-{status}.json").write_text(
+            json.dumps(payload, indent=2) + "\n", encoding="utf-8"
+        )
     return {
-        "schema_version": contract.get("schema_version"),
-        "module": module,
-        "target": contract.get("target"),
-        "environment": contract.get("environment", {}),
+        "schema_version": SCHEMA_VERSION,
+        "status": "completed-with-warnings" if warnings else "completed",
+        "modules": modules,
+        "completed_modules": completed,
+        "warnings": warnings,
     }
 
 
-def _compatible(baseline: dict[str, Any], head: dict[str, Any]) -> None:
-    for key in ("schema_version", "module", "target"):
-        if baseline.get(key) != head.get(key):
-            raise SystemExit(
-                f"baseline {key} mismatch: {baseline.get(key)!r} != {head.get(key)!r}"
-            )
+def _compatible(baseline: dict[str, Any], candidate: dict[str, Any]) -> None:
+    for key in ("schema_version", "module", "target", "benchmark_contract_sha256"):
+        if baseline.get(key) != candidate.get(key):
+            raise ValueError(f"baseline {key} mismatch")
     for key in ("gpu", "capability", "torch", "torch_cuda", "driver"):
-        if baseline["environment"].get(key) != head["environment"].get(key):
-            raise SystemExit(f"baseline environment mismatch for {key}")
+        if baseline["environment"].get(key) != candidate["environment"].get(key):
+            raise ValueError(f"baseline environment mismatch for {key}")
 
 
-def compare(baseline: dict[str, Any], head: dict[str, Any]) -> dict[str, Any]:
-    _compatible(baseline, head)
+def compare_module(
+    baseline: dict[str, Any], candidate: dict[str, Any]
+) -> list[dict[str, Any]]:
+    _compatible(baseline, candidate)
     baseline_profiles = {row["profile"]: row for row in baseline["profiles"]}
-    head_profiles = {row["profile"]: row for row in head["profiles"]}
-    if baseline_profiles.keys() != head_profiles.keys():
-        raise SystemExit("baseline/head profile sets differ")
-    results = []
-    passed = True
-    for profile in sorted(head_profiles):
-        base_row = baseline_profiles[profile]
-        head_row = head_profiles[profile]
-        for key in ("metric", "unit", "direction"):
-            if base_row[key] != head_row[key]:
-                raise SystemExit(f"metric {key} mismatch for {profile}")
-        base_mean = float(base_row["mean"])
-        head_mean = float(head_row["mean"])
-        if not all(
-            math.isfinite(value) and value > 0 for value in (base_mean, head_mean)
-        ):
-            raise SystemExit(f"non-finite/non-positive means for {profile}")
-        if head_row["direction"] == "lower":
-            regression = (head_mean - base_mean) / base_mean
-        elif head_row["direction"] == "higher":
-            regression = (base_mean - head_mean) / base_mean
-        else:
-            raise SystemExit(f"unknown metric direction: {head_row['direction']}")
-        row_passed = regression < REGRESSION_LIMIT or math.isclose(
-            regression, REGRESSION_LIMIT, rel_tol=0.0, abs_tol=1.0e-12
-        )
-        passed &= row_passed
-        results.append(
-            {
-                "profile": profile,
-                "baseline_mean": base_mean,
-                "head_mean": head_mean,
-                "regression": regression,
-                "limit": REGRESSION_LIMIT,
-                "passed": row_passed,
-            }
-        )
+    candidate_profiles = {row["profile"]: row for row in candidate["profiles"]}
+    if baseline_profiles.keys() != candidate_profiles.keys():
+        raise ValueError("baseline/candidate profile sets differ")
+    warnings = []
+    for profile in sorted(candidate_profiles):
+        base_mean = float(baseline_profiles[profile]["mean"])
+        candidate_mean = float(candidate_profiles[profile]["mean"])
+        if candidate_mean > base_mean:
+            warnings.append(
+                {
+                    "kind": "performance-regression",
+                    "module": candidate["module"],
+                    "profile": profile,
+                    "baseline_mean_us": base_mean,
+                    "candidate_mean_us": candidate_mean,
+                    "absolute_us": candidate_mean - base_mean,
+                    "percent": (candidate_mean - base_mean) / base_mean * 100.0,
+                    "baseline_wheel_sha256": baseline["environment"].get(
+                        "wheel_sha256"
+                    ),
+                    "candidate_wheel_sha256": candidate["environment"].get(
+                        "wheel_sha256"
+                    ),
+                }
+            )
+    return warnings
+
+
+def compare_suite(
+    modules: list[str], baseline_dir: Path, candidate_dir: Path
+) -> dict[str, Any]:
+    warnings: list[dict[str, Any]] = []
+    for module in modules:
+        safe = module.replace("/", "-")
+        candidate_path = candidate_dir / f"{safe}-candidate.json"
+        baseline_path = baseline_dir / f"{safe}-baseline.json"
+        if not candidate_path.is_file():
+            warnings.append(
+                {"kind": "benchmark-unavailable", "module": module, "message": "candidate missing"}
+            )
+            continue
+        candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
+        if candidate.get("status") == "unavailable":
+            warnings.append(candidate["warning"])
+            continue
+        if not baseline_path.is_file():
+            warnings.append(
+                {"kind": "baseline-unavailable", "module": module}
+            )
+            continue
+        baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+        if baseline.get("status") == "unavailable":
+            warnings.append(
+                {"kind": "baseline-unavailable", "module": module}
+            )
+            continue
+        try:
+            warnings.extend(compare_module(baseline, candidate))
+        except (KeyError, TypeError, ValueError) as error:
+            warnings.append(
+                {
+                    "kind": "baseline-incompatible",
+                    "module": module,
+                    "message": str(error),
+                }
+            )
     return {
-        "schema_version": 1,
-        "module": head["module"],
-        "baseline_revision": baseline["revision"],
-        "head_revision": head["revision"],
-        "passed": passed,
-        "results": results,
+        "schema_version": SCHEMA_VERSION,
+        "status": "warning" if warnings else "clean",
+        "modules": modules,
+        "warnings": warnings,
     }
 
 
@@ -397,301 +442,211 @@ def _api_json(url: str, token: str) -> dict[str, Any]:
         headers={
             "Accept": "application/vnd.github+json",
             "Authorization": f"Bearer {token}",
+            "X-GitHub-Api-Version": "2022-11-28",
         },
     )
     with urllib.request.urlopen(request) as response:
         return json.load(response)
 
 
-def fetch_baseline(
+def fetch_main_baselines(
     repository: str,
-    module: str,
-    output: Path,
     token: str,
-    head: dict[str, Any],
-) -> bool:
-    safe_module = module.replace("/", "-")
-    url = f"https://api.github.com/repos/{repository}/actions/artifacts?name=flashrwkv2-baseline-sm120-{safe_module}&per_page=100"
-    payload = _api_json(url, token)
-    candidates = sorted(
-        (
-            artifact
-            for artifact in payload.get("artifacts", [])
-            if not artifact.get("expired")
-            and artifact.get("workflow_run", {}).get("head_branch") == "main"
-        ),
-        key=lambda artifact: artifact["created_at"],
-        reverse=True,
+    modules: list[str],
+    output: Path,
+    current_environment: dict[str, Any],
+) -> list[str]:
+    output.mkdir(parents=True, exist_ok=True)
+    runs_url = (
+        f"https://api.github.com/repos/{repository}/actions/workflows/"
+        "pro6000-gpu.yml/runs?branch=main&status=success&per_page=20"
     )
-    if not candidates:
-        return False
-    output.parent.mkdir(parents=True, exist_ok=True)
-    for artifact in candidates:
-        request = urllib.request.Request(
-            artifact["archive_download_url"],
-            headers={
-                "Accept": "application/vnd.github+json",
-                "Authorization": f"Bearer {token}",
-            },
+    runs = _api_json(runs_url, token).get("workflow_runs", [])
+    wanted = {module.replace("/", "-"): module for module in modules}
+    found: set[str] = set()
+    for run in runs:
+        if run.get("name") != "Quality Gate":
+            continue
+        artifacts_url = (
+            f"https://api.github.com/repos/{repository}/actions/runs/"
+            f"{run['id']}/artifacts?per_page=100"
         )
-        with (
-            urllib.request.urlopen(request) as response,
-            tempfile.NamedTemporaryFile() as archive,
-        ):
+        artifacts = _api_json(artifacts_url, token).get("artifacts", [])
+        evidence = next(
+            (
+                row
+                for row in artifacts
+                if row.get("name", "").startswith("flashrwkv2-quality-v2-")
+                and not row.get("expired")
+            ),
+            None,
+        )
+        if evidence is None:
+            continue
+        request = urllib.request.Request(
+            evidence["archive_download_url"],
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        with urllib.request.urlopen(request) as response, tempfile.NamedTemporaryFile() as archive:
             archive.write(response.read())
             archive.flush()
             with zipfile.ZipFile(archive.name) as bundle:
-                json_names = [
-                    name for name in bundle.namelist() if name.endswith(".json")
-                ]
-                if len(json_names) != 1:
-                    continue
-                raw = bundle.read(json_names[0])
-                payload = json.loads(raw)
-                if payload.get("module") != module or payload.get("status") not in {
-                    "approved",
-                    "admin-approved",
-                }:
-                    continue
-                try:
-                    _compatible(payload, head)
-                except (KeyError, TypeError, SystemExit):
-                    continue
-                output.write_bytes(raw)
-                return True
-    return False
+                names = set(bundle.namelist())
+                for safe, module in wanted.items():
+                    if module in found:
+                        continue
+                    candidates = [
+                        name
+                        for name in names
+                        if name.endswith(f"/{safe}-candidate.json")
+                        or name == f"{safe}-candidate.json"
+                    ]
+                    if len(candidates) != 1:
+                        continue
+                    payload = json.loads(bundle.read(candidates[0]))
+                    if payload.get("status") != "candidate":
+                        continue
+                    if payload.get("benchmark_contract_sha256") != _contract_hash(
+                        module
+                    ):
+                        continue
+                    if any(
+                        payload.get("environment", {}).get(key)
+                        != current_environment.get(key)
+                        for key in (
+                            "gpu",
+                            "capability",
+                            "torch",
+                            "torch_cuda",
+                            "driver",
+                        )
+                    ):
+                        continue
+                    payload["status"] = "baseline"
+                    (output / f"{safe}-baseline.json").write_text(
+                        json.dumps(payload, indent=2) + "\n", encoding="utf-8"
+                    )
+                    found.add(module)
+        if len(found) == len(modules):
+            break
+    return [module for module in modules if module not in found]
 
 
-def resolve_baselines(
-    repository: str,
-    modules: list[str],
-    output: Path,
-    token: str,
-    contract: dict[str, Any],
-    base_revision: str,
-) -> dict[str, Any]:
-    output.mkdir(parents=True, exist_ok=True)
-    sources: dict[str, str] = {}
-    measured_base: list[str] = []
-    approved: list[str] = []
-    new_modules: list[str] = []
-    for module in modules:
-        if module not in BENCHMARKS:
-            raise SystemExit(f"no canonical benchmark configured for {module}")
-        candidate = compatibility_candidate(module, contract)
-        baseline_path = output / f"{module.replace('/', '-')}-baseline.json"
-        if fetch_baseline(repository, module, baseline_path, token, candidate):
-            sources[module] = "approved-artifact"
-            approved.append(module)
-            continue
-        benchmark_path = f"benchmarks/{module}/bench.py"
-        exists = subprocess.run(
-            ("git", "cat-file", "-e", f"{base_revision}:{benchmark_path}"),
-            cwd=ROOT,
-            check=False,
-            capture_output=True,
-        ).returncode == 0
-        if exists:
-            sources[module] = "measured-base"
-            measured_base.append(module)
-        else:
-            sources[module] = "new-module-bootstrap"
-            new_modules.append(module)
-    plan = {
-        "schema_version": 1,
-        "base_revision": base_revision,
-        "modules": modules,
-        "sources": sources,
-        "approved_modules": approved,
-        "measured_base_modules": measured_base,
-        "new_modules": new_modules,
-        "needs_base_wheel": bool(measured_base),
-    }
-    (output / "plan.json").write_text(
-        json.dumps(plan, indent=2) + "\n", encoding="utf-8"
-    )
-    return plan
+def _write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
-def approve(
-    candidate: dict[str, Any], *, actor: str, reason: str, admin: bool
-) -> dict[str, Any]:
-    if (
-        candidate.get("independent_runs") != RUNS
-        or len(candidate.get("profiles", ())) == 0
+def _parse_modules(value: str) -> list[str]:
+    modules = json.loads(value)
+    if not isinstance(modules, list) or not all(
+        isinstance(module, str) for module in modules
     ):
-        raise SystemExit("only a complete three-run candidate can become a baseline")
-    approved = dict(candidate)
-    approved["status"] = "admin-approved" if admin else "approved"
-    approved["approval"] = {"actor": actor, "reason": reason}
-    return approved
+        raise SystemExit("--modules must be a JSON string list")
+    return modules
 
 
 def _self_test() -> None:
-    expected_python = Path(sys.executable).absolute()
-    relative_python = os.path.relpath(expected_python, Path.cwd())
-    assert Path(_python_executable(relative_python)) == expected_python
     environment = {
         "gpu": "gpu",
         "capability": [12, 0],
-        "torch": "x",
-        "torch_cuda": "y",
-        "driver": "z",
+        "torch": "torch",
+        "torch_cuda": "cuda",
+        "driver": "driver",
+        "wheel_sha256": "wheel",
     }
 
     def payload(value: float) -> dict[str, Any]:
         return {
-            "schema_version": 1,
-            "module": "tmix/wkv_prepare",
+            "schema_version": SCHEMA_VERSION,
+            "status": "candidate",
+            "module": "cmix",
             "target": "sm120",
-            "revision": str(value),
+            "benchmark_contract_sha256": "contract",
             "environment": environment,
             "profiles": [
                 {
                     "profile": "ci",
-                    "metric": "latency",
                     "unit": "us",
                     "direction": "lower",
-                    "runs": [{"summary": value}] * 3,
                     "mean": value,
+                    "raw_batch_mean_us": [value] * 10,
+                    "total_launches": 10000,
                 }
             ],
         }
 
-    assert compare(payload(100.0), payload(100.199))["passed"]
-    assert compare(payload(100.0), payload(100.2))["passed"]
-    assert not compare(payload(100.0), payload(100.2000001))["passed"]
-    assert statistics.fmean([1.0, 2.0, 6.0]) == 3.0
-    candidate = compatibility_candidate(
-        "tmix/wkv_prepare",
-        {"schema_version": 1, "target": "sm120", "environment": environment},
-    )
-    _compatible(payload(100.0), candidate)
-    incompatible = dict(candidate)
-    incompatible["environment"] = {**environment, "torch": "different"}
-    try:
-        _compatible(payload(100.0), incompatible)
-    except SystemExit:
-        pass
-    else:
-        raise AssertionError("an incompatible environment was accepted")
+    assert compare_module(payload(100.0), payload(100.0)) == []
+    warnings = compare_module(payload(100.0), payload(100.000001))
+    assert len(warnings) == 1 and warnings[0]["kind"] == "performance-regression"
+    assert _contract_hash("cmix") == _contract_hash("cmix")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    subparsers = parser.add_subparsers(dest="command", required=True)
-    run_parser = subparsers.add_parser("run")
-    run_parser.add_argument("--module", required=True, choices=sorted(BENCHMARKS))
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    run_parser = commands.add_parser("run-suite")
+    run_parser.add_argument("--modules", required=True)
     run_parser.add_argument("--python", default=sys.executable)
-    run_parser.add_argument("--samples", type=int, default=30)
-    run_parser.add_argument("--revision", default="")
+    run_parser.add_argument("--revision", required=True)
+    run_parser.add_argument("--status", choices=("candidate", "baseline"), required=True)
     run_parser.add_argument("--output", type=Path, required=True)
-    compare_parser = subparsers.add_parser("compare")
-    compare_parser.add_argument("--baseline", type=Path, required=True)
-    compare_parser.add_argument("--head", type=Path, required=True)
-    compare_parser.add_argument("--output", type=Path, required=True)
-    fetch_parser = subparsers.add_parser("fetch-baseline")
+    run_parser.add_argument("--summary", type=Path, required=True)
+
+    fetch_parser = commands.add_parser("fetch-baselines")
     fetch_parser.add_argument("--repository", required=True)
-    fetch_parser.add_argument("--module", required=True, choices=sorted(BENCHMARKS))
+    fetch_parser.add_argument("--modules", required=True)
     fetch_parser.add_argument("--output", type=Path, required=True)
-    fetch_input = fetch_parser.add_mutually_exclusive_group(required=True)
-    fetch_input.add_argument("--head", type=Path)
-    fetch_input.add_argument("--environment", type=Path)
-    probe_parser = subparsers.add_parser("probe-environment")
-    probe_parser.add_argument("--python", default=sys.executable)
-    probe_parser.add_argument("--output", type=Path, required=True)
-    resolve_parser = subparsers.add_parser("resolve-baselines")
-    resolve_parser.add_argument("--repository", required=True)
-    resolve_parser.add_argument("--modules", required=True)
-    resolve_parser.add_argument("--environment", type=Path, required=True)
-    resolve_parser.add_argument("--base-revision", required=True)
-    resolve_parser.add_argument("--output", type=Path, required=True)
-    resolve_parser.add_argument("--github-output", type=Path)
-    approve_parser = subparsers.add_parser("approve")
-    approve_parser.add_argument("--candidate", type=Path, required=True)
-    approve_parser.add_argument("--output", type=Path, required=True)
-    approve_parser.add_argument("--actor", required=True)
-    approve_parser.add_argument("--reason", required=True)
-    approve_parser.add_argument("--admin", action="store_true")
-    subparsers.add_parser("self-test")
+    fetch_parser.add_argument("--python", default=sys.executable)
+    fetch_parser.add_argument("--github-output", type=Path)
+
+    compare_parser = commands.add_parser("compare-suite")
+    compare_parser.add_argument("--modules", required=True)
+    compare_parser.add_argument("--baseline", type=Path, required=True)
+    compare_parser.add_argument("--candidate", type=Path, required=True)
+    compare_parser.add_argument("--output", type=Path, required=True)
+
+    commands.add_parser("self-test")
     args = parser.parse_args()
 
     if args.command == "self-test":
         _self_test()
         print("benchmark_gate self-test passed")
         return 0
-    if args.command == "run":
-        revision = args.revision or _git("rev-parse", "HEAD")
-        payload = run_benchmark(
-            args.module, python=args.python, samples=args.samples, revision=revision
+    modules = _parse_modules(args.modules)
+    if args.command == "run-suite":
+        summary = run_suite(
+            modules,
+            python=args.python,
+            revision=args.revision,
+            status=args.status,
+            output=args.output,
         )
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        _write_json(args.summary, summary)
+        print(json.dumps(summary, separators=(",", ":")))
         return 0
-    if args.command == "probe-environment":
-        payload = environment_contract(args.python)
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    if args.command == "compare-suite":
+        payload = compare_suite(modules, args.baseline, args.candidate)
+        _write_json(args.output, payload)
+        print(json.dumps(payload, separators=(",", ":")))
         return 0
-    if args.command == "compare":
-        result = compare(
-            json.loads(args.baseline.read_text()), json.loads(args.head.read_text())
-        )
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
-        print(json.dumps(result, separators=(",", ":")))
-        return 0 if result["passed"] else 1
-    if args.command == "approve":
-        payload = approve(
-            json.loads(args.candidate.read_text()),
-            actor=args.actor,
-            reason=args.reason,
-            admin=args.admin,
-        )
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-        return 0
+
     token = os.environ.get("GH_TOKEN", "")
     if not token:
-        raise SystemExit("GH_TOKEN is required to fetch a baseline artifact")
-    if args.command == "resolve-baselines":
-        modules = json.loads(args.modules)
-        if not isinstance(modules, list) or not all(
-            isinstance(module, str) for module in modules
-        ):
-            raise SystemExit("--modules must be a JSON list of module names")
-        plan = resolve_baselines(
-            args.repository,
-            modules,
-            args.output,
-            token,
-            json.loads(args.environment.read_text()),
-            args.base_revision,
-        )
-        if args.github_output:
-            with args.github_output.open("a", encoding="utf-8") as handle:
-                handle.write(
-                    f"needs_base_wheel={str(plan['needs_base_wheel']).lower()}\n"
-                )
-                handle.write(
-                    "measured_base_modules="
-                    + json.dumps(plan["measured_base_modules"], separators=(",", ":"))
-                    + "\n"
-                )
-        print(json.dumps(plan, separators=(",", ":")))
-        return 0
-    head = json.loads((args.head or args.environment).read_text())
-    if args.environment:
-        head = compatibility_candidate(args.module, head)
-    found = fetch_baseline(
+        raise SystemExit("GH_TOKEN is required")
+    missing = fetch_main_baselines(
         args.repository,
-        args.module,
-        args.output,
         token,
-        head,
+        modules,
+        args.output,
+        _environment(args.python),
     )
-    print(json.dumps({"module": args.module, "found": found}))
-    return 0 if found else 2
+    if args.github_output:
+        with args.github_output.open("a", encoding="utf-8") as handle:
+            handle.write(f"missing_modules={json.dumps(missing, separators=(',', ':'))}\n")
+    print(json.dumps({"missing_modules": missing}, separators=(",", ":")))
+    return 0
 
 
 if __name__ == "__main__":

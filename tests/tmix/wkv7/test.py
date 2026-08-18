@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import json
+from itertools import pairwise
 from pathlib import Path
 
 import pytest
@@ -62,7 +63,7 @@ def rwkv7_decay_logits_reference(
     a_f32 = a.float()
     b_f32 = b.float()
 
-    for sequence_index, (start, end) in enumerate(zip(offsets[:-1], offsets[1:])):
+    for sequence_index, (start, end) in enumerate(pairwise(offsets)):
         state = state_pool[slots[sequence_index]].clone()
         for token_index in range(start, end):
             token_logits = logits_f32[token_index]
@@ -102,14 +103,14 @@ def rwkv7_fp16_reference(
     """Reference the Albatross FP16 delta and elapsed-phase contract."""
 
     decay_rate = 0.6065306597126334
-    total_tokens, num_heads, head_size = r.shape
+    _, num_heads, head_size = r.shape
     offsets = tuple(int(value) for value in cu_seqlens.cpu().tolist())
     slots = tuple(int(value) for value in state_indices.cpu().tolist())
     expected_state = state_pool.clone()
     expected = torch.empty_like(r)
     elapsed = elapsed_state_pool.clone()
     bias = None if decay_bias is None else decay_bias.reshape(num_heads, head_size)
-    for sequence_index, (start, end) in enumerate(zip(offsets[:-1], offsets[1:])):
+    for sequence_index, (start, end) in enumerate(pairwise(offsets)):
         slot = slots[sequence_index]
         state = expected_state[slot].clone()
         elapsed_base = int(elapsed[slot].item())
@@ -236,6 +237,7 @@ def _args(case: dict[str, torch.Tensor | None]) -> tuple[torch.Tensor, ...]:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.cuda_graph
 def test_fp32_wkv_zero_active_precapture_warmup_then_graph_replay() -> None:
     _require_cuda_extension()
     torch.manual_seed(20260809)
@@ -297,6 +299,26 @@ def test_fp32_wkv_zero_active_precapture_warmup_then_graph_replay() -> None:
     num_active_tokens.fill_(4)
     num_active_sequences.fill_(2)
 
+    expected_state = initial_state.clone()
+    expected_ticket = prepare_tmix_wkv7_recurrent_metadata(
+        cu_seqlens,
+        state_indices,
+        state_pool_size=slots,
+        token_capacity=token_capacity,
+        sequence_capacity=sequence_capacity,
+        max_seqlen_capacity=3,
+        num_active_tokens=num_active_tokens,
+        num_active_sequences=num_active_sequences,
+    )
+    expected_output = infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
+        *packed,
+        state_pool=expected_state,
+        cu_seqlens=cu_seqlens,
+        state_indices=state_indices,
+        validated_metadata=expected_ticket,
+    )
+    torch.cuda.synchronize()
+
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
         ticket = prepare_tmix_wkv7_recurrent_metadata(
@@ -320,9 +342,8 @@ def test_fp32_wkv_zero_active_precapture_warmup_then_graph_replay() -> None:
     graph.replay()
     torch.cuda.synchronize()
     assert metadata_addresses == (cu_seqlens.data_ptr(), state_indices.data_ptr())
-    assert torch.isfinite(graph_output).all()
-    assert not torch.equal(state[1], initial_state[1])
-    assert not torch.equal(state[0], initial_state[0])
+    assert torch.equal(graph_output, expected_output)
+    assert torch.equal(state, expected_state)
 
     state.copy_(initial_state)
     cu_seqlens.copy_(
@@ -734,15 +755,14 @@ def test_ticket_rejects_identity_version_and_stream_mismatches() -> None:
         state_pool_size=state_pool.shape[0],
     )
     other_stream = torch.cuda.Stream(device=cu_seqlens.device)
-    with torch.cuda.stream(other_stream):
-        with pytest.raises(RuntimeError, match="stream"):
-            infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
-                *args,
-                state_pool=state_pool.clone(),
-                cu_seqlens=cu_seqlens,
-                state_indices=state_indices,
-                validated_metadata=ticket_stream,
-            )
+    with torch.cuda.stream(other_stream), pytest.raises(RuntimeError, match="stream"):
+        infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
+            *args,
+            state_pool=state_pool.clone(),
+            cu_seqlens=cu_seqlens,
+            state_indices=state_indices,
+            validated_metadata=ticket_stream,
+        )
     other_stream.synchronize()
 
 
@@ -772,9 +792,22 @@ def test_packed_low_level_invalid_metadata_fails_closed_without_state_write() ->
     assert torch.equal(state_pool, before)
 
 
-@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
-@pytest.mark.parametrize("head_size", (64, 128, 256))
-@pytest.mark.parametrize("with_decay_bias", (False, True))
+@pytest.mark.parametrize(
+    "dtype,head_size,with_decay_bias",
+    [
+        pytest.param(
+            torch.float16,
+            64,
+            False,
+            marks=(pytest.mark.memcheck, pytest.mark.racecheck),
+        ),
+        *((dtype, head_size, with_bias)
+          for dtype in (torch.float16, torch.bfloat16)
+          for head_size in (64, 128, 256)
+          for with_bias in (False, True)
+          if (dtype, head_size, with_bias) != (torch.float16, 64, False)),
+    ],
+)
 def test_packed_fp32_state_precision_and_state_safety(
     dtype: torch.dtype,
     head_size: int,

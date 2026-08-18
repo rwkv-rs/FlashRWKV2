@@ -15,6 +15,8 @@ from flashrwkv2.tmix.wkv7 import prepare_tmix_wkv7_recurrent_metadata
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.sm90
+@pytest.mark.memcheck
+@pytest.mark.racecheck
 def test_pretrain_tokenshift_forward_backward() -> None:
     torch.manual_seed(7)
     device = torch.device("cuda")
@@ -195,6 +197,8 @@ def test_statetune_tokenshift_rejects_invalid_cuda_contracts() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.sm120
+@pytest.mark.memcheck
+@pytest.mark.racecheck
 def test_infer_tmix_postnorm_tokenshift_matches_albatross_t1_path() -> None:
     torch.manual_seed(19)
     device = torch.device("cuda")
@@ -346,6 +350,20 @@ def test_infer_tokenshift_postnorm_tokenshift_cuda_graph_zero_active_has_no_stat
     )
     torch.cuda.synchronize()
 
+    expected_state = initial.clone()
+    expected_outputs = infer_tmix_postnorm_tokenshift_forward_varlen(
+        x,
+        res,
+        weight,
+        bias,
+        *params,
+        shift_state_pool=expected_state,
+        cu_seqlens=cu_seqlens,
+        state_indices=state_indices,
+        max_seqlen=1,
+    )
+    torch.cuda.synchronize()
+
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         ticket = prepare_tmix_wkv7_recurrent_metadata(
@@ -358,7 +376,7 @@ def test_infer_tokenshift_postnorm_tokenshift_cuda_graph_zero_active_has_no_stat
             num_active_tokens=num_active_tokens,
             num_active_sequences=num_active_sequences,
         )
-        infer_tmix_postnorm_tokenshift_forward_varlen(
+        graph_outputs = infer_tmix_postnorm_tokenshift_forward_varlen(
             x,
             res,
             weight,
@@ -373,8 +391,9 @@ def test_infer_tokenshift_postnorm_tokenshift_cuda_graph_zero_active_has_no_stat
     shift_state.copy_(initial)
     graph.replay()
     torch.cuda.synchronize()
-    assert not torch.equal(shift_state[3], initial[3])
-    assert torch.equal(shift_state[[0, 1, 2]], initial[[0, 1, 2]])
+    for actual, expected in zip(graph_outputs, expected_outputs, strict=True):
+        assert torch.equal(actual, expected)
+    assert torch.equal(shift_state, expected_state)
 
     shift_state.copy_(initial)
     cu_seqlens.zero_()

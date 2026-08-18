@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import argparse
 import json
-import time
 
 import torch
+from _timing import measure_cuda
 
 from flashrwkv2.tmix.tokenshift import (
     pretrain_tmix_tokenshift_bf16,
@@ -26,8 +26,6 @@ def main() -> None:
     parser.add_argument("--batch", type=int, default=2)
     parser.add_argument("--seqlen", type=int, default=32)
     parser.add_argument("--channels", type=int, default=4096)
-    parser.add_argument("--iters", type=int, default=100)
-    parser.add_argument("--measurements", type=int, default=3)
     parser.add_argument(
         "--operator", choices=("pretrain", "stateful", "torch"), default="pretrain"
     )
@@ -71,16 +69,7 @@ def main() -> None:
             for tensor in (x, initial_shift, *params):
                 tensor.grad = None
 
-    for _ in range(10):
-        run()
-    torch.cuda.synchronize()
-    samples = []
-    for _ in range(args.measurements):
-        start = time.perf_counter()
-        for _ in range(args.iters):
-            run()
-        torch.cuda.synchronize()
-        samples.append((time.perf_counter() - start) * 1e6 / args.iters)
+    timing = measure_cuda(run)
     print(
         json.dumps(
             {
@@ -89,8 +78,12 @@ def main() -> None:
                 "batch": args.batch,
                 "seqlen": args.seqlen,
                 "channels": args.channels,
-                "measurements_us": samples,
-                "mean_us": sum(samples) / len(samples),
+                "timing": timing,
+                "steady_state": (
+                    "gradients cleared after each backward launch"
+                    if args.backward
+                    else "stateless inputs are reused"
+                ),
                 "gpu": torch.cuda.get_device_name(),
             }
         )

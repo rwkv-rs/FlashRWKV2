@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import argparse
 import json
-import time
 
 import torch
+from _timing import measure_cuda
 
 from flashrwkv2.tmix.tokenshift import (
     infer_tmix_postnorm_tokenshift_forward_varlen,
@@ -18,8 +18,6 @@ def main() -> None:
     parser.add_argument("--batch", type=int, default=1)
     parser.add_argument("--seqlen", type=int, default=1)
     parser.add_argument("--channels", type=int, default=4096)
-    parser.add_argument("--iters", type=int, default=50)
-    parser.add_argument("--measurements", type=int, default=3)
     args = parser.parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
@@ -54,16 +52,7 @@ def main() -> None:
             max_seqlen=args.seqlen,
         )
 
-    for _ in range(5):
-        outputs = run()
-    torch.cuda.synchronize()
-    samples = []
-    for _ in range(args.measurements):
-        start = time.perf_counter()
-        for _ in range(args.iters):
-            outputs = run()
-        torch.cuda.synchronize()
-        samples.append((time.perf_counter() - start) * 1.0e6 / args.iters)
+    timing = measure_cuda(run, before_batch=shift_state.zero_)
     print(
         json.dumps(
             {
@@ -71,14 +60,11 @@ def main() -> None:
                 "batch": args.batch,
                 "seqlen": args.seqlen,
                 "channels": args.channels,
-                "raw_latency_us": samples,
-                "mean_us": sum(samples) / len(samples),
-                "gpu": torch.cuda.get_device_name(),
-                "correctness": (
-                    "passed"
-                    if all(torch.isfinite(output).all() for output in outputs)
-                    else "failed"
+                "profile": (
+                    f"batch={args.batch}/seqlen={args.seqlen}/channels={args.channels}"
                 ),
+                "steady_state": "shift state is reset before each timing batch",
+                **timing,
             }
         )
     )

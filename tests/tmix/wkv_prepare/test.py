@@ -21,6 +21,7 @@ def test_wkv_prepare_public_contract() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.sm120
+@pytest.mark.memcheck
 @pytest.mark.parametrize("later_layer", [False, True])
 @pytest.mark.parametrize("head_size", [64, 128, 256])
 def test_wkv_prepare_first_and_later_layer_reference(

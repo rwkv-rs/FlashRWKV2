@@ -4,7 +4,10 @@
 
 from __future__ import annotations
 
+import importlib
 import json
+import os
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +20,39 @@ _TOLERANCES = json.loads(
     )
 )
 
+_TEST_MARKERS = (
+    "sm90: requires the FlashRWKV2 SM90 native backend",
+    "sm120: requires the FlashRWKV2 SM120 native backend",
+    "cuda_graph: captures and replays a real CUDA Graph",
+    "resource: validates compiled CUDA binary resource usage",
+    "memcheck: minimal Compute Sanitizer memcheck coverage",
+    "racecheck: minimal Compute Sanitizer racecheck coverage",
+)
+
+
+def _forced_test_backend() -> Any | None:
+    forced_backend = os.environ.get("FLASHRWKV_TEST_BACKEND")
+    if not forced_backend:
+        return None
+    if forced_backend not in {"_C_sm90", "_C_sm120"}:
+        raise pytest.UsageError(
+            f"invalid FLASHRWKV_TEST_BACKEND={forced_backend!r}"
+        )
+
+    import flashrwkv2
+
+    backend = importlib.import_module(f"flashrwkv2.{forced_backend}")
+    flashrwkv2._C = backend
+    sys.modules["flashrwkv2._C"] = backend
+    return backend
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Register private markers and inject the requested installed backend."""
+    for marker in _TEST_MARKERS:
+        config.addinivalue_line("markers", marker)
+    _forced_test_backend()
+
 
 def require_cuda_backend(
     expected_backend: str,
@@ -26,6 +62,18 @@ def require_cuda_backend(
     """Return the selected backend, skipping only unavailable hardware."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
+    forced_backend = _forced_test_backend()
+    if forced_backend is not None:
+        if forced_backend.__name__ != f"flashrwkv2.{expected_backend}":
+            pytest.skip(
+                f"forced test backend {forced_backend.__name__} "
+                f"does not own {expected_backend}"
+            )
+        missing = [
+            name for name in required_symbols if not hasattr(forced_backend, name)
+        ]
+        assert not missing, f"{expected_backend} is missing required symbols: {missing}"
+        return forced_backend
     capability = tuple(torch.cuda.get_device_capability())
     if capability[0] != compatible_major:
         pytest.skip(

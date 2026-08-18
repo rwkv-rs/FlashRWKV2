@@ -15,6 +15,8 @@ from flashrwkv2.tmix.wkv7 import prepare_tmix_wkv7_recurrent_metadata
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.sm120
+@pytest.mark.memcheck
+@pytest.mark.racecheck
 def test_infer_cmix_highest_fusion_island_matches_reference() -> None:
     torch.manual_seed(20260820)
     device = torch.device("cuda")
@@ -163,6 +165,8 @@ def test_infer_cmix_ticket_mutation_fails_without_state_write() -> None:
     assert torch.equal(state, before)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.sm90
+@pytest.mark.memcheck
+@pytest.mark.racecheck
 def test_pretrain_cmix_forward_backward() -> None:
     torch.manual_seed(5)
     device = torch.device("cuda")

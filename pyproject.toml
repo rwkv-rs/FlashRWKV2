@@ -41,4 +41,6 @@ markers = [
   "sm120: requires the FlashRWKV2 SM120 native backend",
   "cuda_graph: captures and replays a real CUDA Graph",
   "resource: validates compiled CUDA binary resource usage",
+  "memcheck: minimal Compute Sanitizer memcheck coverage",
+  "racecheck: minimal Compute Sanitizer racecheck coverage",
 ]

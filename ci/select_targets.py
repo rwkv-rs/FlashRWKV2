@@ -48,13 +48,22 @@ BACKENDS_BY_TARGET = {
     "tmix/wkv7": ("sm90", "sm120"),
     "tmix/wkv7/rl_infctx": ("sm90",),
 }
+RACECHECK_TARGETS = {
+    "cmix",
+    "embedding",
+    "sampling",
+    "tmix/tokenshift",
+    "tmix/wkv7",
+    "tmix/wkv7/rl_infctx",
+}
+CUDA_GRAPH_TARGETS = {"sampling", "tmix/tokenshift", "tmix/wkv7"}
 SHARED_FILES = {
     "setup.py",
     "pyproject.toml",
     "uv.lock",
     "flashrwkv2/__init__.py",
-    "tests/fixtures/tolerances-v1.json",
 }
+TEST_SHARED_FILES = {"tests/fixtures/tolerances-v1.json"}
 SHARED_PREFIXES = (
     ".github/workflows/",
     "ci/",
@@ -63,6 +72,18 @@ SHARED_PREFIXES = (
     "csrc/validation.cpp",
     "csrc/validation/",
 )
+BENCHMARK_SHARED_FILES = {
+    "benchmarks/_timing.py",
+    "ci/benchmark_gate.py",
+}
+SHARED_PRIMITIVE_CALLERS = {
+    "csrc/sm120/internal/linear/": (
+        "cmix",
+        "head/linear",
+        "tmix/readout",
+        "tmix/wkv_prepare",
+    ),
+}
 DOC_PREFIXES = ("docs/",)
 DOC_FILES = {
     "AGENTS.md",
@@ -197,6 +218,8 @@ def classify(
         sorted({path.strip().removeprefix("./") for path in paths if path.strip()})
     )
     modules: set[str] = set()
+    sm90_modules: set[str] = set()
+    sm120_modules: set[str] = set()
     reasons: list[str] = []
     run_gpu = False
     run_benchmark = False
@@ -233,11 +256,40 @@ def classify(
             run_all = run_gpu = run_sanitizer = True
             reasons.append("shared-test-behavior")
             continue
+        if path in TEST_SHARED_FILES:
+            run_all = run_gpu = True
+            reasons.append("shared-numerical-test-contract")
+            continue
+        if path in BENCHMARK_SHARED_FILES:
+            modules.update(MODULES)
+            sm120_modules.update(
+                module for module in MODULES if "sm120" in BACKENDS_BY_TARGET[module]
+            )
+            run_gpu = run_benchmark = True
+            reasons.append("shared-benchmark-behavior")
+            continue
         if path in SHARED_FILES or path.startswith(SHARED_PREFIXES):
             run_all = run_gpu = run_benchmark = True
-            if path.startswith(("csrc/", "ci/", ".github/workflows/")):
+            if path in SHARED_FILES or path.startswith(
+                ("csrc/", "ci/", ".github/workflows/")
+            ):
                 run_sanitizer = True
             reasons.append(f"shared:{path}")
+            continue
+
+        shared_callers = next(
+            (
+                callers
+                for prefix, callers in SHARED_PRIMITIVE_CALLERS.items()
+                if path.startswith(prefix)
+            ),
+            None,
+        )
+        if shared_callers is not None:
+            modules.update(shared_callers)
+            sm120_modules.update(shared_callers)
+            run_gpu = run_benchmark = run_sanitizer = True
+            reasons.append(f"shared-primitive:{path}")
             continue
 
         module = None
@@ -256,6 +308,19 @@ def classify(
         if module:
             modules.add(module)
             run_gpu = True
+            if owner == "csrc":
+                architecture = path.split("/", 2)[1]
+                if architecture == "sm90":
+                    sm90_modules.add(module)
+                elif architecture == "sm120":
+                    sm120_modules.add(module)
+                else:
+                    run_all = True
+            else:
+                if "sm90" in BACKENDS_BY_TARGET[module]:
+                    sm90_modules.add(module)
+                if "sm120" in BACKENDS_BY_TARGET[module]:
+                    sm120_modules.add(module)
             if owner in {"flashrwkv2", "benchmarks", "csrc"}:
                 run_benchmark = True
             if owner == "csrc" and suffix in {".cpp", ".cu", ".cuh", ".h", ".hpp"}:
@@ -273,17 +338,15 @@ def classify(
 
     if run_all:
         modules = set(TARGETS)
+        sm90_modules = {
+            module for module in TARGETS if "sm90" in BACKENDS_BY_TARGET[module]
+        }
+        sm120_modules = {
+            module for module in TARGETS if "sm120" in BACKENDS_BY_TARGET[module]
+        }
     affected_modules = tuple(sorted(modules))
-    affected_sm90_modules = tuple(
-        module
-        for module in affected_modules
-        if "sm90" in BACKENDS_BY_TARGET[module]
-    )
-    affected_sm120_modules = tuple(
-        module
-        for module in affected_modules
-        if "sm120" in BACKENDS_BY_TARGET[module]
-    )
+    affected_sm90_modules = tuple(sorted(sm90_modules))
+    affected_sm120_modules = tuple(sorted(sm120_modules))
     if not changed:
         change_class = "empty"
     elif only_docs and not run_gpu:
@@ -434,11 +497,20 @@ def _write_github_outputs(path: Path, impact: Impact, artifact_path: Path) -> No
         "affected_sm120_modules": json.dumps(
             impact.affected_sm120_modules, separators=(",", ":")
         ),
-        "benchmark_matrix": json.dumps(
-            [
-                {"module": module, "safe": module.replace("/", "-")}
+        "sm90_racecheck_modules": json.dumps(
+            tuple(
+                module
+                for module in impact.affected_sm90_modules
+                if module in RACECHECK_TARGETS
+            ),
+            separators=(",", ":"),
+        ),
+        "sm120_racecheck_modules": json.dumps(
+            tuple(
+                module
                 for module in impact.affected_sm120_modules
-            ],
+                if module in RACECHECK_TARGETS
+            ),
             separators=(",", ":"),
         ),
         "run_gpu": str(impact.run_gpu).lower(),
@@ -471,6 +543,9 @@ def _self_test() -> None:
         and native.run_sanitizer
         and native.run_benchmark
     )
+    assert native.affected_sm90_modules == ()
+    assert native.affected_sm120_modules == ("tmix/wkv7",)
+    assert "tmix/wkv7" in RACECHECK_TARGETS
     benchmark = classify(["benchmarks/cmix/bench.py"])
     assert benchmark.affected_modules == ("cmix",) and benchmark.run_benchmark
     rl_infctx = classify(
@@ -487,8 +562,21 @@ def _self_test() -> None:
     test_utils = classify(["tests/utils.py"])
     assert test_utils.run_all and test_utils.run_gpu and test_utils.run_sanitizer
     assert not test_utils.run_benchmark
+    tolerances = classify(["tests/fixtures/tolerances-v1.json"])
+    assert tolerances.run_all and tolerances.run_gpu
+    assert not tolerances.run_benchmark and not tolerances.run_sanitizer
     runtime = classify(["tests/test_runtime.py"])
     assert not runtime.run_gpu and runtime.change_class == "metadata"
+    benchmark_shared = classify(["benchmarks/_timing.py"])
+    assert benchmark_shared.run_benchmark and not benchmark_shared.run_sanitizer
+    assert benchmark_shared.affected_sm90_modules == ()
+    assert benchmark_shared.affected_sm120_modules
+    primitive = classify(["csrc/sm120/internal/linear/backend.cuh"])
+    assert primitive.affected_modules == tuple(
+        sorted(SHARED_PRIMITIVE_CALLERS["csrc/sm120/internal/linear/"])
+    )
+    assert primitive.affected_sm90_modules == ()
+    assert primitive.run_sanitizer and not primitive.run_all
     unknown = classify(["flashrwkv2/new_family.py"])
     assert unknown.run_all and unknown.run_sanitizer
     release = classify(

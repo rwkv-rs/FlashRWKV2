@@ -10,6 +10,7 @@ from flashrwkv2.tmix.vres_gate import pretrain_tmix_vres_gate_bf16
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.sm90
+@pytest.mark.memcheck
 def test_vres_gate_training_forward_backward() -> None:
     torch.manual_seed(32)
     device = torch.device("cuda")

@@ -96,6 +96,11 @@ def _native_sources(architecture: str) -> list[str]:
 
 def _compile_args(architecture: str) -> dict[str, list[str]]:
     capability = {"sm90": "90", "sm120": "120"}[architecture]
+    code = (
+        f"[sm_{capability},compute_{capability}]"
+        if architecture == "sm90"
+        else f"sm_{capability}"
+    )
     return {
         "cxx": ["-O3", "-Wno-psabi"],
         "nvcc": [
@@ -109,7 +114,7 @@ def _compile_args(architecture: str) -> dict[str, list[str]]:
             # CUDA 13 nvcc ICEs on the unmodified canonical Albatross v3a
             # body under C++20. Keep the translation unit on C++17.
             "-std=c++17",
-            f"-gencode=arch=compute_{capability},code=sm_{capability}",
+            f"-gencode=arch=compute_{capability},code={code}",
         ],
     }
 

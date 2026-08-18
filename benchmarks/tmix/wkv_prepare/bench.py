@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import argparse
 import json
-import time
 
 import torch
+from _timing import measure_cuda
 
 from flashrwkv2.tmix.wkv_prepare import infer_tmix_wkv_prepare_forward_varlen
 
@@ -16,17 +16,18 @@ def main() -> None:
     parser.add_argument("--tokens", type=int, default=1)
     parser.add_argument("--channels", type=int, default=4096)
     parser.add_argument("--rank", type=int, default=64)
-    parser.add_argument("--warmup", type=int, default=10)
-    parser.add_argument("--samples", type=int, default=30)
     args = parser.parse_args()
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is required")
-    device = torch.device("cuda")
-    options = {"device": device, "dtype": torch.float16}
+    options = {"device": torch.device("cuda"), "dtype": torch.float16}
     shifted = [torch.randn(args.tokens, args.channels, **options) for _ in range(6)]
-    dense = [torch.randn(args.channels, args.channels, **options) * 0.01 for _ in range(3)]
-    rank_in = [torch.randn(args.rank, args.channels, **options) * 0.01 for _ in range(4)]
-    rank_out = [torch.randn(args.channels, args.rank, **options) * 0.01 for _ in range(4)]
+    dense = [
+        torch.randn(args.channels, args.channels, **options) * 0.01 for _ in range(3)
+    ]
+    rank_in = [
+        torch.randn(args.rank, args.channels, **options) * 0.01 for _ in range(4)
+    ]
+    rank_out = [
+        torch.randn(args.channels, args.rank, **options) * 0.01 for _ in range(4)
+    ]
     runtime_in = [weight.t().contiguous() for weight in rank_in]
     runtime_out = [weight.t().contiguous() for weight in rank_out]
     vectors = [torch.zeros(args.channels, **options) for _ in range(4)]
@@ -51,22 +52,16 @@ def main() -> None:
             max_seqlen=args.tokens,
         )
 
-    for _ in range(args.warmup):
-        outputs = run()
-    torch.cuda.synchronize()
-    latency = []
-    for _ in range(args.samples):
-        start = time.perf_counter()
-        outputs = run()
-        torch.cuda.synchronize()
-        latency.append((time.perf_counter() - start) * 1e6)
-    correctness = "passed" if all(torch.isfinite(output).all() for output in outputs) else "failed"
+    timing = measure_cuda(run)
     print(
         json.dumps(
             {
                 "operator": "infer_tmix_wkv_prepare_forward_varlen",
-                "raw_latency_us": latency,
-                "correctness": correctness,
+                "profile": (
+                    f"tokens={args.tokens}/channels={args.channels}/rank={args.rank}"
+                ),
+                "steady_state": "stateless inputs and weights are reused",
+                **timing,
             }
         )
     )
