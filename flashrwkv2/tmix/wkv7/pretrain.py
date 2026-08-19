@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: MIT
 
-"""Canonical RWKV-LM ``train_temp`` clampw v3 H100 training operator."""
+"""Canonical RWKV-LM ``train_temp`` clampw v3 training operator."""
 
 from __future__ import annotations
 
 import torch
 
+from . import _extension
 
 CHUNK_LEN = 16
 
@@ -76,7 +77,7 @@ class _PretrainRecurrent(torch.autograd.Function):
             device=r.device,
             dtype=torch.float32,
         )
-        torch.ops.rwkv7_clampw_v3.forward(
+        _extension().pretrain_tmix_wkv7_recurrent_forward(
             *values, output, boundary, state_dot_a, head_size
         )
         ctx.save_for_backward(*values, boundary, state_dot_a)
@@ -97,7 +98,7 @@ class _PretrainRecurrent(torch.autograd.Function):
             batch, tokens, heads, head_size
         )
         gradients = tuple(torch.empty_like(tensor) for tensor in (r, w, k, v, a, b))
-        torch.ops.rwkv7_clampw_v3.backward(
+        _extension().pretrain_tmix_wkv7_recurrent_backward(
             r,
             w,
             k,

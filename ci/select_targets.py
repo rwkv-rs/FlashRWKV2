@@ -34,19 +34,19 @@ TARGETS = MODULES + WORKLOAD_TARGETS
 BACKENDS_BY_TARGET = {
     "cmix": ("sm90", "sm120"),
     "embedding": ("sm120",),
-    "head/l2wrap_ce": ("sm90",),
+    "head/l2wrap_ce": ("sm90", "sm120"),
     "head/linear": ("sm120",),
-    "loss/l2wrap_ce": ("sm90",),
+    "loss/l2wrap_ce": ("sm90", "sm120"),
     "sampling": ("sm120",),
-    "tmix/a_gate": ("sm90",),
-    "tmix/kk_pre": ("sm90",),
+    "tmix/a_gate": ("sm90", "sm120"),
+    "tmix/kk_pre": ("sm90", "sm120"),
     "tmix/readout": ("sm90", "sm120"),
     "tmix/tokenshift": ("sm90", "sm120"),
     "post_norm": ("sm120",),
-    "tmix/vres_gate": ("sm90",),
+    "tmix/vres_gate": ("sm90", "sm120"),
     "tmix/wkv_prepare": ("sm120",),
     "tmix/wkv7": ("sm90", "sm120"),
-    "tmix/wkv7/rl_infctx": ("sm90",),
+    "tmix/wkv7/rl_infctx": ("sm90", "sm120"),
 }
 RACECHECK_TARGETS = {
     "cmix",
@@ -173,6 +173,10 @@ def validate_layout(root: Path = ROOT) -> None:
         root / "csrc/sm90/tmix/wkv7/rl_infctx_chunk_fp32io16_forward.cu",
         root / "csrc/sm90/tmix/wkv7/rl_infctx_chunk_fp32io16_backward.cpp",
         root / "csrc/sm90/tmix/wkv7/rl_infctx_chunk_fp32io16_backward.cu",
+        root / "csrc/sm120/tmix/wkv7/rl_infctx_chunk_fp32io16_forward.cpp",
+        root / "csrc/sm120/tmix/wkv7/rl_infctx_chunk_fp32io16_forward.cu",
+        root / "csrc/sm120/tmix/wkv7/rl_infctx_chunk_fp32io16_backward.cpp",
+        root / "csrc/sm120/tmix/wkv7/rl_infctx_chunk_fp32io16_backward.cu",
     ):
         if not candidate.is_file():
             missing.append(str(candidate.relative_to(root)))
@@ -555,10 +559,18 @@ def _self_test() -> None:
     assert rl_infctx.affected_sm90_modules == ("tmix/wkv7/rl_infctx",)
     assert rl_infctx.affected_sm120_modules == ()
     assert rl_infctx.run_benchmark and rl_infctx.run_sanitizer
+    native_rl_infctx = classify(
+        ["csrc/sm120/tmix/wkv7/rl_infctx_chunk_fp32io16_forward.cu"]
+    )
+    assert native_rl_infctx.affected_modules == ("tmix/wkv7/rl_infctx",)
+    assert native_rl_infctx.affected_sm90_modules == ()
+    assert native_rl_infctx.affected_sm120_modules == ("tmix/wkv7/rl_infctx",)
+    assert native_rl_infctx.run_benchmark and native_rl_infctx.run_sanitizer
     shared = classify(["setup.py"])
     assert shared.run_all and shared.affected_modules == tuple(sorted(TARGETS))
     assert "embedding" not in shared.affected_sm90_modules
-    assert "head/l2wrap_ce" not in shared.affected_sm120_modules
+    assert "head/linear" not in shared.affected_sm90_modules
+    assert "head/l2wrap_ce" in shared.affected_sm120_modules
     test_utils = classify(["tests/utils.py"])
     assert test_utils.run_all and test_utils.run_gpu and test_utils.run_sanitizer
     assert not test_utils.run_benchmark

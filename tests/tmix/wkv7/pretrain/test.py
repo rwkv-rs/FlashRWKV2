@@ -14,9 +14,12 @@ W_SCALE = -0.6065306597
 
 
 def _require_cuda() -> None:
-    require_cuda_backend("_C_sm90", 9)
-    assert hasattr(torch.ops.rwkv7_clampw_v3, "forward")
-    assert hasattr(torch.ops.rwkv7_clampw_v3, "backward")
+    require_cuda_backend(
+        ("_C_sm90", "_C_sm120"),
+        (9, 12),
+        "pretrain_tmix_wkv7_recurrent_forward",
+        "pretrain_tmix_wkv7_recurrent_backward",
+    )
 
 
 def _case(
@@ -81,6 +84,7 @@ def test_public_contract_matches_clampw_v3() -> None:
     ],
 )
 @pytest.mark.sm90
+@pytest.mark.sm120
 def test_forward_matches_clampw_recurrence(
     batch: int, tokens: int, heads: int
 ) -> None:
@@ -96,6 +100,7 @@ def test_forward_matches_clampw_recurrence(
 
 
 @pytest.mark.sm90
+@pytest.mark.sm120
 def test_backward_matches_clampw_recurrence() -> None:
     _require_cuda()
     values = _case(1, 16, 1, requires_grad=True)
@@ -121,6 +126,7 @@ def test_backward_matches_clampw_recurrence() -> None:
 
 @pytest.mark.parametrize("head_size", (128, 256))
 @pytest.mark.sm90
+@pytest.mark.sm120
 def test_generalized_forward_backward_matches_recurrence(head_size: int) -> None:
     _require_cuda()
     values = _case(1, 16, 1, requires_grad=True, head_size=head_size)
@@ -137,6 +143,7 @@ def test_generalized_forward_backward_matches_recurrence(head_size: int) -> None
 
 
 @pytest.mark.sm90
+@pytest.mark.sm120
 def test_invalid_input_contract_is_rejected() -> None:
     _require_cuda()
     valid = list(_case(1, 16, 1))

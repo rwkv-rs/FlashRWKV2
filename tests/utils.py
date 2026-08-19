@@ -55,39 +55,56 @@ def pytest_configure(config: pytest.Config) -> None:
 
 
 def require_cuda_backend(
-    expected_backend: str,
-    compatible_major: int,
+    expected_backend: str | tuple[str, ...],
+    compatible_major: int | tuple[int, ...],
     *required_symbols: str,
 ) -> Any:
     """Return the selected backend, skipping only unavailable hardware."""
+    expected_backends = (
+        (expected_backend,) if isinstance(expected_backend, str) else expected_backend
+    )
+    compatible_majors = (
+        (compatible_major,)
+        if isinstance(compatible_major, int)
+        else compatible_major
+    )
+    if len(expected_backends) != len(compatible_majors):
+        raise ValueError("expected backends and compatible majors must align")
+    backend_by_major = dict(zip(compatible_majors, expected_backends, strict=True))
+
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
     forced_backend = _forced_test_backend()
     if forced_backend is not None:
-        if forced_backend.__name__ != f"flashrwkv2.{expected_backend}":
+        if forced_backend.__name__.removeprefix("flashrwkv2.") not in expected_backends:
             pytest.skip(
                 f"forced test backend {forced_backend.__name__} "
-                f"does not own {expected_backend}"
+                f"does not own any of {expected_backends}"
             )
         missing = [
             name for name in required_symbols if not hasattr(forced_backend, name)
         ]
-        assert not missing, f"{expected_backend} is missing required symbols: {missing}"
+        assert not missing, (
+            f"{forced_backend.__name__} is missing required symbols: {missing}"
+        )
         return forced_backend
     capability = tuple(torch.cuda.get_device_capability())
-    if capability[0] != compatible_major:
+    expected_for_device = backend_by_major.get(capability[0])
+    if expected_for_device is None:
         pytest.skip(
-            f"{expected_backend} requires compute capability major "
-            f"{compatible_major}, found sm{capability[0]}{capability[1]}"
+            f"{expected_backends} require compute capability majors "
+            f"{compatible_majors}, found sm{capability[0]}{capability[1]}"
         )
 
     import flashrwkv2
 
     backend = flashrwkv2._C
     assert backend is not None, "matching CUDA hardware did not load a backend"
-    assert backend.__name__ == f"flashrwkv2.{expected_backend}"
+    assert backend.__name__ == f"flashrwkv2.{expected_for_device}"
     missing = [name for name in required_symbols if not hasattr(backend, name)]
-    assert not missing, f"{expected_backend} is missing required symbols: {missing}"
+    assert not missing, (
+        f"{expected_for_device} is missing required symbols: {missing}"
+    )
     return backend
 
 

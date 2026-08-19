@@ -36,6 +36,7 @@ void register_pretrain_tmix_kk_pre_backward_bindings(py::module_&);
 void register_pretrain_tmix_readout_forward_bindings(py::module_&);
 void register_pretrain_tmix_readout_backward_bindings(py::module_&);
 void register_pretrain_head_l2wrap_ce_bindings(py::module_&);
+void register_pretrain_tmix_wkv7_recurrent_bindings(py::module_&);
 void register_statetune_tmix_wkv7_recurrent_forward_bindings(py::module_&);
 void register_statetune_tmix_wkv7_recurrent_backward_bindings(py::module_&);
 void register_rl_infctx_tmix_wkv7_chunk_forward_bindings(py::module_&);

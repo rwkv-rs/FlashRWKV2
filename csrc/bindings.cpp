@@ -16,7 +16,9 @@ void register_flashrwkv2_bindings(py::module_& module) {
   register_head_linear_bindings(module);
   register_sampling_bindings(module);
   register_infer_tmix_wkv7_chunk_bindings(module);
-#elif defined(FLASHRWKV_BACKEND_SM90)
+#endif
+
+#if defined(FLASHRWKV_BACKEND_SM90) || defined(FLASHRWKV_BACKEND_SM120)
   register_pretrain_l2wrap_ce_forward_bindings(module);
   register_pretrain_l2wrap_ce_backward_bindings(module);
   register_pretrain_tmix_a_gate_forward_bindings(module);
@@ -36,6 +38,7 @@ void register_flashrwkv2_bindings(py::module_& module) {
   register_pretrain_tmix_readout_forward_bindings(module);
   register_pretrain_tmix_readout_backward_bindings(module);
   register_pretrain_head_l2wrap_ce_bindings(module);
+  register_pretrain_tmix_wkv7_recurrent_bindings(module);
   register_statetune_tmix_wkv7_recurrent_forward_bindings(module);
   register_statetune_tmix_wkv7_recurrent_backward_bindings(module);
   register_rl_infctx_tmix_wkv7_chunk_forward_bindings(module);

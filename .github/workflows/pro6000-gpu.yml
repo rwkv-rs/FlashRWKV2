@@ -371,10 +371,24 @@ jobs:
               raise SystemExit(f'unexpected GPU capability: {torch.cuda.get_device_capability(0)}')
           if flashrwkv2._C is None or flashrwkv2._C.__name__ != 'flashrwkv2._C_sm120':
               raise SystemExit('native SM120 backend was not selected')
+          backends = {}
           for backend in ('flashrwkv2._C_sm90', 'flashrwkv2._C_sm120'):
               if importlib.util.find_spec(backend) is None:
                   raise SystemExit(f'wheel lacks {backend}')
-              importlib.import_module(backend)
+              backends[backend] = importlib.import_module(backend)
+          public_sm90 = {
+              name for name in dir(backends['flashrwkv2._C_sm90'])
+              if not name.startswith('_')
+          }
+          public_sm120 = {
+              name for name in dir(backends['flashrwkv2._C_sm120'])
+              if not name.startswith('_')
+          }
+          missing_sm120 = sorted(public_sm90 - public_sm120)
+          if missing_sm120:
+              raise SystemExit(
+                  f'SM120 backend lacks SM90 workload symbols: {missing_sm120}'
+              )
           PY
           )
       - name: Run affected correctness and CUDA Graph tests once

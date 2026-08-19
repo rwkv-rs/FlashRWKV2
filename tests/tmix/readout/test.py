@@ -69,6 +69,7 @@ def test_readout_inference_matches_reference(head_size: int) -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.sm90
+@pytest.mark.sm120
 @pytest.mark.memcheck
 @pytest.mark.parametrize("head_size", [64, 128, 256])
 def test_readout_pretrain_matches_forward_and_gradient_reference(

@@ -13,6 +13,7 @@ import sys
 import tempfile
 import urllib.request
 import zipfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -20,22 +21,109 @@ ROOT = Path(
     os.environ.get("FLASH_RWKV_SOURCE_ROOT", Path(__file__).resolve().parents[1])
 ).resolve()
 SCHEMA_VERSION = 2
+
+
+@dataclass(frozen=True, slots=True)
+class BenchmarkCase:
+    workload: str
+    path: str
+    arguments: tuple[str, ...] = ()
+    output_argument: str | None = None
+
+
 BENCHMARKS = {
-    "cmix": "benchmarks/cmix/bench.py",
-    "embedding": "benchmarks/embedding/bench.py",
-    "head/l2wrap_ce": "benchmarks/head/l2wrap_ce/bench.py",
-    "head/linear": "benchmarks/head/linear/bench.py",
-    "loss/l2wrap_ce": "benchmarks/loss/l2wrap_ce/bench.py",
-    "sampling": "benchmarks/sampling/bench.py",
-    "tmix/a_gate": "benchmarks/tmix/a_gate/bench.py",
-    "tmix/kk_pre": "benchmarks/tmix/kk_pre/bench.py",
-    "tmix/readout": "benchmarks/tmix/readout/bench.py",
-    "tmix/tokenshift": "benchmarks/tmix/tokenshift/bench.py",
-    "post_norm": "benchmarks/post_norm/bench.py",
-    "tmix/vres_gate": "benchmarks/tmix/vres_gate/bench.py",
-    "tmix/wkv_prepare": "benchmarks/tmix/wkv_prepare/bench.py",
-    "tmix/wkv7": "benchmarks/tmix/wkv7/bench.py",
-    "tmix/wkv7/rl_infctx": "benchmarks/tmix/wkv7/rl_infctx/bench.py",
+    "cmix": (
+        BenchmarkCase("infer", "benchmarks/cmix/bench.py", ("--operator", "infer")),
+        BenchmarkCase(
+            "pretrain_forward_backward",
+            "benchmarks/cmix/bench.py",
+            ("--operator", "pretrain", "--backward"),
+        ),
+        BenchmarkCase(
+            "statetune_forward_backward",
+            "benchmarks/cmix/bench.py",
+            ("--operator", "stateful", "--backward"),
+        ),
+    ),
+    "embedding": (BenchmarkCase("infer", "benchmarks/embedding/bench.py"),),
+    "head/l2wrap_ce": (
+        BenchmarkCase("pretrain", "benchmarks/head/l2wrap_ce/bench.py"),
+    ),
+    "head/linear": (BenchmarkCase("infer", "benchmarks/head/linear/bench.py"),),
+    "loss/l2wrap_ce": (
+        BenchmarkCase(
+            "pretrain_forward_backward", "benchmarks/loss/l2wrap_ce/bench.py"
+        ),
+    ),
+    "sampling": (BenchmarkCase("infer", "benchmarks/sampling/bench.py"),),
+    "tmix/a_gate": (
+        BenchmarkCase("pretrain", "benchmarks/tmix/a_gate/bench.py"),
+    ),
+    "tmix/kk_pre": (
+        BenchmarkCase("pretrain", "benchmarks/tmix/kk_pre/bench.py"),
+    ),
+    "tmix/readout": (
+        BenchmarkCase(
+            "infer", "benchmarks/tmix/readout/bench.py", ("--operator", "infer")
+        ),
+        BenchmarkCase(
+            "pretrain_forward_backward",
+            "benchmarks/tmix/readout/bench.py",
+            ("--operator", "pretrain", "--backward"),
+        ),
+    ),
+    "tmix/tokenshift": (
+        BenchmarkCase("infer", "benchmarks/tmix/tokenshift/bench.py"),
+        BenchmarkCase(
+            "pretrain_forward_backward",
+            "benchmarks/tmix/tokenshift/pretrain/bench.py",
+            ("--operator", "pretrain", "--backward"),
+        ),
+        BenchmarkCase(
+            "statetune_forward_backward",
+            "benchmarks/tmix/tokenshift/pretrain/bench.py",
+            ("--operator", "stateful", "--backward"),
+        ),
+    ),
+    "post_norm": (BenchmarkCase("infer", "benchmarks/post_norm/bench.py"),),
+    "tmix/vres_gate": (
+        BenchmarkCase("pretrain", "benchmarks/tmix/vres_gate/bench.py"),
+    ),
+    "tmix/wkv_prepare": (
+        BenchmarkCase("infer", "benchmarks/tmix/wkv_prepare/bench.py"),
+    ),
+    "tmix/wkv7": (
+        BenchmarkCase(
+            "infer_recurrent_fp32io16",
+            "benchmarks/tmix/wkv7/bench.py",
+            ("--shapes", "h32d64", "--dtype", "bfloat16", "--seed", "20260804"),
+            "--output",
+        ),
+        BenchmarkCase("infer_chunk_bf16", "benchmarks/tmix/wkv7/chunk/bench.py"),
+        BenchmarkCase(
+            "pretrain_forward_backward", "benchmarks/tmix/wkv7/pretrain/bench.py"
+        ),
+        BenchmarkCase(
+            "statetune", "benchmarks/tmix/wkv7/statetune/bench.py"
+        ),
+    ),
+    "tmix/wkv7/rl_infctx": (
+        BenchmarkCase(
+            "forward_materialized",
+            "benchmarks/tmix/wkv7/rl_infctx/bench.py",
+            ("--stage", "forward", "--strategy", "materialized"),
+        ),
+        BenchmarkCase(
+            "forward_recompute",
+            "benchmarks/tmix/wkv7/rl_infctx/bench.py",
+            ("--stage", "forward", "--strategy", "recompute"),
+        ),
+        BenchmarkCase(
+            "backward_replay",
+            "benchmarks/tmix/wkv7/rl_infctx/bench.py",
+            ("--stage", "backward_replay"),
+        ),
+    ),
 }
 
 
@@ -132,11 +220,23 @@ def _last_json(stdout: str) -> dict[str, Any]:
 
 def _contract_hash(module: str) -> str:
     digest = hashlib.sha256()
-    for path in (ROOT / BENCHMARKS[module], ROOT / "benchmarks/_timing.py"):
+    for case in BENCHMARKS[module]:
+        digest.update(case.workload.encode())
+        digest.update(b"\0")
+        digest.update(json.dumps(case.arguments, separators=(",", ":")).encode())
+        digest.update(b"\0")
+        digest.update(str(case.output_argument).encode())
+        digest.update(b"\0")
+        path = ROOT / case.path
         digest.update(str(path.relative_to(ROOT)).encode())
         digest.update(b"\0")
         digest.update(path.read_bytes())
         digest.update(b"\0")
+    timing = ROOT / "benchmarks/_timing.py"
+    digest.update(str(timing.relative_to(ROOT)).encode())
+    digest.update(b"\0")
+    digest.update(timing.read_bytes())
+    digest.update(b"\0")
     return digest.hexdigest()
 
 
@@ -213,6 +313,23 @@ def _profiles(payload: dict[str, Any], module: str) -> list[dict[str, Any]]:
         if profiles:
             return profiles
 
+    timing = payload.get("timing")
+    if isinstance(timing, dict):
+        raw = _positive(
+            [float(value) for value in timing.get("raw_batch_mean_us", ())],
+            module,
+        )
+        return [
+            {
+                "profile": str(payload.get("profile", payload.get("operator", "ci"))),
+                "unit": "us",
+                "direction": "lower",
+                "mean": float(timing.get("mean_us", sum(raw) / len(raw))),
+                "raw_batch_mean_us": raw,
+                "total_launches": int(timing.get("total_launches", 10000)),
+            }
+        ]
+
     raw_value = payload.get(
         "raw_batch_mean_us",
         payload.get("raw_latency_us", payload.get("latency_us")),
@@ -232,31 +349,20 @@ def _profiles(payload: dict[str, Any], module: str) -> list[dict[str, Any]]:
     ]
 
 
-def run_module(
+def _run_case(
     module: str,
+    case: BenchmarkCase,
     *,
     python: str,
-    revision: str,
-    status: str,
-    environment: dict[str, Any],
-) -> dict[str, Any]:
-    script = ROOT / BENCHMARKS[module]
-    command = [_python_executable(python), str(script)]
+) -> list[dict[str, Any]]:
+    script = ROOT / case.path
+    command = [_python_executable(python), str(script), *case.arguments]
     output_path: Path | None = None
-    if module == "tmix/wkv7":
-        output_path = Path(tempfile.gettempdir()) / f"flashrwkv2-wkv7-{os.getpid()}.json"
-        command.extend(
-            [
-                "--shapes",
-                "h32d64",
-                "--dtype",
-                "bfloat16",
-                "--seed",
-                "20260804",
-                "--output",
-                str(output_path),
-            ]
+    if case.output_argument is not None:
+        output_path = Path(tempfile.gettempdir()) / (
+            f"flashrwkv2-{module.replace('/', '-')}-{case.workload}-{os.getpid()}.json"
         )
+        command.extend((case.output_argument, str(output_path)))
     environment_variables = os.environ.copy()
     environment_variables["PYTHONPATH"] = str(ROOT / "benchmarks")
     result = subprocess.run(
@@ -274,6 +380,23 @@ def run_module(
     )
     if output_path is not None:
         output_path.unlink(missing_ok=True)
+    profiles = _profiles(payload, module)
+    for profile in profiles:
+        profile["profile"] = f"{case.workload}/{profile['profile']}"
+    return profiles
+
+
+def run_module(
+    module: str,
+    *,
+    python: str,
+    revision: str,
+    status: str,
+    environment: dict[str, Any],
+) -> dict[str, Any]:
+    profiles = []
+    for case in BENCHMARKS[module]:
+        profiles.extend(_run_case(module, case, python=python))
     return {
         "schema_version": SCHEMA_VERSION,
         "status": status,
@@ -282,7 +405,7 @@ def run_module(
         "revision": revision,
         "benchmark_contract_sha256": _contract_hash(module),
         "environment": environment,
-        "profiles": _profiles(payload, module),
+        "profiles": profiles,
     }
 
 
@@ -580,6 +703,39 @@ def _self_test() -> None:
     warnings = compare_module(payload(100.0), payload(100.000001))
     assert len(warnings) == 1 and warnings[0]["kind"] == "performance-regression"
     assert _contract_hash("cmix") == _contract_hash("cmix")
+    configured_paths = {
+        case.path for cases in BENCHMARKS.values() for case in cases
+    }
+    discovered_paths = {
+        str(path.relative_to(ROOT))
+        for path in (ROOT / "benchmarks").glob("**/bench.py")
+    }
+    assert configured_paths == discovered_paths
+    for module, cases in BENCHMARKS.items():
+        workloads = [case.workload for case in cases]
+        assert len(workloads) == len(set(workloads)), module
+        assert all((ROOT / case.path).is_file() for case in cases), module
+    assert {case.workload for case in BENCHMARKS["cmix"]} == {
+        "infer",
+        "pretrain_forward_backward",
+        "statetune_forward_backward",
+    }
+    assert {case.workload for case in BENCHMARKS["tmix/tokenshift"]} == {
+        "infer",
+        "pretrain_forward_backward",
+        "statetune_forward_backward",
+    }
+    assert {case.workload for case in BENCHMARKS["tmix/wkv7"]} == {
+        "infer_recurrent_fp32io16",
+        "infer_chunk_bf16",
+        "pretrain_forward_backward",
+        "statetune",
+    }
+    assert {case.workload for case in BENCHMARKS["tmix/wkv7/rl_infctx"]} == {
+        "forward_materialized",
+        "forward_recompute",
+        "backward_replay",
+    }
 
 
 def main() -> int:

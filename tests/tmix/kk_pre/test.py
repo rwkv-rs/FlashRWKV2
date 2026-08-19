@@ -23,6 +23,7 @@ def test_kk_pre_rejects_cpu_before_native_launch() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.sm90
+@pytest.mark.sm120
 @pytest.mark.memcheck
 @pytest.mark.parametrize("head_size", (64, 128, 256))
 def test_kk_pre_forward_backward(head_size: int) -> None:
@@ -69,6 +70,7 @@ def test_kk_pre_forward_backward(head_size: int) -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.sm90
+@pytest.mark.sm120
 def test_kk_pre_rejects_non_head_aligned_channels() -> None:
     device = torch.device("cuda")
     key = torch.zeros(1, 1, 65, device=device, dtype=torch.bfloat16)

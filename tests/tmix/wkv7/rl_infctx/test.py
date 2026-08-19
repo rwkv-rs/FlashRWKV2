@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import itertools
+
 import pytest
 import torch
 
-from flashrwkv2.tmix.wkv7 import rl_infctx_tmix_wkv7_chunk_fp32io16
+from flashrwkv2.tmix.wkv7 import (
+    _extension,
+    rl_infctx_tmix_wkv7_chunk_fp32io16,
+)
 
 
 def _reference(
@@ -30,7 +35,7 @@ def _reference(
     bias = None if decay_bias is None else decay_bias.reshape(r.shape[1], r.shape[2])
     offsets = tuple(int(value) for value in cu_seqlens.cpu().tolist())
     slots = tuple(int(value) for value in state_indices.cpu().tolist())
-    for sequence_index, (start, end) in enumerate(zip(offsets[:-1], offsets[1:])):
+    for sequence_index, (start, end) in enumerate(itertools.pairwise(offsets)):
         state = expected_state[slots[sequence_index]].clone()
         for token_index in range(start, end):
             logits = decay_logits[token_index].float()
@@ -54,6 +59,7 @@ def _reference(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.sm90
+@pytest.mark.sm120
 @pytest.mark.memcheck
 @pytest.mark.racecheck
 @pytest.mark.parametrize("d", (64, 128, 256))
@@ -112,6 +118,75 @@ def test_rl_infctx_ragged_materialized_and_recompute(d: int) -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.sm90
+@pytest.mark.sm120
+@pytest.mark.memcheck
+@pytest.mark.racecheck
+@pytest.mark.parametrize("d", (64, 128, 256))
+def test_rl_infctx_backward_replay_matches_recurrence(d: int) -> None:
+    torch.manual_seed(41 + d)
+    device = torch.device("cuda")
+    total, heads = 3, 1
+    inputs = [
+        (torch.randn(total, heads, d, device=device) * 0.01).to(torch.float16)
+        for _ in range(6)
+    ]
+    initial_state = (
+        torch.randn(heads, d, d, device=device, dtype=torch.float32) * 0.01
+    )
+    boundary = initial_state.unsqueeze(0).contiguous()
+    starts = torch.tensor([0], device=device, dtype=torch.int32)
+    ends = torch.tensor([total], device=device, dtype=torch.int32)
+    decay_bias = (torch.randn(heads, d, device=device) * 0.01).to(torch.float16)
+    output = torch.empty_like(inputs[3])
+    state_dot_a = torch.empty_like(inputs[0], dtype=torch.float32)
+
+    expected_output, _ = _reference(
+        *inputs,
+        state_pool=initial_state.unsqueeze(0),
+        cu_seqlens=torch.tensor([0, total], device=device, dtype=torch.int32),
+        state_indices=torch.tensor([0], device=device, dtype=torch.int32),
+        scale=0.75,
+        decay_bias=decay_bias,
+    )
+    expected_state_dot_a = torch.empty_like(state_dot_a)
+    state = initial_state.clone()
+    for token_index in range(total):
+        dot = torch.einsum("hk,hkv->hv", inputs[4][token_index].float(), state)
+        expected_state_dot_a[token_index] = dot
+        retention = torch.exp(
+            -0.6065306597126334
+            * torch.sigmoid(
+                inputs[1][token_index].float() + decay_bias.float()
+            )
+        )
+        state = (
+            retention.unsqueeze(-1) * state
+            + inputs[5][token_index].float().unsqueeze(-1) * dot.unsqueeze(-2)
+            + inputs[2][token_index].float().unsqueeze(-1)
+            * inputs[3][token_index].float().unsqueeze(-2)
+        )
+
+    _extension().rl_infctx_tmix_wkv7_chunk_fp32io16_backward_replay(
+        starts,
+        ends,
+        boundary,
+        *inputs,
+        output,
+        state_dot_a,
+        0.75,
+        decay_bias,
+    )
+    torch.testing.assert_close(
+        output.float(), expected_output.float(), rtol=0.0, atol=3.0e-3
+    )
+    torch.testing.assert_close(
+        state_dot_a, expected_state_dot_a, rtol=2.0e-4, atol=2.0e-4
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.sm90
+@pytest.mark.sm120
 @pytest.mark.parametrize("d", (64, 128, 256))
 def test_rl_infctx_bf16_chunk_sizes_and_tail_match_reference(d: int) -> None:
     torch.manual_seed(43)
@@ -168,6 +243,7 @@ def test_rl_infctx_bf16_chunk_sizes_and_tail_match_reference(d: int) -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.sm90
+@pytest.mark.sm120
 def test_rl_infctx_rejects_duplicate_slots() -> None:
     device = torch.device("cuda")
     shape = (2, 1, 64)
@@ -183,6 +259,7 @@ def test_rl_infctx_rejects_duplicate_slots() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.sm90
+@pytest.mark.sm120
 def test_rl_infctx_rejects_invalid_packed_boundaries() -> None:
     device = torch.device("cuda")
     values = [

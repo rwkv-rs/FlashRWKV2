@@ -15,6 +15,7 @@ from flashrwkv2.tmix.wkv7 import prepare_tmix_wkv7_recurrent_metadata
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.sm90
+@pytest.mark.sm120
 @pytest.mark.memcheck
 @pytest.mark.racecheck
 def test_pretrain_tokenshift_forward_backward() -> None:
@@ -48,6 +49,7 @@ def test_pretrain_tokenshift_forward_backward() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.sm90
+@pytest.mark.sm120
 @pytest.mark.parametrize("batch_size", (1, 2))
 @pytest.mark.parametrize("seqlen", (1, 2, 7, 16, 31))
 @pytest.mark.parametrize("zero_shift", (False, True))
@@ -101,6 +103,7 @@ def test_statetune_tokenshift_matches_torch_forward_backward(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.sm90
+@pytest.mark.sm120
 def test_statetune_tokenshift_chunk_composition() -> None:
     torch.manual_seed(23)
     device = torch.device("cuda")
@@ -151,6 +154,7 @@ def test_statetune_tokenshift_rejects_cpu_and_invalid_shape() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.sm90
+@pytest.mark.sm120
 def test_statetune_tokenshift_rejects_misaligned_vec2_input() -> None:
     device = torch.device("cuda")
     x = torch.empty(1 * 2 * 8 + 1, device=device, dtype=torch.bfloat16)[1:].view(
@@ -165,6 +169,7 @@ def test_statetune_tokenshift_rejects_misaligned_vec2_input() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.sm90
+@pytest.mark.sm120
 def test_statetune_tokenshift_rejects_invalid_cuda_contracts() -> None:
     device = torch.device("cuda")
     x = torch.zeros(1, 2, 8, device=device, dtype=torch.bfloat16)

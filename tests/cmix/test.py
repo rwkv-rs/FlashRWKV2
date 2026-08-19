@@ -165,6 +165,7 @@ def test_infer_cmix_ticket_mutation_fails_without_state_write() -> None:
     assert torch.equal(state, before)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.sm90
+@pytest.mark.sm120
 @pytest.mark.memcheck
 @pytest.mark.racecheck
 def test_pretrain_cmix_forward_backward() -> None:
@@ -204,6 +205,7 @@ def test_pretrain_cmix_forward_backward() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.sm90
+@pytest.mark.sm120
 @pytest.mark.parametrize("batch_size", (1, 2))
 @pytest.mark.parametrize("seqlen", (1, 2, 7, 16, 31))
 @pytest.mark.parametrize("zero_shift", (False, True))
@@ -271,6 +273,7 @@ def test_statetune_cmix_matches_torch_forward_backward(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.sm90
+@pytest.mark.sm120
 def test_statetune_cmix_chunk_composition() -> None:
     torch.manual_seed(29)
     device = torch.device("cuda")
@@ -333,6 +336,7 @@ def test_statetune_cmix_rejects_cpu_and_invalid_shape() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.sm90
+@pytest.mark.sm120
 def test_statetune_cmix_rejects_misaligned_vec2_input() -> None:
     device = torch.device("cuda")
     x = torch.zeros(1, 2, 8, device=device, dtype=torch.bfloat16)
@@ -349,6 +353,7 @@ def test_statetune_cmix_rejects_misaligned_vec2_input() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.sm90
+@pytest.mark.sm120
 def test_statetune_cmix_rejects_invalid_cuda_contracts() -> None:
     device = torch.device("cuda")
     x = torch.zeros(1, 2, 8, device=device, dtype=torch.bfloat16)
