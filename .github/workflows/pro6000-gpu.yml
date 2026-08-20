@@ -702,7 +702,7 @@ jobs:
         run: |
           mkdir -p evidence/final
           cp evidence/control/plan.json evidence/final/plan.json
-          wheel="$(find evidence/stage -name '*.whl' -print -quit 2>/dev/null || true)"
+          wheel="$(find evidence/stage/package/dist -maxdepth 1 -name '*.whl' -print -quit 2>/dev/null || true)"
           sdist="$(find evidence/stage -name '*.tar.gz' -print -quit 2>/dev/null || true)"
           benchmark="$(find evidence/stage -path '*/benchmark/summary.json' -print -quit 2>/dev/null || true)"
           validation="$(find evidence/stage -name validation.json -print -quit 2>/dev/null || true)"
