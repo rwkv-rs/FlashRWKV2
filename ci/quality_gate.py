@@ -505,10 +505,8 @@ def _extract_artifact(
         raise SystemExit(
             f"run {run_id} has {len(matches)} artifacts named {artifact_name}"
         )
-    request = urllib.request.Request(
-        matches[0]["archive_download_url"],
-        headers={"Authorization": f"Bearer {token}"},
-    )
+    request = urllib.request.Request(matches[0]["archive_download_url"])
+    request.add_unredirected_header("Authorization", f"Bearer {token}")
     output.mkdir(parents=True, exist_ok=True)
     with urllib.request.urlopen(request) as response, tempfile.NamedTemporaryFile() as tmp:
         tmp.write(response.read())
@@ -521,6 +519,18 @@ def _self_test() -> None:
     head = _git("rev-parse", "HEAD")
     assert len(source_tree_sha(head)) == 40
     assert build_input_hash(head) == build_input_hash(head)
+    request = urllib.request.Request("https://api.github.com/artifact")
+    request.add_unredirected_header("Authorization", "Bearer test-token")
+    redirected = urllib.request.HTTPRedirectHandler().redirect_request(
+        request,
+        None,
+        302,
+        "Found",
+        {},
+        "https://example.blob.core.windows.net/artifact.zip?signature=test",
+    )
+    assert redirected is not None
+    assert redirected.get_header("Authorization") is None
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         wheel = root / "candidate.whl"
