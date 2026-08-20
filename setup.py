@@ -126,12 +126,14 @@ EXT_MODULES = (
             define_macros=[("FLASHRWKV_BACKEND_SM90", "1")],
             sources=_native_sources("sm90"),
             extra_compile_args=_compile_args("sm90"),
+            extra_link_args=["-Wl,--strip-debug"],
         ),
         CUDAExtension(
             name="flashrwkv2._C_sm120",
             define_macros=[("FLASHRWKV_BACKEND_SM120", "1")],
             sources=_native_sources("sm120"),
             extra_compile_args=_compile_args("sm120"),
+            extra_link_args=["-Wl,--strip-debug"],
         ),
     ]
     if NATIVE_BUILD
