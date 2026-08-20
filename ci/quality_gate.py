@@ -160,6 +160,12 @@ def _api_json(path: str, repository: str, token: str) -> dict[str, Any]:
         return json.load(response)
 
 
+def _artifact_request(url: str, token: str) -> urllib.request.Request:
+    request = urllib.request.Request(url)
+    request.add_unredirected_header("Authorization", f"Bearer {token}")
+    return request
+
+
 def _artifact_run(
     repository: str,
     token: str,
@@ -197,10 +203,7 @@ def _artifact_run(
 def _artifact_covers_plan(
     artifact: dict[str, Any], plan: dict[str, Any], token: str
 ) -> bool:
-    request = urllib.request.Request(
-        artifact["archive_download_url"],
-        headers={"Authorization": f"Bearer {token}"},
-    )
+    request = _artifact_request(artifact["archive_download_url"], token)
     try:
         with urllib.request.urlopen(request) as response, tempfile.NamedTemporaryFile() as tmp:
             tmp.write(response.read())
@@ -505,8 +508,7 @@ def _extract_artifact(
         raise SystemExit(
             f"run {run_id} has {len(matches)} artifacts named {artifact_name}"
         )
-    request = urllib.request.Request(matches[0]["archive_download_url"])
-    request.add_unredirected_header("Authorization", f"Bearer {token}")
+    request = _artifact_request(matches[0]["archive_download_url"], token)
     output.mkdir(parents=True, exist_ok=True)
     with urllib.request.urlopen(request) as response, tempfile.NamedTemporaryFile() as tmp:
         tmp.write(response.read())
@@ -519,8 +521,8 @@ def _self_test() -> None:
     head = _git("rev-parse", "HEAD")
     assert len(source_tree_sha(head)) == 40
     assert build_input_hash(head) == build_input_hash(head)
-    request = urllib.request.Request("https://api.github.com/artifact")
-    request.add_unredirected_header("Authorization", "Bearer test-token")
+    request = _artifact_request("https://api.github.com/artifact", "test-token")
+    assert request.get_header("Authorization") == "Bearer test-token"
     redirected = urllib.request.HTTPRedirectHandler().redirect_request(
         request,
         None,

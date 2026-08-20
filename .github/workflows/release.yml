@@ -27,6 +27,13 @@ jobs:
           ref: ${{ github.event.release.tag_name || inputs.tag }}
           fetch-depth: 0
           persist-credentials: false
+      - name: Check out current release tooling
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: release-tools
+          sparse-checkout: ci
+          persist-credentials: false
       - name: Verify immutable tag identity
         id: identity
         env:
@@ -56,7 +63,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          python3 ci/quality_gate.py resolve \
+          python3 release-tools/ci/quality_gate.py resolve \
             --plan release/plan.json \
             --repository "$GITHUB_REPOSITORY" \
             --current-run "$GITHUB_RUN_ID" \
@@ -75,12 +82,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          python3 ci/quality_gate.py extract \
+          python3 release-tools/ci/quality_gate.py extract \
             --repository "$GITHUB_REPOSITORY" \
             --artifact '${{ steps.reuse.outputs.evidence_name }}' \
             --run-id '${{ steps.reuse.outputs.evidence_run_id }}' \
             --output release/evidence
-          python3 ci/quality_gate.py extract \
+          python3 release-tools/ci/quality_gate.py extract \
             --repository "$GITHUB_REPOSITORY" \
             --artifact '${{ steps.reuse.outputs.wheel_name }}' \
             --run-id '${{ steps.reuse.outputs.wheel_run_id }}' \
@@ -143,7 +150,7 @@ jobs:
           shutil.copy2(sdist, destination / sdist.name)
           shutil.copy2(manifests[0], Path('release/payload/quality-manifest.json'))
           PY
-          python3 ci/quality_gate.py verify \
+          python3 release-tools/ci/quality_gate.py verify \
             --manifest release/payload/quality-manifest.json \
             --expected-tree '${{ steps.plan.outputs.source_tree_sha }}' \
             --wheel release/payload/dist/*.whl \
