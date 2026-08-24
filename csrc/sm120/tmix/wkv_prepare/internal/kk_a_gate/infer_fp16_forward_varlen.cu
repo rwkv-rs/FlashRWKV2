@@ -250,9 +250,7 @@ void tmix_kk_a_gate_forward_varlen_cuda(
   // C=4096/H=64 production family uses the head-grid launch, and the packed
   // metadata supplies the original B/T dispatch coordinates.
   const bool use_2d = channels == 4096 && heads == 64 && batch_size > 0 &&
-      max_seqlen > 0 &&
-      static_cast<int64_t>(batch_size) * max_seqlen <= kMaxGridDimYZ &&
-      total_tokens <= kMaxGridDimYZ;
+      max_seqlen > 0 && total_tokens <= kMaxGridDimYZ;
   if (use_2d) {
     const dim3 grid(
         static_cast<unsigned int>(ceil_div(heads, WARPS_PER_BLOCK)),

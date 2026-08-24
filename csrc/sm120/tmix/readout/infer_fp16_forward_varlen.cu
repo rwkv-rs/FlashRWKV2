@@ -339,13 +339,12 @@ void tmix_lnx_rkvres_xg_forward_varlen_cuda(
     return;
   }
   assert(head_size == HEAD_SIZE);
-  const int64_t head_tasks =
-      static_cast<int64_t>(batch_size) * max_seqlen * heads;
+  const int64_t head_tasks = rows;
 
   // Exact tuned predicates from rwkv7_fast_v3a.py.  In the canonical tuned
-  // mode the lnx head-grid policy is disabled; the warp family is admitted
-  // from real B/T metadata, not from a guessed rectangular factorization of
-  // packed rows.
+  // mode the lnx head-grid policy is disabled.  Packed admission uses the
+  // real token/head task supply; B1 remains an exact uniform anchor because a
+  // single packed sequence necessarily has total_tokens == max_seqlen.
   constexpr int kB1T4096[] = {64, 96, 128, 160, 192, 240, 248, 264, 512};
   bool use_warp = channels == 4096 && heads == 64 && head_tasks >= 4096;
   if (use_warp && batch_size == 1) {

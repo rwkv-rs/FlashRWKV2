@@ -24,7 +24,8 @@ void cmix_tokenshift_forward_varlen_cuda(
     torch::Tensor output,
     torch::Tensor query_start_loc,
     torch::Tensor state_indices,
-    torch::Tensor metadata_status);
+    torch::Tensor metadata_status,
+    torch::Tensor token_predecessor);
 std::vector<torch::Tensor> cmix_res_ln_tokenshift_fused_forward_cuda(
     torch::Tensor x,
     torch::Tensor res,
@@ -32,7 +33,7 @@ std::vector<torch::Tensor> cmix_res_ln_tokenshift_fused_forward_cuda(
     torch::Tensor weight,
     torch::Tensor bias,
     torch::Tensor x_k,
-    torch::Tensor state_indices,
+    torch::Tensor token_predecessor,
     torch::Tensor metadata_status,
     double eps);
 std::vector<torch::Tensor> post_norm_forward_varlen_cuda(
@@ -105,6 +106,7 @@ torch::Tensor cmix_tokenshift_forward_varlen(
   torch::Tensor launch_query_start_loc = cu_seqlens;
   torch::Tensor launch_state_indices = state_indices;
   torch::Tensor metadata_status;
+  torch::Tensor token_predecessor;
   if (!validated_metadata.is_none()) {
     validated_metadata.attr("_check_compatible")(
         cu_seqlens, state_indices, total_tokens, shift_state_pool.size(0),
@@ -116,6 +118,9 @@ torch::Tensor cmix_tokenshift_forward_varlen(
         .attr("_state_indices_snapshot")()
         .cast<torch::Tensor>();
     metadata_status = validated_metadata.attr("_status")().cast<torch::Tensor>();
+    token_predecessor = validated_metadata
+        .attr("_token_predecessor")()
+        .cast<torch::Tensor>();
     max_seqlen = validated_metadata.attr("_max_seqlen")().cast<int64_t>();
   } else {
     if (max_seqlen <= 0) {
@@ -126,12 +131,14 @@ torch::Tensor cmix_tokenshift_forward_varlen(
     launch_query_start_loc = std::move(prepared.query_start_loc);
     launch_state_indices = std::move(prepared.state_indices);
     metadata_status = std::move(prepared.status);
+    token_predecessor = std::move(prepared.token_predecessor);
   }
   auto output = torch::empty_like(x);
   cmix_tokenshift_forward_varlen_cuda(
       batch_size, static_cast<int>(total_tokens), static_cast<int>(channels),
       static_cast<int>(max_seqlen), x, shift_state_pool, x_k, output,
-      launch_query_start_loc, launch_state_indices, metadata_status);
+      launch_query_start_loc, launch_state_indices, metadata_status,
+      token_predecessor);
   return output;
 }
 
@@ -186,6 +193,7 @@ std::vector<torch::Tensor> cmix_postnorm_tokenshift_forward_varlen(
   torch::Tensor launch_query_start_loc = cu_seqlens;
   torch::Tensor launch_state_indices = state_indices;
   torch::Tensor metadata_status;
+  torch::Tensor token_predecessor;
   if (!validated_metadata.is_none()) {
     validated_metadata.attr("_check_compatible")(
         cu_seqlens, state_indices, total_tokens, shift_state_pool.size(0),
@@ -197,6 +205,9 @@ std::vector<torch::Tensor> cmix_postnorm_tokenshift_forward_varlen(
         .attr("_state_indices_snapshot")()
         .cast<torch::Tensor>();
     metadata_status = validated_metadata.attr("_status")().cast<torch::Tensor>();
+    token_predecessor = validated_metadata
+        .attr("_token_predecessor")()
+        .cast<torch::Tensor>();
     max_seqlen = validated_metadata.attr("_max_seqlen")().cast<int64_t>();
   } else {
     if (max_seqlen <= 0) {
@@ -207,11 +218,12 @@ std::vector<torch::Tensor> cmix_postnorm_tokenshift_forward_varlen(
     launch_query_start_loc = std::move(prepared.query_start_loc);
     launch_state_indices = std::move(prepared.state_indices);
     metadata_status = std::move(prepared.status);
+    token_predecessor = std::move(prepared.token_predecessor);
   }
   if (channels == 4096 && max_seqlen == 1 && total_tokens == batch_size) {
     return cmix_res_ln_tokenshift_fused_forward_cuda(
         x, res, shift_state_pool, weight, bias, x_k,
-        launch_state_indices, metadata_status, eps);
+        token_predecessor, metadata_status, eps);
   }
   auto post_norm = post_norm_forward_varlen_cuda(
       x, res, weight, bias, eps, batch_size);
@@ -220,7 +232,7 @@ std::vector<torch::Tensor> cmix_postnorm_tokenshift_forward_varlen(
       static_cast<int>(batch_size), static_cast<int>(total_tokens),
       static_cast<int>(channels), static_cast<int>(max_seqlen), post_norm[1],
       shift_state_pool, x_k, output, launch_query_start_loc,
-      launch_state_indices, metadata_status);
+      launch_state_indices, metadata_status, token_predecessor);
   return {post_norm[0], output};
 }
 

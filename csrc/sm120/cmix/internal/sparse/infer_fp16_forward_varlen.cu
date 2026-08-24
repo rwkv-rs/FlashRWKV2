@@ -752,11 +752,10 @@ torch::Tensor cmix_sparse_down_relu_forward_varlen_cuda(
   int accumulators = 1;
   bool reuse = false;
   bool split2 = false;
-  const int64_t dispatch_rows =
-      batch_size > 0 && max_seqlen > 0
-      ? batch_size * max_seqlen
-      : static_cast<int64_t>(rows);
-  if (batch_size > 0 && max_seqlen > 0 && channels == 4096 && features == 16384) {
+  const int64_t dispatch_rows = static_cast<int64_t>(rows);
+  const bool uniform_shape = batch_size > 0 && max_seqlen > 0 &&
+      dispatch_rows == batch_size * max_seqlen;
+  if (uniform_shape && channels == 4096 && features == 16384) {
     const bool use_t512 = dispatch_rows >= 8;
     if (use_t512) {
       const bool accum2 =

@@ -32,23 +32,6 @@ __device__ inline void store_h2(dtype* ptr, float x0, float x1) {
   *reinterpret_cast<__half2*>(ptr) = __floats2half2_rn(x0, x1);
 }
 
-__device__ inline int find_sequence(
-    int token,
-    int batch_size,
-    const int* cu_seqlens) {
-  int low = 0;
-  int high = batch_size;
-  while (low + 1 < high) {
-    const int middle = (low + high) >> 1;
-    if (cu_seqlens[middle] <= token) {
-      low = middle;
-    } else {
-      high = middle;
-    }
-  }
-  return low;
-}
-
 template <bool Grid3D, bool UpdateShift>
 __global__ void cmix_tokenshift_varlen_kernel(
     int batch_size,
@@ -58,8 +41,7 @@ __global__ void cmix_tokenshift_varlen_kernel(
     dtype* __restrict__ shift_state,
     const dtype* __restrict__ x_k,
     dtype* __restrict__ out,
-    const int* __restrict__ cu_seqlens,
-    const int* __restrict__ state_indices,
+    const int* __restrict__ token_predecessor,
     const int* __restrict__ metadata_status) {
   const int c_pairs = C >> 1;
   const int64_t pair_idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -84,16 +66,16 @@ __global__ void cmix_tokenshift_varlen_kernel(
     return;
   }
 
-  const int sequence = find_sequence(token, metadata_status[2], cu_seqlens);
-  const int token_start = cu_seqlens[sequence];
-  const int slot = state_indices[sequence];
-  const int64_t previous_idx = token == token_start
+  const int predecessor = token_predecessor[token];
+  const bool sequence_start = predecessor < 0;
+  const int slot = -predecessor - 1;
+  const int64_t previous_idx = sequence_start
       ? static_cast<int64_t>(slot) * C + c
-      : static_cast<int64_t>(token - 1) * C + c;
+      : static_cast<int64_t>(predecessor) * C + c;
 
   // This is the canonical Albatross cmix_tokenshift arithmetic.
   const __half2 cur2 = load_h2(x + idx);
-  const __half2 prev2 = token == token_start
+  const __half2 prev2 = sequence_start
       ? load_h2(shift_state + previous_idx)
       : load_h2(x + previous_idx);
   const float2 cur = __half22float2(cur2);
@@ -169,7 +151,7 @@ __global__ __launch_bounds__(Threads, 1) void res_ln_cmix_tokenshift_fused_kerne
     const dtype* __restrict__ x_k,
     dtype* __restrict__ res_out,
     dtype* __restrict__ mixed,
-    const int* __restrict__ state_indices,
+    const int* __restrict__ token_predecessor,
     const int* __restrict__ metadata_status,
     int64_t rows,
     float eps) {
@@ -177,42 +159,43 @@ __global__ __launch_bounds__(Threads, 1) void res_ln_cmix_tokenshift_fused_kerne
   constexpr int pairs = C / 2;
   const int64_t row = blockIdx.x;
   if (row >= rows) return;
+  const int64_t base = row * C;
+  const int64_t base2 = row * pairs;
   if (metadata_status[0] != 0) {
     const __half2 invalid = __floats2half2_rn(
         __int_as_float(0x7fffffff), __int_as_float(0x7fffffff));
-    const int64_t base = row * pairs;
     for (int p = threadIdx.x; p < pairs; p += Threads) {
-      reinterpret_cast<__half2*>(res_out)[base + p] = invalid;
-      reinterpret_cast<__half2*>(mixed)[base + p] = invalid;
+      reinterpret_cast<__half2*>(res_out)[base2 + p] = invalid;
+      reinterpret_cast<__half2*>(mixed)[base2 + p] = invalid;
     }
     return;
   }
   // Captured capacity may exceed the active request count on graph replay.
   if (row >= metadata_status[2]) return;
-  const int slot = state_indices[row];
-  const int64_t base = row * pairs;
+  const int slot = -token_predecessor[row] - 1;
   float sum = 0.0f;
 #pragma unroll
-  for (int p = threadIdx.x; p < pairs; p += Threads) {
-    const float2 xv = __half22float2(reinterpret_cast<const __half2*>(x)[base + p]);
-    const float2 rv = __half22float2(reinterpret_cast<const __half2*>(res)[base + p]);
-    sum += xv.x + rv.x + xv.y + rv.y;
+  for (int k = 0; k < C / Threads; ++k) {
+    const int c = threadIdx.x + k * Threads;
+    sum += __half2float(*reinterpret_cast<const __half*>(x + base + c)) +
+           __half2float(*reinterpret_cast<const __half*>(res + base + c));
   }
   const float mean = block_sum<Threads>(sum) / C;
   float var = 0.0f;
 #pragma unroll
-  for (int p = threadIdx.x; p < pairs; p += Threads) {
-    const float2 xv = __half22float2(reinterpret_cast<const __half2*>(x)[base + p]);
-    const float2 rv = __half22float2(reinterpret_cast<const __half2*>(res)[base + p]);
-    const float d0 = xv.x + rv.x - mean;
-    const float d1 = xv.y + rv.y - mean;
-    var += d0 * d0 + d1 * d1;
+  for (int k = 0; k < C / Threads; ++k) {
+    const int c = threadIdx.x + k * Threads;
+    const float value =
+        __half2float(*reinterpret_cast<const __half*>(x + base + c)) +
+        __half2float(*reinterpret_cast<const __half*>(res + base + c));
+    const float delta = value - mean;
+    var += delta * delta;
   }
   const float rstd = rsqrtf(block_sum<Threads>(var) / C + eps);
 #pragma unroll
   for (int p = threadIdx.x; p < pairs; p += Threads) {
-    const float2 xv = __half22float2(reinterpret_cast<const __half2*>(x)[base + p]);
-    const float2 rv = __half22float2(reinterpret_cast<const __half2*>(res)[base + p]);
+    const float2 xv = __half22float2(reinterpret_cast<const __half2*>(x)[base2 + p]);
+    const float2 rv = __half22float2(reinterpret_cast<const __half2*>(res)[base2 + p]);
     const float2 w = __half22float2(reinterpret_cast<const __half2*>(weight)[p]);
     const float2 b = __half22float2(reinterpret_cast<const __half2*>(bias)[p]);
     const float2 mix = __half22float2(reinterpret_cast<const __half2*>(x_k)[p]);
@@ -224,8 +207,8 @@ __global__ __launch_bounds__(Threads, 1) void res_ln_cmix_tokenshift_fused_kerne
         (s0 - mean) * rstd * w.x + b.x,
         (s1 - mean) * rstd * w.y + b.y);
     const float2 norm = __half22float2(norm2);
-    reinterpret_cast<__half2*>(res_out)[base + p] = __floats2half2_rn(s0, s1);
-    reinterpret_cast<__half2*>(mixed)[base + p] = __floats2half2_rn(
+    reinterpret_cast<__half2*>(res_out)[base2 + p] = __floats2half2_rn(s0, s1);
+    reinterpret_cast<__half2*>(mixed)[base2 + p] = __floats2half2_rn(
         norm.x + (prev.x - norm.x) * mix.x,
         norm.y + (prev.y - norm.y) * mix.y);
     reinterpret_cast<__half2*>(shift_state)[static_cast<int64_t>(slot) * pairs + p] = norm2;
@@ -245,7 +228,8 @@ void cmix_tokenshift_forward_varlen_cuda(
     torch::Tensor output,
     torch::Tensor query_start_loc,
     torch::Tensor state_indices,
-    torch::Tensor metadata_status) {
+    torch::Tensor metadata_status,
+    torch::Tensor token_predecessor) {
   constexpr int threads = 256;
   constexpr int cmix_tokenshift_3d_b1_t_4096[] = {2, 4, 16, 64, 512};
   // Albatross uses grid=(channel_tiles,T,B).  This packed adaptation places
@@ -281,8 +265,7 @@ void cmix_tokenshift_forward_varlen_cuda(
         reinterpret_cast<dtype*>(shift_state.data_ptr()),
         reinterpret_cast<const dtype*>(x_k.data_ptr()),
         reinterpret_cast<dtype*>(output.data_ptr()),
-        query_start_loc.data_ptr<int>(),
-        state_indices.data_ptr<int>(),
+        token_predecessor.data_ptr<int>(),
         metadata_status.data_ptr<int>());
   } else {
     const int64_t total_pairs = static_cast<int64_t>(total_tokens) * pairs;
@@ -299,8 +282,7 @@ void cmix_tokenshift_forward_varlen_cuda(
           reinterpret_cast<dtype*>(shift_state.data_ptr()),
           reinterpret_cast<const dtype*>(x_k.data_ptr()),
           reinterpret_cast<dtype*>(output.data_ptr()),
-          query_start_loc.data_ptr<int>(),
-          state_indices.data_ptr<int>(),
+          token_predecessor.data_ptr<int>(),
           metadata_status.data_ptr<int>());
     } else {
       cmix_tokenshift_varlen_kernel<false, false><<<
@@ -315,8 +297,7 @@ void cmix_tokenshift_forward_varlen_cuda(
           reinterpret_cast<dtype*>(shift_state.data_ptr()),
           reinterpret_cast<const dtype*>(x_k.data_ptr()),
           reinterpret_cast<dtype*>(output.data_ptr()),
-          query_start_loc.data_ptr<int>(),
-          state_indices.data_ptr<int>(),
+          token_predecessor.data_ptr<int>(),
           metadata_status.data_ptr<int>());
     }
   }
@@ -341,18 +322,20 @@ std::vector<torch::Tensor> cmix_res_ln_tokenshift_fused_forward_cuda(
     torch::Tensor weight,
     torch::Tensor bias,
     torch::Tensor x_k,
-    torch::Tensor state_indices,
+    torch::Tensor token_predecessor,
     torch::Tensor metadata_status,
     double eps) {
   auto res_out = torch::empty_like(x);
   auto mixed = torch::empty_like(x);
-  res_ln_cmix_tokenshift_fused_kernel<256><<<
-      static_cast<int>(x.size(0)), 256, 0,
+  // Match Albatross's C=4096 scalar-statistics launch.  Packed predecessor
+  // addressing does not change the per-row channel parallelism.
+  res_ln_cmix_tokenshift_fused_kernel<1024><<<
+      static_cast<int>(x.size(0)), 1024, 0,
       at::cuda::getCurrentCUDAStream()>>>(
       x.data_ptr<dtype>(), res.data_ptr<dtype>(), shift_state.data_ptr<dtype>(),
       weight.data_ptr<dtype>(), bias.data_ptr<dtype>(), x_k.data_ptr<dtype>(),
       res_out.data_ptr<dtype>(), mixed.data_ptr<dtype>(),
-      state_indices.data_ptr<int>(), metadata_status.data_ptr<int>(),
+      token_predecessor.data_ptr<int>(), metadata_status.data_ptr<int>(),
       x.size(0), static_cast<float>(eps));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return {res_out, mixed};

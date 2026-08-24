@@ -373,6 +373,82 @@ def test_fp32_wkv_zero_active_precapture_warmup_then_graph_replay() -> None:
     assert torch.equal(state, initial_state)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.cuda_graph
+def test_metadata_ticket_predecessor_matches_cpu_reference_and_live_updates() -> None:
+    _require_cuda_extension()
+    device = torch.device("cuda")
+    inactive = torch.iinfo(torch.int32).min
+
+    static_cu = torch.tensor([0, 1, 5, 7], device=device, dtype=torch.int32)
+    static_slots = torch.tensor([8, 2, 6], device=device, dtype=torch.int32)
+    static_ticket = prepare_tmix_wkv7_recurrent_metadata(
+        static_cu,
+        static_slots,
+        total_tokens=7,
+        state_pool_size=10,
+        max_seqlen=4,
+    )
+    torch.cuda.synchronize()
+    assert static_ticket._active_status().data_ptr() == static_ticket._status().data_ptr()
+    assert static_ticket._token_predecessor().cpu().tolist() == [
+        -9,
+        -3,
+        1,
+        2,
+        3,
+        -7,
+        5,
+    ]
+
+    token_capacity, sequence_capacity, state_pool_size = 8, 4, 6
+    cu = torch.tensor([0, -1, -1, -1, -1], device=device, dtype=torch.int32)
+    slots = torch.full((sequence_capacity,), 99, device=device, dtype=torch.int32)
+    active_tokens = torch.zeros(1, device=device, dtype=torch.int32)
+    active_sequences = torch.zeros(1, device=device, dtype=torch.int32)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        live_ticket = prepare_tmix_wkv7_recurrent_metadata(
+            cu,
+            slots,
+            state_pool_size=state_pool_size,
+            token_capacity=token_capacity,
+            sequence_capacity=sequence_capacity,
+            max_seqlen_capacity=4,
+            num_active_tokens=active_tokens,
+            num_active_sequences=active_sequences,
+        )
+
+    graph.replay()
+    torch.cuda.synchronize()
+    assert live_ticket._active_status().cpu().tolist() == [0, 0, 0]
+    assert live_ticket._token_predecessor().cpu().tolist() == [inactive] * 8
+
+    cu.copy_(torch.tensor([0, 1, 4, 6, -1], device=device, dtype=torch.int32))
+    slots.copy_(torch.tensor([5, 2, 0, 99], device=device, dtype=torch.int32))
+    active_tokens.fill_(6)
+    active_sequences.fill_(3)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert live_ticket._active_status().cpu().tolist() == [0, 6, 3]
+    assert live_ticket._token_predecessor().cpu().tolist() == [
+        -6,
+        -3,
+        1,
+        2,
+        -1,
+        4,
+        inactive,
+        inactive,
+    ]
+
+    slots.copy_(torch.tensor([2, 2, 0, 99], device=device, dtype=torch.int32))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert live_ticket._active_status()[0].item() != 0
+    assert live_ticket._token_predecessor().cpu().tolist() == [inactive] * 8
+
+
 def test_public_signature_is_raw_only_and_old_symbols_are_absent() -> None:
     signature = inspect.signature(infer_tmix_wkv7_recurrent_fp32io16_forward_varlen)
     assert "decay_logits" in signature.parameters

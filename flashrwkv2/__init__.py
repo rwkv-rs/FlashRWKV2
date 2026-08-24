@@ -121,4 +121,4 @@ __all__ = [
     "statetune_tmix_tokenshift_bf16",
 ]
 
-__version__ = "0.1.0a7"
+__version__ = "0.1.0a8"

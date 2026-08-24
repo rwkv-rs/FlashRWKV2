@@ -112,6 +112,14 @@ OPERATOR_SHAPES = {
 
 
 STRESS_CASES = {
+    "decode_b16_t1": (1,) * 16,
+    "decode_b64_t1": (1,) * 64,
+    "decode_b320_t1": (1,) * 320,
+    "decode_b960_t1": (1,) * 960,
+    "decode_heavy_b960": (1,) * 768 + (2,) * 144 + (4,) * 32 + (16,) * 16,
+    "mixed_b320": (1,) * 256 + (8,) * 48 + (64,) * 16,
+    "balanced_b320": tuple(range(1, 17)) * 20,
+    "prefill_skew_b64": (1,) * 48 + (16,) * 8 + (128,) * 4 + (512,) * 4,
     "stress_decode_b320_t1": (1,) * 320,
     "stress_decode_b2048_t1": (1,) * 2048,
     "stress_equal_b320_t16": (16,) * 320,
@@ -366,32 +374,13 @@ def _measure(
     return timing
 
 
-def _use_small_fp32(batch_size: int, max_seqlen: int, io_fp16: bool) -> bool:
-    if io_fp16:
-        return (
-            (max_seqlen == 1 and batch_size <= 96)
-            or (max_seqlen == 2 and batch_size <= 21)
-            or (max_seqlen == 3 and batch_size <= 3)
-            or (max_seqlen == 4 and batch_size in (1, 3))
-            or (batch_size == 1 and 5 <= max_seqlen <= 11)
-        )
-    return (
-        max_seqlen == 1
-        or (max_seqlen == 2 and batch_size <= 96)
-        or (max_seqlen == 3 and (batch_size <= 4 or batch_size == 6))
-        or (max_seqlen == 4 and batch_size in (1, 3))
-        or (batch_size == 1 and 5 <= max_seqlen <= 9)
-    )
-
-
 def _selected_fp32_family(workload: Workload, dtype: torch.dtype) -> str:
-    """Mirror the native Albatross-family policy for benchmark attribution."""
+    """Report the measured family selected for canonical [K,V] state."""
 
-    return (
-        "wkv_fp32_v2_small_warp"
-        if _use_small_fp32(workload.batch_size, max(workload.lengths), dtype == torch.float16)
-        else "wkv_fp32_v2"
-    )
+    del dtype
+    if workload.batch_size == 1 and workload.uniform_t == 1:
+        return "wkv_fp32_v2_kv_tile"
+    return "wkv_fp32_v2"
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -496,9 +485,11 @@ def main(argv: list[str] | None = None) -> int:
                         "batch_size": workload.batch_size,
                         "max_seqlen": max(workload.lengths),
                         "policy": (
-                            "automatic policy uses Albatross large/small-auto; "
-                            "upstream forced short-block is retained under #if 0 "
-                            "because no local selector exists"
+                            "automatic policy uses a canonical-[K,V] B1 tile "
+                            "or the Albatross large family; "
+                            "small-warp and forced short-block are retained as "
+                            "source references because canonical [K,V] state "
+                            "makes their fixed-V traversal strided"
                         ),
                     },
                 }

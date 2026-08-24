@@ -70,6 +70,85 @@ def test_infer_cmix_highest_fusion_island_matches_reference() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.sm120
+@pytest.mark.parametrize("batch_size", (16, 64, 320, 960))
+def test_infer_cmix_t1_fused_varlen_preserves_fragmented_slots(
+    batch_size: int,
+) -> None:
+    torch.manual_seed(20260824 + batch_size)
+    device = torch.device("cuda")
+    channels, features = 4096, 128
+    x = torch.randn(
+        batch_size, channels, device=device, dtype=torch.float16
+    ).mul_(0.02)
+    res = torch.randn_like(x).mul_(0.02)
+    weight = torch.randn(
+        channels, device=device, dtype=torch.float16
+    ).mul_(0.05).add_(1)
+    bias = torch.randn(
+        channels, device=device, dtype=torch.float16
+    ).mul_(0.01)
+    x_k = torch.randn(
+        channels, device=device, dtype=torch.float16
+    ).mul_(0.1)
+    key = torch.randn(
+        features, channels, device=device, dtype=torch.float16
+    ).mul_(0.01)
+    value = torch.randn_like(key).mul_(0.01)
+    initial = torch.randn(
+        batch_size + 3, channels, device=device, dtype=torch.float16
+    ).mul_(0.02)
+    state = initial.clone()
+    cu = torch.arange(batch_size + 1, device=device, dtype=torch.int32)
+    slots = torch.arange(
+        batch_size - 1, -1, -1, device=device, dtype=torch.int32
+    )
+    ticket = prepare_tmix_wkv7_recurrent_metadata(
+        cu,
+        slots,
+        total_tokens=batch_size,
+        state_pool_size=state.shape[0],
+        max_seqlen=1,
+    )
+    summed, output = infer_cmix_forward_varlen(
+        x,
+        res,
+        weight,
+        bias,
+        x_k,
+        key,
+        value,
+        shift_state_pool=state,
+        cu_seqlens=cu,
+        state_indices=slots,
+        validated_metadata=ticket,
+    )
+
+    summed_ref = x.float() + res.float()
+    centered = summed_ref - summed_ref.mean(dim=-1, keepdim=True)
+    normalized = (
+        centered
+        * torch.rsqrt(centered.square().mean(dim=-1, keepdim=True) + 1.0e-5)
+        * weight.float()
+        + bias.float()
+    ).to(torch.float16)
+    previous = initial.index_select(0, slots.to(torch.int64))
+    mixed = normalized.float() + (
+        previous.float() - normalized.float()
+    ) * x_k.float()
+    expected = torch.relu(mixed @ key.float().t()).square() @ value.float()
+    torch.testing.assert_close(summed.float(), summed_ref, atol=0.01, rtol=0.01)
+    torch.testing.assert_close(output.float(), expected, atol=0.12, rtol=0.07)
+    torch.testing.assert_close(
+        state.index_select(0, slots.to(torch.int64)).float(),
+        normalized.float(),
+        atol=0.01,
+        rtol=0.01,
+    )
+    assert torch.equal(state[batch_size:], initial[batch_size:])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.sm120
 def test_infer_cmix_packed_ragged_matches_reference_and_slot_updates() -> None:
     torch.manual_seed(20260821)
     device = torch.device("cuda")
