@@ -27,6 +27,7 @@ void tmix_tokenshift_forward_varlen(
     torch::Tensor query_start_loc,
     torch::Tensor state_indices,
     torch::Tensor metadata_status,
+    torch::Tensor token_predecessor,
     std::vector<torch::Tensor>& outputs);
 std::vector<torch::Tensor> tmix_res_ln_tokenshift_fused_forward_cuda(
     torch::Tensor x,
@@ -40,7 +41,7 @@ std::vector<torch::Tensor> tmix_res_ln_tokenshift_fused_forward_cuda(
     torch::Tensor x_v,
     torch::Tensor x_a,
     torch::Tensor x_g,
-    torch::Tensor state_indices,
+    torch::Tensor token_predecessor,
     torch::Tensor metadata_status,
     double eps);
 std::vector<torch::Tensor> post_norm_forward_varlen_cuda(
@@ -124,6 +125,7 @@ std::vector<torch::Tensor> tmix_postnorm_tokenshift_forward_varlen(
   torch::Tensor launch_query_start_loc = cu_seqlens;
   torch::Tensor launch_state_indices = state_indices;
   torch::Tensor metadata_status;
+  torch::Tensor token_predecessor;
   if (!validated_metadata.is_none()) {
     validated_metadata.attr("_check_compatible")(
         cu_seqlens, state_indices, total_tokens, shift_state_pool.size(0),
@@ -135,6 +137,9 @@ std::vector<torch::Tensor> tmix_postnorm_tokenshift_forward_varlen(
         .attr("_state_indices_snapshot")()
         .cast<torch::Tensor>();
     metadata_status = validated_metadata.attr("_status")().cast<torch::Tensor>();
+    token_predecessor = validated_metadata
+        .attr("_token_predecessor")()
+        .cast<torch::Tensor>();
     max_seqlen = validated_metadata.attr("_max_seqlen")().cast<int64_t>();
   } else {
     if (max_seqlen <= 0) {
@@ -145,12 +150,12 @@ std::vector<torch::Tensor> tmix_postnorm_tokenshift_forward_varlen(
     launch_query_start_loc = std::move(prepared.query_start_loc);
     launch_state_indices = std::move(prepared.state_indices);
     metadata_status = std::move(prepared.status);
+    token_predecessor = std::move(prepared.token_predecessor);
   }
-  if (channels == 4096 && batch_size == 1 && total_tokens == 1 &&
-      max_seqlen == 1) {
+  if (channels == 4096 && total_tokens == batch_size && max_seqlen == 1) {
     return tmix_res_ln_tokenshift_fused_forward_cuda(
         x, res, shift_state_pool, weight, bias, x_r, x_w, x_k, x_v,
-        x_a, x_g, launch_state_indices, metadata_status, eps);
+        x_a, x_g, token_predecessor, metadata_status, eps);
   }
   auto post_norm = post_norm_forward_varlen_cuda(
       x, res, weight, bias, eps, batch_size);
@@ -163,7 +168,8 @@ std::vector<torch::Tensor> tmix_postnorm_tokenshift_forward_varlen(
       static_cast<int>(batch_size), static_cast<int>(total_tokens),
       static_cast<int>(channels), static_cast<int>(max_seqlen), post_norm[1],
       shift_state_pool, x_r, x_w, x_k, x_v, x_a, x_g,
-      launch_query_start_loc, launch_state_indices, metadata_status, shifted);
+      launch_query_start_loc, launch_state_indices, metadata_status,
+      token_predecessor, shifted);
   std::vector<torch::Tensor> outputs;
   outputs.reserve(7);
   outputs.push_back(post_norm[0]);

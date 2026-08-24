@@ -1,4 +1,4 @@
-# FlashRWKV2 0.1.0a7 operator contract
+# FlashRWKV2 0.1.0a8 operator contract
 
 推理公共接口只包含模型调用者需要的最高融合岛。内部 launcher 不属于 Python 或 native 公共契约，也不会从根包导出。
 
@@ -39,4 +39,4 @@ TMix 的 `B=1,T=1,C=4096` 与 CMix 的 `T=1,C=4096` 使用 Albatross 派生的�
 
 ## Downstream handoff
 
-`transformers-rwkv` 必须精确依赖 `FlashRWKV2==0.1.0a7`，只检查和调用上述公共接口。模型侧不得调用 standalone LN、Res、TokenShift、CMix ReLU²、FFN-down、sparse 子步骤、WKV elapsed-state 更新或通用 Linear helper。
+`transformers-rwkv` 必须精确依赖 `FlashRWKV2==0.1.0a8`，只检查和调用上述公共接口。模型侧不得调用 standalone LN、Res、TokenShift、CMix ReLU²、FFN-down、sparse 子步骤、WKV elapsed-state 更新或通用 Linear helper。

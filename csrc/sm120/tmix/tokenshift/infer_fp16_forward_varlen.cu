@@ -36,23 +36,6 @@ __device__ inline void store_h2(dtype* ptr, float x0, float x1) {
   *reinterpret_cast<__half2*>(ptr) = __floats2half2_rn(x0, x1);
 }
 
-__device__ __forceinline__ int find_sequence(
-    int token,
-    int batch_size,
-    const int* cu_seqlens) {
-  int low = 0;
-  int high = batch_size;
-  while (low + 1 < high) {
-    const int middle = (low + high) >> 1;
-    if (cu_seqlens[middle] <= token) {
-      low = middle;
-    } else {
-      high = middle;
-    }
-  }
-  return low;
-}
-
 template <typename T>
 __device__ __forceinline__ void fill_invalid(
     int64_t block_index,
@@ -88,8 +71,7 @@ __global__ void tmix_tokenshift_kernel(
     dtype* __restrict__ out_v,
     dtype* __restrict__ out_a,
     dtype* __restrict__ out_g,
-    const int* __restrict__ cu_seqlens,
-    const int* __restrict__ state_indices,
+    const int* __restrict__ token_predecessor,
     const int* __restrict__ metadata_status) {
   const int c_pairs = C >> 1;
   const int64_t pair_index =
@@ -124,17 +106,17 @@ __global__ void tmix_tokenshift_kernel(
     return;
   }
 
-  const int sequence = find_sequence(token, metadata_status[2], cu_seqlens);
-  const int token_start = cu_seqlens[sequence];
-  const int slot = state_indices[sequence];
+  const int predecessor = token_predecessor[token];
+  const bool sequence_start = predecessor < 0;
+  const int slot = -predecessor - 1;
   const int c = pair << 1;
   const int64_t idx = static_cast<int64_t>(token) * C + c;
-  const int64_t previous_idx = token == token_start
+  const int64_t previous_idx = sequence_start
       ? static_cast<int64_t>(slot) * C + c
-      : idx - C;
+      : static_cast<int64_t>(predecessor) * C + c;
 
   const __half2 cur2 = load_h2(x + idx);
-  const __half2 prev2 = token == token_start
+  const __half2 prev2 = sequence_start
       ? load_h2(shift_state + previous_idx)
       : load_h2(x + previous_idx);
   const float2 cur = __half22float2(cur2);
@@ -257,51 +239,58 @@ __global__ __launch_bounds__(Threads, 1) void res_ln_tmix_tokenshift_fused_kerne
     dtype* __restrict__ out_v,
     dtype* __restrict__ out_a,
     dtype* __restrict__ out_g,
-    const int* __restrict__ state_indices,
+    const int* __restrict__ token_predecessor,
     const int* __restrict__ metadata_status,
+    int64_t rows,
     float eps) {
   constexpr int C = 4096;
   constexpr int pairs = C / 2;
+  const int64_t row = blockIdx.x;
+  if (row >= rows) return;
+  const int64_t base = row * C;
+  const int64_t base2 = row * pairs;
   if (metadata_status[0] != 0) {
     const __half2 invalid = __floats2half2_rn(
         __int_as_float(0x7fffffff), __int_as_float(0x7fffffff));
     for (int p = threadIdx.x; p < pairs; p += Threads) {
-      reinterpret_cast<__half2*>(res_out)[p] = invalid;
-      reinterpret_cast<__half2*>(out_r)[p] = invalid;
-      reinterpret_cast<__half2*>(out_w)[p] = invalid;
-      reinterpret_cast<__half2*>(out_k)[p] = invalid;
-      reinterpret_cast<__half2*>(out_v)[p] = invalid;
-      reinterpret_cast<__half2*>(out_a)[p] = invalid;
-      reinterpret_cast<__half2*>(out_g)[p] = invalid;
+      reinterpret_cast<__half2*>(res_out)[base2 + p] = invalid;
+      reinterpret_cast<__half2*>(out_r)[base2 + p] = invalid;
+      reinterpret_cast<__half2*>(out_w)[base2 + p] = invalid;
+      reinterpret_cast<__half2*>(out_k)[base2 + p] = invalid;
+      reinterpret_cast<__half2*>(out_v)[base2 + p] = invalid;
+      reinterpret_cast<__half2*>(out_a)[base2 + p] = invalid;
+      reinterpret_cast<__half2*>(out_g)[base2 + p] = invalid;
     }
     return;
   }
   // CUDA Graph replay may reduce the active batch to zero while retaining
   // the captured physical buffers.  Do not inspect state_indices in that case.
-  if (metadata_status[1] == 0 || metadata_status[2] == 0) return;
-  const int slot = state_indices[0];
+  if (row >= metadata_status[1]) return;
+  const int descriptor = token_predecessor[row];
+  const int slot = -descriptor - 1;
   float sum = 0.0f;
 #pragma unroll
-  for (int p = threadIdx.x; p < pairs; p += Threads) {
-    const float2 xv = __half22float2(reinterpret_cast<const __half2*>(x)[p]);
-    const float2 rv = __half22float2(reinterpret_cast<const __half2*>(res)[p]);
-    sum += xv.x + rv.x + xv.y + rv.y;
+  for (int k = 0; k < C / Threads; ++k) {
+    const int c = threadIdx.x + k * Threads;
+    sum += __half2float(*reinterpret_cast<const __half*>(x + base + c)) +
+           __half2float(*reinterpret_cast<const __half*>(res + base + c));
   }
   const float mean = block_sum<Threads>(sum) / C;
   float var = 0.0f;
 #pragma unroll
-  for (int p = threadIdx.x; p < pairs; p += Threads) {
-    const float2 xv = __half22float2(reinterpret_cast<const __half2*>(x)[p]);
-    const float2 rv = __half22float2(reinterpret_cast<const __half2*>(res)[p]);
-    const float d0 = xv.x + rv.x - mean;
-    const float d1 = xv.y + rv.y - mean;
-    var += d0 * d0 + d1 * d1;
+  for (int k = 0; k < C / Threads; ++k) {
+    const int c = threadIdx.x + k * Threads;
+    const float value =
+        __half2float(*reinterpret_cast<const __half*>(x + base + c)) +
+        __half2float(*reinterpret_cast<const __half*>(res + base + c));
+    const float delta = value - mean;
+    var += delta * delta;
   }
   const float rstd = rsqrtf(block_sum<Threads>(var) / C + eps);
 #pragma unroll
   for (int p = threadIdx.x; p < pairs; p += Threads) {
-    const float2 xv = __half22float2(reinterpret_cast<const __half2*>(x)[p]);
-    const float2 rv = __half22float2(reinterpret_cast<const __half2*>(res)[p]);
+    const float2 xv = __half22float2(reinterpret_cast<const __half2*>(x)[base2 + p]);
+    const float2 rv = __half22float2(reinterpret_cast<const __half2*>(res)[base2 + p]);
     const float2 w = __half22float2(reinterpret_cast<const __half2*>(weight)[p]);
     const float2 b = __half22float2(reinterpret_cast<const __half2*>(bias)[p]);
     const float2 prev = __half22float2(
@@ -314,19 +303,19 @@ __global__ __launch_bounds__(Threads, 1) void res_ln_tmix_tokenshift_fused_kerne
     const float2 norm = __half22float2(norm2);
     const float d0 = prev.x - norm.x;
     const float d1 = prev.y - norm.y;
-#define STORE_MIX(dst, coeff) do { \
+    reinterpret_cast<__half2*>(res_out)[base2 + p] = __floats2half2_rn(s0, s1);
+#define STORE_ROW_MIX(dst, coeff) do { \
       const float2 m = __half22float2(reinterpret_cast<const __half2*>(coeff)[p]); \
-      reinterpret_cast<__half2*>(dst)[p] = __floats2half2_rn( \
+      reinterpret_cast<__half2*>(dst)[base2 + p] = __floats2half2_rn( \
           norm.x + d0 * m.x, norm.y + d1 * m.y); \
     } while (0)
-    reinterpret_cast<__half2*>(res_out)[p] = __floats2half2_rn(s0, s1);
-    STORE_MIX(out_r, x_r);
-    STORE_MIX(out_w, x_w);
-    STORE_MIX(out_k, x_k);
-    STORE_MIX(out_v, x_v);
-    STORE_MIX(out_a, x_a);
-    STORE_MIX(out_g, x_g);
-#undef STORE_MIX
+    STORE_ROW_MIX(out_r, x_r);
+    STORE_ROW_MIX(out_w, x_w);
+    STORE_ROW_MIX(out_k, x_k);
+    STORE_ROW_MIX(out_v, x_v);
+    STORE_ROW_MIX(out_a, x_a);
+    STORE_ROW_MIX(out_g, x_g);
+#undef STORE_ROW_MIX
     reinterpret_cast<__half2*>(shift_state)[static_cast<int64_t>(slot) * pairs + p] = norm2;
   }
 }
@@ -349,6 +338,7 @@ void tmix_tokenshift_forward_varlen(
     torch::Tensor query_start_loc,
     torch::Tensor state_indices,
     torch::Tensor metadata_status,
+    torch::Tensor token_predecessor,
     std::vector<torch::Tensor>& outputs) {
   const auto stream = at::cuda::getCurrentCUDAStream();
   const int pairs = channels / 2;
@@ -369,7 +359,7 @@ void tmix_tokenshift_forward_varlen(
         outputs[0].data_ptr<dtype>(), outputs[1].data_ptr<dtype>(),
         outputs[2].data_ptr<dtype>(), outputs[3].data_ptr<dtype>(),
         outputs[4].data_ptr<dtype>(), outputs[5].data_ptr<dtype>(),
-        query_start_loc.data_ptr<int>(), state_indices.data_ptr<int>(),
+        token_predecessor.data_ptr<int>(),
         metadata_status.data_ptr<int>());
   } else {
     const dim3 grid(static_cast<unsigned int>(ceil_div(
@@ -383,7 +373,7 @@ void tmix_tokenshift_forward_varlen(
           outputs[0].data_ptr<dtype>(), outputs[1].data_ptr<dtype>(),
           outputs[2].data_ptr<dtype>(), outputs[3].data_ptr<dtype>(),
           outputs[4].data_ptr<dtype>(), outputs[5].data_ptr<dtype>(),
-          query_start_loc.data_ptr<int>(), state_indices.data_ptr<int>(),
+          token_predecessor.data_ptr<int>(),
           metadata_status.data_ptr<int>());
     } else {
       tmix_tokenshift_kernel<false, false><<<grid, 256, 0, stream>>>(
@@ -394,7 +384,7 @@ void tmix_tokenshift_forward_varlen(
           outputs[0].data_ptr<dtype>(), outputs[1].data_ptr<dtype>(),
           outputs[2].data_ptr<dtype>(), outputs[3].data_ptr<dtype>(),
           outputs[4].data_ptr<dtype>(), outputs[5].data_ptr<dtype>(),
-          query_start_loc.data_ptr<int>(), state_indices.data_ptr<int>(),
+          token_predecessor.data_ptr<int>(),
           metadata_status.data_ptr<int>());
     }
   }
@@ -420,14 +410,18 @@ std::vector<torch::Tensor> tmix_res_ln_tokenshift_fused_forward_cuda(
     torch::Tensor x_v,
     torch::Tensor x_a,
     torch::Tensor x_g,
-    torch::Tensor state_indices,
+    torch::Tensor token_predecessor,
     torch::Tensor metadata_status,
     double eps) {
   std::vector<torch::Tensor> outputs;
   outputs.reserve(7);
   for (int i = 0; i < 7; ++i) outputs.push_back(torch::empty_like(x));
-  res_ln_tmix_tokenshift_fused_kernel<256><<<
-      1, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+  // Match Albatross's C=4096 scalar-statistics launch.  The predecessor
+  // descriptor changes only the previous-row address; it does not reduce the
+  // channel work available to this row-owned block.
+  res_ln_tmix_tokenshift_fused_kernel<1024><<<
+      static_cast<int>(x.size(0)), 1024, 0,
+      at::cuda::getCurrentCUDAStream()>>>(
       x.data_ptr<dtype>(), res.data_ptr<dtype>(), shift_state.data_ptr<dtype>(),
       weight.data_ptr<dtype>(), bias.data_ptr<dtype>(), x_r.data_ptr<dtype>(),
       x_w.data_ptr<dtype>(), x_k.data_ptr<dtype>(), x_v.data_ptr<dtype>(),
@@ -435,7 +429,8 @@ std::vector<torch::Tensor> tmix_res_ln_tokenshift_fused_forward_cuda(
       outputs[1].data_ptr<dtype>(), outputs[2].data_ptr<dtype>(),
       outputs[3].data_ptr<dtype>(), outputs[4].data_ptr<dtype>(),
       outputs[5].data_ptr<dtype>(), outputs[6].data_ptr<dtype>(),
-      state_indices.data_ptr<int>(), metadata_status.data_ptr<int>(),
+      token_predecessor.data_ptr<int>(), metadata_status.data_ptr<int>(),
+      x.size(0),
       static_cast<float>(eps));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return outputs;

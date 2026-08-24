@@ -7,6 +7,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
 
+#include <limits>
 #include <utility>
 
 namespace flashrwkv2::validation {
@@ -131,6 +132,45 @@ __global__ void validate_recurrent_metadata_kernel(
   }
 }
 
+__device__ __forceinline__ int find_sequence(
+    int token,
+    int num_sequences,
+    const int* __restrict__ query_start_loc) {
+  int low = 0;
+  int high = num_sequences;
+  while (low + 1 < high) {
+    const int middle = (low + high) >> 1;
+    if (query_start_loc[middle] <= token) {
+      low = middle;
+    } else {
+      high = middle;
+    }
+  }
+  return low;
+}
+
+__global__ void build_token_predecessor_kernel(
+    const int* __restrict__ query_start_loc,
+    const int* __restrict__ state_indices,
+    const int* __restrict__ status,
+    int token_capacity,
+    int* __restrict__ token_predecessor) {
+  const int token = static_cast<int>(
+      static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x);
+  if (token >= token_capacity) {
+    return;
+  }
+  constexpr int kInactiveSentinel = std::numeric_limits<int>::min();
+  if (status[0] != 0 || token >= status[1] || status[2] == 0) {
+    token_predecessor[token] = kInactiveSentinel;
+    return;
+  }
+  const int sequence = find_sequence(token, status[2], query_start_loc);
+  token_predecessor[token] = token == query_start_loc[sequence]
+      ? -state_indices[sequence] - 1
+      : token - 1;
+}
+
 void check_graph_scalar(
     const torch::Tensor& tensor,
     const torch::Tensor& reference,
@@ -163,6 +203,7 @@ PreparedRecurrentMetadata launch_recurrent_metadata_validation(
   auto state_indices_snapshot = snapshot
       ? torch::empty_like(state_indices)
       : state_indices;
+  auto token_predecessor = torch::empty({total_tokens}, query_start_loc.options());
   constexpr int threads = 256;
   validate_recurrent_metadata_kernel<<<
       1,
@@ -184,10 +225,23 @@ PreparedRecurrentMetadata launch_recurrent_metadata_validation(
       snapshot ? query_start_loc_snapshot.data_ptr<int>() : nullptr,
       snapshot ? state_indices_snapshot.data_ptr<int>() : nullptr);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+  const int predecessor_blocks = static_cast<int>((total_tokens + threads - 1) / threads);
+  build_token_predecessor_kernel<<<
+      predecessor_blocks,
+      threads,
+      0,
+      at::cuda::getCurrentCUDAStream()>>>(
+      query_start_loc_snapshot.data_ptr<int>(),
+      state_indices_snapshot.data_ptr<int>(),
+      status.data_ptr<int>(),
+      static_cast<int>(total_tokens),
+      token_predecessor.data_ptr<int>());
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
   return PreparedRecurrentMetadata{
       std::move(query_start_loc_snapshot),
       std::move(state_indices_snapshot),
       std::move(status),
+      std::move(token_predecessor),
       std::move(seen_slots)};
 }
 

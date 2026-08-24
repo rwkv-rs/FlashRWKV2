@@ -19,6 +19,7 @@ struct PreparedRecurrentMetadata {
   torch::Tensor query_start_loc;
   torch::Tensor state_indices;
   torch::Tensor status;
+  torch::Tensor token_predecessor;
   torch::Tensor workspace;
 };
 
