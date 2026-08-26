@@ -21,6 +21,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
+#include <cooperative_groups.h>
 #include <cuda_fp16.h>
 #include <torch/extension.h>
 
@@ -29,6 +30,8 @@
 #include "recurrent_decay.cuh"
 
 namespace {
+
+namespace cg = cooperative_groups;
 
 constexpr int kHeadSize = 64;
 constexpr int kHalf2HeadSize = kHeadSize / 2;
@@ -110,51 +113,56 @@ __device__ __forceinline__ int64_t log_index(
       channel;
 }
 
-// This owner-local check is deliberately separate from the recurrent kernel.
-// Kernel ordering on the current stream guarantees every active sequence is
-// known to be T1 and every active slot phase is valid before any base/log/
-// elapsed/phase write can begin.
+// The regular path snapshots each active slot before the recurrent launch.
+// Small grids perform the same check inside a cooperative launch.  Both paths
+// establish the fail-closed result before any base/log/elapsed/phase write and
+// let the recurrent kernel advance a slot from the immutable snapshot.
 __global__ void validate_deltalog_slots_kernel(
     const int* __restrict__ query_start_loc,
     const int* __restrict__ state_indices,
+    const int* __restrict__ elapsed_pool,
     const int* __restrict__ phase_pool,
     const int* __restrict__ metadata_status,
     int* __restrict__ deltalog_status,
     int num_sequences,
     int merge_interval) {
-  const int sequence_index =
-      static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (threadIdx.x == 0) {
+    deltalog_status[0] = metadata_status[0];
+  }
+  __syncthreads();
   if (metadata_status[0] != 0) {
-    if (sequence_index == 0) {
-      atomicCAS(deltalog_status, 0, metadata_status[0]);
+    return;
+  }
+  for (int sequence_index = static_cast<int>(threadIdx.x);
+       sequence_index < num_sequences;
+       sequence_index += static_cast<int>(blockDim.x)) {
+    if (sequence_index >= metadata_status[2]) {
+      continue;
     }
-    return;
-  }
-  if (sequence_index >= num_sequences ||
-      sequence_index >= metadata_status[2]) {
-    return;
-  }
-  const int token_count =
-      query_start_loc[sequence_index + 1] -
-      query_start_loc[sequence_index];
-  const int state_slot = state_indices[sequence_index];
-  const int phase = phase_pool[state_slot];
-  if (token_count != 1 || phase < 0 || phase >= merge_interval) {
-    atomicCAS(deltalog_status, 0, 1);
+    const int token_count =
+        query_start_loc[sequence_index + 1] -
+        query_start_loc[sequence_index];
+    const int state_slot = state_indices[sequence_index];
+    const int phase = phase_pool[state_slot];
+    deltalog_status[1 + 2 * sequence_index] = phase;
+    deltalog_status[2 + 2 * sequence_index] = elapsed_pool[state_slot];
+    if (token_count != 1 || phase < 0 || phase >= merge_interval) {
+      atomicCAS(deltalog_status, 0, 1);
+    }
   }
 }
 
-template <int M, bool AddBias>
+template <int M, bool AddBias, bool Cooperative>
 __global__ __launch_bounds__(kHeadSize, 1) void deltalog_slot_kernel(
     int num_heads,
     int state_pool_slots,
     int64_t output_elements,
     const int* __restrict__ query_start_loc,
     const int* __restrict__ state_indices,
-    const int* __restrict__ elapsed_pool,
-    const int* __restrict__ phase_pool,
+    int* __restrict__ elapsed_pool,
+    int* __restrict__ phase_pool,
     const int* __restrict__ metadata_status,
-    const int* __restrict__ deltalog_status,
+    int* __restrict__ deltalog_status,
     half* __restrict__ state_pool,
     half* __restrict__ deltalog_pool,
     const half* __restrict__ r_ptr,
@@ -176,7 +184,46 @@ __global__ __launch_bounds__(kHeadSize, 1) void deltalog_slot_kernel(
       static_cast<int64_t>(sequence_index) * num_heads + head_index;
   const int64_t block_count =
       static_cast<int64_t>(gridDim.x) * gridDim.y;
-  if (metadata_status[0] != 0 || deltalog_status[0] != 0) {
+  __shared__ int cooperative_precheck_failed;
+  if constexpr (Cooperative) {
+    const cg::grid_group grid = cg::this_grid();
+    if (metadata_status[0] == 0 && head_index == 0 && thread == 0 &&
+        sequence_index < metadata_status[2]) {
+      const int token_count =
+          query_start_loc[sequence_index + 1] -
+          query_start_loc[sequence_index];
+      const int cooperative_state_slot = state_indices[sequence_index];
+      const int cooperative_phase = phase_pool[cooperative_state_slot];
+      deltalog_status[1 + 2 * sequence_index] =
+          token_count == 1 ? cooperative_phase : M;
+      deltalog_status[2 + 2 * sequence_index] =
+          elapsed_pool[cooperative_state_slot];
+    }
+    grid.sync();
+    if (thread == 0) {
+      cooperative_precheck_failed = metadata_status[0];
+      if (cooperative_precheck_failed == 0) {
+        for (int active_sequence = 0;
+             active_sequence < metadata_status[2];
+             ++active_sequence) {
+          const int active_phase =
+              deltalog_status[1 + 2 * active_sequence];
+          if (active_phase < 0 || active_phase >= M) {
+            cooperative_precheck_failed = 1;
+            break;
+          }
+        }
+      }
+    }
+    __syncthreads();
+  }
+  bool precheck_failed = false;
+  if constexpr (Cooperative) {
+    precheck_failed = cooperative_precheck_failed != 0;
+  } else {
+    precheck_failed = deltalog_status[0] != 0;
+  }
+  if (precheck_failed) {
     fill_invalid_output(
         block_index, block_count, output_elements, output_ptr);
     return;
@@ -192,8 +239,8 @@ __global__ __launch_bounds__(kHeadSize, 1) void deltalog_slot_kernel(
   if (thread == 0) {
     token_index = query_start_loc[sequence_index];
     state_slot = state_indices[sequence_index];
-    slot_phase = phase_pool[state_slot];
-    elapsed_base = elapsed_pool[state_slot];
+    slot_phase = deltalog_status[1 + 2 * sequence_index];
+    elapsed_base = deltalog_status[2 + 2 * sequence_index];
   }
   __syncthreads();
 
@@ -352,6 +399,10 @@ __global__ __launch_bounds__(kHeadSize, 1) void deltalog_slot_kernel(
     deltalog_pool[log_index(
         slot_phase, kVKind, state_slot, head_index, thread,
         state_pool_slots, num_heads)] = current_v;
+    if (head_index == 0 && thread == 0) {
+      elapsed_pool[state_slot] = elapsed_base + 1;
+      phase_pool[state_slot] = slot_phase + 1;
+    }
     return;
   }
 
@@ -407,35 +458,46 @@ __global__ __launch_bounds__(kHeadSize, 1) void deltalog_slot_kernel(
   for (int key_pair = 0; key_pair < kHalf2HeadSize; ++key_pair) {
     store_state_kv(state_base, thread, key_pair, state[key_pair]);
   }
-}
-
-__global__ void advance_deltalog_slots_kernel(
-    const int* __restrict__ state_indices,
-    const int* __restrict__ metadata_status,
-    const int* __restrict__ deltalog_status,
-    int* __restrict__ elapsed_pool,
-    int* __restrict__ phase_pool,
-    int num_sequences,
-    int merge_interval) {
-  const int sequence_index =
-      static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (metadata_status[0] != 0 || deltalog_status[0] != 0 ||
-      sequence_index >= num_sequences ||
-      sequence_index >= metadata_status[2]) {
-    return;
+  if (head_index == 0 && thread == 0) {
+    elapsed_pool[state_slot] = elapsed_base + 1;
+    phase_pool[state_slot] = 0;
   }
-  const int state_slot = state_indices[sequence_index];
-  elapsed_pool[state_slot] += 1;
-  const int phase = phase_pool[state_slot] + 1;
-  phase_pool[state_slot] = phase == merge_interval ? 0 : phase;
 }
 
-template <int M>
-void launch_deltalog_step(
-    bool add_bias,
+template <int M, bool AddBias>
+bool cooperative_grid_fits(int block_count, int device) {
+  thread_local int cached_device = -1;
+  thread_local int cached_resident_blocks = 0;
+  if (cached_device == device) {
+    return block_count <= cached_resident_blocks;
+  }
+  int cooperative_launch = 0;
+  int multiprocessor_count = 0;
+  int blocks_per_multiprocessor = 0;
+  C10_CUDA_CHECK(cudaDeviceGetAttribute(
+      &cooperative_launch, cudaDevAttrCooperativeLaunch, device));
+  if (cooperative_launch == 0) {
+    cached_device = device;
+    cached_resident_blocks = 0;
+    return false;
+  }
+  C10_CUDA_CHECK(cudaDeviceGetAttribute(
+      &multiprocessor_count, cudaDevAttrMultiProcessorCount, device));
+  C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+      &blocks_per_multiprocessor,
+      deltalog_slot_kernel<M, AddBias, true>, kHeadSize, 0));
+  cached_device = device;
+  cached_resident_blocks =
+      multiprocessor_count * blocks_per_multiprocessor;
+  return block_count <= cached_resident_blocks;
+}
+
+template <int M, bool AddBias>
+void launch_deltalog_specialization(
     int num_sequences,
     int num_heads,
     int state_pool_slots,
+    int device,
     const torch::Tensor& query_start_loc,
     const torch::Tensor& state_indices,
     torch::Tensor& elapsed_pool,
@@ -451,32 +513,124 @@ void launch_deltalog_step(
     const torch::Tensor& b,
     torch::Tensor& output,
     const torch::Tensor& metadata_status,
-    const torch::Tensor& deltalog_status,
+    torch::Tensor& deltalog_status,
     float scale,
     cudaStream_t stream) {
-#define LAUNCH_DELTALOG(AddBias) \
-  deltalog_slot_kernel<M, AddBias> \
-      <<<dim3(num_heads, num_sequences), dim3(kHeadSize), 0, stream>>>( \
-          num_heads, state_pool_slots, output.numel(), \
-          query_start_loc.data_ptr<int>(), state_indices.data_ptr<int>(), \
-          elapsed_pool.data_ptr<int>(), phase_pool.data_ptr<int>(), \
-          metadata_status.data_ptr<int>(), deltalog_status.data_ptr<int>(), \
-          reinterpret_cast<half*>(state_pool.data_ptr()), \
-          reinterpret_cast<half*>(deltalog_pool.data_ptr()), \
-          reinterpret_cast<const half*>(r.data_ptr()), \
-          reinterpret_cast<const half*>(decay.data_ptr()), \
-          AddBias ? reinterpret_cast<const half*>(decay_bias.data_ptr()) : nullptr, \
-          reinterpret_cast<const half*>(k.data_ptr()), \
-          reinterpret_cast<const half*>(v.data_ptr()), \
-          reinterpret_cast<const half*>(a.data_ptr()), \
-          reinterpret_cast<const half*>(b.data_ptr()), \
-          reinterpret_cast<half*>(output.data_ptr()), scale)
-  if (add_bias) {
-    LAUNCH_DELTALOG(true);
-  } else {
-    LAUNCH_DELTALOG(false);
+  const dim3 grid(num_heads, num_sequences);
+  const dim3 block(kHeadSize);
+  const int block_count = num_sequences * num_heads;
+  if (cooperative_grid_fits<M, AddBias>(block_count, device)) {
+    int64_t output_elements = output.numel();
+    const int* query_start_loc_ptr = query_start_loc.data_ptr<int>();
+    const int* state_indices_ptr = state_indices.data_ptr<int>();
+    int* elapsed_pool_ptr = elapsed_pool.data_ptr<int>();
+    int* phase_pool_ptr = phase_pool.data_ptr<int>();
+    const int* metadata_status_ptr = metadata_status.data_ptr<int>();
+    int* deltalog_status_ptr = deltalog_status.data_ptr<int>();
+    half* state_pool_ptr = reinterpret_cast<half*>(state_pool.data_ptr());
+    half* deltalog_pool_ptr =
+        reinterpret_cast<half*>(deltalog_pool.data_ptr());
+    const half* r_ptr = reinterpret_cast<const half*>(r.data_ptr());
+    const half* decay_ptr = reinterpret_cast<const half*>(decay.data_ptr());
+    const half* decay_bias_ptr = AddBias
+        ? reinterpret_cast<const half*>(decay_bias.data_ptr())
+        : nullptr;
+    const half* k_ptr = reinterpret_cast<const half*>(k.data_ptr());
+    const half* v_ptr = reinterpret_cast<const half*>(v.data_ptr());
+    const half* a_ptr = reinterpret_cast<const half*>(a.data_ptr());
+    const half* b_ptr = reinterpret_cast<const half*>(b.data_ptr());
+    half* output_ptr = reinterpret_cast<half*>(output.data_ptr());
+    void* kernel_arguments[] = {
+        &num_heads,
+        &state_pool_slots,
+        &output_elements,
+        &query_start_loc_ptr,
+        &state_indices_ptr,
+        &elapsed_pool_ptr,
+        &phase_pool_ptr,
+        &metadata_status_ptr,
+        &deltalog_status_ptr,
+        &state_pool_ptr,
+        &deltalog_pool_ptr,
+        &r_ptr,
+        &decay_ptr,
+        &decay_bias_ptr,
+        &k_ptr,
+        &v_ptr,
+        &a_ptr,
+        &b_ptr,
+        &output_ptr,
+        &scale,
+    };
+    C10_CUDA_CHECK(cudaLaunchCooperativeKernel(
+        deltalog_slot_kernel<M, AddBias, true>,
+        grid, block, kernel_arguments, 0, stream));
+    return;
   }
-#undef LAUNCH_DELTALOG
+
+  constexpr int validation_threads = 256;
+  validate_deltalog_slots_kernel<<<1, validation_threads, 0, stream>>>(
+      query_start_loc.data_ptr<int>(), state_indices.data_ptr<int>(),
+      elapsed_pool.data_ptr<int>(), phase_pool.data_ptr<int>(),
+      metadata_status.data_ptr<int>(), deltalog_status.data_ptr<int>(),
+      num_sequences, M);
+  deltalog_slot_kernel<M, AddBias, false>
+      <<<grid, block, 0, stream>>>(
+          num_heads, state_pool_slots, output.numel(),
+          query_start_loc.data_ptr<int>(), state_indices.data_ptr<int>(),
+          elapsed_pool.data_ptr<int>(), phase_pool.data_ptr<int>(),
+          metadata_status.data_ptr<int>(), deltalog_status.data_ptr<int>(),
+          reinterpret_cast<half*>(state_pool.data_ptr()),
+          reinterpret_cast<half*>(deltalog_pool.data_ptr()),
+          reinterpret_cast<const half*>(r.data_ptr()),
+          reinterpret_cast<const half*>(decay.data_ptr()),
+          AddBias ? reinterpret_cast<const half*>(decay_bias.data_ptr())
+                  : nullptr,
+          reinterpret_cast<const half*>(k.data_ptr()),
+          reinterpret_cast<const half*>(v.data_ptr()),
+          reinterpret_cast<const half*>(a.data_ptr()),
+          reinterpret_cast<const half*>(b.data_ptr()),
+          reinterpret_cast<half*>(output.data_ptr()), scale);
+}
+
+template <int M>
+void launch_deltalog_step(
+    bool add_bias,
+    int num_sequences,
+    int num_heads,
+    int state_pool_slots,
+    int device,
+    const torch::Tensor& query_start_loc,
+    const torch::Tensor& state_indices,
+    torch::Tensor& elapsed_pool,
+    torch::Tensor& phase_pool,
+    torch::Tensor& state_pool,
+    torch::Tensor& deltalog_pool,
+    const torch::Tensor& r,
+    const torch::Tensor& decay,
+    const torch::Tensor& decay_bias,
+    const torch::Tensor& k,
+    const torch::Tensor& v,
+    const torch::Tensor& a,
+    const torch::Tensor& b,
+    torch::Tensor& output,
+    const torch::Tensor& metadata_status,
+    torch::Tensor& deltalog_status,
+    float scale,
+    cudaStream_t stream) {
+  if (add_bias) {
+    launch_deltalog_specialization<M, true>(
+        num_sequences, num_heads, state_pool_slots, device, query_start_loc,
+        state_indices, elapsed_pool, phase_pool, state_pool, deltalog_pool, r,
+        decay, decay_bias, k, v, a, b, output, metadata_status,
+        deltalog_status, scale, stream);
+  } else {
+    launch_deltalog_specialization<M, false>(
+        num_sequences, num_heads, state_pool_slots, device, query_start_loc,
+        state_indices, elapsed_pool, phase_pool, state_pool, deltalog_pool, r,
+        decay, decay_bias, k, v, a, b, output, metadata_status,
+        deltalog_status, scale, stream);
+  }
 }
 
 }  // namespace
@@ -504,18 +658,13 @@ void tmix_wkv7_recurrent_deltalog_fp16_from_decay_logits_cuda(
   const int num_sequences = static_cast<int>(state_indices.numel());
   const int num_heads = static_cast<int>(state_pool.size(1));
   const int state_pool_slots = static_cast<int>(state_pool.size(0));
+  const int device = state_pool.get_device();
   const int merge_interval = static_cast<int>(deltalog_pool.size(0) + 1);
-  constexpr int threads = 256;
-  validate_deltalog_slots_kernel<<<
-      (num_sequences + threads - 1) / threads, threads, 0, stream>>>(
-      query_start_loc.data_ptr<int>(), state_indices.data_ptr<int>(),
-      phase_pool.data_ptr<int>(), metadata_status.data_ptr<int>(),
-      deltalog_status.data_ptr<int>(), num_sequences, merge_interval);
-
 #define DISPATCH_M(Value) \
   case Value: \
     launch_deltalog_step<Value>( \
         decay_bias.defined(), num_sequences, num_heads, state_pool_slots, \
+        device, \
         query_start_loc, state_indices, elapsed_pool, phase_pool, state_pool, \
         deltalog_pool, r, decay_logits, decay_bias, k, v, a, b, output, \
         metadata_status, deltalog_status, static_cast<float>(scale), stream); \
@@ -530,11 +679,5 @@ void tmix_wkv7_recurrent_deltalog_fp16_from_decay_logits_cuda(
       TORCH_CHECK(false, "unsupported DeltaLog merge interval");
   }
 #undef DISPATCH_M
-
-  advance_deltalog_slots_kernel<<<
-      (num_sequences + threads - 1) / threads, threads, 0, stream>>>(
-      state_indices.data_ptr<int>(), metadata_status.data_ptr<int>(),
-      deltalog_status.data_ptr<int>(), elapsed_pool.data_ptr<int>(),
-      phase_pool.data_ptr<int>(), num_sequences, merge_interval);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

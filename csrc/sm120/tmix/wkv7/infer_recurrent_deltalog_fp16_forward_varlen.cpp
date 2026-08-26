@@ -187,8 +187,12 @@ void tmix_wkv7_recurrent_deltalog_fp16_from_decay_logits(
     launch_state_indices = std::move(prepared.state_indices);
     metadata_status = std::move(prepared.status);
   }
-  auto deltalog_status = torch::zeros(
-      {1}, state_pool.options().dtype(torch::kInt32));
+  // Element zero backs the regular fail-closed precheck.  The remaining pairs
+  // are the immutable phase/elapsed snapshot for each sequence-capacity entry,
+  // which lets head zero advance the slot without a third CUDA launch.
+  auto deltalog_status = torch::empty(
+      {1 + 2 * state_indices.numel()},
+      state_pool.options().dtype(torch::kInt32));
   tmix_wkv7_recurrent_deltalog_fp16_from_decay_logits_cuda(
       launch_query_start_loc, launch_state_indices, elapsed_pool, phase_pool,
       state_pool, deltalog_pool, r, decay_logits,
