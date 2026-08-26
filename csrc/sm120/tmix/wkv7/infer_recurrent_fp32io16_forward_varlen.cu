@@ -476,6 +476,7 @@ void wkv_fp32_v2_kv_tloop_group4_kernel(
     c10::Half* __restrict__ output_ptr,
     float scale) {
   static_assert(ValueTile == 4 || ValueTile == 8);
+  constexpr int kHeadSize = 64;
   constexpr int kWarpsPerBlock = 4;
   constexpr int kKeyLanes = kWarpThreads / ValueTile;
   constexpr int kStatesPerLane = kHeadSize / kKeyLanes;
