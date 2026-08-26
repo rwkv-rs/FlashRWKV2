@@ -249,6 +249,13 @@ def _assert_gpu_idle() -> None:
 
 
 def _last_json(stdout: str) -> dict[str, Any]:
+    try:
+        payload = json.loads(stdout)
+    except json.JSONDecodeError:
+        pass
+    else:
+        if isinstance(payload, dict):
+            return payload
     for line in reversed(stdout.splitlines()):
         try:
             payload = json.loads(line)
@@ -726,6 +733,10 @@ def _parse_modules(value: str) -> list[str]:
 
 
 def _self_test() -> None:
+    assert _last_json('{\n  "status": "pretty"\n}') == {"status": "pretty"}
+    assert _last_json('diagnostic\n{"status":"compact"}\n') == {
+        "status": "compact"
+    }
     environment = {
         "gpu": "gpu",
         "capability": [12, 0],

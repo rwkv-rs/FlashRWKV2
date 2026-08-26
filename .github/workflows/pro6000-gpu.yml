@@ -139,10 +139,28 @@ jobs:
         run: git checkout --detach "$HEAD_SHA"
       - name: Generate fail-closed validation plan
         id: quality
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           python3 ci/quality_gate.py plan \
             --base '${{ steps.revision.outputs.base_sha }}' \
             --head '${{ steps.revision.outputs.head_sha }}' \
+            --output artifacts/plan.json
+          force_full=()
+          if [[ "$(python3 -c 'import json; print(str(json.load(open("artifacts/plan.json"))["coverage_requires_parent"]).lower())')" == true ]]; then
+            python3 ci/quality_gate.py resolve-tree \
+              --tree "$(python3 -c 'import json; print(json.load(open("artifacts/plan.json"))["base_tree_sha"])')" \
+              --repository "$GITHUB_REPOSITORY" \
+              --current-run "$GITHUB_RUN_ID" \
+              --output artifacts/base-tree-evidence.json
+            if [[ "$(python3 -c 'import json; print(str(json.load(open("artifacts/base-tree-evidence.json"))["found"]).lower())')" != true ]]; then
+              force_full+=(--force-full)
+            fi
+          fi
+          python3 ci/quality_gate.py plan \
+            --base '${{ steps.revision.outputs.base_sha }}' \
+            --head '${{ steps.revision.outputs.head_sha }}' \
+            "${force_full[@]}" \
             --output artifacts/plan.json \
             --github-output "$GITHUB_OUTPUT"
       - name: Resolve reusable tree evidence and build artifact

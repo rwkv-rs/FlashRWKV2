@@ -11,7 +11,7 @@ import tempfile
 import urllib.parse
 import urllib.request
 import zipfile
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +20,7 @@ from select_targets import (
     CUDA_GRAPH_TARGETS,
     RACECHECK_TARGETS,
     TARGETS,
+    Impact,
     _git_changed_files,
     _release_metadata_only,
     classify,
@@ -86,7 +87,37 @@ def build_input_hash(revision: str) -> str:
     return digest.hexdigest()
 
 
-def build_plan(base_sha: str, head_sha: str) -> dict[str, Any]:
+def _force_full_coverage(impact: Impact) -> Impact:
+    return replace(
+        impact,
+        change_class="shared_or_unknown",
+        affected_modules=tuple(sorted(TARGETS)),
+        affected_sm90_modules=tuple(
+            sorted(
+                module
+                for module in TARGETS
+                if "sm90" in BACKENDS_BY_TARGET[module]
+            )
+        ),
+        affected_sm120_modules=tuple(
+            sorted(
+                module
+                for module in TARGETS
+                if "sm120" in BACKENDS_BY_TARGET[module]
+            )
+        ),
+        run_gpu=True,
+        run_benchmark=True,
+        run_sanitizer=True,
+        run_all=True,
+        package_smoke_only=False,
+        reasons=tuple(sorted({*impact.reasons, "missing-base-evidence"})),
+    )
+
+
+def build_plan(
+    base_sha: str, head_sha: str, *, force_full: bool = False
+) -> dict[str, Any]:
     changed = _git_changed_files(base_sha, head_sha)
     release_only = _release_metadata_only(changed, base_sha, head_sha)
     impact = classify(
@@ -95,6 +126,8 @@ def build_plan(base_sha: str, head_sha: str) -> dict[str, Any]:
         head_sha=head_sha,
         release_metadata_only=release_only,
     )
+    if force_full:
+        impact = _force_full_coverage(impact)
     payload: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "base_sha": base_sha,
@@ -533,6 +566,10 @@ def _self_test() -> None:
     )
     assert redirected is not None
     assert redirected.get_header("Authorization") is None
+    forced = _force_full_coverage(classify(["README.md"]))
+    assert forced.run_all and forced.run_gpu and forced.run_sanitizer
+    assert forced.affected_modules == tuple(sorted(TARGETS))
+    assert "missing-base-evidence" in forced.reasons
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         wheel = root / "candidate.whl"
@@ -663,6 +700,7 @@ def main() -> int:
     plan_parser = commands.add_parser("plan")
     plan_parser.add_argument("--base", required=True)
     plan_parser.add_argument("--head", required=True)
+    plan_parser.add_argument("--force-full", action="store_true")
     plan_parser.add_argument("--output", type=Path, required=True)
     plan_parser.add_argument("--github-output", type=Path)
 
@@ -711,7 +749,7 @@ def main() -> int:
         print("quality_gate self-test passed")
         return 0
     if args.command == "plan":
-        payload = build_plan(args.base, args.head)
+        payload = build_plan(args.base, args.head, force_full=args.force_full)
         _write_json(args.output, payload)
         if args.github_output:
             impact = payload["impact"]
