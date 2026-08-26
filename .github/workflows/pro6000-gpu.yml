@@ -630,9 +630,14 @@ jobs:
         with:
           name: flashrwkv2-quality-stage-${{ needs.plan.outputs.source_tree_sha }}
           path: |
-            artifacts/package/
+            artifacts/package/dist/
+            artifacts/package/locked-requirements.txt
+            artifacts/package/wheel-audit.txt
             artifacts/validation/
-            artifacts/benchmark/
+            artifacts/benchmark/*.json
+            artifacts/benchmark/*-output.txt
+            artifacts/benchmark/baseline/*.json
+            artifacts/benchmark/candidate/*.json
           if-no-files-found: error
           retention-days: 7
 
