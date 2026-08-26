@@ -3,7 +3,7 @@
 //
 // Canonical body source:
 //   BlinkDL/Albatross/faster3a_2607/cuda/rwkv7_wkv_fp32_v2.cu
-//   revision ee3308f6922e59f2166c7fac3c5a192340a2b48e
+//   revision 3e41bc43ed5e8332927ddd7e0ce4816cf200a6ea
 //   Apache-2.0
 //
 // Local adaptation:
@@ -453,6 +453,146 @@ void wkv_fp32_v2_kv_tile_kernel(
   }
 }
 
+// Albatross's automatically selected four-warp t-loop, adapted to packed
+// request boundaries and slot-indexed [K,V] state.  Four independent value
+// tiles share one copy of the token vectors, avoiding the one-warp CTA slot
+// limit at the exact short-sequence selector points measured upstream.
+template <int ValueTile>
+__global__ __launch_bounds__(kWarpThreads * 4, 2)
+void wkv_fp32_v2_kv_tloop_group4_kernel(
+    int num_heads,
+    int64_t output_elements,
+    const int* __restrict__ query_start_loc,
+    const int* __restrict__ state_indices,
+    const int* __restrict__ metadata_status,
+    float* __restrict__ state_ptr,
+    const c10::Half* __restrict__ r_ptr,
+    const c10::Half* __restrict__ decay_logits_ptr,
+    const c10::Half* __restrict__ decay_bias_ptr,
+    const c10::Half* __restrict__ k_ptr,
+    const c10::Half* __restrict__ v_ptr,
+    const c10::Half* __restrict__ a_ptr,
+    const c10::Half* __restrict__ b_ptr,
+    c10::Half* __restrict__ output_ptr,
+    float scale) {
+  static_assert(ValueTile == 4 || ValueTile == 8);
+  constexpr int kWarpsPerBlock = 4;
+  constexpr int kKeyLanes = kWarpThreads / ValueTile;
+  constexpr int kStatesPerLane = kHeadSize / kKeyLanes;
+
+  const int head_index = static_cast<int>(blockIdx.x);
+  const int sequence_index = static_cast<int>(blockIdx.y);
+  const int thread = static_cast<int>(threadIdx.x);
+  const int warp = thread / kWarpThreads;
+  const int lane = thread & (kWarpThreads - 1);
+  const int value_lane = lane & (ValueTile - 1);
+  const int key_lane = lane / ValueTile;
+  const int value_tile = static_cast<int>(blockIdx.z) * kWarpsPerBlock + warp;
+  const int value_index = value_tile * ValueTile + value_lane;
+  const int64_t block_index =
+      (static_cast<int64_t>(sequence_index) * num_heads + head_index) *
+          gridDim.z +
+      blockIdx.z;
+  const int64_t block_count =
+      static_cast<int64_t>(gridDim.x) * gridDim.y * gridDim.z;
+
+  if (metadata_status[0] != 0) {
+    fill_invalid_output(
+        block_index, block_count, output_elements, output_ptr);
+    return;
+  }
+  if (sequence_index >= metadata_status[2]) {
+    return;
+  }
+
+  __shared__ int token_start;
+  __shared__ int token_end;
+  __shared__ int state_slot;
+  if (thread == 0) {
+    token_start = query_start_loc[sequence_index];
+    token_end = query_start_loc[sequence_index + 1];
+    state_slot = state_indices[sequence_index];
+  }
+  __syncthreads();
+
+  float* state_base =
+      state_ptr +
+      (static_cast<int64_t>(state_slot) * num_heads + head_index) *
+          kHeadSize * kHeadSize;
+  float state[kStatesPerLane];
+#pragma unroll
+  for (int slot = 0; slot < kStatesPerLane; ++slot) {
+    const int key_index = slot * kKeyLanes + key_lane;
+    state[slot] = state_base[key_index * kHeadSize + value_index];
+  }
+
+  __shared__ float shared_r[kHeadSize];
+  __shared__ float shared_decay[kHeadSize];
+  __shared__ float shared_k[kHeadSize];
+  __shared__ float shared_v[kHeadSize];
+  __shared__ float shared_a[kHeadSize];
+  __shared__ float shared_b[kHeadSize];
+
+  for (int token_index = token_start; token_index < token_end; ++token_index) {
+    const int64_t token_base =
+        (static_cast<int64_t>(token_index) * num_heads + head_index) *
+        kHeadSize;
+    __syncthreads();
+    if (thread < kHeadSize) {
+      const int64_t input_index = token_base + thread;
+      shared_r[thread] = to_float(r_ptr[input_index]);
+      float decay_logits = to_float(decay_logits_ptr[input_index]);
+      if (decay_bias_ptr != nullptr) {
+        decay_logits += to_float(
+            decay_bias_ptr[head_index * kHeadSize + thread]);
+      }
+      shared_decay[thread] = recurrent_retention(decay_logits);
+      shared_k[thread] = to_float(k_ptr[input_index]);
+      shared_v[thread] = to_float(v_ptr[input_index]);
+      shared_a[thread] = to_float(a_ptr[input_index]);
+      shared_b[thread] = to_float(b_ptr[input_index]);
+    }
+    __syncthreads();
+
+    float a_state = 0.0f;
+#pragma unroll
+    for (int slot = 0; slot < kStatesPerLane; ++slot) {
+      const int key_index = slot * kKeyLanes + key_lane;
+      a_state += state[slot] * shared_a[key_index];
+    }
+#pragma unroll
+    for (int offset = kWarpThreads / 2; offset >= ValueTile; offset >>= 1) {
+      a_state += __shfl_down_sync(0xffffffffu, a_state, offset);
+    }
+    a_state = __shfl_sync(0xffffffffu, a_state, value_lane);
+
+    const float value = shared_v[value_index];
+    float result = 0.0f;
+#pragma unroll
+    for (int slot = 0; slot < kStatesPerLane; ++slot) {
+      const int key_index = slot * kKeyLanes + key_lane;
+      const float updated = state[slot] * shared_decay[key_index] +
+          a_state * shared_b[key_index] + shared_k[key_index] * value;
+      state[slot] = updated;
+      result += updated * shared_r[key_index];
+    }
+#pragma unroll
+    for (int offset = kWarpThreads / 2; offset >= ValueTile; offset >>= 1) {
+      result += __shfl_down_sync(0xffffffffu, result, offset);
+    }
+    if (lane < ValueTile) {
+      output_ptr[token_base + value_index] =
+          from_float<c10::Half>(scale * result);
+    }
+  }
+
+#pragma unroll
+  for (int slot = 0; slot < kStatesPerLane; ++slot) {
+    const int key_index = slot * kKeyLanes + key_lane;
+    state_base[key_index * kHeadSize + value_index] = state[slot];
+  }
+}
+
 // Albatross small-warp family.  Each block owns one output row and uses the
 // 32-lane warp to traverse arbitrary D in 32-lane strips.  Unlike the fixed
 // length upstream launch, token_start/token_end are read per request.
@@ -543,7 +683,7 @@ void wkv_fp32_v2_small_warp_kernel(
 }
 
 // Upstream status: Albatross revision
-// ee3308f6922e59f2166c7fac3c5a192340a2b48e exposes this body through the
+// 3e41bc43ed5e8332927ddd7e0ce4816cf200a6ea exposes this body through the
 // registered forward_block operator (mode==3).  Local status: FlashRWKV's
 // public packed-varlen API intentionally has no forced mode selector.  Keep
 // the upstream adaptation as disabled reference code; do not re-enable it
@@ -657,6 +797,28 @@ bool use_small_auto(
   return false;
 }
 
+int group4_value_tile_auto(
+    int sequence_capacity,
+    int num_heads,
+    int max_seqlen,
+    bool io_fp16) {
+  if (!io_fp16 || max_seqlen <= 0) {
+    return 0;
+  }
+  const int64_t sequence_heads =
+      static_cast<int64_t>(sequence_capacity) * num_heads;
+  if (max_seqlen == 5 && sequence_heads <= 80) {
+    return 8;
+  }
+  if (max_seqlen >= 6 && max_seqlen <= 9 && sequence_heads <= 80) {
+    return sequence_heads <= 40 ? 4 : 8;
+  }
+  if (max_seqlen >= 10 && sequence_heads <= 48) {
+    return 4;
+  }
+  return 0;
+}
+
 template <int HeadSize, typename io_t>
 void launch_recurrent_fp32(
     int num_sequences,
@@ -681,6 +843,8 @@ void launch_recurrent_fp32(
   const bool io_fp16 = r.scalar_type() == at::ScalarType::Half;
   const bool use_small = use_small_auto(
       num_sequences, total_tokens, max_seqlen, io_fp16);
+  const int group4_value_tile = group4_value_tile_auto(
+      num_sequences, num_heads, max_seqlen, io_fp16);
   const auto* query_ptr = query_start_loc.data_ptr<int>();
   const auto* state_indices_ptr = state_indices.data_ptr<int>();
   const auto* status_ptr = metadata_status.data_ptr<int>();
@@ -711,6 +875,40 @@ void launch_recurrent_fp32(
               decay_logits.data_ptr<io_t>(), decay_bias_ptr,
               k.data_ptr<io_t>(), v.data_ptr<io_t>(), a.data_ptr<io_t>(),
               b.data_ptr<io_t>(), output.data_ptr<io_t>(), scale);
+      return;
+    }
+    if (group4_value_tile == 4) {
+      wkv_fp32_v2_kv_tloop_group4_kernel<4>
+          <<<dim3(num_heads, num_sequences, HeadSize / (4 * 4)),
+             dim3(kWarpThreads * 4), 0, stream>>>(
+              num_heads, output_elements, query_ptr, state_indices_ptr,
+              status_ptr, state_ptr,
+              reinterpret_cast<const c10::Half*>(r.data_ptr<io_t>()),
+              reinterpret_cast<const c10::Half*>(
+                  decay_logits.data_ptr<io_t>()),
+              reinterpret_cast<const c10::Half*>(decay_bias_ptr),
+              reinterpret_cast<const c10::Half*>(k.data_ptr<io_t>()),
+              reinterpret_cast<const c10::Half*>(v.data_ptr<io_t>()),
+              reinterpret_cast<const c10::Half*>(a.data_ptr<io_t>()),
+              reinterpret_cast<const c10::Half*>(b.data_ptr<io_t>()),
+              reinterpret_cast<c10::Half*>(output.data_ptr<io_t>()), scale);
+      return;
+    }
+    if (group4_value_tile == 8) {
+      wkv_fp32_v2_kv_tloop_group4_kernel<8>
+          <<<dim3(num_heads, num_sequences, HeadSize / (8 * 4)),
+             dim3(kWarpThreads * 4), 0, stream>>>(
+              num_heads, output_elements, query_ptr, state_indices_ptr,
+              status_ptr, state_ptr,
+              reinterpret_cast<const c10::Half*>(r.data_ptr<io_t>()),
+              reinterpret_cast<const c10::Half*>(
+                  decay_logits.data_ptr<io_t>()),
+              reinterpret_cast<const c10::Half*>(decay_bias_ptr),
+              reinterpret_cast<const c10::Half*>(k.data_ptr<io_t>()),
+              reinterpret_cast<const c10::Half*>(v.data_ptr<io_t>()),
+              reinterpret_cast<const c10::Half*>(a.data_ptr<io_t>()),
+              reinterpret_cast<const c10::Half*>(b.data_ptr<io_t>()),
+              reinterpret_cast<c10::Half*>(output.data_ptr<io_t>()), scale);
       return;
     }
   }

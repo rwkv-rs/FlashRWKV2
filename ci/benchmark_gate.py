@@ -99,6 +99,47 @@ BENCHMARKS = {
             ("--shapes", "h32d64", "--dtype", "bfloat16", "--seed", "20260804"),
             "--output",
         ),
+        BenchmarkCase(
+            "infer_recurrent_fp32io16_selectors",
+            "benchmarks/tmix/wkv7/bench.py",
+            (
+                "--operator",
+                "fp32io16",
+                "--shapes",
+                "h32d64",
+                "--cases",
+                "1x5",
+                "1x6",
+                "2x6",
+                "1x10",
+                "--dtype",
+                "float16",
+                "--decay-bias",
+                "--seed",
+                "20260825",
+            ),
+            "--output",
+        ),
+        BenchmarkCase(
+            "infer_recurrent_fp16",
+            "benchmarks/tmix/wkv7/bench.py",
+            (
+                "--operator",
+                "fp16",
+                "--shapes",
+                "h64d64",
+                "--cases",
+                "256x1",
+                "320x1",
+                "20x2",
+                "--dtype",
+                "float16",
+                "--decay-bias",
+                "--seed",
+                "20260825",
+            ),
+            "--output",
+        ),
         BenchmarkCase("infer_chunk_bf16", "benchmarks/tmix/wkv7/chunk/bench.py"),
         BenchmarkCase(
             "pretrain_forward_backward", "benchmarks/tmix/wkv7/pretrain/bench.py"
@@ -354,7 +395,8 @@ def _run_case(
     case: BenchmarkCase,
     *,
     python: str,
-) -> list[dict[str, Any]]:
+    status: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     script = ROOT / case.path
     command = [_python_executable(python), str(script), *case.arguments]
     output_path: Path | None = None
@@ -365,6 +407,7 @@ def _run_case(
         command.extend((case.output_argument, str(output_path)))
     environment_variables = os.environ.copy()
     environment_variables["PYTHONPATH"] = str(ROOT / "benchmarks")
+    environment_variables["FLASHRWKV_BENCHMARK_STATUS"] = status
     result = subprocess.run(
         command,
         cwd=tempfile.gettempdir(),
@@ -383,7 +426,14 @@ def _run_case(
     profiles = _profiles(payload, module)
     for profile in profiles:
         profile["profile"] = f"{case.workload}/{profile['profile']}"
-    return profiles
+    experiments = payload.get("experiments", [])
+    if not isinstance(experiments, list):
+        raise TypeError("benchmark experiments must be a list")
+    return profiles, [
+        {"workload": case.workload, **experiment}
+        for experiment in experiments
+        if isinstance(experiment, dict)
+    ]
 
 
 def run_module(
@@ -395,8 +445,13 @@ def run_module(
     environment: dict[str, Any],
 ) -> dict[str, Any]:
     profiles = []
+    experiments = []
     for case in BENCHMARKS[module]:
-        profiles.extend(_run_case(module, case, python=python))
+        case_profiles, case_experiments = _run_case(
+            module, case, python=python, status=status
+        )
+        profiles.extend(case_profiles)
+        experiments.extend(case_experiments)
     return {
         "schema_version": SCHEMA_VERSION,
         "status": status,
@@ -406,6 +461,7 @@ def run_module(
         "benchmark_contract_sha256": _contract_hash(module),
         "environment": environment,
         "profiles": profiles,
+        "experiments": experiments,
     }
 
 
@@ -727,6 +783,8 @@ def _self_test() -> None:
     }
     assert {case.workload for case in BENCHMARKS["tmix/wkv7"]} == {
         "infer_recurrent_fp32io16",
+        "infer_recurrent_fp32io16_selectors",
+        "infer_recurrent_fp16",
         "infer_chunk_bf16",
         "pretrain_forward_backward",
         "statetune",

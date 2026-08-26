@@ -13,6 +13,7 @@ from utils import require_cuda_backend
 
 import flashrwkv2
 from flashrwkv2.tmix.wkv7 import (
+    infer_tmix_wkv7_recurrent_deltalog_fp16_forward_varlen,
     infer_tmix_wkv7_recurrent_fp16_forward_varlen,
     infer_tmix_wkv7_recurrent_fp32io16_forward_varlen,
     prepare_tmix_wkv7_recurrent_metadata,
@@ -158,6 +159,14 @@ def _require_cuda_extension() -> None:
 def _require_fp16_extension() -> None:
     require_cuda_backend(
         "_C_sm120", 12, "tmix_wkv7_recurrent_fp16_from_decay_logits"
+    )
+
+
+def _require_deltalog_extension() -> None:
+    require_cuda_backend(
+        "_C_sm120",
+        12,
+        "tmix_wkv7_recurrent_deltalog_fp16_from_decay_logits",
     )
 
 
@@ -1174,3 +1183,599 @@ def test_fp16_public_rejects_non_fp16_state_and_tokens() -> None:
             cu_seqlens=case["cu_seqlens"],
             state_indices=case["state_indices"],
         )
+
+
+@pytest.mark.parametrize(
+    ("lengths", "num_heads", "dtype"),
+    [
+        ((5,) * 10, 4, torch.float16),
+        ((6,) * 10, 4, torch.float16),
+        ((6,) * 11, 4, torch.float16),
+        ((10,) * 12, 4, torch.float16),
+        ((10,) * 13, 4, torch.float16),
+        ((2, 5, 3, 1, 4, 5, 2, 5), 4, torch.float16),
+        ((6,) * 10, 4, torch.bfloat16),
+    ],
+)
+def test_fp32_group4_selector_boundaries_and_fallbacks(
+    lengths: tuple[int, ...],
+    num_heads: int,
+    dtype: torch.dtype,
+) -> None:
+    """Cover every 3e41bc4 group4 admission edge with packed slot reorder."""
+
+    _require_cuda_extension()
+    case = _make_case(
+        dtype=dtype,
+        head_size=64,
+        lengths=lengths,
+        num_heads=num_heads,
+        state_pool_slots=len(lengths) + 3,
+        with_decay_bias=True,
+    )
+    args = _args(case)
+    state_indices = torch.arange(
+        len(lengths) + 1,
+        0,
+        -1,
+        device=args[0].device,
+        dtype=torch.int32,
+    )[: len(lengths)]
+    state = case["state_pool"]
+    cu_seqlens = case["cu_seqlens"]
+    decay_bias = case["decay_bias"]
+    assert isinstance(state, torch.Tensor)
+    assert isinstance(cu_seqlens, torch.Tensor)
+    expected_output, expected_state = rwkv7_decay_logits_reference(
+        *args,
+        state_pool=state,
+        cu_seqlens=cu_seqlens,
+        state_indices=state_indices,
+        decay_bias=decay_bias,
+    )
+    observed_state = state.clone()
+    observed_output = infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
+        *args,
+        state_pool=observed_state,
+        cu_seqlens=cu_seqlens,
+        state_indices=state_indices,
+        decay_bias=decay_bias,
+    )
+    torch.cuda.synchronize()
+    assert _relative_rmse(observed_output, expected_output) <= TOLERANCES[
+        "output_relative_rmse"
+    ]
+    active = state_indices.long()
+    assert _relative_rmse(
+        observed_state.index_select(0, active),
+        expected_state.index_select(0, active),
+    ) <= TOLERANCES["state_relative_rmse"]
+
+
+@pytest.mark.parametrize(
+    ("batch_size", "max_seqlen", "num_heads"),
+    ((250, 1, 60), (400, 1, 50), (20, 2, 64)),
+)
+def test_fp16_kv_native_selector_workloads(
+    batch_size: int,
+    max_seqlen: int,
+    num_heads: int,
+) -> None:
+    """Exercise the exact 15000, 20000, and non-T1 1280 boundaries."""
+
+    _require_fp16_extension()
+    lengths = (max_seqlen,) * batch_size
+    case = _make_case(
+        dtype=torch.float16,
+        head_size=64,
+        lengths=lengths,
+        num_heads=num_heads,
+        state_pool_slots=batch_size + 1,
+        with_decay_bias=True,
+    )
+    args = _args(case)
+    state = case["state_pool"].half()
+    elapsed = case["elapsed_state_pool"]
+    cu_seqlens = case["cu_seqlens"]
+    state_indices = torch.arange(
+        batch_size - 1,
+        -1,
+        -1,
+        device=args[0].device,
+        dtype=torch.int32,
+    )
+    decay_bias = case["decay_bias"]
+    assert isinstance(elapsed, torch.Tensor)
+    assert isinstance(cu_seqlens, torch.Tensor)
+    assert isinstance(state_indices, torch.Tensor)
+    expected_output, expected_state = rwkv7_fp16_reference(
+        *args,
+        state_pool=state,
+        elapsed_state_pool=elapsed,
+        cu_seqlens=cu_seqlens,
+        state_indices=state_indices,
+        decay_bias=decay_bias,
+    )
+    observed_state = state.clone()
+    untouched_before = observed_state[-1].clone()
+    observed_elapsed = elapsed.clone()
+    expected_elapsed = elapsed.clone()
+    expected_elapsed[state_indices.long()] += max_seqlen
+    observed_output = infer_tmix_wkv7_recurrent_fp16_forward_varlen(
+        *args,
+        state_pool=observed_state,
+        elapsed_state_pool=observed_elapsed,
+        cu_seqlens=cu_seqlens,
+        state_indices=state_indices,
+        decay_bias=decay_bias,
+    )
+    torch.cuda.synchronize()
+    assert _relative_rmse(observed_output, expected_output) <= 4.0e-3
+    active = state_indices.long()
+    assert _relative_rmse(
+        observed_state.index_select(0, active),
+        expected_state.index_select(0, active),
+    ) <= 4.0e-3
+    assert torch.equal(observed_state[-1], untouched_before)
+    assert torch.equal(observed_elapsed, expected_elapsed)
+
+
+def _make_deltalog_cycle_case(
+    merge_interval: int,
+    *,
+    batch_size: int = 3,
+    num_heads: int = 2,
+    with_decay_bias: bool = True,
+) -> tuple[
+    tuple[tuple[torch.Tensor, ...], ...],
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor | None,
+]:
+    case = _make_case(
+        dtype=torch.float16,
+        head_size=64,
+        lengths=(merge_interval,) * batch_size,
+        num_heads=num_heads,
+        state_pool_slots=batch_size + 3,
+        with_decay_bias=with_decay_bias,
+    )
+    packed = _args(case)
+    steps = tuple(
+        tuple(
+            tensor.reshape(batch_size, merge_interval, num_heads, 64)[
+                :, step
+            ].contiguous()
+            for tensor in packed
+        )
+        for step in range(merge_interval)
+    )
+    cu_seqlens = torch.arange(
+        batch_size + 1, device=packed[0].device, dtype=torch.int32
+    )
+    initial_state = case["state_pool"].half()
+    elapsed = case["elapsed_state_pool"]
+    assert isinstance(elapsed, torch.Tensor)
+    phase = torch.zeros_like(elapsed)
+    logs = torch.zeros(
+        (
+            merge_interval - 1,
+            5,
+            initial_state.shape[0],
+            num_heads,
+            64,
+        ),
+        device=initial_state.device,
+        dtype=torch.float16,
+    )
+    return (
+        steps,
+        cu_seqlens,
+        initial_state,
+        elapsed,
+        phase,
+        logs,
+        case["decay_bias"],
+    )
+
+
+@pytest.mark.parametrize("merge_interval", (2, 3, 4, 6, 8))
+@pytest.mark.parametrize("with_decay_bias", (False, True))
+def test_deltalog_complete_cycles_slot_reorder_and_merge_state(
+    merge_interval: int,
+    with_decay_bias: bool,
+) -> None:
+    _require_deltalog_extension()
+    (
+        steps,
+        cu_seqlens,
+        initial_state,
+        initial_elapsed,
+        phase,
+        logs,
+        decay_bias,
+    ) = _make_deltalog_cycle_case(
+        merge_interval, with_decay_bias=with_decay_bias
+    )
+    normal_state = initial_state.clone()
+    normal_elapsed = initial_elapsed.clone()
+    deltalog_state = initial_state.clone()
+    deltalog_elapsed = initial_elapsed.clone()
+    initial_logs = logs.clone()
+    slot_orders = (
+        torch.tensor([4, 1, 3], device=initial_state.device, dtype=torch.int32),
+        torch.tensor([1, 3, 4], device=initial_state.device, dtype=torch.int32),
+    )
+    for step_index, packed in enumerate(steps):
+        slots = slot_orders[step_index & 1]
+        normal_output = infer_tmix_wkv7_recurrent_fp16_forward_varlen(
+            *packed,
+            state_pool=normal_state,
+            elapsed_state_pool=normal_elapsed,
+            cu_seqlens=cu_seqlens,
+            state_indices=slots,
+            decay_bias=decay_bias,
+            max_seqlen=1,
+        )
+        deltalog_output = (
+            infer_tmix_wkv7_recurrent_deltalog_fp16_forward_varlen(
+                *packed,
+                state_pool=deltalog_state,
+                elapsed_state_pool=deltalog_elapsed,
+                deltalog_phase_pool=phase,
+                deltalog_pool=logs,
+                cu_seqlens=cu_seqlens,
+                state_indices=slots,
+                decay_bias=decay_bias,
+            )
+        )
+        torch.cuda.synchronize()
+        assert _relative_rmse(deltalog_output, normal_output) <= 4.0e-3
+        assert torch.equal(deltalog_elapsed, normal_elapsed)
+        expected_phase = (step_index + 1) % merge_interval
+        assert torch.equal(
+            phase.index_select(0, slots.long()),
+            torch.full(
+                (slots.numel(),),
+                expected_phase,
+                device=phase.device,
+                dtype=torch.int32,
+            ),
+        )
+        if expected_phase != 0:
+            assert torch.equal(
+                deltalog_state.index_select(0, slots.long()),
+                initial_state.index_select(0, slots.long()),
+            )
+
+    active = slot_orders[0].long()
+    assert _relative_rmse(
+        deltalog_state.index_select(0, active),
+        normal_state.index_select(0, active),
+    ) <= 4.0e-3
+    untouched = torch.tensor([0, 2, 5], device=phase.device, dtype=torch.long)
+    assert torch.equal(
+        deltalog_state.index_select(0, untouched),
+        initial_state.index_select(0, untouched),
+    )
+    assert torch.equal(logs[:, :, untouched], initial_logs[:, :, untouched])
+
+
+@pytest.mark.memcheck
+@pytest.mark.racecheck
+def test_deltalog_append_merge_multiple_staggered_slots() -> None:
+    """Minimal sanitizer case: one launch has append and merge CTAs together."""
+
+    _require_deltalog_extension()
+    (
+        steps,
+        _,
+        initial_state,
+        initial_elapsed,
+        phase,
+        logs,
+        decay_bias,
+    ) = _make_deltalog_cycle_case(3)
+    normal_state = initial_state.clone()
+    normal_elapsed = initial_elapsed.clone()
+    deltalog_state = initial_state.clone()
+    deltalog_elapsed = initial_elapsed.clone()
+
+    def run_subset(step: int, slots: tuple[int, ...]) -> None:
+        selected = torch.tensor(
+            slots, device=initial_state.device, dtype=torch.int32
+        )
+        cu = torch.arange(
+            len(slots) + 1, device=initial_state.device, dtype=torch.int32
+        )
+        packed = tuple(tensor[: len(slots)].contiguous() for tensor in steps[step])
+        infer_tmix_wkv7_recurrent_fp16_forward_varlen(
+            *packed,
+            state_pool=normal_state,
+            elapsed_state_pool=normal_elapsed,
+            cu_seqlens=cu,
+            state_indices=selected,
+            decay_bias=decay_bias,
+            max_seqlen=1,
+        )
+        infer_tmix_wkv7_recurrent_deltalog_fp16_forward_varlen(
+            *packed,
+            state_pool=deltalog_state,
+            elapsed_state_pool=deltalog_elapsed,
+            deltalog_phase_pool=phase,
+            deltalog_pool=logs,
+            cu_seqlens=cu,
+            state_indices=selected,
+            decay_bias=decay_bias,
+        )
+
+    run_subset(0, (1, 4))
+    run_subset(1, (1,))
+    slots = torch.tensor([4, 3, 1], device=initial_state.device, dtype=torch.int32)
+    cu = torch.arange(4, device=initial_state.device, dtype=torch.int32)
+    normal_output = infer_tmix_wkv7_recurrent_fp16_forward_varlen(
+        *steps[2],
+        state_pool=normal_state,
+        elapsed_state_pool=normal_elapsed,
+        cu_seqlens=cu,
+        state_indices=slots,
+        decay_bias=decay_bias,
+        max_seqlen=1,
+    )
+    deltalog_output = infer_tmix_wkv7_recurrent_deltalog_fp16_forward_varlen(
+        *steps[2],
+        state_pool=deltalog_state,
+        elapsed_state_pool=deltalog_elapsed,
+        deltalog_phase_pool=phase,
+        deltalog_pool=logs,
+        cu_seqlens=cu,
+        state_indices=slots,
+        decay_bias=decay_bias,
+    )
+    torch.cuda.synchronize()
+    assert _relative_rmse(deltalog_output, normal_output) <= 4.0e-3
+    assert phase[1].item() == 0
+    assert phase[4].item() == 2
+    assert phase[3].item() == 1
+    assert _relative_rmse(deltalog_state[1], normal_state[1]) <= 4.0e-3
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ("non_t1", "illegal_phase", "duplicate_slot"),
+)
+def test_deltalog_runtime_failures_preserve_entire_state_bundle(
+    failure: str,
+) -> None:
+    _require_deltalog_extension()
+    (
+        steps,
+        cu_seqlens,
+        initial_state,
+        initial_elapsed,
+        phase,
+        logs,
+        decay_bias,
+    ) = _make_deltalog_cycle_case(3)
+    packed = steps[0]
+    slots = torch.tensor([4, 1, 3], device=initial_state.device, dtype=torch.int32)
+    if failure == "non_t1":
+        packed = tuple(torch.cat((tensor, tensor[:1]), dim=0) for tensor in packed)
+        cu_seqlens = torch.tensor(
+            [0, 2, 3, 4], device=initial_state.device, dtype=torch.int32
+        )
+    elif failure == "illegal_phase":
+        phase[1] = 3
+    else:
+        slots[1] = slots[0]
+
+    state = initial_state.clone()
+    elapsed = initial_elapsed.clone()
+    before = tuple(tensor.clone() for tensor in (state, elapsed, phase, logs))
+    if failure == "duplicate_slot":
+        with pytest.raises(RuntimeError, match="unique"):
+            infer_tmix_wkv7_recurrent_deltalog_fp16_forward_varlen(
+                *packed,
+                state_pool=state,
+                elapsed_state_pool=elapsed,
+                deltalog_phase_pool=phase,
+                deltalog_pool=logs,
+                cu_seqlens=cu_seqlens,
+                state_indices=slots,
+                decay_bias=decay_bias,
+            )
+    else:
+        output = infer_tmix_wkv7_recurrent_deltalog_fp16_forward_varlen(
+            *packed,
+            state_pool=state,
+            elapsed_state_pool=elapsed,
+            deltalog_phase_pool=phase,
+            deltalog_pool=logs,
+            cu_seqlens=cu_seqlens,
+            state_indices=slots,
+            decay_bias=decay_bias,
+        )
+        torch.cuda.synchronize()
+        assert torch.isnan(output).all()
+    for observed, expected in zip((state, elapsed, phase, logs), before):
+        assert torch.equal(observed, expected)
+
+
+@pytest.mark.parametrize(
+    "bad_bundle",
+    ("log_shape", "log_dtype", "phase_dtype", "log_device"),
+)
+def test_deltalog_rejects_invalid_bundle_without_state_write(
+    bad_bundle: str,
+) -> None:
+    _require_deltalog_extension()
+    (
+        steps,
+        cu_seqlens,
+        state,
+        elapsed,
+        phase,
+        logs,
+        decay_bias,
+    ) = _make_deltalog_cycle_case(3)
+    slots = torch.tensor([4, 1, 3], device=state.device, dtype=torch.int32)
+    if bad_bundle == "log_shape":
+        logs = logs[..., :-1].contiguous()
+    elif bad_bundle == "log_dtype":
+        logs = logs.float()
+    elif bad_bundle == "phase_dtype":
+        phase = phase.long()
+    else:
+        logs = logs.cpu()
+    before_state = state.clone()
+    with pytest.raises((TypeError, ValueError, RuntimeError)):
+        infer_tmix_wkv7_recurrent_deltalog_fp16_forward_varlen(
+            *steps[0],
+            state_pool=state,
+            elapsed_state_pool=elapsed,
+            deltalog_phase_pool=phase,
+            deltalog_pool=logs,
+            cu_seqlens=cu_seqlens,
+            state_indices=slots,
+            decay_bias=decay_bias,
+        )
+    assert torch.equal(state, before_state)
+
+
+def test_deltalog_public_signature_and_native_symbol() -> None:
+    signature = inspect.signature(
+        infer_tmix_wkv7_recurrent_deltalog_fp16_forward_varlen
+    )
+    assert tuple(signature.parameters) == (
+        "r",
+        "decay_logits",
+        "k",
+        "v",
+        "a",
+        "b",
+        "state_pool",
+        "elapsed_state_pool",
+        "deltalog_phase_pool",
+        "deltalog_pool",
+        "cu_seqlens",
+        "state_indices",
+        "scale",
+        "decay_bias",
+        "validated_metadata",
+    )
+    assert "merge_interval" not in signature.parameters
+    if flashrwkv2._C is not None:
+        assert hasattr(
+            flashrwkv2._C,
+            "tmix_wkv7_recurrent_deltalog_fp16_from_decay_logits",
+        )
+
+
+@pytest.mark.cuda_graph
+def test_deltalog_live_metadata_zero_active_warmup_and_graph_replay() -> None:
+    _require_deltalog_extension()
+    device = torch.device("cuda")
+    token_capacity, sequence_capacity, slots, heads = 4, 4, 3, 2
+    torch.manual_seed(20260825)
+    packed = tuple(
+        (torch.randn(token_capacity, heads, 64, device=device) * scale).half()
+        for scale in (0.12, 3.0, 0.06, 0.06, 0.06, 0.06)
+    )
+    initial_state = (
+        torch.randn(slots, heads, 64, 64, device=device) * 0.03
+    ).half()
+    state = initial_state.clone()
+    elapsed = torch.arange(slots, device=device, dtype=torch.int32) * 7
+    initial_elapsed = elapsed.clone()
+    phase = torch.zeros(slots, device=device, dtype=torch.int32)
+    logs = torch.zeros(
+        2, 5, slots, heads, 64, device=device, dtype=torch.float16
+    )
+    cu = torch.tensor([0, -1, -1, -1, -1], device=device, dtype=torch.int32)
+    state_indices = torch.full(
+        (sequence_capacity,), 99, device=device, dtype=torch.int32
+    )
+    active_tokens = torch.zeros(1, device=device, dtype=torch.int32)
+    active_sequences = torch.zeros(1, device=device, dtype=torch.int32)
+    ticket = prepare_tmix_wkv7_recurrent_metadata(
+        cu,
+        state_indices,
+        state_pool_size=slots,
+        token_capacity=token_capacity,
+        sequence_capacity=sequence_capacity,
+        max_seqlen_capacity=1,
+        num_active_tokens=active_tokens,
+        num_active_sequences=active_sequences,
+    )
+    infer_tmix_wkv7_recurrent_deltalog_fp16_forward_varlen(
+        *packed,
+        state_pool=state,
+        elapsed_state_pool=elapsed,
+        deltalog_phase_pool=phase,
+        deltalog_pool=logs,
+        cu_seqlens=cu,
+        state_indices=state_indices,
+        validated_metadata=ticket,
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(state, initial_state)
+    assert torch.equal(elapsed, initial_elapsed)
+    assert torch.count_nonzero(phase).item() == 0
+    assert torch.count_nonzero(logs).item() == 0
+
+    cu.copy_(torch.tensor([0, 1, 2, -1, -1], device=device, dtype=torch.int32))
+    state_indices.copy_(
+        torch.tensor([2, 0, 99, 99], device=device, dtype=torch.int32)
+    )
+    active_tokens.fill_(2)
+    active_sequences.fill_(2)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_ticket = prepare_tmix_wkv7_recurrent_metadata(
+            cu,
+            state_indices,
+            state_pool_size=slots,
+            token_capacity=token_capacity,
+            sequence_capacity=sequence_capacity,
+            max_seqlen_capacity=1,
+            num_active_tokens=active_tokens,
+            num_active_sequences=active_sequences,
+        )
+        graph_output = infer_tmix_wkv7_recurrent_deltalog_fp16_forward_varlen(
+            *packed,
+            state_pool=state,
+            elapsed_state_pool=elapsed,
+            deltalog_phase_pool=phase,
+            deltalog_pool=logs,
+            cu_seqlens=cu,
+            state_indices=state_indices,
+            validated_metadata=graph_ticket,
+        )
+
+    state.copy_(initial_state)
+    elapsed.copy_(initial_elapsed)
+    phase.zero_()
+    logs.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.isfinite(graph_output[:2]).all()
+    assert phase.cpu().tolist() == [1, 0, 1]
+    assert elapsed.cpu().tolist() == [1, 7, 15]
+
+    # Replay with different active count, slot ownership, and an externally
+    # restored per-slot phase.  Capacity tails remain invalid dummy entries.
+    cu.copy_(torch.tensor([0, 1, -1, -1, -1], device=device, dtype=torch.int32))
+    state_indices.copy_(
+        torch.tensor([1, 99, 99, 99], device=device, dtype=torch.int32)
+    )
+    active_tokens.fill_(1)
+    active_sequences.fill_(1)
+    phase[1] = 2
+    graph.replay()
+    torch.cuda.synchronize()
+    assert phase.cpu().tolist() == [1, 0, 1]
+    assert elapsed.cpu().tolist() == [1, 8, 15]
+    assert torch.isfinite(graph_output[0]).all()

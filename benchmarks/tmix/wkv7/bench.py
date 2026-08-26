@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 
-"""Benchmark the raw RWKV-7 FP32-state recurrent inference operator.
+"""Benchmark the raw RWKV-7 recurrent inference operators.
 
 This benchmark owns only operator shapes and packed workloads.  It does not
 define a model, compose an operator graph, or multiply any model-level
@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import platform
 import subprocess
 from collections.abc import Iterable
@@ -34,14 +35,20 @@ class ImportedSourceFamily:
 
 
 SOURCE_FAMILY = ImportedSourceFamily(
-    name="albatross-faster3a-2607-recurrent-fp32io16",
+    name="albatross-faster3a-2607-recurrent",
     repository="https://github.com/BlinkDL/Albatross",
-    revision="ee3308f6922e59f2166c7fac3c5a192340a2b48e",
+    revision="3e41bc43ed5e8332927ddd7e0ce4816cf200a6ea",
     license="Apache-2.0",
     paths=(
         "faster3a_2607/cuda/rwkv7_wkv_fp32_v2.cu",
+        "faster3a_2607/cuda/rwkv7_wkv_fp16_v2.cu",
+        "faster3a_2607/cuda/rwkv7_wkv_deltalog_v3a.cu",
         "csrc/sm120/tmix/wkv7/infer_recurrent_fp32io16_forward_varlen.cu",
         "csrc/sm120/tmix/wkv7/infer_recurrent_fp32io16_forward_varlen.cpp",
+        "csrc/sm120/tmix/wkv7/infer_recurrent_fp16_forward_varlen.cu",
+        "csrc/sm120/tmix/wkv7/infer_recurrent_fp16_forward_varlen.cpp",
+        "csrc/sm120/tmix/wkv7/infer_recurrent_deltalog_fp16_forward_varlen.cu",
+        "csrc/sm120/tmix/wkv7/infer_recurrent_deltalog_fp16_forward_varlen.cpp",
     ),
 )
 
@@ -57,15 +64,26 @@ class KernelSpec:
     source_family: str
 
 
-KERNEL_SPEC = KernelSpec(
-    provider="Albatross",
-    name="infer_tmix_wkv7_recurrent_fp32io16_forward_varlen",
-    layouts=("packed",),
-    state_dtype="float32",
-    token_dtypes=("float16", "bfloat16"),
-    head_sizes=(64, 128, 256),
-    source_family=SOURCE_FAMILY.name,
-)
+KERNEL_SPECS = {
+    "fp32io16": KernelSpec(
+        provider="Albatross",
+        name="infer_tmix_wkv7_recurrent_fp32io16_forward_varlen",
+        layouts=("packed",),
+        state_dtype="float32",
+        token_dtypes=("float16", "bfloat16"),
+        head_sizes=(64, 128, 256),
+        source_family=SOURCE_FAMILY.name,
+    ),
+    "fp16": KernelSpec(
+        provider="Albatross",
+        name="infer_tmix_wkv7_recurrent_fp16_forward_varlen",
+        layouts=("packed", "state_indices", "kv_state"),
+        state_dtype="float16",
+        token_dtypes=("float16",),
+        head_sizes=(64, 128, 256),
+        source_family=SOURCE_FAMILY.name,
+    ),
+}
 
 
 ALBATROSS_BT_MATRIX = (
@@ -171,6 +189,10 @@ def _native_source_set_hash(root: Path) -> str:
         "csrc/validation/recurrent_metadata.cu",
         "csrc/sm120/tmix/wkv7/infer_recurrent_fp32io16_forward_varlen.cu",
         "csrc/sm120/tmix/wkv7/infer_recurrent_fp32io16_forward_varlen.cpp",
+        "csrc/sm120/tmix/wkv7/infer_recurrent_fp16_forward_varlen.cu",
+        "csrc/sm120/tmix/wkv7/infer_recurrent_fp16_forward_varlen.cpp",
+        "csrc/sm120/tmix/wkv7/infer_recurrent_deltalog_fp16_forward_varlen.cu",
+        "csrc/sm120/tmix/wkv7/infer_recurrent_deltalog_fp16_forward_varlen.cpp",
         "csrc/sm120/tmix/wkv7/recurrent_decay.cuh",
     )
     return _sha256_paths(root / relative for relative in relative_paths)
@@ -251,6 +273,7 @@ def _make_inputs(
     device: torch.device,
     seed: int,
     with_decay_bias: bool,
+    operator: str,
 ) -> dict[str, torch.Tensor | None]:
     generator = torch.Generator(device=device).manual_seed(seed)
     total_tokens = workload.total_tokens
@@ -275,6 +298,7 @@ def _make_inputs(
         dtype=torch.int32,
     )
     state_slots = workload.batch_size + 4
+    state_dtype = torch.float32 if operator == "fp32io16" else torch.float16
     state_pool = torch.randn(
         (
             state_slots,
@@ -283,7 +307,7 @@ def _make_inputs(
             operator_shape.head_size,
         ),
         device=device,
-        dtype=torch.float32,
+        dtype=state_dtype,
         generator=generator,
     ).mul_(0.02)
     decay_bias = None
@@ -304,6 +328,9 @@ def _make_inputs(
         "cu_seqlens": cu_seqlens,
         "state_indices": state_indices,
         "state_pool": state_pool,
+        "elapsed_state_pool": torch.zeros(
+            state_slots, device=device, dtype=torch.int32
+        ),
         "decay_bias": decay_bias,
     }
 
@@ -324,6 +351,8 @@ def _timed_native_launch(
     output: torch.Tensor,
     state: torch.Tensor,
     ticket: object,
+    operator: str,
+    max_seqlen: int,
     scale: float = 1.0,
 ) -> None:
     cu_seqlens = inputs["cu_seqlens"]
@@ -334,16 +363,32 @@ def _timed_native_launch(
     extension = flashrwkv2._C
     if extension is None:
         raise RuntimeError("flashrwkv2._C is not loaded")
-    extension.tmix_wkv7_recurrent_fp32_from_decay_logits(
-        cu_seqlens,
-        state_indices,
-        state,
-        *flat_inputs,
-        output,
-        scale,
-        decay_bias=decay_bias,
-        validated_metadata=ticket,
-    )
+    if operator == "fp32io16":
+        extension.tmix_wkv7_recurrent_fp32_from_decay_logits(
+            cu_seqlens,
+            state_indices,
+            state,
+            *flat_inputs,
+            output,
+            scale,
+            decay_bias=decay_bias,
+            validated_metadata=ticket,
+        )
+    else:
+        elapsed = inputs["elapsed_state_pool"]
+        assert isinstance(elapsed, torch.Tensor)
+        extension.tmix_wkv7_recurrent_fp16_from_decay_logits(
+            cu_seqlens,
+            state_indices,
+            elapsed,
+            state,
+            *flat_inputs,
+            output,
+            scale,
+            decay_bias=decay_bias,
+            validated_metadata=ticket,
+            max_seqlen=max_seqlen,
+        )
 
 
 def _measure(
@@ -352,19 +397,32 @@ def _measure(
     *,
     workload: Workload,
     ticket: object,
+    operator: str,
 ) -> dict[str, object]:
     reset_state = inputs["state_pool"]
     if not isinstance(reset_state, torch.Tensor):
         raise TypeError("benchmark state pool is incomplete")
     output = torch.empty_like(flat_inputs[3])
     state = reset_state.clone()
+    reset_elapsed = inputs["elapsed_state_pool"]
+    if not isinstance(reset_elapsed, torch.Tensor):
+        raise TypeError("benchmark elapsed state is incomplete")
+    elapsed = reset_elapsed.clone()
+    launch_inputs = {**inputs, "elapsed_state_pool": elapsed}
 
     def reset() -> None:
         state.copy_(reset_state)
+        elapsed.copy_(reset_elapsed)
 
     def run() -> None:
         _timed_native_launch(
-            flat_inputs, inputs, output=output, state=state, ticket=ticket
+            flat_inputs,
+            launch_inputs,
+            output=output,
+            state=state,
+            ticket=ticket,
+            operator=operator,
+            max_seqlen=max(workload.lengths),
         )
 
     timing = measure_cuda(run, before_batch=reset)
@@ -374,17 +432,185 @@ def _measure(
     return timing
 
 
-def _selected_fp32_family(workload: Workload, dtype: torch.dtype) -> str:
+def _selected_fp32_family(
+    workload: Workload, dtype: torch.dtype, num_heads: int
+) -> str:
     """Report the measured family selected for canonical [K,V] state."""
 
-    del dtype
     if workload.batch_size == 1 and workload.uniform_t == 1:
         return "wkv_fp32_v2_kv_tile"
+    sequence_heads = workload.batch_size * num_heads
+    max_seqlen = max(workload.lengths)
+    if dtype == torch.float16:
+        if max_seqlen == 5 and sequence_heads <= 80:
+            return "wkv_fp32_v2_kv_tloop_group4_vt8"
+        if 6 <= max_seqlen <= 9 and sequence_heads <= 80:
+            tile = 4 if sequence_heads <= 40 else 8
+            return f"wkv_fp32_v2_kv_tloop_group4_vt{tile}"
+        if max_seqlen >= 10 and sequence_heads <= 48:
+            return "wkv_fp32_v2_kv_tloop_group4_vt4"
     return "wkv_fp32_v2"
+
+
+def _selected_fp16_family(workload: Workload, num_heads: int) -> str:
+    sequence_heads = workload.batch_size * num_heads
+    if workload.uniform_t == 1 and sequence_heads >= 20000:
+        return "wkv_fp16_kv_vector"
+    if (
+        workload.uniform_t == 1
+        and 15000 <= sequence_heads < 20000
+    ) or (max(workload.lengths) > 1 and sequence_heads >= 1280):
+        return "wkv_fp16_kv_warp_pair"
+    return "wkv_fp16_existing_family"
+
+
+DELTALOG_EXPERIMENTS = (
+    (8, 2, False),
+    (64, 3, False),
+    (256, 3, False),
+    (512, 4, False),
+    (256, 3, True),
+)
+
+
+def _measure_deltalog_experiment(
+    *,
+    batch_size: int,
+    merge_interval: int,
+    staggered: bool,
+    device: torch.device,
+    seed: int,
+) -> dict[str, object]:
+    shape = OPERATOR_SHAPES["h64d64"]
+    workload = Workload(f"{batch_size}x1", (1,) * batch_size)
+    inputs = _make_inputs(
+        workload,
+        shape,
+        torch.float16,
+        device=device,
+        seed=seed,
+        with_decay_bias=True,
+        operator="fp16",
+    )
+    packed = _flatten_inputs(inputs)
+    state_template = inputs["state_pool"]
+    elapsed_template = inputs["elapsed_state_pool"]
+    cu_seqlens = inputs["cu_seqlens"]
+    state_indices = inputs["state_indices"]
+    decay_bias = inputs["decay_bias"]
+    assert isinstance(state_template, torch.Tensor)
+    assert isinstance(elapsed_template, torch.Tensor)
+    assert isinstance(cu_seqlens, torch.Tensor)
+    assert isinstance(state_indices, torch.Tensor)
+    ticket = flashrwkv2.prepare_tmix_wkv7_recurrent_metadata(
+        cu_seqlens,
+        state_indices,
+        total_tokens=batch_size,
+        state_pool_size=state_template.shape[0],
+        max_seqlen=1,
+    )
+    extension = flashrwkv2._C
+    if extension is None:
+        raise RuntimeError("flashrwkv2._C is not loaded")
+    output = torch.empty_like(packed[3])
+
+    normal_state = state_template.clone()
+    normal_elapsed = elapsed_template.clone()
+
+    def reset_normal() -> None:
+        normal_state.copy_(state_template)
+        normal_elapsed.copy_(elapsed_template)
+
+    def run_normal_cycle() -> None:
+        for _ in range(merge_interval):
+            extension.tmix_wkv7_recurrent_fp16_from_decay_logits(
+                cu_seqlens,
+                state_indices,
+                normal_elapsed,
+                normal_state,
+                *packed,
+                output,
+                1.0,
+                decay_bias=decay_bias,
+                validated_metadata=ticket,
+                max_seqlen=1,
+            )
+
+    normal_timing = measure_cuda(run_normal_cycle, before_batch=reset_normal)
+
+    deltalog_state = state_template.clone()
+    deltalog_elapsed = elapsed_template.clone()
+    phase_template = torch.zeros_like(elapsed_template)
+    if staggered:
+        phase_template[:batch_size] = torch.arange(
+            batch_size, device=device, dtype=torch.int32
+        ).remainder_(merge_interval)
+    phase = phase_template.clone()
+    logs_template = torch.zeros(
+        (
+            merge_interval - 1,
+            5,
+            state_template.shape[0],
+            shape.num_heads,
+            64,
+        ),
+        device=device,
+        dtype=torch.float16,
+    )
+    logs = logs_template.clone()
+
+    def reset_deltalog() -> None:
+        deltalog_state.copy_(state_template)
+        deltalog_elapsed.copy_(elapsed_template)
+        phase.copy_(phase_template)
+        logs.copy_(logs_template)
+
+    def run_deltalog_cycle() -> None:
+        for _ in range(merge_interval):
+            extension.tmix_wkv7_recurrent_deltalog_fp16_from_decay_logits(
+                cu_seqlens,
+                state_indices,
+                deltalog_elapsed,
+                phase,
+                deltalog_state,
+                logs,
+                *packed,
+                output,
+                1.0,
+                decay_bias=decay_bias,
+                validated_metadata=ticket,
+            )
+
+    deltalog_timing = measure_cuda(
+        run_deltalog_cycle, before_batch=reset_deltalog
+    )
+    normal_mean = float(normal_timing["mean_us"])
+    deltalog_mean = float(deltalog_timing["mean_us"])
+    return {
+        "name": (
+            f"c4096_b{batch_size}_m{merge_interval}"
+            + ("_staggered" if staggered else "")
+        ),
+        "B": batch_size,
+        "H": shape.num_heads,
+        "D": 64,
+        "M": merge_interval,
+        "staggered_phase": staggered,
+        "boundary": "complete_cycle_returns_each_slot_to_its_initial_phase",
+        "normal_fp16": normal_timing,
+        "slot_native_deltalog": deltalog_timing,
+        "deltalog_speedup": normal_mean / deltalog_mean,
+        "deltalog_lower_latency": deltalog_mean < normal_mean,
+    }
 
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--operator",
+        choices=("fp32io16", "fp16"),
+        default="fp32io16",
+    )
     parser.add_argument(
         "--shapes",
         nargs="+",
@@ -425,7 +651,7 @@ def main(argv: list[str] | None = None) -> int:
         else default_workloads(args.stress)
     )
     family = SOURCE_FAMILY
-    spec = KERNEL_SPEC
+    spec = KERNEL_SPECS[args.operator]
     git = _git_metadata(root)
     extension = getattr(flashrwkv2, "_C", None)
     if extension is None:
@@ -433,7 +659,7 @@ def main(argv: list[str] | None = None) -> int:
     extension_path = Path(getattr(extension, "__file__", ""))
     payload: dict[str, object] = {
         "schema_version": 1,
-        "benchmark": "flashrwkv2_wkv7_recurrent_fp32io16",
+        "benchmark": f"flashrwkv2_wkv7_recurrent_{args.operator}",
         "revision": git["revision"],
         "git_status": git["status"],
         "benchmark_script_sha256": _sha256_paths((Path(__file__).resolve(),)),
@@ -451,12 +677,14 @@ def main(argv: list[str] | None = None) -> int:
         "configuration": {
             "operator_shapes": args.shapes,
             "dtype": args.dtype,
-            "state_dtype": "float32",
+            "state_dtype": "float32" if args.operator == "fp32io16" else "float16",
+            "operator": args.operator,
             "stress": args.stress,
             "decay_bias": args.decay_bias,
             "seed": args.seed,
         },
         "results": [],
+        "experiments": [],
     }
 
     device = torch.device("cuda")
@@ -477,19 +705,25 @@ def main(argv: list[str] | None = None) -> int:
                     "num_heads": operator_shape.num_heads,
                     "head_size": operator_shape.head_size,
                     "token_dtype": dtype_name,
-                    "state_dtype": "float32",
+                    "state_dtype": (
+                        "float32" if args.operator == "fp32io16" else "float16"
+                    ),
                     "boundary": "preallocated_native_consecutive_in_place_launches",
                     "steady_state": "state pool is reset before each timing batch",
-                    "selected_kernel_family": _selected_fp32_family(workload, dtype),
+                    "selected_kernel_family": (
+                        _selected_fp32_family(
+                            workload, dtype, operator_shape.num_heads
+                        )
+                        if args.operator == "fp32io16"
+                        else _selected_fp16_family(workload, operator_shape.num_heads)
+                    ),
                     "dispatch": {
                         "batch_size": workload.batch_size,
                         "max_seqlen": max(workload.lengths),
                         "policy": (
-                            "automatic policy uses a canonical-[K,V] B1 tile "
-                            "or the Albatross large family; "
-                            "small-warp and forced short-block are retained as "
-                            "source references because canonical [K,V] state "
-                            "makes their fixed-V traversal strided"
+                            "automatic packed-varlen policy; FP32IO16 includes "
+                            "the D64 group4 t-loop selector and FP16 includes "
+                            "native [K,V] warp-pair/vector thresholds"
                         ),
                     },
                 }
@@ -501,6 +735,7 @@ def main(argv: list[str] | None = None) -> int:
                         device=device,
                         seed=args.seed + workload_index,
                         with_decay_bias=args.decay_bias,
+                        operator=args.operator,
                     )
                     state_pool = inputs["state_pool"]
                     r = inputs["r"]
@@ -523,6 +758,7 @@ def main(argv: list[str] | None = None) -> int:
                         inputs,
                         workload=workload,
                         ticket=ticket,
+                        operator=args.operator,
                     )
                     print(
                         "RESULT "
@@ -542,6 +778,35 @@ def main(argv: list[str] | None = None) -> int:
                         f"timing=unavailable reason={type(error).__name__}"
                     )
                 results.append(row)
+
+    if (
+        args.operator == "fp16"
+        and os.environ.get("FLASHRWKV_BENCHMARK_STATUS") == "candidate"
+        and hasattr(
+            extension,
+            "tmix_wkv7_recurrent_deltalog_fp16_from_decay_logits",
+        )
+    ):
+        experiments = payload["experiments"]
+        assert isinstance(experiments, list)
+        for index, (batch_size, merge_interval, staggered) in enumerate(
+            DELTALOG_EXPERIMENTS
+        ):
+            experiment = _measure_deltalog_experiment(
+                batch_size=batch_size,
+                merge_interval=merge_interval,
+                staggered=staggered,
+                device=device,
+                seed=args.seed + 1000 + index,
+            )
+            experiments.append(experiment)
+            print(
+                "EXPERIMENT "
+                f"name={experiment['name']} "
+                f"normal_mean_us={experiment['normal_fp16']['mean_us']:.6f} "
+                "deltalog_mean_us="
+                f"{experiment['slot_native_deltalog']['mean_us']:.6f}"
+            )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(payload, indent=2, default=list) + "\n")

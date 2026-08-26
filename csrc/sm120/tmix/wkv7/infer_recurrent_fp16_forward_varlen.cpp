@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright contributors to the FlashRWKV2 project
 //
 // The FP16 kernel body is adapted from Albatross faster3a_2607 at revision
-// ee3308f6922e59f2166c7fac3c5a192340a2b48e.  vllm-rwkv is used only for the
+// 3e41bc43ed5e8332927ddd7e0ce4816cf200a6ea.  vllm-rwkv is used only for the
 // packed metadata/state-slot contract reference.
 
 #include "../../../validation.h"

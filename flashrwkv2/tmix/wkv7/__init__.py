@@ -62,6 +62,48 @@ def _validate_fp16_elapsed_state(
         raise ValueError("elapsed_state_pool must have shape [state_pool_slots]")
 
 
+def _validate_deltalog_state_bundle(
+    state_pool: torch.Tensor,
+    elapsed_state_pool: torch.Tensor,
+    deltalog_phase_pool: torch.Tensor,
+    deltalog_pool: torch.Tensor,
+) -> None:
+    _validate_fp16_state(state_pool)
+    _validate_fp16_elapsed_state(elapsed_state_pool, state_pool)
+    if not isinstance(deltalog_phase_pool, torch.Tensor):
+        raise TypeError("deltalog_phase_pool must be a torch.Tensor")
+    if deltalog_phase_pool.dtype != torch.int32:
+        raise TypeError("deltalog_phase_pool must have dtype torch.int32")
+    if not deltalog_phase_pool.is_cuda or not deltalog_phase_pool.is_contiguous():
+        raise ValueError("deltalog_phase_pool must be contiguous CUDA int32")
+    if deltalog_phase_pool.device != state_pool.device:
+        raise ValueError("deltalog_phase_pool must share state_pool's device")
+    if (
+        deltalog_phase_pool.ndim != 1
+        or deltalog_phase_pool.shape[0] != state_pool.shape[0]
+    ):
+        raise ValueError("deltalog_phase_pool must have shape [state_pool_slots]")
+    if not isinstance(deltalog_pool, torch.Tensor):
+        raise TypeError("deltalog_pool must be a torch.Tensor")
+    if deltalog_pool.dtype != torch.float16:
+        raise TypeError("deltalog_pool must have dtype torch.float16")
+    if not deltalog_pool.is_cuda or not deltalog_pool.is_contiguous():
+        raise ValueError("deltalog_pool must be contiguous CUDA float16")
+    if deltalog_pool.device != state_pool.device:
+        raise ValueError("deltalog_pool must share state_pool's device")
+    if deltalog_pool.ndim != 5 or tuple(deltalog_pool.shape[1:]) != (
+        5,
+        state_pool.shape[0],
+        state_pool.shape[1],
+        64,
+    ):
+        raise ValueError(
+            "deltalog_pool must have shape [M-1,5,state_pool_slots,H,64]"
+        )
+    if deltalog_pool.shape[0] + 1 not in {2, 3, 4, 6, 8}:
+        raise ValueError("DeltaLog M must be one of {2,3,4,6,8}")
+
+
 def _check_metadata_inputs(
     cu_seqlens: torch.Tensor,
     state_indices: torch.Tensor,
@@ -318,24 +360,80 @@ def infer_tmix_wkv7_recurrent_fp16_forward_varlen(
     return output
 
 
-__all__ = [
-    "infer_tmix_wkv7_recurrent_fp32io16_forward_varlen",
-    "infer_tmix_wkv7_recurrent_fp16_forward_varlen",
-    "prepare_tmix_wkv7_recurrent_metadata",
-]
+def infer_tmix_wkv7_recurrent_deltalog_fp16_forward_varlen(
+    r: torch.Tensor,
+    decay_logits: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    *,
+    state_pool: torch.Tensor,
+    elapsed_state_pool: torch.Tensor,
+    deltalog_phase_pool: torch.Tensor,
+    deltalog_pool: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    state_indices: torch.Tensor,
+    scale: float = 1.0,
+    decay_bias: torch.Tensor | None = None,
+    validated_metadata: object | None = None,
+) -> torch.Tensor:
+    """Run one packed T1 step using slot-native FP16 DeltaLog state.
 
-from .pretrain import pretrain_tmix_wkv7_recurrent_bf16
+    ``state_pool``, ``elapsed_state_pool``, ``deltalog_phase_pool``, and
+    ``deltalog_pool`` form one indivisible state bundle.  The merge interval is
+    inferred from ``deltalog_pool.shape[0] + 1``.
+    """
+
+    packed = _validate_packed_inputs(r, decay_logits, k, v, a, b)
+    _validate_deltalog_state_bundle(
+        state_pool,
+        elapsed_state_pool,
+        deltalog_phase_pool,
+        deltalog_pool,
+    )
+    _check_metadata_inputs(cu_seqlens, state_indices)
+    ticket = (
+        validated_metadata
+        if validated_metadata is not None
+        else prepare_tmix_wkv7_recurrent_metadata(
+            cu_seqlens,
+            state_indices,
+            total_tokens=r.shape[0],
+            state_pool_size=state_pool.shape[0],
+        )
+    )
+    output = torch.empty_like(packed[3])
+    _extension().tmix_wkv7_recurrent_deltalog_fp16_from_decay_logits(
+        cu_seqlens,
+        state_indices,
+        elapsed_state_pool,
+        deltalog_phase_pool,
+        state_pool,
+        deltalog_pool,
+        *packed,
+        output,
+        float(scale),
+        decay_bias,
+        ticket,
+    )
+    return output
+
+
 from .chunk import infer_tmix_wkv7_chunk_bf16_forward_varlen
+from .pretrain import pretrain_tmix_wkv7_recurrent_bf16
 from .rl_infctx import (
     rl_infctx_tmix_wkv7_chunk_fp32io16,
     rl_infctx_tmix_wkv7_chunk_fp32io16_factor_recompute,
 )
 
-__all__.extend(
-    [
-        "pretrain_tmix_wkv7_recurrent_bf16",
-        "infer_tmix_wkv7_chunk_bf16_forward_varlen",
-        "rl_infctx_tmix_wkv7_chunk_fp32io16",
-        "rl_infctx_tmix_wkv7_chunk_fp32io16_factor_recompute",
-    ]
-)
+__all__ = [
+    "infer_tmix_wkv7_chunk_bf16_forward_varlen",
+    "infer_tmix_wkv7_recurrent_deltalog_fp16_forward_varlen",
+    "infer_tmix_wkv7_recurrent_fp16_forward_varlen",
+    "infer_tmix_wkv7_recurrent_fp32io16_forward_varlen",
+    "prepare_tmix_wkv7_recurrent_metadata",
+    "pretrain_tmix_wkv7_recurrent_bf16",
+    "rl_infctx_tmix_wkv7_chunk_fp32io16",
+    "rl_infctx_tmix_wkv7_chunk_fp32io16_factor_recompute",
+]

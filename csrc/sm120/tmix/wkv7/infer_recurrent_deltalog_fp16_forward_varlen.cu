@@ -1,0 +1,540 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright contributors to the Albatross project
+//
+// Canonical algorithm source:
+//   BlinkDL/Albatross/faster3a_2607/cuda/rwkv7_wkv_deltalog_v3a.cu
+//   revision 3e41bc43ed5e8332927ddd7e0ce4816cf200a6ea
+//   Apache-2.0
+//
+// Local adaptation:
+//   - packed token storage and live metadata status;
+//   - state_indices-owned [K,V] base state, elapsed, phase, and log bundle;
+//   - per-slot append/merge phase instead of one rectangular batch phase;
+//   - optional decay bias, output scaling, CUDA Graph capacity tails, and
+//     fail-closed prevalidation before any state mutation.
+
+#undef __CUDA_NO_HALF2_OPERATORS__
+#undef __CUDA_NO_HALF_CONVERSIONS__
+#undef __CUDA_NO_HALF_OPERATORS__
+
+#include <ATen/ATen.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAException.h>
+#include <cuda_fp16.h>
+#include <torch/extension.h>
+
+#include <cstdint>
+
+#include "recurrent_decay.cuh"
+
+namespace {
+
+constexpr int kHeadSize = 64;
+constexpr int kHalf2HeadSize = kHeadSize / 2;
+constexpr int kKinds = 5;
+constexpr int kDeltaKind = 0;
+constexpr int kUKind = 1;
+constexpr int kBKind = 2;
+constexpr int kKKind = 3;
+constexpr int kVKind = 4;
+
+using flashrwkv2::wkv7::recurrent_fp16_delta;
+
+template <typename io_t>
+__device__ __forceinline__ io_t invalid_value() {
+  return static_cast<io_t>(__int_as_float(0x7fffffff));
+}
+
+template <typename io_t>
+__device__ __forceinline__ void fill_invalid_output(
+    int64_t block_index,
+    int64_t block_count,
+    int64_t output_elements,
+    io_t* output_ptr) {
+  for (int64_t index =
+           block_index * static_cast<int64_t>(blockDim.x) + threadIdx.x;
+       index < output_elements;
+       index += block_count * static_cast<int64_t>(blockDim.x)) {
+    output_ptr[index] = invalid_value<io_t>();
+  }
+}
+
+__device__ __forceinline__ float warp_sum(float value) {
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    value += __shfl_down_sync(0xffffffffu, value, offset);
+  }
+  return value;
+}
+
+__device__ __forceinline__ half warp_dot(half2 left, half2 right) {
+  const half2 product = __hmul2(left, right);
+  const float local =
+      __half2float(product.x) + __half2float(product.y);
+  return __float2half_rn(warp_sum(local));
+}
+
+__device__ __forceinline__ half2 load_state_kv(
+    const half* state_base,
+    int value_index,
+    int key_pair) {
+  return __halves2half2(
+      __ldg(state_base + (2 * key_pair) * kHeadSize + value_index),
+      __ldg(state_base + (2 * key_pair + 1) * kHeadSize + value_index));
+}
+
+__device__ __forceinline__ void store_state_kv(
+    half* state_base,
+    int value_index,
+    int key_pair,
+    half2 value) {
+  state_base[(2 * key_pair) * kHeadSize + value_index] = value.x;
+  state_base[(2 * key_pair + 1) * kHeadSize + value_index] = value.y;
+}
+
+__device__ __forceinline__ int64_t log_index(
+    int log_slot,
+    int kind,
+    int state_slot,
+    int head_index,
+    int channel,
+    int state_pool_slots,
+    int num_heads) {
+  return (((static_cast<int64_t>(log_slot) * kKinds + kind) *
+                state_pool_slots +
+            state_slot) *
+               num_heads +
+           head_index) *
+          kHeadSize +
+      channel;
+}
+
+// This owner-local check is deliberately separate from the recurrent kernel.
+// Kernel ordering on the current stream guarantees every active sequence is
+// known to be T1 and every active slot phase is valid before any base/log/
+// elapsed/phase write can begin.
+__global__ void validate_deltalog_slots_kernel(
+    const int* __restrict__ query_start_loc,
+    const int* __restrict__ state_indices,
+    const int* __restrict__ phase_pool,
+    const int* __restrict__ metadata_status,
+    int* __restrict__ deltalog_status,
+    int num_sequences,
+    int merge_interval) {
+  const int sequence_index =
+      static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (metadata_status[0] != 0) {
+    if (sequence_index == 0) {
+      atomicCAS(deltalog_status, 0, metadata_status[0]);
+    }
+    return;
+  }
+  if (sequence_index >= num_sequences ||
+      sequence_index >= metadata_status[2]) {
+    return;
+  }
+  const int token_count =
+      query_start_loc[sequence_index + 1] -
+      query_start_loc[sequence_index];
+  const int state_slot = state_indices[sequence_index];
+  const int phase = phase_pool[state_slot];
+  if (token_count != 1 || phase < 0 || phase >= merge_interval) {
+    atomicCAS(deltalog_status, 0, 1);
+  }
+}
+
+template <int M, bool AddBias>
+__global__ __launch_bounds__(kHeadSize, 1) void deltalog_slot_kernel(
+    int num_heads,
+    int state_pool_slots,
+    int64_t output_elements,
+    const int* __restrict__ query_start_loc,
+    const int* __restrict__ state_indices,
+    const int* __restrict__ elapsed_pool,
+    const int* __restrict__ phase_pool,
+    const int* __restrict__ metadata_status,
+    const int* __restrict__ deltalog_status,
+    half* __restrict__ state_pool,
+    half* __restrict__ deltalog_pool,
+    const half* __restrict__ r_ptr,
+    const half* __restrict__ decay_ptr,
+    const half* __restrict__ decay_bias_ptr,
+    const half* __restrict__ k_ptr,
+    const half* __restrict__ v_ptr,
+    const half* __restrict__ a_ptr,
+    const half* __restrict__ b_ptr,
+    half* __restrict__ output_ptr,
+    float scale) {
+  static_assert(M == 2 || M == 3 || M == 4 || M == 6 || M == 8);
+  const int head_index = static_cast<int>(blockIdx.x);
+  const int sequence_index = static_cast<int>(blockIdx.y);
+  const int thread = static_cast<int>(threadIdx.x);
+  const int warp = thread >> 5;
+  const int lane = thread & 31;
+  const int64_t block_index =
+      static_cast<int64_t>(sequence_index) * num_heads + head_index;
+  const int64_t block_count =
+      static_cast<int64_t>(gridDim.x) * gridDim.y;
+  if (metadata_status[0] != 0 || deltalog_status[0] != 0) {
+    fill_invalid_output(
+        block_index, block_count, output_elements, output_ptr);
+    return;
+  }
+  if (sequence_index >= metadata_status[2]) {
+    return;
+  }
+
+  __shared__ int token_index;
+  __shared__ int state_slot;
+  __shared__ int slot_phase;
+  __shared__ int elapsed_base;
+  if (thread == 0) {
+    token_index = query_start_loc[sequence_index];
+    state_slot = state_indices[sequence_index];
+    slot_phase = phase_pool[state_slot];
+    elapsed_base = elapsed_pool[state_slot];
+  }
+  __syncthreads();
+
+  const int64_t token_base =
+      (static_cast<int64_t>(token_index) * num_heads + head_index) *
+      kHeadSize;
+  half* const state_base =
+      state_pool +
+      (static_cast<int64_t>(state_slot) * num_heads + head_index) *
+          kHeadSize * kHeadSize;
+
+  __shared__ __align__(128) half2 current_r[kHalf2HeadSize];
+  __shared__ __align__(128) half2 current_a[kHalf2HeadSize];
+  __shared__ __align__(128) half2 current_b[kHalf2HeadSize];
+  __shared__ __align__(128) half2 current_k[kHalf2HeadSize];
+  __shared__ __align__(128) half2 current_delta[kHalf2HeadSize];
+  __shared__ __align__(128) half2 history_delta[M - 1][kHalf2HeadSize];
+  __shared__ __align__(128) half2 history_b[M - 1][kHalf2HeadSize];
+  __shared__ __align__(128) half2 history_k[M - 1][kHalf2HeadSize];
+  __shared__ __align__(128) half2 final_query[2][kHalf2HeadSize];
+  __shared__ half coeff_b[2][M - 1];
+  __shared__ half coeff_k[2][M - 1];
+  __shared__ half current_br;
+  __shared__ half current_kr;
+
+  if (thread < kHalf2HeadSize) {
+    const int64_t pair_base = token_base / 2 + thread;
+    current_r[thread] =
+        __ldg(reinterpret_cast<const half2*>(r_ptr) + pair_base);
+    current_a[thread] =
+        __ldg(reinterpret_cast<const half2*>(a_ptr) + pair_base);
+    current_b[thread] =
+        __ldg(reinterpret_cast<const half2*>(b_ptr) + pair_base);
+    current_k[thread] =
+        __ldg(reinterpret_cast<const half2*>(k_ptr) + pair_base);
+    const half2 raw_decay =
+        __ldg(reinterpret_cast<const half2*>(decay_ptr) + pair_base);
+    float decay0 = __half2float(raw_decay.x);
+    float decay1 = __half2float(raw_decay.y);
+    if constexpr (AddBias) {
+      const half2 bias = __ldg(
+          reinterpret_cast<const half2*>(
+              decay_bias_ptr + head_index * kHeadSize) + thread);
+      decay0 += __half2float(bias.x);
+      decay1 += __half2float(bias.y);
+    }
+    const int phase0 =
+        elapsed_base + head_index * kHeadSize + 2 * thread;
+    current_delta[thread] = __halves2half2(
+        __float2half_rn(recurrent_fp16_delta(decay0, phase0)),
+        __float2half_rn(recurrent_fp16_delta(decay1, phase0 + 1)));
+  }
+  const int history_count = slot_phase == M - 1 ? M - 1 : slot_phase;
+  for (int flat = thread;
+       flat < history_count * kHalf2HeadSize;
+       flat += kHeadSize) {
+    const int log_slot = flat / kHalf2HeadSize;
+    const int key_pair = flat % kHalf2HeadSize;
+    const int key = 2 * key_pair;
+    history_delta[log_slot][key_pair] = __ldg(
+        reinterpret_cast<const half2*>(
+            deltalog_pool +
+            log_index(log_slot, kDeltaKind, state_slot, head_index, key,
+                      state_pool_slots, num_heads)));
+    history_b[log_slot][key_pair] = __ldg(
+        reinterpret_cast<const half2*>(
+            deltalog_pool +
+            log_index(log_slot, kBKind, state_slot, head_index, key,
+                      state_pool_slots, num_heads)));
+    history_k[log_slot][key_pair] = __ldg(
+        reinterpret_cast<const half2*>(
+            deltalog_pool +
+            log_index(log_slot, kKKind, state_slot, head_index, key,
+                      state_pool_slots, num_heads)));
+  }
+  __syncthreads();
+
+  half2 state[kHalf2HeadSize];
+#pragma unroll
+  for (int key_pair = 0; key_pair < kHalf2HeadSize; ++key_pair) {
+    state[key_pair] = load_state_kv(state_base, thread, key_pair);
+  }
+
+  if (slot_phase != M - 1) {
+    half2 query = warp == 0
+        ? current_a[lane]
+        : __hfma2(current_r[lane], current_delta[lane], current_r[lane]);
+    for (int log_slot = history_count - 1; log_slot >= 0; --log_slot) {
+      const half b_coeff = warp_dot(history_b[log_slot][lane], query);
+      const half k_coeff = warp_dot(history_k[log_slot][lane], query);
+      if (lane == 0) {
+        coeff_b[warp][log_slot] = b_coeff;
+        coeff_k[warp][log_slot] = k_coeff;
+      }
+      query = __hfma2(
+          query, history_delta[log_slot][lane], query);
+    }
+    final_query[warp][lane] = query;
+    const half current_dot = warp == 0
+        ? warp_dot(current_b[lane], current_r[lane])
+        : warp_dot(current_k[lane], current_r[lane]);
+    if (lane == 0) {
+      if (warp == 0) {
+        current_br = current_dot;
+      } else {
+        current_kr = current_dot;
+      }
+    }
+    __syncthreads();
+
+    half2 base_u = __float2half2_rn(0.0f);
+    half2 base_output = __float2half2_rn(0.0f);
+#pragma unroll
+    for (int key_pair = 0; key_pair < kHalf2HeadSize; ++key_pair) {
+      base_u = __hfma2(state[key_pair], final_query[0][key_pair], base_u);
+      base_output = __hfma2(
+          state[key_pair], final_query[1][key_pair], base_output);
+    }
+    half logical_u = __hadd(base_u.x, base_u.y);
+    half logical_output = __hadd(base_output.x, base_output.y);
+    for (int log_slot = history_count - 1; log_slot >= 0; --log_slot) {
+      const half old_u = deltalog_pool[log_index(
+          log_slot, kUKind, state_slot, head_index, thread,
+          state_pool_slots, num_heads)];
+      const half old_v = deltalog_pool[log_index(
+          log_slot, kVKind, state_slot, head_index, thread,
+          state_pool_slots, num_heads)];
+      logical_u = __hfma(old_u, coeff_b[0][log_slot], logical_u);
+      logical_u = __hfma(old_v, coeff_k[0][log_slot], logical_u);
+      logical_output =
+          __hfma(old_u, coeff_b[1][log_slot], logical_output);
+      logical_output =
+          __hfma(old_v, coeff_k[1][log_slot], logical_output);
+    }
+    const half current_v = v_ptr[token_base + thread];
+    logical_output = __hfma(logical_u, current_br, logical_output);
+    logical_output = __hfma(current_v, current_kr, logical_output);
+    output_ptr[token_base + thread] = __float2half_rn(
+        __half2float(logical_output) * scale);
+
+    deltalog_pool[log_index(
+        slot_phase, kDeltaKind, state_slot, head_index, thread,
+        state_pool_slots, num_heads)] =
+        reinterpret_cast<half*>(current_delta)[thread];
+    deltalog_pool[log_index(
+        slot_phase, kUKind, state_slot, head_index, thread,
+        state_pool_slots, num_heads)] = logical_u;
+    deltalog_pool[log_index(
+        slot_phase, kBKind, state_slot, head_index, thread,
+        state_pool_slots, num_heads)] =
+        reinterpret_cast<half*>(current_b)[thread];
+    deltalog_pool[log_index(
+        slot_phase, kKKind, state_slot, head_index, thread,
+        state_pool_slots, num_heads)] =
+        reinterpret_cast<half*>(current_k)[thread];
+    deltalog_pool[log_index(
+        slot_phase, kVKind, state_slot, head_index, thread,
+        state_pool_slots, num_heads)] = current_v;
+    return;
+  }
+
+  // Merge all existing log entries into the physical state, then execute the
+  // current token as the final recurrence of the cycle.
+#pragma unroll
+  for (int log_slot = 0; log_slot < M - 1; ++log_slot) {
+    const half old_u = deltalog_pool[log_index(
+        log_slot, kUKind, state_slot, head_index, thread,
+        state_pool_slots, num_heads)];
+    const half old_v = deltalog_pool[log_index(
+        log_slot, kVKind, state_slot, head_index, thread,
+        state_pool_slots, num_heads)];
+    const half2 old_u_pair = __halves2half2(old_u, old_u);
+    const half2 old_v_pair = __halves2half2(old_v, old_v);
+#pragma unroll
+    for (int key_pair = 0; key_pair < kHalf2HeadSize; ++key_pair) {
+      const half2 old_state = state[key_pair];
+      state[key_pair] = __hfma2(
+          old_state, history_delta[log_slot][key_pair],
+          __hfma2(
+              history_k[log_slot][key_pair], old_v_pair,
+              __hfma2(old_u_pair, history_b[log_slot][key_pair], old_state)));
+    }
+  }
+
+  half2 current_u_pair = __float2half2_rn(0.0f);
+#pragma unroll
+  for (int key_pair = 0; key_pair < kHalf2HeadSize; ++key_pair) {
+    current_u_pair = __hfma2(
+        current_a[key_pair], state[key_pair], current_u_pair);
+  }
+  const half current_u = __hadd(current_u_pair.x, current_u_pair.y);
+  const half2 current_u_broadcast =
+      __halves2half2(current_u, current_u);
+  const half current_v = v_ptr[token_base + thread];
+  const half2 current_v_broadcast =
+      __halves2half2(current_v, current_v);
+  half2 result = __float2half2_rn(0.0f);
+#pragma unroll
+  for (int key_pair = 0; key_pair < kHalf2HeadSize; ++key_pair) {
+    const half2 old_state = state[key_pair];
+    state[key_pair] = __hfma2(
+        old_state, current_delta[key_pair],
+        __hfma2(
+            current_k[key_pair], current_v_broadcast,
+            __hfma2(current_u_broadcast, current_b[key_pair], old_state)));
+    result = __hfma2(state[key_pair], current_r[key_pair], result);
+  }
+  output_ptr[token_base + thread] = __float2half_rn(
+      (__half2float(result.x) + __half2float(result.y)) * scale);
+#pragma unroll
+  for (int key_pair = 0; key_pair < kHalf2HeadSize; ++key_pair) {
+    store_state_kv(state_base, thread, key_pair, state[key_pair]);
+  }
+}
+
+__global__ void advance_deltalog_slots_kernel(
+    const int* __restrict__ state_indices,
+    const int* __restrict__ metadata_status,
+    const int* __restrict__ deltalog_status,
+    int* __restrict__ elapsed_pool,
+    int* __restrict__ phase_pool,
+    int num_sequences,
+    int merge_interval) {
+  const int sequence_index =
+      static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (metadata_status[0] != 0 || deltalog_status[0] != 0 ||
+      sequence_index >= num_sequences ||
+      sequence_index >= metadata_status[2]) {
+    return;
+  }
+  const int state_slot = state_indices[sequence_index];
+  elapsed_pool[state_slot] += 1;
+  const int phase = phase_pool[state_slot] + 1;
+  phase_pool[state_slot] = phase == merge_interval ? 0 : phase;
+}
+
+template <int M>
+void launch_deltalog_step(
+    bool add_bias,
+    int num_sequences,
+    int num_heads,
+    int state_pool_slots,
+    const torch::Tensor& query_start_loc,
+    const torch::Tensor& state_indices,
+    torch::Tensor& elapsed_pool,
+    torch::Tensor& phase_pool,
+    torch::Tensor& state_pool,
+    torch::Tensor& deltalog_pool,
+    const torch::Tensor& r,
+    const torch::Tensor& decay,
+    const torch::Tensor& decay_bias,
+    const torch::Tensor& k,
+    const torch::Tensor& v,
+    const torch::Tensor& a,
+    const torch::Tensor& b,
+    torch::Tensor& output,
+    const torch::Tensor& metadata_status,
+    const torch::Tensor& deltalog_status,
+    float scale,
+    cudaStream_t stream) {
+#define LAUNCH_DELTALOG(AddBias) \
+  deltalog_slot_kernel<M, AddBias> \
+      <<<dim3(num_heads, num_sequences), dim3(kHeadSize), 0, stream>>>( \
+          num_heads, state_pool_slots, output.numel(), \
+          query_start_loc.data_ptr<int>(), state_indices.data_ptr<int>(), \
+          elapsed_pool.data_ptr<int>(), phase_pool.data_ptr<int>(), \
+          metadata_status.data_ptr<int>(), deltalog_status.data_ptr<int>(), \
+          reinterpret_cast<half*>(state_pool.data_ptr()), \
+          reinterpret_cast<half*>(deltalog_pool.data_ptr()), \
+          reinterpret_cast<const half*>(r.data_ptr()), \
+          reinterpret_cast<const half*>(decay.data_ptr()), \
+          AddBias ? reinterpret_cast<const half*>(decay_bias.data_ptr()) : nullptr, \
+          reinterpret_cast<const half*>(k.data_ptr()), \
+          reinterpret_cast<const half*>(v.data_ptr()), \
+          reinterpret_cast<const half*>(a.data_ptr()), \
+          reinterpret_cast<const half*>(b.data_ptr()), \
+          reinterpret_cast<half*>(output.data_ptr()), scale)
+  if (add_bias) {
+    LAUNCH_DELTALOG(true);
+  } else {
+    LAUNCH_DELTALOG(false);
+  }
+#undef LAUNCH_DELTALOG
+}
+
+}  // namespace
+
+void tmix_wkv7_recurrent_deltalog_fp16_from_decay_logits_cuda(
+    torch::Tensor query_start_loc,
+    torch::Tensor state_indices,
+    torch::Tensor elapsed_pool,
+    torch::Tensor phase_pool,
+    torch::Tensor state_pool,
+    torch::Tensor deltalog_pool,
+    torch::Tensor r,
+    torch::Tensor decay_logits,
+    torch::Tensor decay_bias,
+    torch::Tensor k,
+    torch::Tensor v,
+    torch::Tensor a,
+    torch::Tensor b,
+    torch::Tensor output,
+    torch::Tensor metadata_status,
+    torch::Tensor deltalog_status,
+    double scale) {
+  const c10::cuda::CUDAGuard device_guard(state_pool.device());
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  const int num_sequences = static_cast<int>(state_indices.numel());
+  const int num_heads = static_cast<int>(state_pool.size(1));
+  const int state_pool_slots = static_cast<int>(state_pool.size(0));
+  const int merge_interval = static_cast<int>(deltalog_pool.size(0) + 1);
+  constexpr int threads = 256;
+  validate_deltalog_slots_kernel<<<
+      (num_sequences + threads - 1) / threads, threads, 0, stream>>>(
+      query_start_loc.data_ptr<int>(), state_indices.data_ptr<int>(),
+      phase_pool.data_ptr<int>(), metadata_status.data_ptr<int>(),
+      deltalog_status.data_ptr<int>(), num_sequences, merge_interval);
+
+#define DISPATCH_M(Value) \
+  case Value: \
+    launch_deltalog_step<Value>( \
+        decay_bias.defined(), num_sequences, num_heads, state_pool_slots, \
+        query_start_loc, state_indices, elapsed_pool, phase_pool, state_pool, \
+        deltalog_pool, r, decay_logits, decay_bias, k, v, a, b, output, \
+        metadata_status, deltalog_status, static_cast<float>(scale), stream); \
+    break
+  switch (merge_interval) {
+    DISPATCH_M(2);
+    DISPATCH_M(3);
+    DISPATCH_M(4);
+    DISPATCH_M(6);
+    DISPATCH_M(8);
+    default:
+      TORCH_CHECK(false, "unsupported DeltaLog merge interval");
+  }
+#undef DISPATCH_M
+
+  advance_deltalog_slots_kernel<<<
+      (num_sequences + threads - 1) / threads, threads, 0, stream>>>(
+      state_indices.data_ptr<int>(), metadata_status.data_ptr<int>(),
+      deltalog_status.data_ptr<int>(), elapsed_pool.data_ptr<int>(),
+      phase_pool.data_ptr<int>(), num_sequences, merge_interval);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}

@@ -3,21 +3,22 @@
 //
 // Canonical body source:
 //   BlinkDL/Albatross/faster3a_2607/cuda/rwkv7_wkv_fp16_v2.cu
-//   revision ee3308f6922e59f2166c7fac3c5a192340a2b48e
+//   revision 3e41bc43ed5e8332927ddd7e0ce4816cf200a6ea
 //   Apache-2.0
 //
 // Additional exact helper body source:
 //   BlinkDL/Albatross/faster3a_2607/cuda/rwkv7_fast_ops_fp16.cu
-//   revision ee3308f6922e59f2166c7fac3c5a192340a2b48e
+//   revision 3e41bc43ed5e8332927ddd7e0ce4816cf200a6ea
 //
 // Local adaptation:
 //   - packed [total_tokens,H,D] token storage and cu_seqlens boundaries;
 //   - state_indices-backed FP16 state pool in FlashRWKV2's [K,V] layout;
 //   - raw decay logits and optional bias fused into the retention transform;
-//   - clone, exact, seq-v2, one-cp and one-direct family symbols retained for
-//     Albatross-shaped dispatch;
-//   - Albatross half2 arithmetic, cp.async token staging and swizzled shared
-//     state staging are preserved for the canonical D=64 implementation;
+//   - clone, exact, seq-v2, one-cp and one-direct token pipelines retained for
+//     Albatross-shaped dispatch, with their old shared state transpose replaced
+//     by the 3e41bc4 direct [K,V] load/store body;
+//   - Albatross half2 arithmetic and cp.async token staging are preserved for
+//     the canonical D=64 implementation;
 //   - D=128/256 use a local 64-key-tiled recurrent family. Each warp owns one
 //     value column, keeps only the active 64-key tile live, and updates the
 //     FP16 state pool directly; no FP32-state fallback is selected.
@@ -372,86 +373,30 @@ void launch_fp16_tiled_column(
           reinterpret_cast<half*>(output.data_ptr()), scale);
 }
 
-// The state pool is [K,V].  Shared state is staged as [K,V/2] with the
-// Albatross XOR swizzle; each thread then reconstructs the two adjacent-key
-// values for one fixed V coordinate.  This is the local state-layout adapter;
-// the five public bodies below retain the distinct Albatross token pipelines.
-__device__ __forceinline__ void load_state_swizzled(
-    half* state_base,
-    half2* state_shared,
+// Albatross 3e41bc4 replaces the old layout-compatibility transpose outright:
+// the public state is already [K,V], and thread V directly loads/stores its
+// adjacent K pairs.  The five established token pipelines below all use this
+// native implementation; there is no remaining slow transpose fallback.
+__device__ __forceinline__ void load_state_kv(
+    const half* state_base,
     half2* state) {
   const int thread = static_cast<int>(threadIdx.x);
 #pragma unroll
-  for (int vector_iteration = 0;
-       vector_iteration < kHeadSize / kHalfPerInt4; ++vector_iteration) {
-    const int vector_index = vector_iteration * kHeadSize + thread;
-    const int4 state_vector =
-        reinterpret_cast<const int4*>(state_base)[vector_index];
-#pragma unroll
-    for (int pair_index = 0; pair_index < kHalfPerInt4 / 2; ++pair_index) {
-      const int key_index =
-          vector_iteration * kHalfPerInt4 + thread / kHalfPerInt4;
-      const int value_pair =
-          (thread % kHalfPerInt4) * (kHalfPerInt4 / 2) + pair_index;
-      state_shared[key_index * kHalf2HeadSize +
-                   ((key_index & 31) ^ value_pair)] =
-          reinterpret_cast<const half2*>(&state_vector)[pair_index];
-    }
-  }
-  __syncthreads();
-
-#pragma unroll
   for (int pair_index = 0; pair_index < kHalf2HeadSize; ++pair_index) {
-    const int key0 = pair_index * 2;
-    const int key1 = key0 + 1;
-    const int value_pair = thread >> 1;
-    const int value_lane = thread & 1;
-    const half value0 = reinterpret_cast<const half*>(
-        &state_shared[key0 * kHalf2HeadSize +
-                      ((key0 & 31) ^ value_pair)])[value_lane];
-    const half value1 = reinterpret_cast<const half*>(
-        &state_shared[key1 * kHalf2HeadSize +
-                      ((key1 & 31) ^ value_pair)])[value_lane];
-    state[pair_index] = __halves2half2(value0, value1);
+    state[pair_index] = __halves2half2(
+        __ldg(state_base + (2 * pair_index) * kHeadSize + thread),
+        __ldg(state_base + (2 * pair_index + 1) * kHeadSize + thread));
   }
 }
 
-__device__ __forceinline__ void store_state_swizzled(
+__device__ __forceinline__ void store_state_kv(
     half* state_base,
-    half2* state_shared,
     const half2* state) {
   const int thread = static_cast<int>(threadIdx.x);
 #pragma unroll
   for (int pair_index = 0; pair_index < kHalf2HeadSize; ++pair_index) {
-    const int key0 = pair_index * 2;
-    const int key1 = key0 + 1;
-    const int value_pair = thread >> 1;
-    const int value_lane = thread & 1;
-    reinterpret_cast<half*>(
-        &state_shared[key0 * kHalf2HeadSize +
-                      ((key0 & 31) ^ value_pair)])[value_lane] = state[pair_index].x;
-    reinterpret_cast<half*>(
-        &state_shared[key1 * kHalf2HeadSize +
-                      ((key1 & 31) ^ value_pair)])[value_lane] = state[pair_index].y;
-  }
-  __syncthreads();
-
-#pragma unroll
-  for (int vector_iteration = 0;
-       vector_iteration < kHeadSize / kHalfPerInt4; ++vector_iteration) {
-    const int vector_index = vector_iteration * kHeadSize + thread;
-    const int key_index =
-        vector_iteration * kHalfPerInt4 + thread / kHalfPerInt4;
-    const int value_pair =
-        (thread % kHalfPerInt4) * (kHalfPerInt4 / 2);
-    int4 state_vector;
-#pragma unroll
-    for (int pair_index = 0; pair_index < kHalfPerInt4 / 2; ++pair_index) {
-      reinterpret_cast<half2*>(&state_vector)[pair_index] = state_shared[
-          key_index * kHalf2HeadSize +
-          ((key_index & 31) ^ (value_pair + pair_index))];
-    }
-    reinterpret_cast<int4*>(state_base)[vector_index] = state_vector;
+    state_base[(2 * pair_index) * kHeadSize + thread] = state[pair_index].x;
+    state_base[(2 * pair_index + 1) * kHeadSize + thread] = state[pair_index].y;
   }
 }
 
@@ -516,10 +461,8 @@ void wkv_fp16_v1_clone_kernel(
   half* state_base = state_ptr +
       (static_cast<int64_t>(state_slot) * num_heads + head_index) *
       kHeadSize * kHeadSize;
-  __shared__ __align__(256) half2 state_shared[kHeadSize][kHalf2HeadSize];
-  half2* state_shared_ptr = &state_shared[0][0];
   half2 state[kHalf2HeadSize];
-  load_state_swizzled(state_base, state_shared_ptr, state);
+  load_state_kv(state_base, state);
 
   // Mechanical Albatross clone body: a single shared token buffer and the
   // clone-specific cp.async sequence are intentionally retained here.
@@ -582,7 +525,7 @@ void wkv_fp16_v1_clone_kernel(
         (__half2float(output2.x) + __half2float(output2.y)) * scale);
     token_base += static_cast<int64_t>(num_heads) * kHeadSize;
   }
-  store_state_swizzled(state_base, state_shared_ptr, state);
+  store_state_kv(state_base, state);
 }
 
 template <bool Tis1 = false, bool AddW0 = false, bool Grid2D = false>
@@ -644,10 +587,8 @@ void wkv_fp16_v1_exact_kernel(
   half* state_base = state_ptr +
       (static_cast<int64_t>(state_slot) * num_heads + head_index) *
       kHeadSize * kHeadSize;
-  __shared__ __align__(256) half2 state_shared[kHeadSize][kHalf2HeadSize];
-  half2* state_shared_ptr = &state_shared[0][0];
   half2 state[kHalf2HeadSize];
-  load_state_swizzled(state_base, state_shared_ptr, state);
+  load_state_kv(state_base, state);
 
   // Mechanical Albatross exact body: the single-buffer cp.async pipeline is
   // kept separate from clone and seq-v2 instead of being routed through a
@@ -697,7 +638,7 @@ void wkv_fp16_v1_exact_kernel(
         (__half2float(output2.x) + __half2float(output2.y)) * scale);
     token_base += static_cast<int64_t>(num_heads) * kHeadSize;
   }
-  store_state_swizzled(state_base, state_shared_ptr, state);
+  store_state_kv(state_base, state);
 }
 
 template <bool AddW0 = false, bool Grid2D = false>
@@ -756,10 +697,8 @@ void wkv_fp16_seq_v2_kernel(
   half* state_base = state_ptr +
       (static_cast<int64_t>(state_slot) * num_heads + head_index) *
       kHeadSize * kHeadSize;
-  __shared__ __align__(256) half2 state_shared[kHeadSize][kHalf2HeadSize];
-  half2* state_shared_ptr = &state_shared[0][0];
   half2 state[kHalf2HeadSize];
-  load_state_swizzled(state_base, state_shared_ptr, state);
+  load_state_kv(state_base, state);
 
   // Mechanical Albatross seq-v2 body: double-buffered token staging and the
   // upstream prefetch/wait ordering are preserved for the tuned sequence path.
@@ -816,7 +755,7 @@ void wkv_fp16_seq_v2_kernel(
         (__half2float(output2.x) + __half2float(output2.y)) * scale);
     token_base += sequence_stride;
   }
-  store_state_swizzled(state_base, state_shared_ptr, state);
+  store_state_kv(state_base, state);
 }
 
 template <bool AddW0 = false, bool Grid2D = false>
@@ -873,10 +812,8 @@ void wkv_fp16_one_cp_kernel(
   half* state_base = state_ptr +
       (static_cast<int64_t>(state_slot) * num_heads + head_index) *
       kHeadSize * kHeadSize;
-  __shared__ __align__(256) half2 state_shared[kHeadSize][kHalf2HeadSize];
-  half2* state_shared_ptr = &state_shared[0][0];
   half2 state[kHalf2HeadSize];
-  load_state_swizzled(state_base, state_shared_ptr, state);
+  load_state_kv(state_base, state);
 
   // Mechanical Albatross one-direct body: the T=1 path intentionally uses
   // direct __ldg loads and no cp.async token pipeline.
@@ -924,7 +861,7 @@ void wkv_fp16_one_cp_kernel(
   }
   output_ptr[token_base + thread] = __float2half_rn(
       (__half2float(output2.x) + __half2float(output2.y)) * scale);
-  store_state_swizzled(state_base, state_shared_ptr, state);
+  store_state_kv(state_base, state);
 }
 
 template <bool AddW0 = false, bool Grid2D = false>
@@ -981,10 +918,8 @@ void wkv_fp16_one_direct_kernel(
   half* state_base = state_ptr +
       (static_cast<int64_t>(state_slot) * num_heads + head_index) *
       kHeadSize * kHeadSize;
-  __shared__ __align__(256) half2 state_shared[kHeadSize][kHalf2HeadSize];
-  half2* state_shared_ptr = &state_shared[0][0];
   half2 state[kHalf2HeadSize];
-  load_state_swizzled(state_base, state_shared_ptr, state);
+  load_state_kv(state_base, state);
 
   // Mechanical Albatross one-cp body: one token, one cp.async group, and the
   // same half2/shared-state sequence as the pinned upstream implementation.
@@ -1042,7 +977,429 @@ void wkv_fp16_one_direct_kernel(
   }
   output_ptr[token_base + thread] = __float2half_rn(
       (__half2float(output2.x) + __half2float(output2.y)) * scale);
-  store_state_swizzled(state_base, state_shared_ptr, state);
+  store_state_kv(state_base, state);
+}
+
+// Native [K,V] family from Albatross 3e41bc4.  Each lane owns two adjacent V
+// columns and keeps all K rows in registers, so state traffic stays coalesced
+// without the compatibility transpose used by the older FP16 families.
+template <bool AddW0, bool StreamState>
+__global__ __launch_bounds__(32, 8) void wkv_fp16_kv_warp_pair_kernel(
+    int num_heads,
+    int64_t output_elements,
+    const int* __restrict__ query_start_loc,
+    const int* __restrict__ state_indices,
+    const int* __restrict__ elapsed_state_ptr,
+    const int* __restrict__ metadata_status,
+    half* __restrict__ state_ptr,
+    const half* __restrict__ r_ptr,
+    const half* __restrict__ decay_ptr,
+    const half* __restrict__ decay_bias_ptr,
+    const half* __restrict__ k_ptr,
+    const half* __restrict__ v_ptr,
+    const half* __restrict__ a_ptr,
+    const half* __restrict__ b_ptr,
+    half* __restrict__ output_ptr,
+    float scale) {
+  const int head_index = static_cast<int>(blockIdx.x);
+  const int sequence_index = static_cast<int>(blockIdx.y);
+  const int lane = static_cast<int>(threadIdx.x);
+  const int64_t block_index =
+      static_cast<int64_t>(sequence_index) * num_heads + head_index;
+  const int64_t block_count =
+      static_cast<int64_t>(gridDim.x) * gridDim.y;
+  if (metadata_status[0] != 0) {
+    fill_invalid_output(block_index, block_count, output_elements, output_ptr);
+    return;
+  }
+  if (sequence_index >= metadata_status[2]) {
+    return;
+  }
+
+  int token_start = lane == 0 ? query_start_loc[sequence_index] : 0;
+  int token_end = lane == 0 ? query_start_loc[sequence_index + 1] : 0;
+  int state_slot = lane == 0 ? state_indices[sequence_index] : 0;
+  int elapsed_base = lane == 0 ? elapsed_state_ptr[state_slot] : 0;
+  token_start = __shfl_sync(0xffffffffu, token_start, 0);
+  token_end = __shfl_sync(0xffffffffu, token_end, 0);
+  state_slot = __shfl_sync(0xffffffffu, state_slot, 0);
+  elapsed_base = __shfl_sync(0xffffffffu, elapsed_base, 0);
+
+  half* const state_base =
+      state_ptr +
+      (static_cast<int64_t>(state_slot) * num_heads + head_index) *
+          kHeadSize * kHeadSize;
+  half2 state[kHeadSize];
+#pragma unroll
+  for (int key_index = 0; key_index < kHeadSize; ++key_index) {
+    const half2* const state_row =
+        reinterpret_cast<const half2*>(
+            state_base + key_index * kHeadSize) + lane;
+    if constexpr (StreamState) {
+      state[key_index] = __ldcs(state_row);
+    } else {
+      state[key_index] = __ldg(state_row);
+    }
+  }
+
+  __shared__ __align__(128) half2 shared_r[kHalf2HeadSize];
+  __shared__ __align__(128) half2 shared_decay[kHalf2HeadSize];
+  __shared__ __align__(128) half2 shared_k[kHalf2HeadSize];
+  __shared__ __align__(128) half2 shared_a[kHalf2HeadSize];
+  __shared__ __align__(128) half2 shared_b[kHalf2HeadSize];
+  for (int token_index = token_start; token_index < token_end; ++token_index) {
+    const int64_t token_base =
+        (static_cast<int64_t>(token_index) * num_heads + head_index) *
+        kHeadSize;
+    const int64_t pair_base = token_base / 2 + lane;
+    shared_r[lane] = __ldg(reinterpret_cast<const half2*>(r_ptr) + pair_base);
+    shared_k[lane] = __ldg(reinterpret_cast<const half2*>(k_ptr) + pair_base);
+    shared_a[lane] = __ldg(reinterpret_cast<const half2*>(a_ptr) + pair_base);
+    shared_b[lane] = __ldg(reinterpret_cast<const half2*>(b_ptr) + pair_base);
+    const half2 raw_decay =
+        __ldg(reinterpret_cast<const half2*>(decay_ptr) + pair_base);
+    float decay0 = __half2float(raw_decay.x);
+    float decay1 = __half2float(raw_decay.y);
+    if constexpr (AddW0) {
+      const half2 bias = __ldg(
+          reinterpret_cast<const half2*>(
+              decay_bias_ptr + head_index * kHeadSize) + lane);
+      decay0 += __half2float(bias.x);
+      decay1 += __half2float(bias.y);
+    }
+    const int token_offset = token_index - token_start;
+    const int phase = elapsed_base + head_index * kHeadSize + 2 * lane +
+        token_offset;
+    shared_decay[lane] = __halves2half2(
+        __float2half_rn(recurrent_fp16_delta(decay0, phase)),
+        __float2half_rn(recurrent_fp16_delta(decay1, phase + 1)));
+    __syncwarp();
+
+    half2 state_dot_a_even = __float2half2_rn(0.0f);
+    half2 state_dot_a_odd = __float2half2_rn(0.0f);
+#pragma unroll
+    for (int key_pair = 0; key_pair < kHalf2HeadSize; ++key_pair) {
+      const half2 av = shared_a[key_pair];
+      state_dot_a_even = __hfma2(
+          state[2 * key_pair], __halves2half2(av.x, av.x),
+          state_dot_a_even);
+      state_dot_a_odd = __hfma2(
+          state[2 * key_pair + 1], __halves2half2(av.y, av.y),
+          state_dot_a_odd);
+    }
+    const half2 state_dot_a =
+        __hadd2(state_dot_a_even, state_dot_a_odd);
+    const half2 value =
+        __ldg(reinterpret_cast<const half2*>(v_ptr) + pair_base);
+    half2 output_even = __float2half2_rn(0.0f);
+    half2 output_odd = __float2half2_rn(0.0f);
+#pragma unroll
+    for (int key_pair = 0; key_pair < kHalf2HeadSize; ++key_pair) {
+      const half2 rv = shared_r[key_pair];
+      const half2 decay = shared_decay[key_pair];
+      const half2 kv = shared_k[key_pair];
+      const half2 bv = shared_b[key_pair];
+      half2& even = state[2 * key_pair];
+      half2& odd = state[2 * key_pair + 1];
+      even = __hfma2(
+          even, __halves2half2(decay.x, decay.x),
+          __hfma2(__halves2half2(kv.x, kv.x), value,
+                  __hfma2(state_dot_a, __halves2half2(bv.x, bv.x), even)));
+      odd = __hfma2(
+          odd, __halves2half2(decay.y, decay.y),
+          __hfma2(__halves2half2(kv.y, kv.y), value,
+                  __hfma2(state_dot_a, __halves2half2(bv.y, bv.y), odd)));
+      output_even =
+          __hfma2(even, __halves2half2(rv.x, rv.x), output_even);
+      output_odd =
+          __hfma2(odd, __halves2half2(rv.y, rv.y), output_odd);
+    }
+    const half2 result = __hadd2(output_even, output_odd);
+    reinterpret_cast<half2*>(output_ptr)[pair_base] = __halves2half2(
+        __float2half_rn(__half2float(result.x) * scale),
+        __float2half_rn(__half2float(result.y) * scale));
+    __syncwarp();
+  }
+
+#pragma unroll
+  for (int key_index = 0; key_index < kHeadSize; ++key_index) {
+    half2* const state_row = reinterpret_cast<half2*>(
+        state_base + key_index * kHeadSize) + lane;
+    if constexpr (StreamState) {
+      __stcs(state_row, state[key_index]);
+    } else {
+      *state_row = state[key_index];
+    }
+  }
+}
+
+// The very-high-concurrency T1 path retains the Albatross int4 [K,V] stream
+// and uses shared memory only for the value-owner register transpose.
+template <bool AddW0>
+__global__ __launch_bounds__(kHeadSize, 2) void wkv_fp16_kv_vector_kernel(
+    int num_heads,
+    int64_t output_elements,
+    const int* __restrict__ query_start_loc,
+    const int* __restrict__ state_indices,
+    const int* __restrict__ elapsed_state_ptr,
+    const int* __restrict__ metadata_status,
+    half* __restrict__ state_ptr,
+    const half* __restrict__ r_ptr,
+    const half* __restrict__ decay_ptr,
+    const half* __restrict__ decay_bias_ptr,
+    const half* __restrict__ k_ptr,
+    const half* __restrict__ v_ptr,
+    const half* __restrict__ a_ptr,
+    const half* __restrict__ b_ptr,
+    half* __restrict__ output_ptr,
+    float scale) {
+  const int head_index = static_cast<int>(blockIdx.x);
+  const int sequence_index = static_cast<int>(blockIdx.y);
+  const int thread = static_cast<int>(threadIdx.x);
+  const int lane = thread & 31;
+  const int64_t block_index =
+      static_cast<int64_t>(sequence_index) * num_heads + head_index;
+  const int64_t block_count =
+      static_cast<int64_t>(gridDim.x) * gridDim.y;
+  if (metadata_status[0] != 0) {
+    fill_invalid_output(block_index, block_count, output_elements, output_ptr);
+    return;
+  }
+  if (sequence_index >= metadata_status[2]) {
+    return;
+  }
+
+  __shared__ int token_index;
+  __shared__ int state_slot;
+  __shared__ int elapsed_base;
+  if (thread == 0) {
+    token_index = query_start_loc[sequence_index];
+    state_slot = state_indices[sequence_index];
+    elapsed_base = elapsed_state_ptr[state_slot];
+  }
+  __syncthreads();
+  half* const state_base =
+      state_ptr +
+      (static_cast<int64_t>(state_slot) * num_heads + head_index) *
+          kHeadSize * kHeadSize;
+  __shared__ __align__(256) half2
+      state_shared[kHeadSize][kHalf2HeadSize];
+
+#pragma unroll
+  for (int pair_segment = thread;
+       pair_segment < kHalf2HeadSize * (kHeadSize / kHalfPerInt4);
+       pair_segment += kHeadSize) {
+    const int key_pair = pair_segment >> 3;
+    const int segment = pair_segment & 7;
+    const int4 lo = __ldcs(
+        reinterpret_cast<const int4*>(
+            state_base + (2 * key_pair) * kHeadSize) + segment);
+    const int4 hi = __ldcs(
+        reinterpret_cast<const int4*>(
+            state_base + (2 * key_pair + 1) * kHeadSize) + segment);
+    const int value0 = segment * kHalfPerInt4;
+#pragma unroll
+    for (int offset = 0; offset < kHalfPerInt4; ++offset) {
+      const int value_index = value0 + offset;
+      state_shared[value_index][(value_index & 31) ^ key_pair] =
+          __halves2half2(
+              reinterpret_cast<const half*>(&lo)[offset],
+              reinterpret_cast<const half*>(&hi)[offset]);
+    }
+  }
+  __syncthreads();
+
+  half2 state[kHalf2HeadSize];
+#pragma unroll
+  for (int key_pair = 0; key_pair < kHalf2HeadSize; ++key_pair) {
+    state[key_pair] = state_shared[thread][lane ^ key_pair];
+  }
+  __shared__ __align__(128) half2 shared_r[kHalf2HeadSize];
+  __shared__ __align__(128) half2 shared_decay[kHalf2HeadSize];
+  __shared__ __align__(128) half2 shared_k[kHalf2HeadSize];
+  __shared__ __align__(128) half2 shared_a[kHalf2HeadSize];
+  __shared__ __align__(128) half2 shared_b[kHalf2HeadSize];
+  if (thread < kHalf2HeadSize) {
+    const int64_t token_base =
+        (static_cast<int64_t>(token_index) * num_heads + head_index) *
+        kHeadSize;
+    const int64_t pair_base = token_base / 2 + thread;
+    shared_r[thread] =
+        __ldg(reinterpret_cast<const half2*>(r_ptr) + pair_base);
+    shared_k[thread] =
+        __ldg(reinterpret_cast<const half2*>(k_ptr) + pair_base);
+    shared_a[thread] =
+        __ldg(reinterpret_cast<const half2*>(a_ptr) + pair_base);
+    shared_b[thread] =
+        __ldg(reinterpret_cast<const half2*>(b_ptr) + pair_base);
+    const half2 raw_decay =
+        __ldg(reinterpret_cast<const half2*>(decay_ptr) + pair_base);
+    float decay0 = __half2float(raw_decay.x);
+    float decay1 = __half2float(raw_decay.y);
+    if constexpr (AddW0) {
+      const half2 bias = __ldg(
+          reinterpret_cast<const half2*>(
+              decay_bias_ptr + head_index * kHeadSize) + thread);
+      decay0 += __half2float(bias.x);
+      decay1 += __half2float(bias.y);
+    }
+    const int phase =
+        elapsed_base + head_index * kHeadSize + 2 * thread;
+    shared_decay[thread] = __halves2half2(
+        __float2half_rn(recurrent_fp16_delta(decay0, phase)),
+        __float2half_rn(recurrent_fp16_delta(decay1, phase + 1)));
+  }
+  __syncthreads();
+
+  half2 state_dot_a = __float2half2_rn(0.0f);
+#pragma unroll
+  for (int key_pair = 0; key_pair < kHalf2HeadSize; ++key_pair) {
+    state_dot_a =
+        __hfma2(shared_a[key_pair], state[key_pair], state_dot_a);
+  }
+  const half state_dot = __hadd(state_dot_a.x, state_dot_a.y);
+  const half2 state_dot_pair = __halves2half2(state_dot, state_dot);
+  const int64_t token_base =
+      (static_cast<int64_t>(token_index) * num_heads + head_index) *
+      kHeadSize;
+  const half value = __ldg(v_ptr + token_base + thread);
+  const half2 value_pair = __halves2half2(value, value);
+  half2 result = __float2half2_rn(0.0f);
+#pragma unroll
+  for (int key_pair = 0; key_pair < kHalf2HeadSize; ++key_pair) {
+    half2& state_pair = state[key_pair];
+    state_pair = __hfma2(
+        state_pair, shared_decay[key_pair],
+        __hfma2(shared_k[key_pair], value_pair,
+                __hfma2(state_dot_pair, shared_b[key_pair], state_pair)));
+    result = __hfma2(state_pair, shared_r[key_pair], result);
+  }
+  output_ptr[token_base + thread] = __float2half_rn(
+      (__half2float(result.x) + __half2float(result.y)) * scale);
+
+#pragma unroll
+  for (int key_pair = 0; key_pair < kHalf2HeadSize; ++key_pair) {
+    state_shared[thread][lane ^ key_pair] = state[key_pair];
+  }
+  __syncthreads();
+#pragma unroll
+  for (int pair_segment = thread;
+       pair_segment < kHalf2HeadSize * (kHeadSize / kHalfPerInt4);
+       pair_segment += kHeadSize) {
+    int4 lo;
+    int4 hi;
+    const int key_pair = pair_segment >> 3;
+    const int segment = pair_segment & 7;
+    const int value0 = segment * kHalfPerInt4;
+#pragma unroll
+    for (int offset = 0; offset < kHalfPerInt4; ++offset) {
+      const int value_index = value0 + offset;
+      const half2 packed =
+          state_shared[value_index][(value_index & 31) ^ key_pair];
+      reinterpret_cast<half*>(&lo)[offset] = packed.x;
+      reinterpret_cast<half*>(&hi)[offset] = packed.y;
+    }
+    __stcs(
+        reinterpret_cast<int4*>(
+            state_base + (2 * key_pair) * kHeadSize) + segment,
+        lo);
+    __stcs(
+        reinterpret_cast<int4*>(
+            state_base + (2 * key_pair + 1) * kHeadSize) + segment,
+        hi);
+  }
+}
+
+bool use_kv_vector_auto(int sequence_capacity, int max_seqlen, int num_heads) {
+  return max_seqlen == 1 &&
+      static_cast<int64_t>(sequence_capacity) * num_heads >= 20000;
+}
+
+bool use_kv_warp_auto(int sequence_capacity, int max_seqlen, int num_heads) {
+  const int64_t sequence_heads =
+      static_cast<int64_t>(sequence_capacity) * num_heads;
+  if (max_seqlen == 1) {
+    return sequence_heads >= 15000 && sequence_heads < 20000;
+  }
+  return max_seqlen > 1 && sequence_heads >= 1280;
+}
+
+template <bool AddW0>
+void launch_kv_warp_pair(
+    bool stream_state,
+    int num_sequences,
+    int num_heads,
+    const torch::Tensor& query_start_loc,
+    const torch::Tensor& state_indices,
+    const torch::Tensor& elapsed_state,
+    torch::Tensor& state,
+    const torch::Tensor& r,
+    const torch::Tensor& decay,
+    const torch::Tensor& decay_bias,
+    const torch::Tensor& k,
+    const torch::Tensor& v,
+    const torch::Tensor& a,
+    const torch::Tensor& b,
+    torch::Tensor& output,
+    const torch::Tensor& metadata_status,
+    float scale,
+    cudaStream_t stream) {
+#define LAUNCH_KV_WARP(StreamState) \
+  wkv_fp16_kv_warp_pair_kernel<AddW0, StreamState> \
+      <<<dim3(num_heads, num_sequences), dim3(32), 0, stream>>>( \
+          num_heads, output.numel(), query_start_loc.data_ptr<int>(), \
+          state_indices.data_ptr<int>(), elapsed_state.data_ptr<int>(), \
+          metadata_status.data_ptr<int>(), \
+          reinterpret_cast<half*>(state.data_ptr()), \
+          reinterpret_cast<const half*>(r.data_ptr()), \
+          reinterpret_cast<const half*>(decay.data_ptr()), \
+          AddW0 ? reinterpret_cast<const half*>(decay_bias.data_ptr()) : nullptr, \
+          reinterpret_cast<const half*>(k.data_ptr()), \
+          reinterpret_cast<const half*>(v.data_ptr()), \
+          reinterpret_cast<const half*>(a.data_ptr()), \
+          reinterpret_cast<const half*>(b.data_ptr()), \
+          reinterpret_cast<half*>(output.data_ptr()), scale)
+  if (stream_state) {
+    LAUNCH_KV_WARP(true);
+  } else {
+    LAUNCH_KV_WARP(false);
+  }
+#undef LAUNCH_KV_WARP
+}
+
+template <bool AddW0>
+void launch_kv_vector(
+    int num_sequences,
+    int num_heads,
+    const torch::Tensor& query_start_loc,
+    const torch::Tensor& state_indices,
+    const torch::Tensor& elapsed_state,
+    torch::Tensor& state,
+    const torch::Tensor& r,
+    const torch::Tensor& decay,
+    const torch::Tensor& decay_bias,
+    const torch::Tensor& k,
+    const torch::Tensor& v,
+    const torch::Tensor& a,
+    const torch::Tensor& b,
+    torch::Tensor& output,
+    const torch::Tensor& metadata_status,
+    float scale,
+    cudaStream_t stream) {
+  wkv_fp16_kv_vector_kernel<AddW0>
+      <<<dim3(num_heads, num_sequences), dim3(kHeadSize), 0, stream>>>(
+          num_heads, output.numel(), query_start_loc.data_ptr<int>(),
+          state_indices.data_ptr<int>(), elapsed_state.data_ptr<int>(),
+          metadata_status.data_ptr<int>(),
+          reinterpret_cast<half*>(state.data_ptr()),
+          reinterpret_cast<const half*>(r.data_ptr()),
+          reinterpret_cast<const half*>(decay.data_ptr()),
+          AddW0 ? reinterpret_cast<const half*>(decay_bias.data_ptr()) : nullptr,
+          reinterpret_cast<const half*>(k.data_ptr()),
+          reinterpret_cast<const half*>(v.data_ptr()),
+          reinterpret_cast<const half*>(a.data_ptr()),
+          reinterpret_cast<const half*>(b.data_ptr()),
+          reinterpret_cast<half*>(output.data_ptr()), scale);
 }
 
 bool use_v2_seq(int batch_size, int max_seqlen) {
@@ -1230,7 +1587,31 @@ void tmix_wkv7_recurrent_fp16_from_decay_logits_cuda(
   const bool grid2d = use_grid2d(num_sequences, max_seqlen, num_heads);
 
   if (state.size(2) == kHeadSize) {
-    if (all_t1) {
+    if (use_kv_vector_auto(num_sequences, max_seqlen, num_heads)) {
+      if (add_w0) {
+        launch_kv_vector<true>(
+            num_sequences, num_heads, query_start_loc, state_indices,
+            elapsed_state, state, r, decay_logits, decay_bias, k, v, a, b,
+            output, metadata_status, static_cast<float>(scale), stream);
+      } else {
+        launch_kv_vector<false>(
+            num_sequences, num_heads, query_start_loc, state_indices,
+            elapsed_state, state, r, decay_logits, decay_bias, k, v, a, b,
+            output, metadata_status, static_cast<float>(scale), stream);
+      }
+    } else if (use_kv_warp_auto(num_sequences, max_seqlen, num_heads)) {
+      if (add_w0) {
+        launch_kv_warp_pair<true>(
+            all_t1, num_sequences, num_heads, query_start_loc, state_indices,
+            elapsed_state, state, r, decay_logits, decay_bias, k, v, a, b,
+            output, metadata_status, static_cast<float>(scale), stream);
+      } else {
+        launch_kv_warp_pair<false>(
+            all_t1, num_sequences, num_heads, query_start_loc, state_indices,
+            elapsed_state, state, r, decay_logits, decay_bias, k, v, a, b,
+            output, metadata_status, static_cast<float>(scale), stream);
+      }
+    } else if (all_t1) {
       if (num_sequences <= 2) {
         dispatch_fp16_family<Fp16Family::Clone>(
             add_w0, grid2d, num_sequences, num_heads, query_start_loc,

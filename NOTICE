@@ -26,8 +26,22 @@ RWKV/Albatross integration at rwkv-rs/vllm-rwkv commit
 - benchmarks/benchmark_training.py
 - benchmarks/kernel_benchmark.py
 
-The FP16 recurrent lineage includes BlinkDL/Albatross faster3a_2607 commit
-63c53f4abf2cd891dd3a18c8f44f5b2cccc8c64b.
+The SM120 FP16/FP32 recurrent and DeltaLog implementations contain material
+adapted from BlinkDL/Albatross faster3a_2607 commit
+3e41bc43ed5e8332927ddd7e0ce4816cf200a6ea:
+
+- csrc/sm120/tmix/wkv7/infer_recurrent_fp16_forward_varlen.cpp
+- csrc/sm120/tmix/wkv7/infer_recurrent_fp16_forward_varlen.cu
+- csrc/sm120/tmix/wkv7/infer_recurrent_fp32io16_forward_varlen.cpp
+- csrc/sm120/tmix/wkv7/infer_recurrent_fp32io16_forward_varlen.cu
+- csrc/sm120/tmix/wkv7/infer_recurrent_deltalog_fp16_forward_varlen.cpp
+- csrc/sm120/tmix/wkv7/infer_recurrent_deltalog_fp16_forward_varlen.cu
+
+The FP16 update replaces the earlier state-layout compatibility transpose
+inside the established recurrent families with direct [K,V] access. The
+DeltaLog source is adapted to packed, independently phased state slots. These
+derived files are licensed under the Apache License, Version 2.0; see
+LICENSES/Apache-2.0.txt.
 
 The following fused FP16 inference block operators are adapted from
 BlinkDL/Albatross faster3a_2607 commit
@@ -49,8 +63,7 @@ ee3308f6922e59f2166c7fac3c5a192340a2b48e:
 - csrc/sm120/post_norm/infer_fp16_forward_varlen.cpp
 - csrc/sm120/post_norm/infer_fp16_forward_varlen.cu
 
-The already-owned FP16/FP32 WKV recurrence files from that source are not
-duplicated. These derived files are licensed under the Apache License,
+The fused block derived files are licensed under the Apache License,
 Version 2.0; see LICENSES/Apache-2.0.txt.
 
 The following files contain recurrent checkpoint and reverse-recurrence
