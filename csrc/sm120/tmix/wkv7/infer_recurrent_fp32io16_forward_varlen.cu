@@ -468,7 +468,6 @@ void wkv_fp32_v2_kv_tloop_group4_kernel(
     float* __restrict__ state_ptr,
     const c10::Half* __restrict__ r_ptr,
     const c10::Half* __restrict__ decay_logits_ptr,
-    const c10::Half* __restrict__ decay_bias_ptr,
     const c10::Half* __restrict__ k_ptr,
     const c10::Half* __restrict__ v_ptr,
     const c10::Half* __restrict__ a_ptr,
@@ -506,15 +505,12 @@ void wkv_fp32_v2_kv_tloop_group4_kernel(
     return;
   }
 
-  __shared__ int token_start;
-  __shared__ int token_end;
-  __shared__ int state_slot;
-  if (thread == 0) {
-    token_start = query_start_loc[sequence_index];
-    token_end = query_start_loc[sequence_index + 1];
-    state_slot = state_indices[sequence_index];
-  }
-  __syncthreads();
+  // These three values are warp-uniform and remain hot in L1.  Keeping them
+  // in registers avoids an otherwise unconditional CTA barrier before the
+  // short t-loop starts.
+  const int token_start = query_start_loc[sequence_index];
+  const int token_end = query_start_loc[sequence_index + 1];
+  const int state_slot = state_indices[sequence_index];
 
   float* state_base =
       state_ptr +
@@ -538,16 +534,19 @@ void wkv_fp32_v2_kv_tloop_group4_kernel(
     const int64_t token_base =
         (static_cast<int64_t>(token_index) * num_heads + head_index) *
         kHeadSize;
-    __syncthreads();
+    // This is the consumer barrier for the preceding token.  The first
+    // iteration has no shared-vector producer to wait for, while the barrier
+    // after the loads below already covers the initial state loads.
+    if (token_index != token_start) {
+      __syncthreads();
+    }
     if (thread < kHeadSize) {
       const int64_t input_index = token_base + thread;
       shared_r[thread] = to_float(r_ptr[input_index]);
-      float decay_logits = to_float(decay_logits_ptr[input_index]);
-      if (decay_bias_ptr != nullptr) {
-        decay_logits += to_float(
-            decay_bias_ptr[head_index * kHeadSize + thread]);
-      }
-      shared_decay[thread] = recurrent_retention(decay_logits);
+      // The owner pre-adds an optional decay bias before dispatch, so the
+      // selected group4 body never needs an inner-loop nullable-pointer branch.
+      shared_decay[thread] =
+          recurrent_retention(to_float(decay_logits_ptr[input_index]));
       shared_k[thread] = to_float(k_ptr[input_index]);
       shared_v[thread] = to_float(v_ptr[input_index]);
       shared_a[thread] = to_float(a_ptr[input_index]);
@@ -887,7 +886,6 @@ void launch_recurrent_fp32(
               reinterpret_cast<const c10::Half*>(r.data_ptr<io_t>()),
               reinterpret_cast<const c10::Half*>(
                   decay_logits.data_ptr<io_t>()),
-              reinterpret_cast<const c10::Half*>(decay_bias_ptr),
               reinterpret_cast<const c10::Half*>(k.data_ptr<io_t>()),
               reinterpret_cast<const c10::Half*>(v.data_ptr<io_t>()),
               reinterpret_cast<const c10::Half*>(a.data_ptr<io_t>()),
@@ -904,7 +902,6 @@ void launch_recurrent_fp32(
               reinterpret_cast<const c10::Half*>(r.data_ptr<io_t>()),
               reinterpret_cast<const c10::Half*>(
                   decay_logits.data_ptr<io_t>()),
-              reinterpret_cast<const c10::Half*>(decay_bias_ptr),
               reinterpret_cast<const c10::Half*>(k.data_ptr<io_t>()),
               reinterpret_cast<const c10::Half*>(v.data_ptr<io_t>()),
               reinterpret_cast<const c10::Half*>(a.data_ptr<io_t>()),
