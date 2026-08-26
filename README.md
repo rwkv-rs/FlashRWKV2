@@ -78,6 +78,10 @@ WKV7 recurrent correctness benchmark with:
 These benchmarks measure individual operators. They do not report or infer
 model-level latency.
 
+The release-specific WKV7 measurements, evidence identities, acceptance
+boundaries, and non-target advisory regressions are recorded in the
+[FlashRWKV2 0.1.0a9 WKV7 performance report](docs/performance/wkv7-0.1.0a9.md).
+
 For Albatross-compatible TMix low-rank inference, `varlen` means that the
 operator consumes packed token rows; it does not mean that one fused kernel is
 used for every row count.  The public composite callers automatically use the
