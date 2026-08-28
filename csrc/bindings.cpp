@@ -8,6 +8,7 @@ void register_flashrwkv2_bindings(py::module_& module) {
   register_infer_tmix_wkv7_recurrent_fp32io16_bindings(module);
   register_infer_tmix_wkv7_recurrent_fp16_bindings(module);
   register_infer_tmix_wkv7_recurrent_deltalog_fp16_bindings(module);
+  register_infer_tmix_wkv7_recurrent_deltalog_fp32io16_bindings(module);
   register_tmix_tokenshift_bindings(module);
   register_tmix_wkv_prepare_bindings(module);
   register_tmix_readout_bindings(module);

@@ -136,6 +136,56 @@ def test_root_exports_module_operators_by_identity() -> None:
         assert getattr(flashrwkv2, name) is operator
 
 
+def test_deltalog_policy_matches_pinned_albatross_exact_table() -> None:
+    module = importlib.import_module("flashrwkv2.tmix.wkv7")
+    expected = {
+        (768, 16): 2,
+        (768, 32): 3,
+        (768, 64): 3,
+        (768, 128): 3,
+        (768, 256): 3,
+        (768, 512): 3,
+        (1024, 16): 2,
+        (1024, 32): 3,
+        (1024, 64): 3,
+        (1024, 256): 3,
+        (1024, 512): 3,
+        (2048, 8): 2,
+        (2048, 16): 3,
+        (2048, 32): 3,
+        (2048, 64): 3,
+        (2048, 256): 3,
+        (2048, 512): 4,
+        (2560, 8): 2,
+        (2560, 16): 3,
+        (2560, 32): 3,
+        (2560, 64): 3,
+        (2560, 256): 3,
+        (2560, 512): 4,
+        (4096, 8): 2,
+        (4096, 16): 3,
+        (4096, 32): 3,
+        (4096, 64): 3,
+        (4096, 128): 3,
+        (4096, 256): 3,
+        (4096, 512): 4,
+    }
+    assert module._DELTALOG_POLICY_SOURCE_REVISION == (
+        "3465da5070beceb4bab9e07b03abee1642a0bdf8"
+    )
+    assert module._DELTALOG_TUNED_M == expected
+    for (channels, batch_size), merge_interval in expected.items():
+        assert (
+            module._select_deltalog_merge_interval(
+                channels, batch_size, 64, (12, 0)
+            )
+            == merge_interval
+        )
+    assert module._select_deltalog_merge_interval(4096, 320, 64, (12, 0)) == 0
+    assert module._select_deltalog_merge_interval(4096, 64, 128, (12, 0)) == 0
+    assert module._select_deltalog_merge_interval(4096, 64, 64, (9, 0)) == 0
+
+
 def test_retired_public_aliases_are_absent() -> None:
     import flashrwkv2
 
@@ -155,6 +205,8 @@ def test_retired_public_aliases_are_absent() -> None:
         "infer_tmix_lnx_rkvres_xg_forward_varlen",
         "infer_head_linear_forward_varlen",
         "infer_recurrent_fp16_forward_varlen",
+        "infer_tmix_wkv7_recurrent_deltalog_fp16_forward_varlen",
+        "infer_tmix_wkv7_recurrent_deltalog_fp32io16_forward_varlen",
         "infer_recurrent_fp32io16_forward_varlen",
         "infer_chunk_bf16_forward_varlen",
         "prepare_recurrent_metadata",

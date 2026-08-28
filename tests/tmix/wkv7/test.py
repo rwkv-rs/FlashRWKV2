@@ -12,10 +12,12 @@ import torch
 from utils import require_cuda_backend
 
 import flashrwkv2
+import flashrwkv2.tmix.wkv7 as wkv7_module
 from flashrwkv2.tmix.wkv7 import (
-    infer_tmix_wkv7_recurrent_deltalog_fp16_forward_varlen,
     infer_tmix_wkv7_recurrent_fp16_forward_varlen,
     infer_tmix_wkv7_recurrent_fp32io16_forward_varlen,
+    prepare_tmix_wkv7_recurrent_fp16_state,
+    prepare_tmix_wkv7_recurrent_fp32io16_state,
     prepare_tmix_wkv7_recurrent_metadata,
 )
 
@@ -170,6 +172,29 @@ def _require_deltalog_extension() -> None:
     )
 
 
+def _require_fp32io16_deltalog_extension() -> None:
+    require_cuda_backend(
+        "_C_sm120",
+        12,
+        "tmix_wkv7_recurrent_deltalog_fp32io16_from_decay_logits",
+    )
+
+
+def _prepare_fp32io16_state(
+    state_pool: torch.Tensor,
+    state_indices: torch.Tensor | list[int],
+) -> object:
+    sequence_capacity = (
+        state_indices.numel()
+        if isinstance(state_indices, torch.Tensor)
+        else len(state_indices)
+    )
+    return prepare_tmix_wkv7_recurrent_fp32io16_state(
+        state_pool,
+        sequence_capacity=sequence_capacity,
+    )
+
+
 def _relative_rmse(actual: torch.Tensor, expected: torch.Tensor) -> float:
     difference = actual.float() - expected.float()
     baseline = expected.float().square().mean().sqrt().clamp_min(1.0e-6)
@@ -269,6 +294,10 @@ def test_fp32_wkv_zero_active_precapture_warmup_then_graph_replay() -> None:
     num_active_sequences = torch.zeros(1, device=device, dtype=torch.int32)
     metadata_addresses = (cu_seqlens.data_ptr(), state_indices.data_ptr())
     stream = torch.cuda.Stream(device=device)
+    state_handle = prepare_tmix_wkv7_recurrent_fp32io16_state(
+        state,
+        sequence_capacity=sequence_capacity,
+    )
 
     # vLLM V2 warms the exact capture shape before torch.cuda.graph().  The
     # padded sequence capacity can exceed the physical state-pool capacity;
@@ -287,7 +316,7 @@ def test_fp32_wkv_zero_active_precapture_warmup_then_graph_replay() -> None:
         )
         infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
             *packed,
-            state_pool=state,
+            state=state_handle,
             cu_seqlens=cu_seqlens,
             state_indices=state_indices,
             validated_metadata=warmup_ticket,
@@ -309,6 +338,10 @@ def test_fp32_wkv_zero_active_precapture_warmup_then_graph_replay() -> None:
     num_active_sequences.fill_(2)
 
     expected_state = initial_state.clone()
+    expected_state_handle = prepare_tmix_wkv7_recurrent_fp32io16_state(
+        expected_state,
+        sequence_capacity=sequence_capacity,
+    )
     expected_ticket = prepare_tmix_wkv7_recurrent_metadata(
         cu_seqlens,
         state_indices,
@@ -321,7 +354,7 @@ def test_fp32_wkv_zero_active_precapture_warmup_then_graph_replay() -> None:
     )
     expected_output = infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
         *packed,
-        state_pool=expected_state,
+        state=expected_state_handle,
         cu_seqlens=cu_seqlens,
         state_indices=state_indices,
         validated_metadata=expected_ticket,
@@ -342,7 +375,7 @@ def test_fp32_wkv_zero_active_precapture_warmup_then_graph_replay() -> None:
         )
         graph_output = infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
             *packed,
-            state_pool=state,
+            state=state_handle,
             cu_seqlens=cu_seqlens,
             state_indices=state_indices,
             validated_metadata=ticket,
@@ -461,7 +494,10 @@ def test_metadata_ticket_predecessor_matches_cpu_reference_and_live_updates() ->
 def test_public_signature_is_raw_only_and_old_symbols_are_absent() -> None:
     signature = inspect.signature(infer_tmix_wkv7_recurrent_fp32io16_forward_varlen)
     assert "decay_logits" in signature.parameters
-    assert "state_pool" in signature.parameters
+    assert "state" in signature.parameters
+    assert "state_pool" not in signature.parameters
+    assert "deltalog_phase_pool" not in signature.parameters
+    assert "deltalog_pool" not in signature.parameters
     assert "initial_state" not in signature.parameters
     assert "output_final_state" not in signature.parameters
     assert "log_decay" not in signature.parameters
@@ -475,10 +511,17 @@ def test_public_signature_is_raw_only_and_old_symbols_are_absent() -> None:
             None,
             None,
             None,
-            state_pool=None,
+            state=None,
             cu_seqlens=None,
             log_decay=None,
         )
+    prepare_signature = inspect.signature(
+        prepare_tmix_wkv7_recurrent_fp32io16_state
+    )
+    assert tuple(prepare_signature.parameters) == (
+        "state_pool",
+        "sequence_capacity",
+    )
     if flashrwkv2._C is not None:
         assert hasattr(
             flashrwkv2._C, "tmix_wkv7_recurrent_fp32_from_decay_logits"
@@ -507,7 +550,9 @@ def test_public_rejects_unsupported_token_dtype(
             case["v"],
             case["a"],
             case["b"],
-            state_pool=case["state_pool"],
+            state=_prepare_fp32io16_state(
+                case["state_pool"], case["state_indices"]
+            ),
             cu_seqlens=case["cu_seqlens"],
             state_indices=case["state_indices"],
         )
@@ -534,7 +579,9 @@ def test_public_rejects_structural_arguments_without_launching() -> None:
             infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
                 bad_r,
                 *args[1:],
-                state_pool=state_pool,
+                state=_prepare_fp32io16_state(
+                    state_pool, case["state_indices"]
+                ),
                 cu_seqlens=case["cu_seqlens"],
                 state_indices=case["state_indices"],
             )
@@ -543,7 +590,7 @@ def test_public_rejects_structural_arguments_without_launching() -> None:
         infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
             object(),
             *args[1:],
-            state_pool=state_pool,
+            state=_prepare_fp32io16_state(state_pool, case["state_indices"]),
             cu_seqlens=case["cu_seqlens"],
             state_indices=case["state_indices"],
         )
@@ -551,7 +598,7 @@ def test_public_rejects_structural_arguments_without_launching() -> None:
         infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
             args[0].reshape(-1, args[0].shape[-1]),
             *args[1:],
-            state_pool=state_pool,
+            state=_prepare_fp32io16_state(state_pool, case["state_indices"]),
             cu_seqlens=case["cu_seqlens"],
             state_indices=case["state_indices"],
         )
@@ -560,7 +607,7 @@ def test_public_rejects_structural_arguments_without_launching() -> None:
             args[0],
             args[1].to(torch.bfloat16),
             *args[2:],
-            state_pool=state_pool,
+            state=_prepare_fp32io16_state(state_pool, case["state_indices"]),
             cu_seqlens=case["cu_seqlens"],
             state_indices=case["state_indices"],
         )
@@ -572,37 +619,33 @@ def test_public_rejects_structural_arguments_without_launching() -> None:
             args[3].unsqueeze(0),
             args[4].unsqueeze(0),
             args[5].unsqueeze(0),
-            state_pool=state_pool,
+            state=_prepare_fp32io16_state(state_pool, case["state_indices"]),
             cu_seqlens=case["cu_seqlens"],
             state_indices=case["state_indices"],
         )
 
     with pytest.raises(TypeError, match="float32"):
-        infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
-            *args,
-            state_pool=state_pool.to(torch.float16),
-            cu_seqlens=case["cu_seqlens"],
-            state_indices=case["state_indices"],
+        prepare_tmix_wkv7_recurrent_fp32io16_state(
+            state_pool.to(torch.float16),
+            sequence_capacity=case["state_indices"].numel(),
         )
-    with pytest.raises(RuntimeError, match="square"):
-        infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
-            *args,
-            state_pool=state_pool[:, :, :, :-1].contiguous(),
-            cu_seqlens=case["cu_seqlens"],
-            state_indices=case["state_indices"],
+    with pytest.raises(ValueError, match="shape"):
+        prepare_tmix_wkv7_recurrent_fp32io16_state(
+            state_pool[:, :, :, :-1].contiguous(),
+            sequence_capacity=case["state_indices"].numel(),
         )
-    with pytest.raises(RuntimeError, match="square"):
-        infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
-            *args,
-            state_pool=state_pool.reshape(-1),
-            cu_seqlens=case["cu_seqlens"],
-            state_indices=case["state_indices"],
+    with pytest.raises(ValueError, match="shape"):
+        prepare_tmix_wkv7_recurrent_fp32io16_state(
+            state_pool.reshape(-1),
+            sequence_capacity=case["state_indices"].numel(),
         )
     unsupported = _make_case(dtype=torch.float16, head_size=32, lengths=(4,))
     with pytest.raises(RuntimeError, match="64, 128, or 256"):
         infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
             *_args(unsupported),
-            state_pool=unsupported["state_pool"],
+            state=_prepare_fp32io16_state(
+                unsupported["state_pool"], unsupported["state_indices"]
+            ),
             cu_seqlens=unsupported["cu_seqlens"],
             state_indices=unsupported["state_indices"],
         )
@@ -677,10 +720,11 @@ def test_packed_public_rejects_invalid_metadata_and_preserves_state(
         bad_slots[0] = state_pool.shape[0]
 
     before = state_pool.clone()
+    state_handle = _prepare_fp32io16_state(state_pool, state_indices)
     with pytest.raises((TypeError, ValueError, RuntimeError)):
         infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
             *args,
-            state_pool=state_pool,
+            state=state_handle,
             cu_seqlens=bad_cu,
             state_indices=bad_slots,
         )
@@ -697,11 +741,12 @@ def test_public_rejects_devices_bias_scale_and_state_indices_contracts() -> None
     assert isinstance(state_pool, torch.Tensor)
     assert isinstance(cu_seqlens, torch.Tensor)
     assert isinstance(state_indices, torch.Tensor)
+    state_handle = _prepare_fp32io16_state(state_pool, state_indices)
 
     with pytest.raises((ValueError, RuntimeError), match="CUDA"):
         infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
             *(tensor.cpu() for tensor in args),
-            state_pool=state_pool.cpu(),
+            state=state_handle,
             cu_seqlens=cu_seqlens.cpu(),
             state_indices=state_indices.cpu(),
         )
@@ -709,7 +754,7 @@ def test_public_rejects_devices_bias_scale_and_state_indices_contracts() -> None
         with pytest.raises(RuntimeError, match="same device"):
             infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
                 *args,
-                state_pool=state_pool,
+                state=state_handle,
                 cu_seqlens=cu_seqlens,
                 state_indices=state_indices,
                 decay_bias=torch.zeros(
@@ -720,7 +765,7 @@ def test_public_rejects_devices_bias_scale_and_state_indices_contracts() -> None
     with pytest.raises((ValueError, RuntimeError), match="decay_bias"):
         infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
             *args,
-            state_pool=state_pool,
+            state=state_handle,
             cu_seqlens=cu_seqlens,
             state_indices=state_indices,
             decay_bias=torch.zeros(2, 63, device=state_pool.device, dtype=args[0].dtype),
@@ -728,7 +773,7 @@ def test_public_rejects_devices_bias_scale_and_state_indices_contracts() -> None
     with pytest.raises((TypeError, RuntimeError), match="decay_bias"):
         infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
             *args,
-            state_pool=state_pool,
+            state=state_handle,
             cu_seqlens=cu_seqlens,
             state_indices=state_indices,
             decay_bias=torch.zeros(2, 64, device=state_pool.device, dtype=torch.float32),
@@ -736,7 +781,7 @@ def test_public_rejects_devices_bias_scale_and_state_indices_contracts() -> None
     with pytest.raises((ValueError, RuntimeError), match="contiguous"):
         infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
             *args,
-            state_pool=state_pool,
+            state=state_handle,
             cu_seqlens=cu_seqlens,
             state_indices=state_indices,
             decay_bias=torch.zeros(
@@ -746,14 +791,14 @@ def test_public_rejects_devices_bias_scale_and_state_indices_contracts() -> None
     with pytest.raises(TypeError, match="cu_seqlens must be a torch.Tensor"):
         infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
             *args,
-            state_pool=state_pool,
+            state=state_handle,
             cu_seqlens=[0, args[0].shape[0]],
             state_indices=state_indices,
         )
     with pytest.raises(TypeError, match="state_indices must be a torch.Tensor"):
         infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
             *args,
-            state_pool=state_pool,
+            state=state_handle,
             cu_seqlens=cu_seqlens,
             state_indices=[0] * state_indices.numel(),
         )
@@ -761,12 +806,12 @@ def test_public_rejects_devices_bias_scale_and_state_indices_contracts() -> None
         with pytest.raises(RuntimeError, match="finite"):
             infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
                 *args,
-                state_pool=state_pool,
+                state=state_handle,
                 cu_seqlens=cu_seqlens,
                 state_indices=state_indices,
                 scale=bad_scale,
             )
-    with pytest.raises(TypeError, match="state_pool"):
+    with pytest.raises(TypeError, match="state"):
         infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
             *args,
             cu_seqlens=cu_seqlens,
@@ -793,7 +838,7 @@ def test_ticket_rejects_identity_version_and_stream_mismatches() -> None:
     with pytest.raises(RuntimeError, match="identity"):
         infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
             *args,
-            state_pool=state_pool.clone(),
+            state=_prepare_fp32io16_state(state_pool.clone(), state_indices),
             cu_seqlens=cu_seqlens.clone(),
             state_indices=state_indices,
             validated_metadata=ticket,
@@ -803,7 +848,7 @@ def test_ticket_rejects_identity_version_and_stream_mismatches() -> None:
     with pytest.raises(RuntimeError, match="total_tokens"):
         infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
             *short_args,
-            state_pool=state_pool.clone(),
+            state=_prepare_fp32io16_state(state_pool.clone(), state_indices),
             cu_seqlens=cu_seqlens,
             state_indices=state_indices,
             validated_metadata=ticket,
@@ -811,8 +856,11 @@ def test_ticket_rejects_identity_version_and_stream_mismatches() -> None:
     with pytest.raises(RuntimeError, match="state_pool_size"):
         infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
             *args,
-            state_pool=torch.cat(
-                (state_pool, torch.zeros_like(state_pool[:1])), dim=0
+            state=_prepare_fp32io16_state(
+                torch.cat(
+                    (state_pool, torch.zeros_like(state_pool[:1])), dim=0
+                ),
+                state_indices,
             ),
             cu_seqlens=cu_seqlens,
             state_indices=state_indices,
@@ -826,7 +874,7 @@ def test_ticket_rejects_identity_version_and_stream_mismatches() -> None:
     with pytest.raises(RuntimeError, match="version"):
         infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
             *args,
-            state_pool=state_pool.clone(),
+            state=_prepare_fp32io16_state(state_pool.clone(), state_indices),
             cu_seqlens=cu_seqlens,
             state_indices=state_indices,
             validated_metadata=ticket,
@@ -843,7 +891,7 @@ def test_ticket_rejects_identity_version_and_stream_mismatches() -> None:
     with torch.cuda.stream(other_stream), pytest.raises(RuntimeError, match="stream"):
         infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
             *args,
-            state_pool=state_pool.clone(),
+            state=_prepare_fp32io16_state(state_pool.clone(), state_indices),
             cu_seqlens=cu_seqlens,
             state_indices=state_indices,
             validated_metadata=ticket_stream,
@@ -921,9 +969,10 @@ def test_packed_fp32_state_precision_and_state_safety(
     )
 
     before = state_pool.clone()
+    state_handle = _prepare_fp32io16_state(state_pool, state_indices)
     observed_output = infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
         *args,
-        state_pool=state_pool,
+        state=state_handle,
         cu_seqlens=cu_seqlens,
         state_indices=state_indices,
         decay_bias=decay_bias,
@@ -953,9 +1002,10 @@ def test_packed_fp32_state_precision_and_state_safety(
     assert not torch.equal(observed_active, before.index_select(0, active))
 
     second_state = before.clone()
+    second_handle = _prepare_fp32io16_state(second_state, state_indices)
     second_output = infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
         *args,
-        state_pool=second_state,
+        state=second_handle,
         cu_seqlens=cu_seqlens,
         state_indices=state_indices,
         decay_bias=decay_bias,
@@ -965,14 +1015,40 @@ def test_packed_fp32_state_precision_and_state_safety(
     assert torch.equal(state_pool, second_state)
 
 
-def test_fp16_public_signature_is_raw_only_and_has_no_elapsed_alias() -> None:
-    signature = inspect.signature(infer_tmix_wkv7_recurrent_fp16_forward_varlen)
-    assert "decay_logits" in signature.parameters
-    assert "state_pool" in signature.parameters
-    assert "elapsed_state_pool" in signature.parameters
-    assert "max_seqlen" in signature.parameters
-    assert "log_decay" not in signature.parameters
-    assert "elapsed_t" not in signature.parameters
+def test_public_signatures_use_only_prepared_state_handles() -> None:
+    for infer in (
+        infer_tmix_wkv7_recurrent_fp16_forward_varlen,
+        infer_tmix_wkv7_recurrent_fp32io16_forward_varlen,
+    ):
+        signature = inspect.signature(infer)
+        assert "decay_logits" in signature.parameters
+        assert "state" in signature.parameters
+        assert "max_seqlen" in signature.parameters
+        assert "state_pool" not in signature.parameters
+        assert "elapsed_state_pool" not in signature.parameters
+        assert "deltalog_phase_pool" not in signature.parameters
+        assert "deltalog_pool" not in signature.parameters
+    prepare_signature = inspect.signature(prepare_tmix_wkv7_recurrent_fp16_state)
+    assert tuple(prepare_signature.parameters) == (
+        "state_pool",
+        "elapsed_state_pool",
+        "sequence_capacity",
+    )
+    fp32_prepare_signature = inspect.signature(
+        prepare_tmix_wkv7_recurrent_fp32io16_state
+    )
+    assert tuple(fp32_prepare_signature.parameters) == (
+        "state_pool",
+        "sequence_capacity",
+    )
+    assert not hasattr(
+        wkv7_module,
+        "infer_tmix_wkv7_recurrent_deltalog_fp16_forward_varlen",
+    )
+    assert not hasattr(
+        wkv7_module,
+        "infer_tmix_wkv7_recurrent_deltalog_fp32io16_forward_varlen",
+    )
     if flashrwkv2._C is not None:
         assert hasattr(
             flashrwkv2._C, "tmix_wkv7_recurrent_fp16_from_decay_logits"
@@ -1009,10 +1085,15 @@ def test_packed_fp16_state_family_correctness(
         decay_bias=decay_bias,
     )
     observed_state = initial_state.clone()
+    observed_elapsed = case["elapsed_state_pool"].clone()
+    state = prepare_tmix_wkv7_recurrent_fp16_state(
+        observed_state,
+        observed_elapsed,
+        sequence_capacity=state_indices.numel(),
+    )
     observed_output = infer_tmix_wkv7_recurrent_fp16_forward_varlen(
         *args,
-        state_pool=observed_state,
-        elapsed_state_pool=case["elapsed_state_pool"],
+        state=state,
         cu_seqlens=cu_seqlens,
         state_indices=state_indices,
         decay_bias=decay_bias,
@@ -1088,10 +1169,15 @@ def test_fp16_dispatch_covers_albatross_grid_and_family_boundaries(
         decay_bias=decay_bias,
     )
     observed_state = initial_state.clone()
+    observed_elapsed = elapsed_state.clone()
+    state = prepare_tmix_wkv7_recurrent_fp16_state(
+        observed_state,
+        observed_elapsed,
+        sequence_capacity=state_indices.numel(),
+    )
     observed_output = infer_tmix_wkv7_recurrent_fp16_forward_varlen(
         *args,
-        state_pool=observed_state,
-        elapsed_state_pool=elapsed_state,
+        state=state,
         cu_seqlens=cu_seqlens,
         state_indices=state_indices,
         decay_bias=decay_bias,
@@ -1129,17 +1215,25 @@ def test_fp16_consumes_the_same_metadata_ticket_contract() -> None:
     observed_state = state_pool.clone()
     expected_elapsed = case["elapsed_state_pool"].clone()
     observed_elapsed = case["elapsed_state_pool"].clone()
+    expected_handle = prepare_tmix_wkv7_recurrent_fp16_state(
+        expected_state,
+        expected_elapsed,
+        sequence_capacity=state_indices.numel(),
+    )
+    observed_handle = prepare_tmix_wkv7_recurrent_fp16_state(
+        observed_state,
+        observed_elapsed,
+        sequence_capacity=state_indices.numel(),
+    )
     expected_output = infer_tmix_wkv7_recurrent_fp16_forward_varlen(
         *args,
-        state_pool=expected_state,
-        elapsed_state_pool=expected_elapsed,
+        state=expected_handle,
         cu_seqlens=cu_seqlens,
         state_indices=state_indices,
     )
     observed_output = infer_tmix_wkv7_recurrent_fp16_forward_varlen(
         *args,
-        state_pool=observed_state,
-        elapsed_state_pool=observed_elapsed,
+        state=observed_handle,
         cu_seqlens=cu_seqlens,
         state_indices=state_indices,
         validated_metadata=ticket,
@@ -1150,11 +1244,15 @@ def test_fp16_consumes_the_same_metadata_ticket_contract() -> None:
     assert torch.equal(observed_elapsed, expected_elapsed)
 
     cu_seqlens[1] += 1
+    invalid_handle = prepare_tmix_wkv7_recurrent_fp16_state(
+        state_pool.clone(),
+        case["elapsed_state_pool"].clone(),
+        sequence_capacity=state_indices.numel(),
+    )
     with pytest.raises(RuntimeError, match="version"):
         infer_tmix_wkv7_recurrent_fp16_forward_varlen(
             *args,
-            state_pool=state_pool.clone(),
-            elapsed_state_pool=case["elapsed_state_pool"],
+            state=invalid_handle,
             cu_seqlens=cu_seqlens,
             state_indices=state_indices,
             validated_metadata=ticket,
@@ -1167,19 +1265,21 @@ def test_fp16_public_rejects_non_fp16_state_and_tokens() -> None:
     case = _make_case(dtype=torch.float16, head_size=64, lengths=(2,))
     args = _args(case)
     with pytest.raises(TypeError, match="FP16-state state_pool"):
-        infer_tmix_wkv7_recurrent_fp16_forward_varlen(
-            *args,
-            state_pool=case["state_pool"],
-            elapsed_state_pool=case["elapsed_state_pool"],
-            cu_seqlens=case["cu_seqlens"],
-            state_indices=case["state_indices"],
+        prepare_tmix_wkv7_recurrent_fp16_state(
+            case["state_pool"],
+            case["elapsed_state_pool"],
+            sequence_capacity=case["state_indices"].numel(),
         )
+    state = prepare_tmix_wkv7_recurrent_fp16_state(
+        case["state_pool"].half(),
+        case["elapsed_state_pool"],
+        sequence_capacity=case["state_indices"].numel(),
+    )
     with pytest.raises((TypeError, RuntimeError), match="float16"):
         infer_tmix_wkv7_recurrent_fp16_forward_varlen(
             args[0].bfloat16(),
             *args[1:],
-            state_pool=case["state_pool"].half(),
-            elapsed_state_pool=case["elapsed_state_pool"],
+            state=state,
             cu_seqlens=case["cu_seqlens"],
             state_indices=case["state_indices"],
         )
@@ -1234,9 +1334,10 @@ def test_fp32_group4_selector_boundaries_and_fallbacks(
         decay_bias=decay_bias,
     )
     observed_state = state.clone()
+    observed_handle = _prepare_fp32io16_state(observed_state, state_indices)
     observed_output = infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
         *args,
-        state_pool=observed_state,
+        state=observed_handle,
         cu_seqlens=cu_seqlens,
         state_indices=state_indices,
         decay_bias=decay_bias,
@@ -1305,9 +1406,10 @@ def test_fp32io16_matches_ee3308_recurrent_arithmetic(
     )
     cu_seqlens = torch.tensor([0, seqlen], device="cuda", dtype=torch.int32)
     state_indices = torch.tensor([0], device="cuda", dtype=torch.int32)
+    state_handle = _prepare_fp32io16_state(state, state_indices)
     output = infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
         *packed,
-        state_pool=state,
+        state=state_handle,
         cu_seqlens=cu_seqlens,
         state_indices=state_indices,
         max_seqlen=seqlen,
@@ -1367,10 +1469,14 @@ def test_fp16_kv_native_selector_workloads(
     observed_elapsed = elapsed.clone()
     expected_elapsed = elapsed.clone()
     expected_elapsed[state_indices.long()] += max_seqlen
+    state_handle = prepare_tmix_wkv7_recurrent_fp16_state(
+        observed_state,
+        observed_elapsed,
+        sequence_capacity=state_indices.numel(),
+    )
     observed_output = infer_tmix_wkv7_recurrent_fp16_forward_varlen(
         *args,
-        state_pool=observed_state,
-        elapsed_state_pool=observed_elapsed,
+        state=state_handle,
         cu_seqlens=cu_seqlens,
         state_indices=state_indices,
         decay_bias=decay_bias,
@@ -1450,11 +1556,16 @@ def _make_deltalog_cycle_case(
 
 @pytest.mark.parametrize("merge_interval", (2, 3, 4, 6, 8))
 @pytest.mark.parametrize("with_decay_bias", (False, True))
+@pytest.mark.parametrize("operator", ("fp16", "fp32io16"))
 def test_deltalog_complete_cycles_slot_reorder_and_merge_state(
     merge_interval: int,
     with_decay_bias: bool,
+    operator: str,
 ) -> None:
-    _require_deltalog_extension()
+    if operator == "fp16":
+        _require_deltalog_extension()
+    else:
+        _require_fp32io16_deltalog_extension()
     (
         steps,
         cu_seqlens,
@@ -1466,8 +1577,22 @@ def test_deltalog_complete_cycles_slot_reorder_and_merge_state(
     ) = _make_deltalog_cycle_case(
         merge_interval, with_decay_bias=with_decay_bias
     )
+    if operator == "fp32io16":
+        initial_state = initial_state.float()
+        logs = logs.float()
     normal_state = initial_state.clone()
     normal_elapsed = initial_elapsed.clone()
+    if operator == "fp16":
+        normal_handle = prepare_tmix_wkv7_recurrent_fp16_state(
+            normal_state,
+            normal_elapsed,
+            sequence_capacity=cu_seqlens.numel() - 1,
+        )
+    else:
+        normal_handle = prepare_tmix_wkv7_recurrent_fp32io16_state(
+            normal_state,
+            sequence_capacity=cu_seqlens.numel() - 1,
+        )
     deltalog_state = initial_state.clone()
     deltalog_elapsed = initial_elapsed.clone()
     initial_logs = logs.clone()
@@ -1477,17 +1602,21 @@ def test_deltalog_complete_cycles_slot_reorder_and_merge_state(
     )
     for step_index, packed in enumerate(steps):
         slots = slot_orders[step_index & 1]
-        normal_output = infer_tmix_wkv7_recurrent_fp16_forward_varlen(
+        normal_infer = (
+            infer_tmix_wkv7_recurrent_fp16_forward_varlen
+            if operator == "fp16"
+            else infer_tmix_wkv7_recurrent_fp32io16_forward_varlen
+        )
+        normal_output = normal_infer(
             *packed,
-            state_pool=normal_state,
-            elapsed_state_pool=normal_elapsed,
+            state=normal_handle,
             cu_seqlens=cu_seqlens,
             state_indices=slots,
             decay_bias=decay_bias,
             max_seqlen=1,
         )
-        deltalog_output = (
-            infer_tmix_wkv7_recurrent_deltalog_fp16_forward_varlen(
+        if operator == "fp16":
+            deltalog_output = wkv7_module._run_deltalog_fp16(
                 *packed,
                 state_pool=deltalog_state,
                 elapsed_state_pool=deltalog_elapsed,
@@ -1497,10 +1626,20 @@ def test_deltalog_complete_cycles_slot_reorder_and_merge_state(
                 state_indices=slots,
                 decay_bias=decay_bias,
             )
-        )
+        else:
+            deltalog_output = wkv7_module._run_deltalog_fp32io16(
+                *packed,
+                state_pool=deltalog_state,
+                deltalog_phase_pool=phase,
+                deltalog_pool=logs,
+                cu_seqlens=cu_seqlens,
+                state_indices=slots,
+                decay_bias=decay_bias,
+            )
         torch.cuda.synchronize()
         assert _relative_rmse(deltalog_output, normal_output) <= 4.0e-3
-        assert torch.equal(deltalog_elapsed, normal_elapsed)
+        if operator == "fp16":
+            assert torch.equal(deltalog_elapsed, normal_elapsed)
         expected_phase = (step_index + 1) % merge_interval
         assert torch.equal(
             phase.index_select(0, slots.long()),
@@ -1532,10 +1671,14 @@ def test_deltalog_complete_cycles_slot_reorder_and_merge_state(
 
 @pytest.mark.memcheck
 @pytest.mark.racecheck
-def test_deltalog_append_merge_multiple_staggered_slots() -> None:
+@pytest.mark.parametrize("operator", ("fp16", "fp32io16"))
+def test_deltalog_append_merge_multiple_staggered_slots(operator: str) -> None:
     """Minimal sanitizer case: one launch has append and merge CTAs together."""
 
-    _require_deltalog_extension()
+    if operator == "fp16":
+        _require_deltalog_extension()
+    else:
+        _require_fp32io16_deltalog_extension()
     (
         steps,
         _,
@@ -1545,10 +1688,69 @@ def test_deltalog_append_merge_multiple_staggered_slots() -> None:
         logs,
         decay_bias,
     ) = _make_deltalog_cycle_case(3)
+    if operator == "fp32io16":
+        initial_state = initial_state.float()
+        logs = logs.float()
     normal_state = initial_state.clone()
     normal_elapsed = initial_elapsed.clone()
+    if operator == "fp16":
+        normal_handle = prepare_tmix_wkv7_recurrent_fp16_state(
+            normal_state,
+            normal_elapsed,
+            sequence_capacity=3,
+        )
+    else:
+        normal_handle = prepare_tmix_wkv7_recurrent_fp32io16_state(
+            normal_state,
+            sequence_capacity=3,
+        )
     deltalog_state = initial_state.clone()
     deltalog_elapsed = initial_elapsed.clone()
+
+    def run_normal(
+        packed: tuple[torch.Tensor, ...],
+        cu: torch.Tensor,
+        selected: torch.Tensor,
+    ) -> torch.Tensor:
+        infer = (
+            infer_tmix_wkv7_recurrent_fp16_forward_varlen
+            if operator == "fp16"
+            else infer_tmix_wkv7_recurrent_fp32io16_forward_varlen
+        )
+        return infer(
+            *packed,
+            state=normal_handle,
+            cu_seqlens=cu,
+            state_indices=selected,
+            decay_bias=decay_bias,
+            max_seqlen=1,
+        )
+
+    def run_deltalog(
+        packed: tuple[torch.Tensor, ...],
+        cu: torch.Tensor,
+        selected: torch.Tensor,
+    ) -> torch.Tensor:
+        if operator == "fp16":
+            return wkv7_module._run_deltalog_fp16(
+                *packed,
+                state_pool=deltalog_state,
+                elapsed_state_pool=deltalog_elapsed,
+                deltalog_phase_pool=phase,
+                deltalog_pool=logs,
+                cu_seqlens=cu,
+                state_indices=selected,
+                decay_bias=decay_bias,
+            )
+        return wkv7_module._run_deltalog_fp32io16(
+            *packed,
+            state_pool=deltalog_state,
+            deltalog_phase_pool=phase,
+            deltalog_pool=logs,
+            cu_seqlens=cu,
+            state_indices=selected,
+            decay_bias=decay_bias,
+        )
 
     def run_subset(step: int, slots: tuple[int, ...]) -> None:
         selected = torch.tensor(
@@ -1558,49 +1760,15 @@ def test_deltalog_append_merge_multiple_staggered_slots() -> None:
             len(slots) + 1, device=initial_state.device, dtype=torch.int32
         )
         packed = tuple(tensor[: len(slots)].contiguous() for tensor in steps[step])
-        infer_tmix_wkv7_recurrent_fp16_forward_varlen(
-            *packed,
-            state_pool=normal_state,
-            elapsed_state_pool=normal_elapsed,
-            cu_seqlens=cu,
-            state_indices=selected,
-            decay_bias=decay_bias,
-            max_seqlen=1,
-        )
-        infer_tmix_wkv7_recurrent_deltalog_fp16_forward_varlen(
-            *packed,
-            state_pool=deltalog_state,
-            elapsed_state_pool=deltalog_elapsed,
-            deltalog_phase_pool=phase,
-            deltalog_pool=logs,
-            cu_seqlens=cu,
-            state_indices=selected,
-            decay_bias=decay_bias,
-        )
+        run_normal(packed, cu, selected)
+        run_deltalog(packed, cu, selected)
 
     run_subset(0, (1, 4))
     run_subset(1, (1,))
     slots = torch.tensor([4, 3, 1], device=initial_state.device, dtype=torch.int32)
     cu = torch.arange(4, device=initial_state.device, dtype=torch.int32)
-    normal_output = infer_tmix_wkv7_recurrent_fp16_forward_varlen(
-        *steps[2],
-        state_pool=normal_state,
-        elapsed_state_pool=normal_elapsed,
-        cu_seqlens=cu,
-        state_indices=slots,
-        decay_bias=decay_bias,
-        max_seqlen=1,
-    )
-    deltalog_output = infer_tmix_wkv7_recurrent_deltalog_fp16_forward_varlen(
-        *steps[2],
-        state_pool=deltalog_state,
-        elapsed_state_pool=deltalog_elapsed,
-        deltalog_phase_pool=phase,
-        deltalog_pool=logs,
-        cu_seqlens=cu,
-        state_indices=slots,
-        decay_bias=decay_bias,
-    )
+    normal_output = run_normal(steps[2], cu, slots)
+    deltalog_output = run_deltalog(steps[2], cu, slots)
     torch.cuda.synchronize()
     assert _relative_rmse(deltalog_output, normal_output) <= 4.0e-3
     assert phase[1].item() == 0
@@ -1613,10 +1781,15 @@ def test_deltalog_append_merge_multiple_staggered_slots() -> None:
     "failure",
     ("non_t1", "illegal_phase", "duplicate_slot"),
 )
+@pytest.mark.parametrize("operator", ("fp16", "fp32io16"))
 def test_deltalog_runtime_failures_preserve_entire_state_bundle(
     failure: str,
+    operator: str,
 ) -> None:
-    _require_deltalog_extension()
+    if operator == "fp16":
+        _require_deltalog_extension()
+    else:
+        _require_fp32io16_deltalog_extension()
     (
         steps,
         cu_seqlens,
@@ -1626,6 +1799,9 @@ def test_deltalog_runtime_failures_preserve_entire_state_bundle(
         logs,
         decay_bias,
     ) = _make_deltalog_cycle_case(3)
+    if operator == "fp32io16":
+        initial_state = initial_state.float()
+        logs = logs.float()
     packed = steps[0]
     slots = torch.tensor([4, 1, 3], device=initial_state.device, dtype=torch.int32)
     if failure == "non_t1":
@@ -1640,10 +1816,16 @@ def test_deltalog_runtime_failures_preserve_entire_state_bundle(
 
     state = initial_state.clone()
     elapsed = initial_elapsed.clone()
-    before = tuple(tensor.clone() for tensor in (state, elapsed, phase, logs))
-    if failure == "duplicate_slot":
-        with pytest.raises(RuntimeError, match="unique"):
-            infer_tmix_wkv7_recurrent_deltalog_fp16_forward_varlen(
+    bundle = (
+        (state, elapsed, phase, logs)
+        if operator == "fp16"
+        else (state, phase, logs)
+    )
+    before = tuple(tensor.clone() for tensor in bundle)
+
+    def run() -> torch.Tensor:
+        if operator == "fp16":
+            return wkv7_module._run_deltalog_fp16(
                 *packed,
                 state_pool=state,
                 elapsed_state_pool=elapsed,
@@ -1653,20 +1835,24 @@ def test_deltalog_runtime_failures_preserve_entire_state_bundle(
                 state_indices=slots,
                 decay_bias=decay_bias,
             )
-    else:
-        output = infer_tmix_wkv7_recurrent_deltalog_fp16_forward_varlen(
+        return wkv7_module._run_deltalog_fp32io16(
             *packed,
             state_pool=state,
-            elapsed_state_pool=elapsed,
             deltalog_phase_pool=phase,
             deltalog_pool=logs,
             cu_seqlens=cu_seqlens,
             state_indices=slots,
             decay_bias=decay_bias,
         )
+
+    if failure == "duplicate_slot":
+        with pytest.raises(RuntimeError, match="unique"):
+            run()
+    else:
+        output = run()
         torch.cuda.synchronize()
         assert torch.isnan(output).all()
-    for observed, expected in zip((state, elapsed, phase, logs), before):
+    for observed, expected in zip(bundle, before, strict=True):
         assert torch.equal(observed, expected)
 
 
@@ -1698,7 +1884,7 @@ def test_deltalog_rejects_invalid_bundle_without_state_write(
         logs = logs.cpu()
     before_state = state.clone()
     with pytest.raises((TypeError, ValueError, RuntimeError)):
-        infer_tmix_wkv7_recurrent_deltalog_fp16_forward_varlen(
+        wkv7_module._run_deltalog_fp16(
             *steps[0],
             state_pool=state,
             elapsed_state_pool=elapsed,
@@ -1711,38 +1897,293 @@ def test_deltalog_rejects_invalid_bundle_without_state_write(
     assert torch.equal(state, before_state)
 
 
-def test_deltalog_public_signature_and_native_symbol() -> None:
-    signature = inspect.signature(
-        infer_tmix_wkv7_recurrent_deltalog_fp16_forward_varlen
-    )
-    assert tuple(signature.parameters) == (
-        "r",
-        "decay_logits",
-        "k",
-        "v",
-        "a",
-        "b",
-        "state_pool",
-        "elapsed_state_pool",
-        "deltalog_phase_pool",
-        "deltalog_pool",
-        "cu_seqlens",
-        "state_indices",
-        "scale",
-        "decay_bias",
-        "validated_metadata",
-    )
-    assert "merge_interval" not in signature.parameters
+def test_deltalog_native_launcher_is_private_provider_detail() -> None:
+    assert "_run_deltalog_fp16" not in wkv7_module.__all__
+    assert "_run_deltalog_fp32io16" not in wkv7_module.__all__
     if flashrwkv2._C is not None:
         assert hasattr(
             flashrwkv2._C,
             "tmix_wkv7_recurrent_deltalog_fp16_from_decay_logits",
         )
+        assert hasattr(
+            flashrwkv2._C,
+            "tmix_wkv7_recurrent_deltalog_fp32io16_from_decay_logits",
+        )
+
+
+def test_unified_fp16_exact_policy_and_complete_state_lifecycle() -> None:
+    _require_deltalog_extension()
+    (
+        steps,
+        cu_seqlens,
+        initial_state,
+        initial_elapsed,
+        _,
+        _,
+        decay_bias,
+    ) = _make_deltalog_cycle_case(2, batch_size=8, num_heads=64)
+    slots = torch.arange(8, device=initial_state.device, dtype=torch.int32)
+    ordinary_state = initial_state.clone()
+    ordinary_elapsed = initial_elapsed.clone()
+    selected_state = initial_state.clone()
+    selected_elapsed = initial_elapsed.clone()
+    state = prepare_tmix_wkv7_recurrent_fp16_state(
+        selected_state,
+        selected_elapsed,
+        sequence_capacity=8,
+    )
+    assert state._merge_interval == 2
+    assert state._deltalog_phase_pool is not None
+    assert state._deltalog_pool is not None
+
+    for step, packed in enumerate(steps):
+        ordinary_output = wkv7_module._run_fp16(
+            *packed,
+            state_pool=ordinary_state,
+            elapsed_state_pool=ordinary_elapsed,
+            cu_seqlens=cu_seqlens,
+            state_indices=slots,
+            decay_bias=decay_bias,
+            max_seqlen=1,
+        )
+        selected_output = infer_tmix_wkv7_recurrent_fp16_forward_varlen(
+            *packed,
+            state=state,
+            cu_seqlens=cu_seqlens,
+            state_indices=slots,
+            decay_bias=decay_bias,
+            max_seqlen=1,
+        )
+        torch.cuda.synchronize()
+        assert _relative_rmse(selected_output, ordinary_output) <= 4.0e-3
+        assert torch.equal(selected_elapsed, ordinary_elapsed)
+        if step == 0:
+            snapshot = state.clone()
+            state.zero_()
+            assert all(
+                torch.count_nonzero(tensor).item() == 0
+                for tensor in state._components()
+            )
+            state.copy_(snapshot)
+            assert all(
+                torch.equal(observed, expected)
+                for observed, expected in zip(
+                    state._components(), snapshot._components(), strict=True
+                )
+            )
+
+    assert torch.count_nonzero(state._deltalog_phase_pool).item() == 0
+    assert _relative_rmse(selected_state, ordinary_state) <= 4.0e-3
+
+
+def test_unified_fp32io16_exact_policy_and_complete_state_lifecycle() -> None:
+    _require_fp32io16_deltalog_extension()
+    (
+        steps,
+        cu_seqlens,
+        initial_state,
+        _,
+        _,
+        _,
+        decay_bias,
+    ) = _make_deltalog_cycle_case(2, batch_size=8, num_heads=64)
+    slots = torch.arange(8, device=initial_state.device, dtype=torch.int32)
+    ordinary_state = initial_state.float()
+    selected_state = ordinary_state.clone()
+    state = prepare_tmix_wkv7_recurrent_fp32io16_state(
+        selected_state,
+        sequence_capacity=8,
+    )
+    assert state._merge_interval == 2
+    assert state._deltalog_phase_pool is not None
+    assert state._deltalog_pool is not None
+    assert state._deltalog_pool.dtype == torch.float32
+
+    for step, packed in enumerate(steps):
+        ordinary_output = wkv7_module._run_fp32io16(
+            *packed,
+            state=ordinary_state,
+            cu_seqlens=cu_seqlens,
+            state_indices=slots,
+            decay_bias=decay_bias,
+            max_seqlen=1,
+            validated_metadata=None,
+            scale=1.0,
+        )
+        selected_output = infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
+            *packed,
+            state=state,
+            cu_seqlens=cu_seqlens,
+            state_indices=slots,
+            decay_bias=decay_bias,
+            max_seqlen=1,
+        )
+        torch.cuda.synchronize()
+        assert _relative_rmse(selected_output, ordinary_output) <= 4.0e-3
+        if step == 0:
+            snapshot = state.clone()
+            state.zero_()
+            assert all(
+                torch.count_nonzero(tensor).item() == 0
+                for tensor in state._components()
+            )
+            state.copy_(snapshot)
+            assert all(
+                torch.equal(observed, expected)
+                for observed, expected in zip(
+                    state._components(), snapshot._components(), strict=True
+                )
+            )
+
+    assert torch.count_nonzero(state._deltalog_phase_pool).item() == 0
+    assert _relative_rmse(selected_state, ordinary_state) <= 4.0e-3
+
+
+@pytest.mark.parametrize("operator", ("fp16", "fp32io16"))
+def test_unified_deltalog_policy_falls_back_for_non_t1(operator: str) -> None:
+    if operator == "fp16":
+        _require_deltalog_extension()
+    else:
+        _require_fp32io16_deltalog_extension()
+    case = _make_case(
+        dtype=torch.float16,
+        head_size=64,
+        lengths=(2,) * 8,
+        num_heads=64,
+        state_pool_slots=8,
+        with_decay_bias=True,
+    )
+    packed = _args(case)
+    cu_seqlens = case["cu_seqlens"]
+    state_indices = case["state_indices"]
+    decay_bias = case["decay_bias"]
+    elapsed = case["elapsed_state_pool"]
+    assert isinstance(cu_seqlens, torch.Tensor)
+    assert isinstance(state_indices, torch.Tensor)
+    assert isinstance(decay_bias, torch.Tensor)
+    assert isinstance(elapsed, torch.Tensor)
+    initial_state = case["state_pool"]
+    assert isinstance(initial_state, torch.Tensor)
+    if operator == "fp16":
+        initial_state = initial_state.half()
+    ordinary_state = initial_state.clone()
+    selected_state = initial_state.clone()
+    if operator == "fp16":
+        ordinary_elapsed = elapsed.clone()
+        selected_elapsed = elapsed.clone()
+        state = prepare_tmix_wkv7_recurrent_fp16_state(
+            selected_state,
+            selected_elapsed,
+            sequence_capacity=8,
+        )
+        ordinary_output = wkv7_module._run_fp16(
+            *packed,
+            state_pool=ordinary_state,
+            elapsed_state_pool=ordinary_elapsed,
+            cu_seqlens=cu_seqlens,
+            state_indices=state_indices,
+            decay_bias=decay_bias,
+            max_seqlen=2,
+        )
+        infer = infer_tmix_wkv7_recurrent_fp16_forward_varlen
+    else:
+        state = prepare_tmix_wkv7_recurrent_fp32io16_state(
+            selected_state,
+            sequence_capacity=8,
+        )
+        ordinary_output = wkv7_module._run_fp32io16(
+            *packed,
+            state=ordinary_state,
+            cu_seqlens=cu_seqlens,
+            state_indices=state_indices,
+            scale=1.0,
+            decay_bias=decay_bias,
+            max_seqlen=2,
+            validated_metadata=None,
+        )
+        infer = infer_tmix_wkv7_recurrent_fp32io16_forward_varlen
+    selected_output = infer(
+        *packed,
+        state=state,
+        cu_seqlens=cu_seqlens,
+        state_indices=state_indices,
+        decay_bias=decay_bias,
+        max_seqlen=2,
+    )
+    torch.cuda.synchronize()
+    assert state._merge_interval == 2
+    assert torch.count_nonzero(state._deltalog_phase_pool).item() == 0
+    assert torch.count_nonzero(state._deltalog_pool).item() == 0
+    assert _relative_rmse(selected_output, ordinary_output) <= 4.0e-3
+    assert _relative_rmse(selected_state, ordinary_state) <= 4.0e-3
+
+
+def test_unified_fp32io16_deltalog_policy_falls_back_for_bf16_io() -> None:
+    _require_fp32io16_deltalog_extension()
+    case = _make_case(
+        dtype=torch.bfloat16,
+        head_size=64,
+        lengths=(1,) * 8,
+        num_heads=64,
+        state_pool_slots=8,
+        with_decay_bias=True,
+    )
+    packed = _args(case)
+    state_indices = case["state_indices"]
+    cu_seqlens = case["cu_seqlens"]
+    decay_bias = case["decay_bias"]
+    initial_state = case["state_pool"]
+    assert isinstance(state_indices, torch.Tensor)
+    assert isinstance(cu_seqlens, torch.Tensor)
+    assert isinstance(decay_bias, torch.Tensor)
+    assert isinstance(initial_state, torch.Tensor)
+    ordinary_state = initial_state.clone()
+    selected_state = initial_state.clone()
+    state = prepare_tmix_wkv7_recurrent_fp32io16_state(
+        selected_state,
+        sequence_capacity=8,
+    )
+    ordinary_output = wkv7_module._run_fp32io16(
+        *packed,
+        state=ordinary_state,
+        cu_seqlens=cu_seqlens,
+        state_indices=state_indices,
+        scale=1.0,
+        decay_bias=decay_bias,
+        max_seqlen=1,
+        validated_metadata=None,
+    )
+    selected_output = infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
+        *packed,
+        state=state,
+        cu_seqlens=cu_seqlens,
+        state_indices=state_indices,
+        decay_bias=decay_bias,
+        max_seqlen=1,
+    )
+    torch.cuda.synchronize()
+    assert state._merge_interval == 2
+    assert torch.count_nonzero(state._deltalog_phase_pool).item() == 0
+    assert torch.count_nonzero(state._deltalog_pool).item() == 0
+    assert torch.equal(selected_output, ordinary_output)
+    assert torch.equal(selected_state, ordinary_state)
 
 
 @pytest.mark.cuda_graph
-def test_deltalog_live_metadata_zero_active_warmup_and_graph_replay() -> None:
-    _require_deltalog_extension()
+@pytest.mark.parametrize("operator", ("fp16", "fp32io16"))
+def test_unified_live_metadata_zero_active_warmup_and_graph_replay(
+    operator: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if operator == "fp16":
+        _require_deltalog_extension()
+    else:
+        _require_fp32io16_deltalog_extension()
+    monkeypatch.setattr(
+        wkv7_module,
+        "_select_deltalog_merge_interval",
+        lambda *_: 3,
+    )
     device = torch.device("cuda")
     token_capacity, sequence_capacity, slots, heads = 4, 4, 3, 2
     torch.manual_seed(20260825)
@@ -1750,16 +2191,33 @@ def test_deltalog_live_metadata_zero_active_warmup_and_graph_replay() -> None:
         (torch.randn(token_capacity, heads, 64, device=device) * scale).half()
         for scale in (0.12, 3.0, 0.06, 0.06, 0.06, 0.06)
     )
-    initial_state = (
+    initial_state_fp32 = (
         torch.randn(slots, heads, 64, 64, device=device) * 0.03
-    ).half()
-    state = initial_state.clone()
+    )
+    initial_state = (
+        initial_state_fp32.half() if operator == "fp16" else initial_state_fp32
+    )
+    base_state = initial_state.clone()
     elapsed = torch.arange(slots, device=device, dtype=torch.int32) * 7
     initial_elapsed = elapsed.clone()
-    phase = torch.zeros(slots, device=device, dtype=torch.int32)
-    logs = torch.zeros(
-        2, 5, slots, heads, 64, device=device, dtype=torch.float16
-    )
+    if operator == "fp16":
+        state = prepare_tmix_wkv7_recurrent_fp16_state(
+            base_state,
+            elapsed,
+            sequence_capacity=sequence_capacity,
+        )
+        infer = infer_tmix_wkv7_recurrent_fp16_forward_varlen
+    else:
+        state = prepare_tmix_wkv7_recurrent_fp32io16_state(
+            base_state,
+            sequence_capacity=sequence_capacity,
+        )
+        infer = infer_tmix_wkv7_recurrent_fp32io16_forward_varlen
+    snapshot = state.clone()
+    phase = state._deltalog_phase_pool
+    logs = state._deltalog_pool
+    assert phase is not None
+    assert logs is not None
     cu = torch.tensor([0, -1, -1, -1, -1], device=device, dtype=torch.int32)
     state_indices = torch.full(
         (sequence_capacity,), 99, device=device, dtype=torch.int32
@@ -1776,18 +2234,15 @@ def test_deltalog_live_metadata_zero_active_warmup_and_graph_replay() -> None:
         num_active_tokens=active_tokens,
         num_active_sequences=active_sequences,
     )
-    infer_tmix_wkv7_recurrent_deltalog_fp16_forward_varlen(
+    infer(
         *packed,
-        state_pool=state,
-        elapsed_state_pool=elapsed,
-        deltalog_phase_pool=phase,
-        deltalog_pool=logs,
+        state=state,
         cu_seqlens=cu,
         state_indices=state_indices,
         validated_metadata=ticket,
     )
     torch.cuda.synchronize()
-    assert torch.equal(state, initial_state)
+    assert torch.equal(base_state, initial_state)
     assert torch.equal(elapsed, initial_elapsed)
     assert torch.count_nonzero(phase).item() == 0
     assert torch.count_nonzero(logs).item() == 0
@@ -1810,26 +2265,21 @@ def test_deltalog_live_metadata_zero_active_warmup_and_graph_replay() -> None:
             num_active_tokens=active_tokens,
             num_active_sequences=active_sequences,
         )
-        graph_output = infer_tmix_wkv7_recurrent_deltalog_fp16_forward_varlen(
+        graph_output = infer(
             *packed,
-            state_pool=state,
-            elapsed_state_pool=elapsed,
-            deltalog_phase_pool=phase,
-            deltalog_pool=logs,
+            state=state,
             cu_seqlens=cu,
             state_indices=state_indices,
             validated_metadata=graph_ticket,
         )
 
-    state.copy_(initial_state)
-    elapsed.copy_(initial_elapsed)
-    phase.zero_()
-    logs.zero_()
+    state.copy_(snapshot)
     graph.replay()
     torch.cuda.synchronize()
     assert torch.isfinite(graph_output[:2]).all()
     assert phase.cpu().tolist() == [1, 0, 1]
-    assert elapsed.cpu().tolist() == [1, 7, 15]
+    expected_elapsed = [1, 7, 15] if operator == "fp16" else [0, 7, 14]
+    assert elapsed.cpu().tolist() == expected_elapsed
 
     # Replay with different active count, slot ownership, and an externally
     # restored per-slot phase.  Capacity tails remain invalid dummy entries.
@@ -1843,5 +2293,6 @@ def test_deltalog_live_metadata_zero_active_warmup_and_graph_replay() -> None:
     graph.replay()
     torch.cuda.synchronize()
     assert phase.cpu().tolist() == [1, 0, 1]
-    assert elapsed.cpu().tolist() == [1, 8, 15]
+    expected_elapsed = [1, 8, 15] if operator == "fp16" else [0, 7, 14]
+    assert elapsed.cpu().tolist() == expected_elapsed
     assert torch.isfinite(graph_output[0]).all()
