@@ -18,6 +18,7 @@ from flashrwkv2.tmix.wkv7 import (
     infer_tmix_wkv7_recurrent_fp32io16_forward_varlen,
     prepare_tmix_wkv7_recurrent_fp16_state,
     prepare_tmix_wkv7_recurrent_fp32io16_state,
+    prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor,
     prepare_tmix_wkv7_recurrent_metadata,
 )
 
@@ -330,10 +331,7 @@ def test_fp32_wkv_zero_active_precapture_warmup_then_graph_replay() -> None:
     num_active_sequences = torch.zeros(1, device=device, dtype=torch.int32)
     metadata_addresses = (cu_seqlens.data_ptr(), state_indices.data_ptr())
     stream = torch.cuda.Stream(device=device)
-    state_handle = _bind_fp32io16_state(
-        state,
-        sequence_capacity=sequence_capacity,
-    )
+    state_handle = prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor(state)
 
     # vLLM V2 warms the exact capture shape before torch.cuda.graph().  The
     # padded sequence capacity can exceed the physical state-pool capacity;
@@ -374,9 +372,8 @@ def test_fp32_wkv_zero_active_precapture_warmup_then_graph_replay() -> None:
     num_active_sequences.fill_(2)
 
     expected_state = initial_state.clone()
-    expected_state_handle = _bind_fp32io16_state(
-        expected_state,
-        sequence_capacity=sequence_capacity,
+    expected_state_handle = (
+        prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor(expected_state)
     )
     expected_ticket = prepare_tmix_wkv7_recurrent_metadata(
         cu_seqlens,
@@ -551,13 +548,10 @@ def test_public_signature_is_raw_only_and_old_symbols_are_absent() -> None:
             cu_seqlens=None,
             log_decay=None,
         )
-    prepare_signature = inspect.signature(
-        prepare_tmix_wkv7_recurrent_fp32io16_state
+    caller_backed_signature = inspect.signature(
+        prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor
     )
-    assert tuple(prepare_signature.parameters) == (
-        "state_pool",
-        "sequence_capacity",
-    )
+    assert tuple(caller_backed_signature.parameters) == ("state",)
     if flashrwkv2._C is not None:
         assert hasattr(
             flashrwkv2._C, "tmix_wkv7_recurrent_fp32_from_decay_logits"
@@ -681,6 +675,14 @@ def test_public_rejects_structural_arguments_without_launching() -> None:
             sequence_capacity=case["state_indices"].numel(),
             device="cpu",
         )
+    with pytest.raises(TypeError, match="dtype float32"):
+        prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor(
+            state_pool.half()
+        )
+    with pytest.raises(ValueError, match="contiguous CUDA"):
+        prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor(
+            state_pool.transpose(-1, -2)
+        )
     unsupported = _make_case(dtype=torch.float16, head_size=32, lengths=(4,))
     with pytest.raises(RuntimeError, match="64, 128, or 256"):
         infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
@@ -762,7 +764,9 @@ def test_packed_public_rejects_invalid_metadata_and_preserves_state(
         bad_slots[0] = state_pool.shape[0]
 
     before = state_pool.clone()
-    state_handle = _prepare_fp32io16_state(state_pool, state_indices)
+    state_handle = prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor(
+        state_pool
+    )
     with pytest.raises((TypeError, ValueError, RuntimeError)):
         infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
             *args,
@@ -783,7 +787,9 @@ def test_public_rejects_devices_bias_scale_and_state_indices_contracts() -> None
     assert isinstance(state_pool, torch.Tensor)
     assert isinstance(cu_seqlens, torch.Tensor)
     assert isinstance(state_indices, torch.Tensor)
-    state_handle = _prepare_fp32io16_state(state_pool, state_indices)
+    state_handle = prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor(
+        state_pool
+    )
 
     with pytest.raises((ValueError, RuntimeError), match="CUDA"):
         infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
@@ -1011,7 +1017,14 @@ def test_packed_fp32_state_precision_and_state_safety(
     )
 
     before = state_pool.clone()
-    state_handle = _prepare_fp32io16_state(state_pool, state_indices)
+    state_handle = prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor(
+        state_pool
+    )
+    assert state_handle._state_pool is state_pool
+    assert state_handle._sequence_capacity is None
+    assert state_handle._merge_interval == 0
+    assert state_handle._deltalog_phase_pool is None
+    assert state_handle._deltalog_pool is None
     observed_output = infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
         *args,
         state=state_handle,
@@ -1044,7 +1057,9 @@ def test_packed_fp32_state_precision_and_state_safety(
     assert not torch.equal(observed_active, before.index_select(0, active))
 
     second_state = before.clone()
-    second_handle = _prepare_fp32io16_state(second_state, state_indices)
+    second_handle = prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor(
+        second_state
+    )
     second_output = infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
         *args,
         state=second_handle,
