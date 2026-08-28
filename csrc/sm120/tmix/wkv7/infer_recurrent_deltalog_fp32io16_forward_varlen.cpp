@@ -2,23 +2,20 @@
 // SPDX-FileCopyrightText: Copyright contributors to the FlashRWKV2 project
 //
 // The DeltaLog algorithm is adapted from Albatross faster3a_2607 at revision
-// 3e41bc43ed5e8332927ddd7e0ce4816cf200a6ea.  The binding below owns the
-// FlashRWKV2 packed-varlen, slot-bundle, and fail-closed contracts.
+// 3e41bc43ed5e8332927ddd7e0ce4816cf200a6ea.  This binding owns the
+// FlashRWKV2 FP32-state packed-varlen and fail-closed contracts.
 
 #include "../../../validation.h"
 
-#include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 
 #include <cmath>
-#include <cstdint>
 #include <optional>
 #include <utility>
 
-void tmix_wkv7_recurrent_deltalog_fp16_from_decay_logits_cuda(
+void tmix_wkv7_recurrent_deltalog_fp32io16_from_decay_logits_cuda(
     torch::Tensor query_start_loc,
     torch::Tensor state_indices,
-    torch::Tensor elapsed_pool,
     torch::Tensor phase_pool,
     torch::Tensor state_pool,
     torch::Tensor deltalog_pool,
@@ -34,7 +31,7 @@ void tmix_wkv7_recurrent_deltalog_fp16_from_decay_logits_cuda(
     torch::Tensor deltalog_status,
     double scale);
 
-void tmix_wkv7_recurrent_deltalog_fp16_materialize_slots_cuda(
+void tmix_wkv7_recurrent_deltalog_fp32io16_materialize_slots_cuda(
     torch::Tensor state_indices,
     torch::Tensor phase_pool,
     torch::Tensor state_pool,
@@ -51,7 +48,6 @@ namespace {
 void check_deltalog_layout(
     const torch::Tensor& query_start_loc,
     const torch::Tensor& state_indices,
-    const torch::Tensor& elapsed_pool,
     const torch::Tensor& phase_pool,
     const torch::Tensor& state_pool,
     const torch::Tensor& deltalog_pool,
@@ -67,7 +63,6 @@ void check_deltalog_layout(
            std::pair<const torch::Tensor*, const char*>{
                &query_start_loc, "query_start_loc"},
            {&state_indices, "state_indices"},
-           {&elapsed_pool, "elapsed_state_pool"},
            {&phase_pool, "deltalog_phase_pool"},
            {&state_pool, "state_pool"},
            {&deltalog_pool, "deltalog_pool"},
@@ -85,9 +80,8 @@ void check_deltalog_layout(
   TORCH_CHECK(
       query_start_loc.scalar_type() == torch::kInt32 &&
           state_indices.scalar_type() == torch::kInt32 &&
-          elapsed_pool.scalar_type() == torch::kInt32 &&
           phase_pool.scalar_type() == torch::kInt32,
-      "DeltaLog metadata, elapsed, and phase tensors must be int32");
+      "DeltaLog metadata and phase tensors must be int32");
   TORCH_CHECK(
       state_indices.dim() == 1 && state_indices.numel() > 0 &&
           query_start_loc.dim() == 1 &&
@@ -95,14 +89,10 @@ void check_deltalog_layout(
       "query_start_loc must have shape [sequence_capacity+1] and "
       "state_indices shape [sequence_capacity]");
   TORCH_CHECK(
-      state_pool.dim() == 4 && state_pool.scalar_type() == torch::kFloat16 &&
+      state_pool.dim() == 4 && state_pool.scalar_type() == torch::kFloat32 &&
           state_pool.size(0) > 0 && state_pool.size(1) > 0 &&
           state_pool.size(2) == 64 && state_pool.size(3) == 64,
-      "state_pool must be contiguous float16 [state_pool_slots,H,64,64]");
-  TORCH_CHECK(
-      elapsed_pool.dim() == 1 &&
-          elapsed_pool.size(0) == state_pool.size(0),
-      "elapsed_state_pool must have shape [state_pool_slots]");
+      "state_pool must be contiguous float32 [state_pool_slots,H,64,64]");
   TORCH_CHECK(
       phase_pool.dim() == 1 && phase_pool.size(0) == state_pool.size(0),
       "deltalog_phase_pool must have shape [state_pool_slots]");
@@ -115,8 +105,8 @@ void check_deltalog_layout(
           deltalog_pool.size(2) == state_pool.size(0) &&
           deltalog_pool.size(3) == state_pool.size(1) &&
           deltalog_pool.size(4) == 64 &&
-          deltalog_pool.scalar_type() == torch::kFloat16,
-      "deltalog_pool must be contiguous float16 "
+          deltalog_pool.scalar_type() == torch::kFloat32,
+      "deltalog_pool must be contiguous float32 "
       "[M-1,5,state_pool_slots,H,64] with M in {2,3,4,6,8}");
   TORCH_CHECK(
       r.dim() == 3 && r.size(0) > 0 &&
@@ -135,8 +125,27 @@ void check_deltalog_layout(
           a.scalar_type() == torch::kFloat16 &&
           b.scalar_type() == torch::kFloat16 &&
           output.scalar_type() == torch::kFloat16,
-      "DeltaLog token tensors must be float16");
+      "FP32IO16 DeltaLog token tensors must be float16");
   TORCH_CHECK(std::isfinite(scale), "scale must be finite");
+}
+
+torch::Tensor resolve_status_workspace(
+    const torch::Tensor& state_pool,
+    const torch::Tensor& state_indices,
+    std::optional<torch::Tensor> workspace) {
+  auto status = workspace.value_or(torch::Tensor());
+  if (status.defined()) {
+    check_cuda_contiguous(status, "deltalog_status_workspace");
+    check_same_device(state_pool, status, "deltalog_status_workspace");
+    TORCH_CHECK(
+        status.scalar_type() == torch::kInt32 && status.dim() == 1 &&
+            status.numel() == 1 + 2 * state_indices.numel(),
+        "deltalog_status_workspace must be int32 [1+2*sequence_capacity]");
+    return status;
+  }
+  return torch::empty(
+      {1 + 2 * state_indices.numel()},
+      state_pool.options().dtype(torch::kInt32));
 }
 
 void check_materialize_layout(
@@ -162,10 +171,10 @@ void check_materialize_layout(
           state_indices.dim() == 1 && state_indices.numel() > 0,
       "state_indices must be non-empty contiguous CUDA int32 [N]");
   TORCH_CHECK(
-      state_pool.dim() == 4 && state_pool.scalar_type() == torch::kFloat16 &&
+      state_pool.dim() == 4 && state_pool.scalar_type() == torch::kFloat32 &&
           state_pool.size(0) > 0 && state_pool.size(1) > 0 &&
           state_pool.size(2) == 64 && state_pool.size(3) == 64,
-      "state_pool must be contiguous float16 [state_pool_slots,H,64,64]");
+      "state_pool must be contiguous float32 [state_pool_slots,H,64,64]");
   TORCH_CHECK(
       phase_pool.scalar_type() == torch::kInt32 && phase_pool.dim() == 1 &&
           phase_pool.size(0) == state_pool.size(0),
@@ -179,8 +188,8 @@ void check_materialize_layout(
           deltalog_pool.size(2) == state_pool.size(0) &&
           deltalog_pool.size(3) == state_pool.size(1) &&
           deltalog_pool.size(4) == 64 &&
-          deltalog_pool.scalar_type() == torch::kFloat16,
-      "deltalog_pool must be contiguous float16 "
+          deltalog_pool.scalar_type() == torch::kFloat32,
+      "deltalog_pool must be contiguous float32 "
       "[M-1,5,state_pool_slots,H,64] with M in {2,3,4,6,8}");
   TORCH_CHECK(
       deltalog_status.scalar_type() == torch::kInt32 &&
@@ -198,10 +207,9 @@ void check_materialize_layout(
 
 }  // namespace
 
-void tmix_wkv7_recurrent_deltalog_fp16_from_decay_logits(
+void tmix_wkv7_recurrent_deltalog_fp32io16_from_decay_logits(
     torch::Tensor query_start_loc,
     torch::Tensor state_indices,
-    torch::Tensor elapsed_pool,
     torch::Tensor phase_pool,
     torch::Tensor state_pool,
     torch::Tensor deltalog_pool,
@@ -217,8 +225,8 @@ void tmix_wkv7_recurrent_deltalog_fp16_from_decay_logits(
     py::object validated_metadata,
     std::optional<torch::Tensor> deltalog_status_workspace) {
   check_deltalog_layout(
-      query_start_loc, state_indices, elapsed_pool, phase_pool, state_pool,
-      deltalog_pool, r, decay_logits, k, v, a, b, output, scale);
+      query_start_loc, state_indices, phase_pool, state_pool, deltalog_pool, r,
+      decay_logits, k, v, a, b, output, scale);
   if (decay_bias.has_value()) {
     check_cuda_contiguous(*decay_bias, "decay_bias");
     check_same_device(state_pool, *decay_bias, "decay_bias");
@@ -253,32 +261,15 @@ void tmix_wkv7_recurrent_deltalog_fp16_from_decay_logits(
     launch_state_indices = std::move(prepared.state_indices);
     metadata_status = std::move(prepared.status);
   }
-  // Element zero backs the regular fail-closed precheck.  The remaining pairs
-  // are the immutable phase/elapsed snapshot for each sequence-capacity entry,
-  // which lets head zero advance the slot without a third CUDA launch.
-  auto deltalog_status = deltalog_status_workspace.value_or(torch::Tensor());
-  if (deltalog_status.defined()) {
-    check_cuda_contiguous(deltalog_status, "deltalog_status_workspace");
-    check_same_device(
-        state_pool, deltalog_status, "deltalog_status_workspace");
-    TORCH_CHECK(
-        deltalog_status.scalar_type() == torch::kInt32 &&
-            deltalog_status.dim() == 1 &&
-            deltalog_status.numel() == 1 + 2 * state_indices.numel(),
-        "deltalog_status_workspace must be int32 [1+2*sequence_capacity]");
-  } else {
-    deltalog_status = torch::empty(
-        {1 + 2 * state_indices.numel()},
-        state_pool.options().dtype(torch::kInt32));
-  }
-  tmix_wkv7_recurrent_deltalog_fp16_from_decay_logits_cuda(
-      launch_query_start_loc, launch_state_indices, elapsed_pool, phase_pool,
-      state_pool, deltalog_pool, r, decay_logits,
-      decay_bias.value_or(torch::Tensor()), k, v, a, b, output,
-      metadata_status, deltalog_status, scale);
+  auto deltalog_status = resolve_status_workspace(
+      state_pool, state_indices, deltalog_status_workspace);
+  tmix_wkv7_recurrent_deltalog_fp32io16_from_decay_logits_cuda(
+      launch_query_start_loc, launch_state_indices, phase_pool, state_pool,
+      deltalog_pool, r, decay_logits, decay_bias.value_or(torch::Tensor()), k,
+      v, a, b, output, metadata_status, deltalog_status, scale);
 }
 
-void tmix_wkv7_recurrent_deltalog_fp16_materialize_slots(
+void tmix_wkv7_recurrent_deltalog_fp32io16_materialize_slots(
     torch::Tensor state_indices,
     torch::Tensor phase_pool,
     torch::Tensor state_pool,
@@ -288,29 +279,29 @@ void tmix_wkv7_recurrent_deltalog_fp16_materialize_slots(
   check_materialize_layout(
       state_indices, phase_pool, state_pool, deltalog_pool, deltalog_status,
       metadata_status);
-  tmix_wkv7_recurrent_deltalog_fp16_materialize_slots_cuda(
+  tmix_wkv7_recurrent_deltalog_fp32io16_materialize_slots_cuda(
       state_indices, phase_pool, state_pool, deltalog_pool, deltalog_status,
       metadata_status.value_or(torch::Tensor()));
 }
 
-void register_infer_tmix_wkv7_recurrent_deltalog_fp16_bindings(
+void register_infer_tmix_wkv7_recurrent_deltalog_fp32io16_bindings(
     py::module_& module) {
   module.def(
-      "tmix_wkv7_recurrent_deltalog_fp16_from_decay_logits",
-      &tmix_wkv7_recurrent_deltalog_fp16_from_decay_logits,
-      "Slot-native packed DeltaLog recurrent forward with FP16 state",
+      "tmix_wkv7_recurrent_deltalog_fp32io16_from_decay_logits",
+      &tmix_wkv7_recurrent_deltalog_fp32io16_from_decay_logits,
+      "Slot-native packed DeltaLog recurrent forward with FP32 state",
       py::arg("query_start_loc"), py::arg("state_indices"),
-      py::arg("elapsed_state_pool"), py::arg("deltalog_phase_pool"),
-      py::arg("state_pool"), py::arg("deltalog_pool"), py::arg("r"),
-      py::arg("decay_logits"), py::arg("k"), py::arg("v"), py::arg("a"),
-      py::arg("b"), py::arg("output"), py::arg("scale"),
+      py::arg("deltalog_phase_pool"), py::arg("state_pool"),
+      py::arg("deltalog_pool"), py::arg("r"), py::arg("decay_logits"),
+      py::arg("k"), py::arg("v"), py::arg("a"), py::arg("b"),
+      py::arg("output"), py::arg("scale"),
       py::arg("decay_bias") = py::none(),
       py::arg("validated_metadata") = py::none(),
       py::arg("deltalog_status_workspace") = py::none());
   module.def(
-      "tmix_wkv7_recurrent_deltalog_fp16_materialize_slots",
-      &tmix_wkv7_recurrent_deltalog_fp16_materialize_slots,
-      "Materialize selected private FP16 DeltaLog slots",
+      "tmix_wkv7_recurrent_deltalog_fp32io16_materialize_slots",
+      &tmix_wkv7_recurrent_deltalog_fp32io16_materialize_slots,
+      "Materialize selected private FP32IO16 DeltaLog slots",
       py::arg("state_indices"), py::arg("deltalog_phase_pool"),
       py::arg("state_pool"), py::arg("deltalog_pool"),
       py::arg("deltalog_status_workspace"),

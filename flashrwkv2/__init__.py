@@ -82,9 +82,10 @@ from .tmix.tokenshift import (
 from .tmix.vres_gate import pretrain_tmix_vres_gate_bf16
 from .tmix.wkv7 import (
     infer_tmix_wkv7_chunk_bf16_forward_varlen,
-    infer_tmix_wkv7_recurrent_deltalog_fp16_forward_varlen,
     infer_tmix_wkv7_recurrent_fp16_forward_varlen,
     infer_tmix_wkv7_recurrent_fp32io16_forward_varlen,
+    prepare_tmix_wkv7_recurrent_fp16_state,
+    prepare_tmix_wkv7_recurrent_fp32io16_state,
     prepare_tmix_wkv7_recurrent_metadata,
     pretrain_tmix_wkv7_recurrent_bf16,
     rl_infctx_tmix_wkv7_chunk_fp32io16,
@@ -104,10 +105,11 @@ __all__ = [
     "infer_tmix_postnorm_tokenshift_forward_varlen",
     "infer_tmix_readout_forward_varlen",
     "infer_tmix_wkv7_chunk_bf16_forward_varlen",
-    "infer_tmix_wkv7_recurrent_deltalog_fp16_forward_varlen",
     "infer_tmix_wkv7_recurrent_fp16_forward_varlen",
     "infer_tmix_wkv7_recurrent_fp32io16_forward_varlen",
     "infer_tmix_wkv_prepare_forward_varlen",
+    "prepare_tmix_wkv7_recurrent_fp16_state",
+    "prepare_tmix_wkv7_recurrent_fp32io16_state",
     "prepare_tmix_wkv7_recurrent_metadata",
     "pretrain_cmix_bf16",
     "pretrain_head_l2wrap_ce_bf16",
@@ -126,4 +128,4 @@ __all__ = [
     "statetune_tmix_wkv7_recurrent_fp32io16",
 ]
 
-__version__ = "0.1.0a9"
+__version__ = "0.1.0a10"
