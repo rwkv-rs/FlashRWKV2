@@ -14,7 +14,6 @@ from utils import require_cuda_backend
 import flashrwkv2
 import flashrwkv2.tmix.wkv7 as wkv7_module
 from flashrwkv2.tmix.wkv7 import (
-    get_tmix_wkv7_recurrent_state_memory_layout,
     infer_tmix_wkv7_recurrent_fp16_forward_varlen,
     infer_tmix_wkv7_recurrent_fp32io16_forward_varlen,
     prepare_tmix_wkv7_recurrent_fp16_state,
@@ -190,10 +189,46 @@ def _prepare_fp32io16_state(
         if isinstance(state_indices, torch.Tensor)
         else len(state_indices)
     )
-    return prepare_tmix_wkv7_recurrent_fp32io16_state(
+    return _bind_fp32io16_state(
         state_pool,
         sequence_capacity=sequence_capacity,
     )
+
+
+def _bind_fp16_state(
+    state_pool: torch.Tensor,
+    elapsed_state_pool: torch.Tensor,
+    *,
+    sequence_capacity: int,
+) -> object:
+    prepare = wkv7_module.prepare_tmix_wkv7_recurrent_fp16_state
+    state = prepare(
+        state_pool.shape[0],
+        state_pool.shape[1] * state_pool.shape[2],
+        sequence_capacity=sequence_capacity,
+        head_size=state_pool.shape[2],
+        device=state_pool.device,
+    )
+    state._state_pool = state_pool
+    state._elapsed_state_pool = elapsed_state_pool
+    return state
+
+
+def _bind_fp32io16_state(
+    state_pool: torch.Tensor,
+    *,
+    sequence_capacity: int,
+) -> object:
+    prepare = wkv7_module.prepare_tmix_wkv7_recurrent_fp32io16_state
+    state = prepare(
+        state_pool.shape[0],
+        state_pool.shape[1] * state_pool.shape[2],
+        sequence_capacity=sequence_capacity,
+        head_size=state_pool.shape[2],
+        device=state_pool.device,
+    )
+    state._state_pool = state_pool
+    return state
 
 
 def _relative_rmse(actual: torch.Tensor, expected: torch.Tensor) -> float:
@@ -295,7 +330,7 @@ def test_fp32_wkv_zero_active_precapture_warmup_then_graph_replay() -> None:
     num_active_sequences = torch.zeros(1, device=device, dtype=torch.int32)
     metadata_addresses = (cu_seqlens.data_ptr(), state_indices.data_ptr())
     stream = torch.cuda.Stream(device=device)
-    state_handle = prepare_tmix_wkv7_recurrent_fp32io16_state(
+    state_handle = _bind_fp32io16_state(
         state,
         sequence_capacity=sequence_capacity,
     )
@@ -339,7 +374,7 @@ def test_fp32_wkv_zero_active_precapture_warmup_then_graph_replay() -> None:
     num_active_sequences.fill_(2)
 
     expected_state = initial_state.clone()
-    expected_state_handle = prepare_tmix_wkv7_recurrent_fp32io16_state(
+    expected_state_handle = _bind_fp32io16_state(
         expected_state,
         sequence_capacity=sequence_capacity,
     )
@@ -625,20 +660,26 @@ def test_public_rejects_structural_arguments_without_launching() -> None:
             state_indices=case["state_indices"],
         )
 
-    with pytest.raises(TypeError, match="float32"):
+    with pytest.raises(ValueError, match="state_pool_size"):
         prepare_tmix_wkv7_recurrent_fp32io16_state(
-            state_pool.to(torch.float16),
+            0,
+            128,
             sequence_capacity=case["state_indices"].numel(),
+            device=state_pool.device,
         )
-    with pytest.raises(ValueError, match="shape"):
+    with pytest.raises(ValueError, match="divisible"):
         prepare_tmix_wkv7_recurrent_fp32io16_state(
-            state_pool[:, :, :, :-1].contiguous(),
+            state_pool.shape[0],
+            129,
             sequence_capacity=case["state_indices"].numel(),
+            device=state_pool.device,
         )
-    with pytest.raises(ValueError, match="shape"):
+    with pytest.raises(ValueError, match="CUDA"):
         prepare_tmix_wkv7_recurrent_fp32io16_state(
-            state_pool.reshape(-1),
+            state_pool.shape[0],
+            128,
             sequence_capacity=case["state_indices"].numel(),
+            device="cpu",
         )
     unsupported = _make_case(dtype=torch.float16, head_size=32, lengths=(4,))
     with pytest.raises(RuntimeError, match="64, 128, or 256"):
@@ -1031,26 +1072,27 @@ def test_public_signatures_use_only_prepared_state_handles() -> None:
         assert "deltalog_pool" not in signature.parameters
     prepare_signature = inspect.signature(prepare_tmix_wkv7_recurrent_fp16_state)
     assert tuple(prepare_signature.parameters) == (
-        "state_pool",
-        "elapsed_state_pool",
+        "state_pool_size",
+        "channels",
         "sequence_capacity",
+        "head_size",
+        "device",
     )
     fp32_prepare_signature = inspect.signature(
         prepare_tmix_wkv7_recurrent_fp32io16_state
     )
     assert tuple(fp32_prepare_signature.parameters) == (
-        "state_pool",
-        "sequence_capacity",
-    )
-    memory_signature = inspect.signature(
-        get_tmix_wkv7_recurrent_state_memory_layout
-    )
-    assert tuple(memory_signature.parameters) == (
+        "state_pool_size",
         "channels",
-        "state_dtype",
         "sequence_capacity",
         "head_size",
         "device",
+    )
+    assert not hasattr(
+        wkv7_module, "get_tmix_wkv7_recurrent_state_memory_layout"
+    )
+    assert not hasattr(
+        flashrwkv2, "get_tmix_wkv7_recurrent_state_memory_layout"
     )
     assert not hasattr(
         wkv7_module,
@@ -1064,6 +1106,48 @@ def test_public_signatures_use_only_prepared_state_handles() -> None:
         assert hasattr(
             flashrwkv2._C, "tmix_wkv7_recurrent_fp16_from_decay_logits"
         )
+
+
+@pytest.mark.parametrize(
+    ("prepare", "state_dtype", "has_elapsed"),
+    (
+        (prepare_tmix_wkv7_recurrent_fp16_state, torch.float16, True),
+        (prepare_tmix_wkv7_recurrent_fp32io16_state, torch.float32, False),
+    ),
+)
+def test_public_state_preparation_owns_complete_zeroed_allocation(
+    prepare,
+    state_dtype: torch.dtype,
+    has_elapsed: bool,
+) -> None:
+    _require_cuda_extension()
+    state = prepare(
+        9,
+        4096,
+        sequence_capacity=8,
+        head_size=64,
+        device="cuda",
+    )
+    assert state._state_pool.shape == (9, 64, 64, 64)
+    assert state._state_pool.dtype == state_dtype
+    assert torch.count_nonzero(state._state_pool).item() == 0
+    assert (state._elapsed_state_pool is not None) is has_elapsed
+    if state._elapsed_state_pool is not None:
+        assert state._elapsed_state_pool.shape == (9,)
+        assert state._elapsed_state_pool.dtype == torch.int32
+        assert torch.count_nonzero(state._elapsed_state_pool).item() == 0
+    layout = state.memory_layout
+    element_size = state._state_pool.element_size()
+    assert layout["base_bytes_per_slot"] == (
+        64 * 64 * 64 * element_size + (4 if has_elapsed else 0)
+    )
+    assert layout["private_bytes_per_slot"] == (
+        4 + 5 * 64 * 64 * element_size
+    )
+    assert layout["fixed_workspace_nbytes"] == (1 + 2 * 8) * 4
+    assert layout["total_nbytes"] == (
+        9 * layout["bytes_per_slot"] + layout["fixed_workspace_nbytes"]
+    )
 
 
 @pytest.mark.parametrize("head_size", (64, 128, 256))
@@ -1097,7 +1181,7 @@ def test_packed_fp16_state_family_correctness(
     )
     observed_state = initial_state.clone()
     observed_elapsed = case["elapsed_state_pool"].clone()
-    state = prepare_tmix_wkv7_recurrent_fp16_state(
+    state = _bind_fp16_state(
         observed_state,
         observed_elapsed,
         sequence_capacity=state_indices.numel(),
@@ -1181,7 +1265,7 @@ def test_fp16_dispatch_covers_albatross_grid_and_family_boundaries(
     )
     observed_state = initial_state.clone()
     observed_elapsed = elapsed_state.clone()
-    state = prepare_tmix_wkv7_recurrent_fp16_state(
+    state = _bind_fp16_state(
         observed_state,
         observed_elapsed,
         sequence_capacity=state_indices.numel(),
@@ -1226,12 +1310,12 @@ def test_fp16_consumes_the_same_metadata_ticket_contract() -> None:
     observed_state = state_pool.clone()
     expected_elapsed = case["elapsed_state_pool"].clone()
     observed_elapsed = case["elapsed_state_pool"].clone()
-    expected_handle = prepare_tmix_wkv7_recurrent_fp16_state(
+    expected_handle = _bind_fp16_state(
         expected_state,
         expected_elapsed,
         sequence_capacity=state_indices.numel(),
     )
-    observed_handle = prepare_tmix_wkv7_recurrent_fp16_state(
+    observed_handle = _bind_fp16_state(
         observed_state,
         observed_elapsed,
         sequence_capacity=state_indices.numel(),
@@ -1255,7 +1339,7 @@ def test_fp16_consumes_the_same_metadata_ticket_contract() -> None:
     assert torch.equal(observed_elapsed, expected_elapsed)
 
     cu_seqlens[1] += 1
-    invalid_handle = prepare_tmix_wkv7_recurrent_fp16_state(
+    invalid_handle = _bind_fp16_state(
         state_pool.clone(),
         case["elapsed_state_pool"].clone(),
         sequence_capacity=state_indices.numel(),
@@ -1276,12 +1360,12 @@ def test_fp16_public_rejects_non_fp16_state_and_tokens() -> None:
     case = _make_case(dtype=torch.float16, head_size=64, lengths=(2,))
     args = _args(case)
     with pytest.raises(TypeError, match="FP16-state state_pool"):
-        prepare_tmix_wkv7_recurrent_fp16_state(
+        _bind_fp16_state(
             case["state_pool"],
             case["elapsed_state_pool"],
             sequence_capacity=case["state_indices"].numel(),
         )
-    state = prepare_tmix_wkv7_recurrent_fp16_state(
+    state = _bind_fp16_state(
         case["state_pool"].half(),
         case["elapsed_state_pool"],
         sequence_capacity=case["state_indices"].numel(),
@@ -1480,7 +1564,7 @@ def test_fp16_kv_native_selector_workloads(
     observed_elapsed = elapsed.clone()
     expected_elapsed = elapsed.clone()
     expected_elapsed[state_indices.long()] += max_seqlen
-    state_handle = prepare_tmix_wkv7_recurrent_fp16_state(
+    state_handle = _bind_fp16_state(
         observed_state,
         observed_elapsed,
         sequence_capacity=state_indices.numel(),
@@ -1594,13 +1678,13 @@ def test_deltalog_complete_cycles_slot_reorder_and_merge_state(
     normal_state = initial_state.clone()
     normal_elapsed = initial_elapsed.clone()
     if operator == "fp16":
-        normal_handle = prepare_tmix_wkv7_recurrent_fp16_state(
+        normal_handle = _bind_fp16_state(
             normal_state,
             normal_elapsed,
             sequence_capacity=cu_seqlens.numel() - 1,
         )
     else:
-        normal_handle = prepare_tmix_wkv7_recurrent_fp32io16_state(
+        normal_handle = _bind_fp32io16_state(
             normal_state,
             sequence_capacity=cu_seqlens.numel() - 1,
         )
@@ -1705,13 +1789,13 @@ def test_deltalog_append_merge_multiple_staggered_slots(operator: str) -> None:
     normal_state = initial_state.clone()
     normal_elapsed = initial_elapsed.clone()
     if operator == "fp16":
-        normal_handle = prepare_tmix_wkv7_recurrent_fp16_state(
+        normal_handle = _bind_fp16_state(
             normal_state,
             normal_elapsed,
             sequence_capacity=3,
         )
     else:
-        normal_handle = prepare_tmix_wkv7_recurrent_fp32io16_state(
+        normal_handle = _bind_fp32io16_state(
             normal_state,
             sequence_capacity=3,
         )
@@ -1965,7 +2049,7 @@ def test_unified_fp16_exact_policy_and_complete_state_lifecycle() -> None:
     ordinary_elapsed = initial_elapsed.clone()
     selected_state = initial_state.clone()
     selected_elapsed = initial_elapsed.clone()
-    state = prepare_tmix_wkv7_recurrent_fp16_state(
+    state = _bind_fp16_state(
         selected_state,
         selected_elapsed,
         sequence_capacity=8,
@@ -2028,7 +2112,7 @@ def test_unified_fp32io16_exact_policy_and_complete_state_lifecycle() -> None:
     slots = torch.arange(8, device=initial_state.device, dtype=torch.int32)
     ordinary_state = initial_state.float()
     selected_state = ordinary_state.clone()
-    state = prepare_tmix_wkv7_recurrent_fp32io16_state(
+    state = _bind_fp32io16_state(
         selected_state,
         sequence_capacity=8,
     )
@@ -2102,7 +2186,7 @@ def test_unified_state_slot_checkpoint_cow_reset_and_memory(
     )
     if operator == "fp16":
         elapsed = initial_elapsed.clone()
-        state = prepare_tmix_wkv7_recurrent_fp16_state(
+        state = _bind_fp16_state(
             state_pool,
             elapsed,
             sequence_capacity=8,
@@ -2116,7 +2200,7 @@ def test_unified_state_slot_checkpoint_cow_reset_and_memory(
             max_seqlen=1,
         )
     else:
-        state = prepare_tmix_wkv7_recurrent_fp32io16_state(
+        state = _bind_fp32io16_state(
             state_pool,
             sequence_capacity=8,
         )
@@ -2232,23 +2316,23 @@ def test_unified_state_materialize_and_pending_log_fallback(
     ordinary_elapsed = initial_elapsed.clone()
     selected_elapsed = initial_elapsed.clone()
     if operator == "fp16":
-        ordinary_handle = prepare_tmix_wkv7_recurrent_fp16_state(
+        ordinary_handle = _bind_fp16_state(
             ordinary_state,
             ordinary_elapsed,
             sequence_capacity=8,
         )
-        selected_handle = prepare_tmix_wkv7_recurrent_fp16_state(
+        selected_handle = _bind_fp16_state(
             selected_state,
             selected_elapsed,
             sequence_capacity=8,
         )
         infer = infer_tmix_wkv7_recurrent_fp16_forward_varlen
     else:
-        ordinary_handle = prepare_tmix_wkv7_recurrent_fp32io16_state(
+        ordinary_handle = _bind_fp32io16_state(
             ordinary_state,
             sequence_capacity=8,
         )
-        selected_handle = prepare_tmix_wkv7_recurrent_fp32io16_state(
+        selected_handle = _bind_fp32io16_state(
             selected_state,
             sequence_capacity=8,
         )
@@ -2330,12 +2414,12 @@ def test_state_prepare_uses_mode_specific_profitable_policy() -> None:
         device="cuda",
         dtype=torch.int32,
     )
-    fp16_state = prepare_tmix_wkv7_recurrent_fp16_state(
+    fp16_state = _bind_fp16_state(
         fp16_state_pool,
         elapsed_state_pool,
         sequence_capacity=sequence_capacity,
     )
-    fp32io16_state = prepare_tmix_wkv7_recurrent_fp32io16_state(
+    fp32io16_state = _bind_fp32io16_state(
         fp16_state_pool.float(),
         sequence_capacity=sequence_capacity,
     )
@@ -2379,7 +2463,7 @@ def test_unified_deltalog_policy_falls_back_for_non_t1(operator: str) -> None:
     if operator == "fp16":
         ordinary_elapsed = elapsed.clone()
         selected_elapsed = elapsed.clone()
-        state = prepare_tmix_wkv7_recurrent_fp16_state(
+        state = _bind_fp16_state(
             selected_state,
             selected_elapsed,
             sequence_capacity=8,
@@ -2395,7 +2479,7 @@ def test_unified_deltalog_policy_falls_back_for_non_t1(operator: str) -> None:
         )
         infer = infer_tmix_wkv7_recurrent_fp16_forward_varlen
     else:
-        state = prepare_tmix_wkv7_recurrent_fp32io16_state(
+        state = _bind_fp32io16_state(
             selected_state,
             sequence_capacity=8,
         )
@@ -2447,7 +2531,7 @@ def test_unified_fp32io16_deltalog_policy_falls_back_for_bf16_io() -> None:
     assert isinstance(initial_state, torch.Tensor)
     ordinary_state = initial_state.clone()
     selected_state = initial_state.clone()
-    state = prepare_tmix_wkv7_recurrent_fp32io16_state(
+    state = _bind_fp32io16_state(
         selected_state,
         sequence_capacity=8,
     )
@@ -2509,14 +2593,14 @@ def test_unified_live_metadata_zero_active_warmup_and_graph_replay(
     elapsed = torch.arange(slots, device=device, dtype=torch.int32) * 7
     initial_elapsed = elapsed.clone()
     if operator == "fp16":
-        state = prepare_tmix_wkv7_recurrent_fp16_state(
+        state = _bind_fp16_state(
             base_state,
             elapsed,
             sequence_capacity=sequence_capacity,
         )
         infer = infer_tmix_wkv7_recurrent_fp16_forward_varlen
     else:
-        state = prepare_tmix_wkv7_recurrent_fp32io16_state(
+        state = _bind_fp32io16_state(
             base_state,
             sequence_capacity=sequence_capacity,
         )
@@ -2640,14 +2724,14 @@ def test_pending_deltalog_graph_fallback_materializes_only_active_slots(
     )
     elapsed = torch.arange(slots, device=device, dtype=torch.int32) * 11
     if operator == "fp16":
-        state = prepare_tmix_wkv7_recurrent_fp16_state(
+        state = _bind_fp16_state(
             base_state,
             elapsed,
             sequence_capacity=sequence_capacity,
         )
         infer = infer_tmix_wkv7_recurrent_fp16_forward_varlen
     else:
-        state = prepare_tmix_wkv7_recurrent_fp32io16_state(
+        state = _bind_fp32io16_state(
             base_state,
             sequence_capacity=sequence_capacity,
         )

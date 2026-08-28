@@ -23,12 +23,15 @@
 | `infer_sampling_temperature_topk_topp_forward_varlen` | `logits, states, slot_indices, *, temperature=1.0, top_k=-1, top_p=1.0, sample_capacity=None, num_active_samples=None` | sampled token ids；原位更新 RNG state |
 | `infer_sampling_six_parameter_forward_varlen` | `logits, penalties, states, slot_indices, *, presence_penalty=0.0, frequency_penalty=0.0, penalty_decay=0.996, temperature=1.0, top_k=-1, top_p=1.0, sample_capacity=None, num_active_samples=None` | sampled token ids；原位更新 penalty/RNG state |
 
-`prepare_tmix_wkv7_recurrent_fp16_state(state_pool, elapsed_state_pool, *,
-sequence_capacity)` 与 `prepare_tmix_wkv7_recurrent_fp32io16_state(state_pool,
-*, sequence_capacity)` 分别返回不透明的统一 FP16 与 FP32IO16 state handle。
-FP16 handle 持有调用方提供的 FP16 基础 state 与 elapsed state；FP32IO16 handle
-持有 FP32 基础 state。两者在需要时都一次性分配与 state 同 dtype 的私有
-DeltaLog phase/log workspace。整池 checkpoint 仍可使用 `clone()`、`copy_()` 和
+`prepare_tmix_wkv7_recurrent_fp16_state(state_pool_size, channels, *,
+sequence_capacity, head_size=64, device=None)` 与
+`prepare_tmix_wkv7_recurrent_fp32io16_state(state_pool_size, channels, *,
+sequence_capacity, head_size=64, device=None)` 分别一次性分配完整的统一 FP16 与
+FP32IO16 state package，并返回不透明 handle。FP16 handle 持有零初始化的 FP16
+基础 state 与 INT32 elapsed state；FP32IO16 handle 持有零初始化的 FP32 基础
+state。两者在需要时同时分配与 state 同 dtype 的私有 DeltaLog phase/log
+workspace。调用方不再预先分配或传入基础 state pool。整池 checkpoint 仍可使用
+`clone()`、`copy_()` 和
 `zero_()`；server 调度应使用 `clone_slots(state_indices)`、
 `copy_slots_(source, source_indices, destination_indices)` 与
 `reset_slots_(state_indices)`，这些操作只访问指定 slot，但始终覆盖 base state、
@@ -37,13 +40,11 @@ elapsed、phase 与 logs 的完整逻辑状态包。`copy_slots_` 具有同时�
 把指定 slot 的 pending logs 合入 base state 并清空其 phase/log，不改变 elapsed；
 统一入口从 DeltaLog 回退普通 kernel 前会自动完成同一操作。
 
-`get_tmix_wkv7_recurrent_state_memory_layout(channels, *, state_dtype,
-sequence_capacity, head_size=64, device=None)` 在 state pool 分配前返回
-`base_bytes_per_slot`、`private_bytes_per_slot`、`bytes_per_slot` 与
-`fixed_workspace_nbytes`。handle 的 `memory_layout` 还返回实际 `total_nbytes`。
-server 必须使用这组数值计算 cache budget，不得遗漏按 slot 增长的 phase/log 或固定
-status workspace。下游不得读取、移动或单独管理 DeltaLog policy、`M`、phase 或
-logs。
+handle 的 `memory_layout` 是唯一显存统计入口，返回实际分配的
+`base_bytes_per_slot`、`private_bytes_per_slot`、`bytes_per_slot`、
+`fixed_workspace_nbytes` 与 `total_nbytes`。state preparation 同时完成内部 policy
+选择、完整 state package 分配和显存统计，不存在独立的预算查询/外部分配步骤。
+下游不得读取、移动或单独管理基础 pool、DeltaLog policy、`M`、phase 或 logs。
 
 策略保留 Albatross `3465da5070beceb4bab9e07b03abee1642a0bdf8` 的普通
 `WKV_DELTALOG_TUNED_M` 精确表作为候选表。FP32IO16 在 SM120、FP16 token IO、
@@ -56,11 +57,10 @@ FlashRWKV2 的普通 FP16-state launcher 在 `(768,64)`、`(768,128)`、`(1024,6
 APW-only 表。策略与 workspace 在 state preparation 阶段确定；统一入口不会在
 热路径查询主机侧 CUDA 数据。native 校验异常继续令整套 state fail-closed。
 
-`get_tmix_wkv7_recurrent_state_memory_layout`、
 `prepare_tmix_wkv7_recurrent_fp16_state`、
 `prepare_tmix_wkv7_recurrent_fp32io16_state`、
 `prepare_tmix_wkv7_recurrent_metadata` 和 `setup_sampling_states` 是上述推理入口
-需要的状态与显存布局 API。
+需要的状态 preparation API。
 
 训练接口保持 14 个既有完整语义入口：`pretrain_cmix_bf16`、
 `statetune_cmix_bf16`、`pretrain_tmix_wkv7_recurrent_bf16`、
@@ -69,8 +69,8 @@ APW-only 表。策略与 workspace 在 state preparation 阶段确定；统一�
 `pretrain_tmix_kk_pre_bf16`、`pretrain_tmix_readout_bf16`、
 `pretrain_tmix_tokenshift_bf16`、`statetune_tmix_tokenshift_bf16`、
 `pretrain_tmix_vres_gate_bf16`、`pretrain_l2wrap_ce_bf16` 和
-`pretrain_head_l2wrap_ce_bf16`。根包总计导出 32 个唯一名称：13 个推理入口、
-14 个训练入口和上述 5 个状态/显存布局入口。
+`pretrain_head_l2wrap_ce_bf16`。根包总计导出 31 个唯一名称：13 个推理入口、
+14 个训练入口和上述 4 个状态 preparation 入口。
 
 TMix 的 `B=1,T=1,C=4096` 与 CMix 的 `T=1,C=4096` 使用 Albatross 派生的单次 Res+LN+TokenShift fused launch；其他 packed varlen 形状在同一公共入口内部顺序启动 PostNorm 与 TokenShift。CMix 的 dense/sparse 选择也完全由 `infer_cmix_forward_varlen` 内部完成。
 

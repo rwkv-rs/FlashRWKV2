@@ -5,10 +5,10 @@
 from __future__ import annotations
 
 import importlib
+import inspect
 import sys
 
 import pytest
-import torch
 
 PUBLIC_MODULES = (
     "flashrwkv2.cmix",
@@ -222,45 +222,20 @@ def test_deltalog_policy_matches_pinned_albatross_exact_table() -> None:
     )
 
 
-def test_wkv7_state_memory_layout_accounts_for_private_workspace(
-    monkeypatch,
-) -> None:
+def test_wkv7_state_preparation_owns_memory_accounting() -> None:
     module = importlib.import_module("flashrwkv2.tmix.wkv7")
-    monkeypatch.setattr(
-        module.torch.cuda, "get_device_capability", lambda device: (12, 0)
-    )
-    fp16 = module.get_tmix_wkv7_recurrent_state_memory_layout(
-        4096,
-        state_dtype=torch.float16,
-        sequence_capacity=8,
-        device="cuda:0",
-    )
-    assert fp16 == {
-        "base_bytes_per_slot": 64 * 64 * 64 * 2 + 4,
-        "private_bytes_per_slot": 4 + 5 * 64 * 64 * 2,
-        "bytes_per_slot": 64 * 64 * 64 * 2 + 8 + 5 * 64 * 64 * 2,
-        "fixed_workspace_nbytes": (1 + 2 * 8) * 4,
-    }
-    fp32 = module.get_tmix_wkv7_recurrent_state_memory_layout(
-        4096,
-        state_dtype=torch.float32,
-        sequence_capacity=8,
-        device=0,
-    )
-    assert fp32 == {
-        "base_bytes_per_slot": 64 * 64 * 64 * 4,
-        "private_bytes_per_slot": 4 + 5 * 64 * 64 * 4,
-        "bytes_per_slot": 64 * 64 * 64 * 4 + 4 + 5 * 64 * 64 * 4,
-        "fixed_workspace_nbytes": (1 + 2 * 8) * 4,
-    }
-    ordinary = module.get_tmix_wkv7_recurrent_state_memory_layout(
-        768,
-        state_dtype=torch.float16,
-        sequence_capacity=64,
-        device="cuda:0",
-    )
-    assert ordinary["private_bytes_per_slot"] == 0
-    assert ordinary["fixed_workspace_nbytes"] == 0
+    assert not hasattr(module, "get_tmix_wkv7_recurrent_state_memory_layout")
+    for name in (
+        "prepare_tmix_wkv7_recurrent_fp16_state",
+        "prepare_tmix_wkv7_recurrent_fp32io16_state",
+    ):
+        assert tuple(inspect.signature(getattr(module, name)).parameters) == (
+            "state_pool_size",
+            "channels",
+            "sequence_capacity",
+            "head_size",
+            "device",
+        )
 
 
 def test_retired_public_aliases_are_absent() -> None:
@@ -286,6 +261,7 @@ def test_retired_public_aliases_are_absent() -> None:
         "infer_tmix_wkv7_recurrent_deltalog_fp32io16_forward_varlen",
         "infer_recurrent_fp32io16_forward_varlen",
         "infer_chunk_bf16_forward_varlen",
+        "get_tmix_wkv7_recurrent_state_memory_layout",
         "prepare_recurrent_metadata",
         "pretrain_recurrent_bf16",
         "statetune_recurrent_fp32io16",

@@ -562,45 +562,15 @@ class _TmixWkv7RecurrentState:
 
 
 def _prepare_recurrent_state(
-    state_pool: torch.Tensor,
-    elapsed_state_pool: torch.Tensor | None,
-    sequence_capacity: int,
-) -> object:
-    if (
-        not isinstance(sequence_capacity, int)
-        or isinstance(sequence_capacity, bool)
-        or sequence_capacity <= 0
-    ):
-        raise ValueError("sequence_capacity must be a positive integer")
-    capability = tuple(torch.cuda.get_device_capability(state_pool.device))
-    head_size = state_pool.shape[2]
-    channels = state_pool.shape[1] * head_size
-    merge_interval = _select_deltalog_merge_interval(
-        channels,
-        sequence_capacity,
-        head_size,
-        capability,
-        "fp16" if state_pool.dtype == torch.float16 else "fp32io16",
-    )
-    return _TmixWkv7RecurrentState(
-        state_pool,
-        elapsed_state_pool,
-        sequence_capacity,
-        merge_interval,
-    )
-
-
-def get_tmix_wkv7_recurrent_state_memory_layout(
+    state_pool_size: int,
     channels: int,
-    *,
-    state_dtype: torch.dtype,
     sequence_capacity: int,
-    head_size: int = 64,
-    device: torch.device | str | int | None = None,
-) -> dict[str, int]:
-    """Return the exact per-slot and fixed bytes for a prepared state."""
-
+    head_size: int,
+    device: torch.device | str | int | None,
+    state_dtype: torch.dtype,
+) -> object:
     for name, value in (
+        ("state_pool_size", state_pool_size),
         ("channels", channels),
         ("sequence_capacity", sequence_capacity),
         ("head_size", head_size),
@@ -613,8 +583,6 @@ def get_tmix_wkv7_recurrent_state_memory_layout(
             raise ValueError(f"{name} must be a positive integer")
     if channels % head_size != 0:
         raise ValueError("channels must be divisible by head_size")
-    if state_dtype not in {torch.float16, torch.float32}:
-        raise TypeError("state_dtype must be torch.float16 or torch.float32")
     if device is None:
         resolved_device = torch.device("cuda", torch.cuda.current_device())
     elif isinstance(device, int):
@@ -623,68 +591,78 @@ def get_tmix_wkv7_recurrent_state_memory_layout(
         resolved_device = torch.device(device)
     if resolved_device.type != "cuda":
         raise ValueError("device must identify a CUDA device")
-    capability = tuple(torch.cuda.get_device_capability(resolved_device))
+
     numerical_mode = "fp16" if state_dtype == torch.float16 else "fp32io16"
     merge_interval = _select_deltalog_merge_interval(
         channels,
         sequence_capacity,
         head_size,
-        capability,
+        tuple(torch.cuda.get_device_capability(resolved_device)),
         numerical_mode,
     )
-    element_size = torch.empty((), dtype=state_dtype).element_size()
-    num_heads = channels // head_size
-    base_bytes_per_slot = num_heads * head_size * head_size * element_size
-    if state_dtype == torch.float16:
-        base_bytes_per_slot += torch.empty((), dtype=torch.int32).element_size()
-    private_bytes_per_slot = 0
-    fixed_workspace_nbytes = 0
-    if merge_interval:
-        private_bytes_per_slot = (
-            torch.empty((), dtype=torch.int32).element_size()
-            + (merge_interval - 1)
-            * 5
-            * num_heads
-            * head_size
-            * element_size
+    state_pool = torch.zeros(
+        state_pool_size,
+        channels // head_size,
+        head_size,
+        head_size,
+        dtype=state_dtype,
+        device=resolved_device,
+    )
+    elapsed_state_pool = (
+        torch.zeros(
+            state_pool_size,
+            dtype=torch.int32,
+            device=resolved_device,
         )
-        fixed_workspace_nbytes = (
-            1 + 2 * sequence_capacity
-        ) * torch.empty((), dtype=torch.int32).element_size()
-    return {
-        "base_bytes_per_slot": base_bytes_per_slot,
-        "private_bytes_per_slot": private_bytes_per_slot,
-        "bytes_per_slot": base_bytes_per_slot + private_bytes_per_slot,
-        "fixed_workspace_nbytes": fixed_workspace_nbytes,
-    }
-
-
-def prepare_tmix_wkv7_recurrent_fp16_state(
-    state_pool: torch.Tensor,
-    elapsed_state_pool: torch.Tensor,
-    *,
-    sequence_capacity: int,
-) -> object:
-    """Prepare one opaque FP16 WKV7 state and its private dispatch workspace."""
-
-    _validate_fp16_state(state_pool)
-    _validate_fp16_elapsed_state(elapsed_state_pool, state_pool)
-    return _prepare_recurrent_state(
+        if state_dtype == torch.float16
+        else None
+    )
+    return _TmixWkv7RecurrentState(
         state_pool,
         elapsed_state_pool,
         sequence_capacity,
+        merge_interval,
+    )
+
+
+def prepare_tmix_wkv7_recurrent_fp16_state(
+    state_pool_size: int,
+    channels: int,
+    *,
+    sequence_capacity: int,
+    head_size: int = 64,
+    device: torch.device | str | int | None = None,
+) -> object:
+    """Allocate one complete opaque FP16 WKV7 state package."""
+
+    return _prepare_recurrent_state(
+        state_pool_size,
+        channels,
+        sequence_capacity,
+        head_size,
+        device,
+        torch.float16,
     )
 
 
 def prepare_tmix_wkv7_recurrent_fp32io16_state(
-    state_pool: torch.Tensor,
+    state_pool_size: int,
+    channels: int,
     *,
     sequence_capacity: int,
+    head_size: int = 64,
+    device: torch.device | str | int | None = None,
 ) -> object:
-    """Prepare one opaque FP32IO16 WKV7 state and private dispatch workspace."""
+    """Allocate one complete opaque FP32IO16 WKV7 state package."""
 
-    _validate_state(state_pool)
-    return _prepare_recurrent_state(state_pool, None, sequence_capacity)
+    return _prepare_recurrent_state(
+        state_pool_size,
+        channels,
+        sequence_capacity,
+        head_size,
+        device,
+        torch.float32,
+    )
 
 
 def _check_metadata_inputs(
@@ -1225,7 +1203,6 @@ from .rl_infctx import (
 )
 
 __all__ = [
-    "get_tmix_wkv7_recurrent_state_memory_layout",
     "infer_tmix_wkv7_chunk_bf16_forward_varlen",
     "infer_tmix_wkv7_recurrent_fp16_forward_varlen",
     "infer_tmix_wkv7_recurrent_fp32io16_forward_varlen",

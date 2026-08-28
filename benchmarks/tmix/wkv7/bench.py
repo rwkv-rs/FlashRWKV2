@@ -399,21 +399,23 @@ def _measure(
     reset_state = inputs["state_pool"]
     if not isinstance(reset_state, torch.Tensor):
         raise TypeError("benchmark state pool is incomplete")
-    state = reset_state.clone()
-    reset_elapsed = inputs["elapsed_state_pool"]
-    if not isinstance(reset_elapsed, torch.Tensor):
-        raise TypeError("benchmark elapsed state is incomplete")
-    elapsed = reset_elapsed.clone()
+    channels = reset_state.shape[1] * reset_state.shape[2]
+    head_size = reset_state.shape[2]
     if operator == "fp16":
         recurrent_state = flashrwkv2.prepare_tmix_wkv7_recurrent_fp16_state(
-            state,
-            elapsed,
+            reset_state.shape[0],
+            channels,
             sequence_capacity=workload.batch_size,
+            head_size=head_size,
+            device=reset_state.device,
         )
     else:
         recurrent_state = flashrwkv2.prepare_tmix_wkv7_recurrent_fp32io16_state(
-            state,
+            reset_state.shape[0],
+            channels,
             sequence_capacity=workload.batch_size,
+            head_size=head_size,
+            device=reset_state.device,
         )
     recurrent_state_snapshot = recurrent_state.clone()
 
