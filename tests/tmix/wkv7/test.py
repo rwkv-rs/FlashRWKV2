@@ -1860,10 +1860,15 @@ def test_deltalog_runtime_failures_preserve_entire_state_bundle(
     "bad_bundle",
     ("log_shape", "log_dtype", "phase_dtype", "log_device"),
 )
+@pytest.mark.parametrize("operator", ("fp16", "fp32io16"))
 def test_deltalog_rejects_invalid_bundle_without_state_write(
     bad_bundle: str,
+    operator: str,
 ) -> None:
-    _require_deltalog_extension()
+    if operator == "fp16":
+        _require_deltalog_extension()
+    else:
+        _require_fp32io16_deltalog_extension()
     (
         steps,
         cu_seqlens,
@@ -1873,27 +1878,41 @@ def test_deltalog_rejects_invalid_bundle_without_state_write(
         logs,
         decay_bias,
     ) = _make_deltalog_cycle_case(3)
+    if operator == "fp32io16":
+        state = state.float()
+        logs = logs.float()
     slots = torch.tensor([4, 1, 3], device=state.device, dtype=torch.int32)
     if bad_bundle == "log_shape":
         logs = logs[..., :-1].contiguous()
     elif bad_bundle == "log_dtype":
-        logs = logs.float()
+        logs = logs.float() if operator == "fp16" else logs.half()
     elif bad_bundle == "phase_dtype":
         phase = phase.long()
     else:
         logs = logs.cpu()
     before_state = state.clone()
     with pytest.raises((TypeError, ValueError, RuntimeError)):
-        wkv7_module._run_deltalog_fp16(
-            *steps[0],
-            state_pool=state,
-            elapsed_state_pool=elapsed,
-            deltalog_phase_pool=phase,
-            deltalog_pool=logs,
-            cu_seqlens=cu_seqlens,
-            state_indices=slots,
-            decay_bias=decay_bias,
-        )
+        if operator == "fp16":
+            wkv7_module._run_deltalog_fp16(
+                *steps[0],
+                state_pool=state,
+                elapsed_state_pool=elapsed,
+                deltalog_phase_pool=phase,
+                deltalog_pool=logs,
+                cu_seqlens=cu_seqlens,
+                state_indices=slots,
+                decay_bias=decay_bias,
+            )
+        else:
+            wkv7_module._run_deltalog_fp32io16(
+                *steps[0],
+                state_pool=state,
+                deltalog_phase_pool=phase,
+                deltalog_pool=logs,
+                cu_seqlens=cu_seqlens,
+                state_indices=slots,
+                decay_bias=decay_bias,
+            )
     assert torch.equal(state, before_state)
 
 
