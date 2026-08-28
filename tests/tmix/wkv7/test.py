@@ -14,6 +14,7 @@ from utils import require_cuda_backend
 import flashrwkv2
 import flashrwkv2.tmix.wkv7 as wkv7_module
 from flashrwkv2.tmix.wkv7 import (
+    get_tmix_wkv7_recurrent_state_memory_layout,
     infer_tmix_wkv7_recurrent_fp16_forward_varlen,
     infer_tmix_wkv7_recurrent_fp32io16_forward_varlen,
     prepare_tmix_wkv7_recurrent_fp16_state,
@@ -1041,6 +1042,16 @@ def test_public_signatures_use_only_prepared_state_handles() -> None:
         "state_pool",
         "sequence_capacity",
     )
+    memory_signature = inspect.signature(
+        get_tmix_wkv7_recurrent_state_memory_layout
+    )
+    assert tuple(memory_signature.parameters) == (
+        "channels",
+        "state_dtype",
+        "sequence_capacity",
+        "head_size",
+        "device",
+    )
     assert not hasattr(
         wkv7_module,
         "infer_tmix_wkv7_recurrent_deltalog_fp16_forward_varlen",
@@ -1928,6 +1939,14 @@ def test_deltalog_native_launcher_is_private_provider_detail() -> None:
             flashrwkv2._C,
             "tmix_wkv7_recurrent_deltalog_fp32io16_from_decay_logits",
         )
+        assert hasattr(
+            flashrwkv2._C,
+            "tmix_wkv7_recurrent_deltalog_fp16_materialize_slots",
+        )
+        assert hasattr(
+            flashrwkv2._C,
+            "tmix_wkv7_recurrent_deltalog_fp32io16_materialize_slots",
+        )
 
 
 def test_unified_fp16_exact_policy_and_complete_state_lifecycle() -> None:
@@ -2056,6 +2075,245 @@ def test_unified_fp32io16_exact_policy_and_complete_state_lifecycle() -> None:
 
     assert torch.count_nonzero(state._deltalog_phase_pool).item() == 0
     assert _relative_rmse(selected_state, ordinary_state) <= 4.0e-3
+
+
+@pytest.mark.parametrize("operator", ("fp16", "fp32io16"))
+def test_unified_state_slot_checkpoint_cow_reset_and_memory(
+    operator: str,
+) -> None:
+    if operator == "fp16":
+        _require_deltalog_extension()
+    else:
+        _require_fp32io16_deltalog_extension()
+    (
+        steps,
+        cu_seqlens,
+        initial_state,
+        initial_elapsed,
+        _,
+        _,
+        decay_bias,
+    ) = _make_deltalog_cycle_case(2, batch_size=8, num_heads=64)
+    slots = torch.arange(8, device=initial_state.device, dtype=torch.int32)
+    state_pool = (
+        initial_state.clone()
+        if operator == "fp16"
+        else initial_state.float()
+    )
+    if operator == "fp16":
+        elapsed = initial_elapsed.clone()
+        state = prepare_tmix_wkv7_recurrent_fp16_state(
+            state_pool,
+            elapsed,
+            sequence_capacity=8,
+        )
+        infer_tmix_wkv7_recurrent_fp16_forward_varlen(
+            *steps[0],
+            state=state,
+            cu_seqlens=cu_seqlens,
+            state_indices=slots,
+            decay_bias=decay_bias,
+            max_seqlen=1,
+        )
+    else:
+        state = prepare_tmix_wkv7_recurrent_fp32io16_state(
+            state_pool,
+            sequence_capacity=8,
+        )
+        infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
+            *steps[0],
+            state=state,
+            cu_seqlens=cu_seqlens,
+            state_indices=slots,
+            decay_bias=decay_bias,
+            max_seqlen=1,
+        )
+    torch.cuda.synchronize()
+
+    checkpoint_slots = torch.tensor(
+        [5, 2, 7], device=state_pool.device, dtype=torch.int32
+    )
+    checkpoint = state.clone_slots(checkpoint_slots)
+    for original, compact in zip(
+        state._components(), checkpoint._components(), strict=True
+    ):
+        dimension = 2 if original.ndim == 5 else 0
+        assert torch.equal(
+            compact,
+            original.index_select(dimension, checkpoint_slots.long()),
+        )
+
+    destination_slots = torch.tensor(
+        [6, 1, 4], device=state_pool.device, dtype=torch.int32
+    )
+    compact_slots = torch.arange(
+        3, device=state_pool.device, dtype=torch.int32
+    )
+    state.copy_slots_(checkpoint, compact_slots, destination_slots)
+    for observed, expected in zip(
+        state._components(), checkpoint._components(), strict=True
+    ):
+        dimension = 2 if observed.ndim == 5 else 0
+        assert torch.equal(
+            observed.index_select(dimension, destination_slots.long()),
+            expected,
+        )
+
+    before_cow = tuple(tensor.clone() for tensor in state._components())
+    cow_source = torch.tensor(
+        [1, 4], device=state_pool.device, dtype=torch.int32
+    )
+    cow_destination = torch.tensor(
+        [4, 0], device=state_pool.device, dtype=torch.int32
+    )
+    state.copy_slots_(state, cow_source, cow_destination)
+    for before, observed in zip(
+        before_cow, state._components(), strict=True
+    ):
+        dimension = 2 if observed.ndim == 5 else 0
+        assert torch.equal(
+            observed.index_select(dimension, cow_destination.long()),
+            before.index_select(dimension, cow_source.long()),
+        )
+
+    reset_slots = torch.tensor(
+        [2, 7], device=state_pool.device, dtype=torch.int32
+    )
+    untouched_before = tuple(tensor.clone() for tensor in state._components())
+    state.reset_slots_(reset_slots)
+    untouched = torch.tensor(
+        [0, 1, 3, 4, 5, 6], device=state_pool.device, dtype=torch.long
+    )
+    for before, observed in zip(
+        untouched_before, state._components(), strict=True
+    ):
+        dimension = 2 if observed.ndim == 5 else 0
+        assert torch.count_nonzero(
+            observed.index_select(dimension, reset_slots.long())
+        ).item() == 0
+        assert torch.equal(
+            observed.index_select(dimension, untouched),
+            before.index_select(dimension, untouched),
+        )
+
+    layout = state.memory_layout
+    assert layout["total_nbytes"] == (
+        layout["bytes_per_slot"] * state_pool.shape[0]
+        + layout["fixed_workspace_nbytes"]
+    )
+
+
+@pytest.mark.memcheck
+@pytest.mark.racecheck
+@pytest.mark.parametrize("operator", ("fp16", "fp32io16"))
+def test_unified_state_materialize_and_pending_log_fallback(
+    operator: str,
+) -> None:
+    if operator == "fp16":
+        _require_deltalog_extension()
+    else:
+        _require_fp32io16_deltalog_extension()
+    (
+        steps,
+        cu_seqlens,
+        initial_state,
+        initial_elapsed,
+        _,
+        _,
+        decay_bias,
+    ) = _make_deltalog_cycle_case(2, batch_size=8, num_heads=64)
+    slots = torch.arange(8, device=initial_state.device, dtype=torch.int32)
+    ordinary_state = (
+        initial_state.clone()
+        if operator == "fp16"
+        else initial_state.float()
+    )
+    selected_state = ordinary_state.clone()
+    ordinary_elapsed = initial_elapsed.clone()
+    selected_elapsed = initial_elapsed.clone()
+    if operator == "fp16":
+        ordinary_handle = prepare_tmix_wkv7_recurrent_fp16_state(
+            ordinary_state,
+            ordinary_elapsed,
+            sequence_capacity=8,
+        )
+        selected_handle = prepare_tmix_wkv7_recurrent_fp16_state(
+            selected_state,
+            selected_elapsed,
+            sequence_capacity=8,
+        )
+        infer = infer_tmix_wkv7_recurrent_fp16_forward_varlen
+    else:
+        ordinary_handle = prepare_tmix_wkv7_recurrent_fp32io16_state(
+            ordinary_state,
+            sequence_capacity=8,
+        )
+        selected_handle = prepare_tmix_wkv7_recurrent_fp32io16_state(
+            selected_state,
+            sequence_capacity=8,
+        )
+        infer = infer_tmix_wkv7_recurrent_fp32io16_forward_varlen
+
+    infer(
+        *steps[0],
+        state=ordinary_handle,
+        cu_seqlens=cu_seqlens,
+        state_indices=slots,
+        decay_bias=decay_bias,
+        max_seqlen=1,
+    )
+    infer(
+        *steps[0],
+        state=selected_handle,
+        cu_seqlens=cu_seqlens,
+        state_indices=slots,
+        decay_bias=decay_bias,
+        max_seqlen=1,
+    )
+    ordinary_handle.materialize_slots_(slots[:4].contiguous())
+    selected_handle.materialize_slots_(slots[:4].contiguous())
+    torch.cuda.synchronize()
+    assert _relative_rmse(selected_state[:4], ordinary_state[:4]) <= 4.0e-3
+    assert torch.count_nonzero(
+        selected_handle._deltalog_phase_pool[:4]
+    ).item() == 0
+    assert torch.equal(
+        selected_handle._deltalog_phase_pool[4:],
+        torch.ones_like(selected_handle._deltalog_phase_pool[4:]),
+    )
+
+    fallback_slots = slots[4:].contiguous()
+    fallback_cu = torch.arange(
+        fallback_slots.numel() + 1,
+        device=slots.device,
+        dtype=torch.int32,
+    )
+    fallback_inputs = tuple(tensor[4:].contiguous() for tensor in steps[1])
+    expected_output = infer(
+        *fallback_inputs,
+        state=ordinary_handle,
+        cu_seqlens=fallback_cu,
+        state_indices=fallback_slots,
+        decay_bias=decay_bias,
+        max_seqlen=1,
+    )
+    observed_output = infer(
+        *fallback_inputs,
+        state=selected_handle,
+        cu_seqlens=fallback_cu,
+        state_indices=fallback_slots,
+        decay_bias=decay_bias,
+        max_seqlen=1,
+    )
+    torch.cuda.synchronize()
+    assert _relative_rmse(observed_output, expected_output) <= 4.0e-3
+    assert _relative_rmse(selected_state, ordinary_state) <= 4.0e-3
+    assert torch.count_nonzero(
+        selected_handle._deltalog_phase_pool
+    ).item() == 0
+    assert torch.count_nonzero(selected_handle._deltalog_pool).item() == 0
+    if operator == "fp16":
+        assert torch.equal(selected_elapsed, ordinary_elapsed)
 
 
 def test_state_prepare_uses_mode_specific_profitable_policy() -> None:
@@ -2345,4 +2603,144 @@ def test_unified_live_metadata_zero_active_warmup_and_graph_replay(
     assert phase.cpu().tolist() == [1, 0, 1]
     expected_elapsed = [1, 8, 15] if operator == "fp16" else [0, 7, 14]
     assert elapsed.cpu().tolist() == expected_elapsed
+
+
+@pytest.mark.cuda_graph
+@pytest.mark.parametrize("operator", ("fp16", "fp32io16"))
+def test_pending_deltalog_graph_fallback_materializes_only_active_slots(
+    operator: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if operator == "fp16":
+        _require_deltalog_extension()
+    else:
+        _require_fp32io16_deltalog_extension()
+    monkeypatch.setattr(
+        wkv7_module,
+        "_select_deltalog_merge_interval",
+        lambda *_: 2,
+    )
+    device = torch.device("cuda")
+    token_capacity, sequence_capacity, slots, heads = 8, 4, 4, 2
+    torch.manual_seed(20260828)
+
+    def make_packed(tokens: int) -> tuple[torch.Tensor, ...]:
+        return tuple(
+            (torch.randn(tokens, heads, 64, device=device) * scale).half()
+            for scale in (0.12, 3.0, 0.06, 0.06, 0.06, 0.06)
+        )
+
+    append_inputs = make_packed(sequence_capacity)
+    fallback_inputs = make_packed(token_capacity)
+    base_state_fp32 = torch.randn(
+        slots, heads, 64, 64, device=device
+    ) * 0.03
+    base_state = (
+        base_state_fp32.half() if operator == "fp16" else base_state_fp32
+    )
+    elapsed = torch.arange(slots, device=device, dtype=torch.int32) * 11
+    if operator == "fp16":
+        state = prepare_tmix_wkv7_recurrent_fp16_state(
+            base_state,
+            elapsed,
+            sequence_capacity=sequence_capacity,
+        )
+        infer = infer_tmix_wkv7_recurrent_fp16_forward_varlen
+    else:
+        state = prepare_tmix_wkv7_recurrent_fp32io16_state(
+            base_state,
+            sequence_capacity=sequence_capacity,
+        )
+        infer = infer_tmix_wkv7_recurrent_fp32io16_forward_varlen
+    decode_cu = torch.arange(
+        sequence_capacity + 1, device=device, dtype=torch.int32
+    )
+    decode_slots = torch.arange(
+        sequence_capacity, device=device, dtype=torch.int32
+    )
+    infer(
+        *append_inputs,
+        state=state,
+        cu_seqlens=decode_cu,
+        state_indices=decode_slots,
+        max_seqlen=1,
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(
+        state._deltalog_phase_pool,
+        torch.ones_like(state._deltalog_phase_pool),
+    )
+    expected = state.clone()
+
+    cu = torch.tensor([0, -1, -1, -1, -1], device=device, dtype=torch.int32)
+    state_indices = torch.full(
+        (sequence_capacity,), 99, device=device, dtype=torch.int32
+    )
+    active_tokens = torch.zeros(1, device=device, dtype=torch.int32)
+    active_sequences = torch.zeros(1, device=device, dtype=torch.int32)
+    warmup_ticket = prepare_tmix_wkv7_recurrent_metadata(
+        cu,
+        state_indices,
+        state_pool_size=slots,
+        token_capacity=token_capacity,
+        sequence_capacity=sequence_capacity,
+        max_seqlen_capacity=2,
+        num_active_tokens=active_tokens,
+        num_active_sequences=active_sequences,
+    )
+    infer(
+        *fallback_inputs,
+        state=state,
+        cu_seqlens=cu,
+        state_indices=state_indices,
+        validated_metadata=warmup_ticket,
+    )
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_ticket = prepare_tmix_wkv7_recurrent_metadata(
+            cu,
+            state_indices,
+            state_pool_size=slots,
+            token_capacity=token_capacity,
+            sequence_capacity=sequence_capacity,
+            max_seqlen_capacity=2,
+            num_active_tokens=active_tokens,
+            num_active_sequences=active_sequences,
+        )
+        graph_output = infer(
+            *fallback_inputs,
+            state=state,
+            cu_seqlens=cu,
+            state_indices=state_indices,
+            validated_metadata=graph_ticket,
+        )
+
+    active_slots = torch.tensor([2, 0], device=device, dtype=torch.int32)
+    cu.copy_(torch.tensor([0, 2, 4, -1, -1], device=device, dtype=torch.int32))
+    state_indices.copy_(
+        torch.tensor([2, 0, 99, 99], device=device, dtype=torch.int32)
+    )
+    active_tokens.fill_(4)
+    active_sequences.fill_(2)
+    expected_output = infer(
+        *(tensor[:4].contiguous() for tensor in fallback_inputs),
+        state=expected,
+        cu_seqlens=torch.tensor(
+            [0, 2, 4], device=device, dtype=torch.int32
+        ),
+        state_indices=active_slots,
+        max_seqlen=2,
+    )
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert _relative_rmse(graph_output[:4], expected_output) <= 4.0e-3
+    assert _relative_rmse(state._state_pool, expected._state_pool) <= 4.0e-3
+    for observed, wanted in zip(
+        state._components()[1:], expected._components()[1:], strict=True
+    ):
+        assert torch.equal(observed, wanted)
+    assert state._deltalog_phase_pool.cpu().tolist() == [0, 1, 0, 1]
     assert torch.isfinite(graph_output[0]).all()

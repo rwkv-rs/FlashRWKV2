@@ -72,6 +72,124 @@ __device__ __forceinline__ int64_t log_index(
       channel;
 }
 
+__global__ void validate_materialize_slots_kernel(
+    const int* __restrict__ state_indices,
+    const int* __restrict__ phase_pool,
+    const int* __restrict__ metadata_status,
+    int* __restrict__ deltalog_status,
+    int num_entries,
+    int state_pool_slots,
+    int merge_interval) {
+  if (threadIdx.x == 0) {
+    deltalog_status[0] = metadata_status == nullptr ? 0 : metadata_status[0];
+    if (metadata_status != nullptr &&
+        (metadata_status[2] < 0 || metadata_status[2] > num_entries)) {
+      deltalog_status[0] = 1;
+    }
+  }
+  __syncthreads();
+  if (deltalog_status[0] != 0) {
+    return;
+  }
+  const int active_entries =
+      metadata_status == nullptr ? num_entries : metadata_status[2];
+  for (int index = static_cast<int>(threadIdx.x);
+       index < active_entries;
+       index += static_cast<int>(blockDim.x)) {
+    const int state_slot = state_indices[index];
+    if (state_slot < 0 || state_slot >= state_pool_slots) {
+      atomicCAS(deltalog_status, 0, 1);
+      continue;
+    }
+    const int phase = phase_pool[state_slot];
+    if (phase < 0 || phase >= merge_interval) {
+      atomicCAS(deltalog_status, 0, 1);
+    }
+    for (int other = index + 1; other < active_entries; ++other) {
+      if (state_indices[other] == state_slot) {
+        atomicCAS(deltalog_status, 0, 1);
+      }
+    }
+  }
+}
+
+template <int M>
+__global__ __launch_bounds__(kHeadSize, 2) void materialize_slots_kernel(
+    int num_heads,
+    int state_pool_slots,
+    const int* __restrict__ state_indices,
+    int* __restrict__ phase_pool,
+    const int* __restrict__ metadata_status,
+    const int* __restrict__ deltalog_status,
+    float* __restrict__ state_pool,
+    float* __restrict__ deltalog_pool) {
+  const int head_index = static_cast<int>(blockIdx.x);
+  const int entry = static_cast<int>(blockIdx.y);
+  const int thread = static_cast<int>(threadIdx.x);
+  if (deltalog_status[0] != 0 ||
+      (metadata_status != nullptr && entry >= metadata_status[2])) {
+    return;
+  }
+  const int state_slot = state_indices[entry];
+  const int phase = phase_pool[state_slot];
+  float* const state_base =
+      state_pool +
+      (static_cast<int64_t>(state_slot) * num_heads + head_index) *
+          kHeadSize * kHeadSize;
+  float state[kHeadSize];
+#pragma unroll
+  for (int key = 0; key < kHeadSize; ++key) {
+    state[key] = state_base[key * kHeadSize + thread];
+  }
+  for (int log_slot = 0; log_slot < phase; ++log_slot) {
+    const float old_u = deltalog_pool[log_index(
+        log_slot, kUKind, state_slot, head_index, thread,
+        state_pool_slots, num_heads)];
+    const float old_v = deltalog_pool[log_index(
+        log_slot, kVKind, state_slot, head_index, thread,
+        state_pool_slots, num_heads)];
+#pragma unroll
+    for (int key = 0; key < kHeadSize; ++key) {
+      const float old_state = state[key];
+      float updated = fmaf(
+          old_state,
+          deltalog_pool[log_index(
+              log_slot, kDeltaKind, state_slot, head_index, key,
+              state_pool_slots, num_heads)],
+          old_state);
+      updated = fmaf(
+          old_u,
+          deltalog_pool[log_index(
+              log_slot, kBKind, state_slot, head_index, key,
+              state_pool_slots, num_heads)],
+          updated);
+      state[key] = fmaf(
+          deltalog_pool[log_index(
+              log_slot, kKKind, state_slot, head_index, key,
+              state_pool_slots, num_heads)],
+          old_v, updated);
+    }
+  }
+  if (phase != 0) {
+#pragma unroll
+    for (int key = 0; key < kHeadSize; ++key) {
+      state_base[key * kHeadSize + thread] = state[key];
+    }
+  }
+#pragma unroll
+  for (int log_slot = 0; log_slot < M - 1; ++log_slot) {
+#pragma unroll
+    for (int kind = 0; kind < kKinds; ++kind) {
+      deltalog_pool[log_index(
+          log_slot, kind, state_slot, head_index, thread,
+          state_pool_slots, num_heads)] = 0.0f;
+    }
+  }
+  if (head_index == 0 && thread == 0) {
+    phase_pool[state_slot] = 0;
+  }
+}
+
 __device__ __forceinline__ void fill_invalid_output(
     int64_t block_index,
     int64_t block_count,
@@ -595,5 +713,48 @@ void tmix_wkv7_recurrent_deltalog_fp32io16_from_decay_logits_cuda(
       TORCH_CHECK(false, "unsupported DeltaLog merge interval");
   }
 #undef DISPATCH_M
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void tmix_wkv7_recurrent_deltalog_fp32io16_materialize_slots_cuda(
+    torch::Tensor state_indices,
+    torch::Tensor phase_pool,
+    torch::Tensor state_pool,
+    torch::Tensor deltalog_pool,
+    torch::Tensor deltalog_status,
+    torch::Tensor metadata_status) {
+  const c10::cuda::CUDAGuard device_guard(state_pool.device());
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  const int num_entries = static_cast<int>(state_indices.numel());
+  const int num_heads = static_cast<int>(state_pool.size(1));
+  const int state_pool_slots = static_cast<int>(state_pool.size(0));
+  const int merge_interval = static_cast<int>(deltalog_pool.size(0) + 1);
+  constexpr int validation_threads = 256;
+  validate_materialize_slots_kernel<<<1, validation_threads, 0, stream>>>(
+      state_indices.data_ptr<int>(), phase_pool.data_ptr<int>(),
+      metadata_status.defined() ? metadata_status.data_ptr<int>() : nullptr,
+      deltalog_status.data_ptr<int>(), num_entries, state_pool_slots,
+      merge_interval);
+  const dim3 grid(num_heads, num_entries);
+  const dim3 block(kHeadSize);
+#define DISPATCH_MATERIALIZE_M(Value) \
+  case Value: \
+    materialize_slots_kernel<Value><<<grid, block, 0, stream>>>( \
+        num_heads, state_pool_slots, state_indices.data_ptr<int>(), \
+        phase_pool.data_ptr<int>(), \
+        metadata_status.defined() ? metadata_status.data_ptr<int>() : nullptr, \
+        deltalog_status.data_ptr<int>(), state_pool.data_ptr<float>(), \
+        deltalog_pool.data_ptr<float>()); \
+    break
+  switch (merge_interval) {
+    DISPATCH_MATERIALIZE_M(2);
+    DISPATCH_MATERIALIZE_M(3);
+    DISPATCH_MATERIALIZE_M(4);
+    DISPATCH_MATERIALIZE_M(6);
+    DISPATCH_MATERIALIZE_M(8);
+    default:
+      TORCH_CHECK(false, "unsupported DeltaLog merge interval");
+  }
+#undef DISPATCH_MATERIALIZE_M
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

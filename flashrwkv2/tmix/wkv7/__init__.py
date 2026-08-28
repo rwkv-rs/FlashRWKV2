@@ -290,6 +290,224 @@ class _TmixWkv7RecurrentState:
             return components
         return (*components, self._deltalog_phase_pool, self._deltalog_pool)
 
+    @property
+    def memory_layout(self) -> dict[str, int]:
+        """Return the exact scalable and fixed bytes owned by this handle."""
+
+        slots = self._state_pool.shape[0]
+        base_nbytes = sum(
+            tensor.numel() * tensor.element_size()
+            for tensor in (self._state_pool, self._elapsed_state_pool)
+            if tensor is not None
+        )
+        private_slot_nbytes = sum(
+            tensor.numel() * tensor.element_size()
+            for tensor in (self._deltalog_phase_pool, self._deltalog_pool)
+            if tensor is not None
+        )
+        fixed_workspace_nbytes = (
+            0
+            if self._deltalog_status is None
+            else self._deltalog_status.numel()
+            * self._deltalog_status.element_size()
+        )
+        return {
+            "base_bytes_per_slot": base_nbytes // slots,
+            "private_bytes_per_slot": private_slot_nbytes // slots,
+            "bytes_per_slot": (base_nbytes + private_slot_nbytes) // slots,
+            "fixed_workspace_nbytes": fixed_workspace_nbytes,
+            "total_nbytes": (
+                base_nbytes + private_slot_nbytes + fixed_workspace_nbytes
+            ),
+        }
+
+    def _check_compatible_slots(
+        self, source: _TmixWkv7RecurrentState
+    ) -> None:
+        if not isinstance(source, _TmixWkv7RecurrentState):
+            raise TypeError("source must be a WKV7 recurrent state handle")
+        if (
+            self._merge_interval != source._merge_interval
+            or self._state_pool.dtype != source._state_pool.dtype
+            or self._state_pool.device != source._state_pool.device
+            or self._state_pool.shape[1:] != source._state_pool.shape[1:]
+            or (self._elapsed_state_pool is None)
+            != (source._elapsed_state_pool is None)
+        ):
+            raise ValueError("WKV7 recurrent state handles have incompatible slots")
+
+    def _slot_indices(
+        self,
+        state_indices: torch.Tensor,
+        *,
+        name: str,
+    ) -> torch.Tensor:
+        if not isinstance(state_indices, torch.Tensor):
+            raise TypeError(f"{name} must be a torch.Tensor")
+        if (
+            not state_indices.is_cuda
+            or not state_indices.is_contiguous()
+            or state_indices.dtype != torch.int32
+            or state_indices.ndim != 1
+            or state_indices.device != self._state_pool.device
+        ):
+            raise ValueError(
+                f"{name} must be one-dimensional contiguous CUDA int32 on "
+                "the state device"
+            )
+        return state_indices
+
+    def clone_slots(
+        self, state_indices: torch.Tensor
+    ) -> _TmixWkv7RecurrentState:
+        """Clone selected complete slots into a compact checkpoint handle."""
+
+        indices = self._slot_indices(
+            state_indices, name="state_indices"
+        ).long()
+        if indices.numel() == 0:
+            raise ValueError("state_indices must select at least one slot")
+        cloned = object.__new__(type(self))
+        cloned._sequence_capacity = self._sequence_capacity
+        cloned._merge_interval = self._merge_interval
+        cloned._state_pool = self._state_pool.index_select(0, indices)
+        cloned._elapsed_state_pool = (
+            None
+            if self._elapsed_state_pool is None
+            else self._elapsed_state_pool.index_select(0, indices)
+        )
+        cloned._deltalog_phase_pool = (
+            None
+            if self._deltalog_phase_pool is None
+            else self._deltalog_phase_pool.index_select(0, indices)
+        )
+        cloned._deltalog_pool = (
+            None
+            if self._deltalog_pool is None
+            else self._deltalog_pool.index_select(2, indices)
+        )
+        cloned._deltalog_status = (
+            None
+            if self._deltalog_status is None
+            else torch.empty_like(self._deltalog_status)
+        )
+        return cloned
+
+    def copy_slots_(
+        self,
+        source: _TmixWkv7RecurrentState,
+        source_indices: torch.Tensor,
+        destination_indices: torch.Tensor,
+    ) -> _TmixWkv7RecurrentState:
+        """Copy selected complete slots with simultaneous COW semantics."""
+
+        self._check_compatible_slots(source)
+        source_slots = source._slot_indices(
+            source_indices, name="source_indices"
+        ).long()
+        destination_slots = self._slot_indices(
+            destination_indices, name="destination_indices"
+        ).long()
+        if source_slots.numel() != destination_slots.numel():
+            raise ValueError(
+                "source_indices and destination_indices must have equal length"
+            )
+        if source_slots.numel() == 0:
+            return self
+        if torch.unique(destination_slots).numel() != destination_slots.numel():
+            raise ValueError("destination_indices must be unique")
+
+        # Gather every source component before the first write.  This preserves
+        # prefix-cache COW semantics even when source and destination overlap.
+        source_values = [source._state_pool.index_select(0, source_slots)]
+        destination_components: list[tuple[torch.Tensor, int]] = [
+            (self._state_pool, 0)
+        ]
+        if self._elapsed_state_pool is not None:
+            assert source._elapsed_state_pool is not None
+            source_values.append(
+                source._elapsed_state_pool.index_select(0, source_slots)
+            )
+            destination_components.append((self._elapsed_state_pool, 0))
+        if self._deltalog_phase_pool is not None:
+            assert source._deltalog_phase_pool is not None
+            assert self._deltalog_pool is not None
+            assert source._deltalog_pool is not None
+            source_values.extend(
+                (
+                    source._deltalog_phase_pool.index_select(0, source_slots),
+                    source._deltalog_pool.index_select(2, source_slots),
+                )
+            )
+            destination_components.extend(
+                (
+                    (self._deltalog_phase_pool, 0),
+                    (self._deltalog_pool, 2),
+                )
+            )
+        for (destination, dimension), value in zip(
+            destination_components, source_values, strict=True
+        ):
+            destination.index_copy_(dimension, destination_slots, value)
+        return self
+
+    def reset_slots_(
+        self, state_indices: torch.Tensor
+    ) -> _TmixWkv7RecurrentState:
+        """Reset selected complete slots without scanning the state pool."""
+
+        indices = self._slot_indices(
+            state_indices, name="state_indices"
+        ).long()
+        if indices.numel() == 0:
+            return self
+        self._state_pool.index_fill_(0, indices, 0)
+        if self._elapsed_state_pool is not None:
+            self._elapsed_state_pool.index_fill_(0, indices, 0)
+        if self._deltalog_phase_pool is not None:
+            assert self._deltalog_pool is not None
+            self._deltalog_phase_pool.index_fill_(0, indices, 0)
+            self._deltalog_pool.index_fill_(2, indices, 0)
+        return self
+
+    def materialize_slots_(
+        self, state_indices: torch.Tensor
+    ) -> _TmixWkv7RecurrentState:
+        """Merge pending private DeltaLog entries into selected base slots."""
+
+        self._materialize_slots(state_indices, None)
+        return self
+
+    def _materialize_slots(
+        self,
+        state_indices: torch.Tensor,
+        metadata_status: torch.Tensor | None,
+    ) -> None:
+        indices = self._slot_indices(state_indices, name="state_indices")
+        if indices.numel() == 0 or self._deltalog_phase_pool is None:
+            return
+        assert self._deltalog_pool is not None
+        assert self._deltalog_status is not None
+        extension = _extension()
+        if self._state_pool.dtype == torch.float16:
+            extension.tmix_wkv7_recurrent_deltalog_fp16_materialize_slots(
+                state_indices,
+                self._deltalog_phase_pool,
+                self._state_pool,
+                self._deltalog_pool,
+                self._deltalog_status,
+                metadata_status,
+            )
+        else:
+            extension.tmix_wkv7_recurrent_deltalog_fp32io16_materialize_slots(
+                state_indices,
+                self._deltalog_phase_pool,
+                self._state_pool,
+                self._deltalog_pool,
+                self._deltalog_status,
+                metadata_status,
+            )
+
     def clone(self) -> _TmixWkv7RecurrentState:
         cloned = object.__new__(type(self))
         cloned._sequence_capacity = self._sequence_capacity
@@ -318,14 +536,9 @@ class _TmixWkv7RecurrentState:
     def copy_(
         self, source: _TmixWkv7RecurrentState
     ) -> _TmixWkv7RecurrentState:
-        if not isinstance(source, _TmixWkv7RecurrentState):
-            raise TypeError("source must be a WKV7 recurrent state handle")
+        self._check_compatible_slots(source)
         if (
             self._sequence_capacity != source._sequence_capacity
-            or self._merge_interval != source._merge_interval
-            or self._state_pool.dtype != source._state_pool.dtype
-            or (self._elapsed_state_pool is None)
-            != (source._elapsed_state_pool is None)
         ):
             raise ValueError("WKV7 recurrent state handles have incompatible policies")
         destination_components = self._components()
@@ -375,6 +588,75 @@ def _prepare_recurrent_state(
         sequence_capacity,
         merge_interval,
     )
+
+
+def get_tmix_wkv7_recurrent_state_memory_layout(
+    channels: int,
+    *,
+    state_dtype: torch.dtype,
+    sequence_capacity: int,
+    head_size: int = 64,
+    device: torch.device | str | int | None = None,
+) -> dict[str, int]:
+    """Return the exact per-slot and fixed bytes for a prepared state."""
+
+    for name, value in (
+        ("channels", channels),
+        ("sequence_capacity", sequence_capacity),
+        ("head_size", head_size),
+    ):
+        if (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or value <= 0
+        ):
+            raise ValueError(f"{name} must be a positive integer")
+    if channels % head_size != 0:
+        raise ValueError("channels must be divisible by head_size")
+    if state_dtype not in {torch.float16, torch.float32}:
+        raise TypeError("state_dtype must be torch.float16 or torch.float32")
+    if device is None:
+        resolved_device = torch.device("cuda", torch.cuda.current_device())
+    elif isinstance(device, int):
+        resolved_device = torch.device("cuda", device)
+    else:
+        resolved_device = torch.device(device)
+    if resolved_device.type != "cuda":
+        raise ValueError("device must identify a CUDA device")
+    capability = tuple(torch.cuda.get_device_capability(resolved_device))
+    numerical_mode = "fp16" if state_dtype == torch.float16 else "fp32io16"
+    merge_interval = _select_deltalog_merge_interval(
+        channels,
+        sequence_capacity,
+        head_size,
+        capability,
+        numerical_mode,
+    )
+    element_size = torch.empty((), dtype=state_dtype).element_size()
+    num_heads = channels // head_size
+    base_bytes_per_slot = num_heads * head_size * head_size * element_size
+    if state_dtype == torch.float16:
+        base_bytes_per_slot += torch.empty((), dtype=torch.int32).element_size()
+    private_bytes_per_slot = 0
+    fixed_workspace_nbytes = 0
+    if merge_interval:
+        private_bytes_per_slot = (
+            torch.empty((), dtype=torch.int32).element_size()
+            + (merge_interval - 1)
+            * 5
+            * num_heads
+            * head_size
+            * element_size
+        )
+        fixed_workspace_nbytes = (
+            1 + 2 * sequence_capacity
+        ) * torch.empty((), dtype=torch.int32).element_size()
+    return {
+        "base_bytes_per_slot": base_bytes_per_slot,
+        "private_bytes_per_slot": private_bytes_per_slot,
+        "bytes_per_slot": base_bytes_per_slot + private_bytes_per_slot,
+        "fixed_workspace_nbytes": fixed_workspace_nbytes,
+    }
 
 
 def prepare_tmix_wkv7_recurrent_fp16_state(
@@ -564,6 +846,43 @@ def _run_fp32io16(
     return output
 
 
+def _materialize_before_ordinary(
+    state: _TmixWkv7RecurrentState,
+    *,
+    cu_seqlens: torch.Tensor,
+    state_indices: torch.Tensor,
+    total_tokens: int,
+    max_seqlen: int | None,
+    validated_metadata: object | None,
+) -> object | None:
+    if state._merge_interval == 0:
+        return validated_metadata
+    launch_max_seqlen = _validate_launch_max_seqlen(max_seqlen)
+    ticket = (
+        validated_metadata
+        if validated_metadata is not None
+        else prepare_tmix_wkv7_recurrent_metadata(
+            cu_seqlens,
+            state_indices,
+            total_tokens=total_tokens,
+            state_pool_size=state._state_pool.shape[0],
+            max_seqlen=max_seqlen,
+        )
+    )
+    ticket._check_compatible(
+        cu_seqlens,
+        state_indices,
+        total_tokens,
+        state._state_pool.shape[0],
+        launch_max_seqlen,
+    )
+    state._materialize_slots(
+        ticket._state_indices_snapshot(),
+        ticket._status(),
+    )
+    return ticket
+
+
 def infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
     r: torch.Tensor,
     decay_logits: torch.Tensor,
@@ -616,6 +935,14 @@ def infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
             decay_bias=decay_bias,
             validated_metadata=validated_metadata,
         )
+    ordinary_metadata = _materialize_before_ordinary(
+        state,
+        cu_seqlens=cu_seqlens,
+        state_indices=state_indices,
+        total_tokens=r.shape[0],
+        max_seqlen=max_seqlen,
+        validated_metadata=validated_metadata,
+    )
     return _run_fp32io16(
         *packed,
         state=state._state_pool,
@@ -624,7 +951,7 @@ def infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
         scale=scale,
         decay_bias=decay_bias,
         max_seqlen=max_seqlen,
-        validated_metadata=validated_metadata,
+        validated_metadata=ordinary_metadata,
     )
 
 
@@ -707,6 +1034,14 @@ def infer_tmix_wkv7_recurrent_fp16_forward_varlen(
             decay_bias=decay_bias,
             validated_metadata=validated_metadata,
         )
+    ordinary_metadata = _materialize_before_ordinary(
+        state,
+        cu_seqlens=cu_seqlens,
+        state_indices=state_indices,
+        total_tokens=r.shape[0],
+        max_seqlen=max_seqlen,
+        validated_metadata=validated_metadata,
+    )
     return _run_fp16(
         *packed,
         state_pool=state._state_pool,
@@ -716,7 +1051,7 @@ def infer_tmix_wkv7_recurrent_fp16_forward_varlen(
         scale=scale,
         decay_bias=decay_bias,
         max_seqlen=max_seqlen,
-        validated_metadata=validated_metadata,
+        validated_metadata=ordinary_metadata,
     )
 
 
@@ -890,6 +1225,7 @@ from .rl_infctx import (
 )
 
 __all__ = [
+    "get_tmix_wkv7_recurrent_state_memory_layout",
     "infer_tmix_wkv7_chunk_bf16_forward_varlen",
     "infer_tmix_wkv7_recurrent_fp16_forward_varlen",
     "infer_tmix_wkv7_recurrent_fp32io16_forward_varlen",

@@ -8,6 +8,7 @@ import importlib
 import sys
 
 import pytest
+import torch
 
 PUBLIC_MODULES = (
     "flashrwkv2.cmix",
@@ -27,6 +28,7 @@ PUBLIC_MODULES = (
     "flashrwkv2.tmix.wkv7.statetune",
 )
 PUBLIC_PREFIXES = (
+    "get_",
     "infer_",
     "prepare_",
     "pretrain_",
@@ -218,6 +220,47 @@ def test_deltalog_policy_matches_pinned_albatross_exact_table() -> None:
         )
         == 0
     )
+
+
+def test_wkv7_state_memory_layout_accounts_for_private_workspace(
+    monkeypatch,
+) -> None:
+    module = importlib.import_module("flashrwkv2.tmix.wkv7")
+    monkeypatch.setattr(
+        module.torch.cuda, "get_device_capability", lambda device: (12, 0)
+    )
+    fp16 = module.get_tmix_wkv7_recurrent_state_memory_layout(
+        4096,
+        state_dtype=torch.float16,
+        sequence_capacity=8,
+        device="cuda:0",
+    )
+    assert fp16 == {
+        "base_bytes_per_slot": 64 * 64 * 64 * 2 + 4,
+        "private_bytes_per_slot": 4 + 5 * 64 * 64 * 2,
+        "bytes_per_slot": 64 * 64 * 64 * 2 + 8 + 5 * 64 * 64 * 2,
+        "fixed_workspace_nbytes": (1 + 2 * 8) * 4,
+    }
+    fp32 = module.get_tmix_wkv7_recurrent_state_memory_layout(
+        4096,
+        state_dtype=torch.float32,
+        sequence_capacity=8,
+        device=0,
+    )
+    assert fp32 == {
+        "base_bytes_per_slot": 64 * 64 * 64 * 4,
+        "private_bytes_per_slot": 4 + 5 * 64 * 64 * 4,
+        "bytes_per_slot": 64 * 64 * 64 * 4 + 4 + 5 * 64 * 64 * 4,
+        "fixed_workspace_nbytes": (1 + 2 * 8) * 4,
+    }
+    ordinary = module.get_tmix_wkv7_recurrent_state_memory_layout(
+        768,
+        state_dtype=torch.float16,
+        sequence_capacity=64,
+        device="cuda:0",
+    )
+    assert ordinary["private_bytes_per_slot"] == 0
+    assert ordinary["fixed_workspace_nbytes"] == 0
 
 
 def test_retired_public_aliases_are_absent() -> None:

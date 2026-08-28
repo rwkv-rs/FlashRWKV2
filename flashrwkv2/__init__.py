@@ -81,6 +81,7 @@ from .tmix.tokenshift import (
 )
 from .tmix.vres_gate import pretrain_tmix_vres_gate_bf16
 from .tmix.wkv7 import (
+    get_tmix_wkv7_recurrent_state_memory_layout,
     infer_tmix_wkv7_chunk_bf16_forward_varlen,
     infer_tmix_wkv7_recurrent_fp16_forward_varlen,
     infer_tmix_wkv7_recurrent_fp32io16_forward_varlen,
@@ -95,6 +96,7 @@ from .tmix.wkv7.statetune import statetune_tmix_wkv7_recurrent_fp32io16
 from .tmix.wkv_prepare import infer_tmix_wkv_prepare_forward_varlen
 
 __all__ = [
+    "get_tmix_wkv7_recurrent_state_memory_layout",
     "infer_cmix_forward_varlen",
     "infer_embedding_ln0_forward_varlen",
     "infer_head_linear_all_forward_varlen",
