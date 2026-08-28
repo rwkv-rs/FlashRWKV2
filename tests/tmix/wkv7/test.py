@@ -1253,6 +1253,72 @@ def test_fp32_group4_selector_boundaries_and_fallbacks(
 
 
 @pytest.mark.parametrize(
+    ("seqlen", "output_index", "output_bits", "state_index", "state_bits"),
+    (
+        (1, 877, 5899, 153784, -1132557914),
+        (5, 7510, -26213, 178, 1011067375),
+        (10, 14699, 7268, 77652, 998222305),
+        (16, 725, 6368, 35618, 990122828),
+    ),
+)
+def test_fp32io16_matches_ee3308_recurrent_arithmetic(
+    seqlen: int,
+    output_index: int,
+    output_bits: int,
+    state_index: int,
+    state_bits: int,
+) -> None:
+    """Lock the ee3308 small/large selector and fast-division arithmetic."""
+
+    _require_cuda_extension()
+    batch_size, num_heads, head_size = 1, 64, 64
+    channels = num_heads * head_size
+    values = torch.arange(
+        batch_size * seqlen * channels,
+        device="cuda",
+        dtype=torch.int32,
+    )
+    specs = (
+        (31, 15, 256.0),
+        (67, 33, 8.0),
+        (37, 18, 512.0),
+        (41, 20, 512.0),
+        (43, 21, 512.0),
+        (47, 23, 512.0),
+    )
+    packed = tuple(
+        (((values % period) - offset).float() / divisor)
+        .half()
+        .view(-1, num_heads, head_size)
+        .contiguous()
+        for period, offset, divisor in specs
+    )
+    state_values = torch.arange(
+        batch_size * num_heads * head_size * head_size,
+        device="cuda",
+        dtype=torch.int32,
+    )
+    state = (
+        (((state_values % 61) - 30).float() / 1024.0)
+        .view(batch_size, num_heads, head_size, head_size)
+        .contiguous()
+    )
+    cu_seqlens = torch.tensor([0, seqlen], device="cuda", dtype=torch.int32)
+    state_indices = torch.tensor([0], device="cuda", dtype=torch.int32)
+    output = infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
+        *packed,
+        state_pool=state,
+        cu_seqlens=cu_seqlens,
+        state_indices=state_indices,
+        max_seqlen=seqlen,
+    )
+    torch.cuda.synchronize()
+
+    assert int(output.view(torch.int16).view(-1)[output_index]) == output_bits
+    assert int(state.view(torch.int32).view(-1)[state_index]) == state_bits
+
+
+@pytest.mark.parametrize(
     ("batch_size", "max_seqlen", "num_heads"),
     ((250, 1, 60), (400, 1, 50), (20, 2, 64)),
 )

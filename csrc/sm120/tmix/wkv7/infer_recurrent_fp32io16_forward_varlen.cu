@@ -10,10 +10,10 @@
 //   - packed [total_tokens,H,D] inputs selected by cu_seqlens;
 //   - state_indices-backed state slots in canonical [K,V] layout;
 //   - raw decay logits plus optional decay bias are transformed in-kernel;
-//   - the Albatross large implementation and a canonical-[K,V] B1 tile are
-//     automatic dispatch families; the small-warp and forced-only short-block
-//     bodies are retained as source references, but are not selected because
-//     their fixed-V lane traversal is strided under the public state layout;
+//   - rectangular FP16 workloads preserve the Albatross large/small-warp
+//     selector; a canonical-[K,V] B1 tile and group4 t-loop cover remaining
+//     optimized shapes, while the forced-only short-block body is retained as
+//     an unselected source reference;
 //   - metadata status remains fail-closed for the low-level binding.
 //
 // vllm-rwkv at 6d683f9e49a2997e405c47edc147872c8609513b is a packed-varlen
@@ -39,6 +39,9 @@ constexpr int kDecayAddThreads = 256;
 constexpr int kKvTileThreads = kWarpThreads;
 constexpr int kKvValueTile = 4;
 constexpr int kKvKeysPerWarp = kWarpThreads / kKvValueTile;
+constexpr int kSmallValuesPerBlock = 8;
+constexpr int kSmallWarpsPerBlock = kSmallValuesPerBlock;
+constexpr int kSmallThreads = kWarpThreads * kSmallWarpsPerBlock;
 
 template <typename io_t>
 __device__ __forceinline__ float to_float(io_t value) {
@@ -180,7 +183,15 @@ void launch_decay_bias_add<c10::Half>(
   }
 }
 
-using flashrwkv2::wkv7::recurrent_retention;
+// ee3308 builds this inference translation unit with --use_fast_math.  Keep
+// its retention division explicit here instead of changing the shared decay
+// helper used by StateTune, RL and the other inference numerical modes.
+__device__ __forceinline__ float recurrent_retention(float decay_logits) {
+  return exp2f(__fdividef(
+      flashrwkv2::wkv7::kNegativeExpHalfLog2E,
+      1.0f + exp2f(
+          flashrwkv2::wkv7::kNegativeLog2E * decay_logits)));
+}
 
 __device__ __forceinline__ float warp_sum(float value) {
 #pragma unroll
@@ -453,10 +464,10 @@ void wkv_fp32_v2_kv_tile_kernel(
   }
 }
 
-// Albatross's automatically selected four-warp t-loop, adapted to packed
-// request boundaries and slot-indexed [K,V] state.  Four independent value
-// tiles share one copy of the token vectors, avoiding the one-warp CTA slot
-// limit at the exact short-sequence selector points measured upstream.
+// Albatross's four-warp t-loop, adapted to packed request boundaries and
+// slot-indexed [K,V] state.  Four independent value tiles share one copy of
+// the token vectors, avoiding the one-warp CTA slot limit for short-sequence
+// shapes outside ee3308's rectangular FP16 selector.
 template <int ValueTile>
 __global__ __launch_bounds__(kWarpThreads * 4, 2)
 void wkv_fp32_v2_kv_tloop_group4_kernel(
@@ -593,11 +604,13 @@ void wkv_fp32_v2_kv_tloop_group4_kernel(
   }
 }
 
-// Albatross small-warp family.  Each block owns one output row and uses the
-// 32-lane warp to traverse arbitrary D in 32-lane strips.  Unlike the fixed
-// length upstream launch, token_start/token_end are read per request.
+// Albatross small-warp arithmetic adapted to canonical [K,V] state.  Each
+// warp still owns one V coordinate and traverses K in the upstream lane order,
+// preserving the reduction tree and FP32 update order.  Eight warps share a
+// coalesced [K,V-tile] load/store so the public layout does not turn every
+// state access into a stride-HeadSize transaction.
 template <int HeadSize, typename io_t>
-__global__ __launch_bounds__(kWarpThreads, 4)
+__global__ __launch_bounds__(kSmallThreads, 2)
 void wkv_fp32_v2_small_warp_kernel(
     int num_heads,
     int64_t output_elements,
@@ -614,14 +627,17 @@ void wkv_fp32_v2_small_warp_kernel(
     const io_t* __restrict__ b_ptr,
     io_t* __restrict__ output_ptr,
     float scale) {
-  const int row = static_cast<int>(blockIdx.x);
+  const int value_tile = static_cast<int>(blockIdx.x);
   const int head_index = static_cast<int>(blockIdx.y);
   const int sequence_index = static_cast<int>(blockIdx.z);
-  const int lane = static_cast<int>(threadIdx.x);
+  const int thread = static_cast<int>(threadIdx.x);
+  const int warp = thread / kWarpThreads;
+  const int lane = thread & (kWarpThreads - 1);
+  const int value_index = value_tile * kSmallValuesPerBlock + warp;
   const int64_t block_index =
       (static_cast<int64_t>(sequence_index) * num_heads + head_index) *
-          HeadSize +
-      row;
+          gridDim.x +
+      value_tile;
   const int64_t block_count = static_cast<int64_t>(gridDim.x) * gridDim.y *
       gridDim.z;
 
@@ -637,48 +653,99 @@ void wkv_fp32_v2_small_warp_kernel(
   const int token_start = query_start_loc[sequence_index];
   const int token_end = query_start_loc[sequence_index + 1];
   const int state_slot = state_indices[sequence_index];
-  // The canonical FlashRWKV2 state is [K,V].  This row-parallel family owns
-  // one fixed V coordinate, so the K loop must stride by HeadSize from the
-  // state column rather than treating the row as K and transposing state.
   float* state_base = state_ptr +
       (static_cast<int64_t>(state_slot) * num_heads + head_index) *
           HeadSize * HeadSize;
+  __shared__ float state_tile[kSmallValuesPerBlock * HeadSize];
+  for (int linear = thread;
+       linear < kSmallValuesPerBlock * HeadSize;
+       linear += kSmallThreads) {
+    const int key_index = linear / kSmallValuesPerBlock;
+    const int value_offset = linear % kSmallValuesPerBlock;
+    state_tile[linear] = state_base[
+        static_cast<int64_t>(key_index) * HeadSize +
+        value_tile * kSmallValuesPerBlock + value_offset];
+  }
+  __syncthreads();
+
+  constexpr int kStatesPerLane = HeadSize / kWarpThreads;
+  float state[kStatesPerLane];
+#pragma unroll
+  for (int slot = 0; slot < kStatesPerLane; ++slot) {
+    const int key_index = slot * kWarpThreads + lane;
+    state[slot] = state_tile[
+        key_index * kSmallValuesPerBlock + warp];
+  }
+
+  __shared__ float shared_r[HeadSize];
+  __shared__ float shared_decay[HeadSize];
+  __shared__ float shared_k[HeadSize];
+  __shared__ float shared_v[HeadSize];
+  __shared__ float shared_a[HeadSize];
+  __shared__ float shared_b[HeadSize];
 
   for (int token_index = token_start; token_index < token_end; ++token_index) {
     const int64_t token_base =
         static_cast<int64_t>(token_index) * num_heads * HeadSize +
         static_cast<int64_t>(head_index) * HeadSize;
-    float a_state = 0.0f;
-    for (int key_index = lane; key_index < HeadSize;
-         key_index += kWarpThreads) {
-      a_state +=
-          state_base[static_cast<int64_t>(key_index) * HeadSize + row] *
-          to_float(a_ptr[token_base + key_index]);
-    }
-    a_state = warp_sum_broadcast(a_state);
-
-    const float value = to_float(v_ptr[token_base + row]);
-    float result = 0.0f;
-    for (int key_index = lane; key_index < HeadSize;
-         key_index += kWarpThreads) {
-      const int64_t index = token_base + key_index;
+    if (thread < HeadSize) {
+      const int64_t index = token_base + thread;
       float decay_logits = to_float(decay_logits_ptr[index]);
       if (decay_bias_ptr != nullptr) {
         decay_logits +=
-            to_float(decay_bias_ptr[head_index * HeadSize + key_index]);
+            to_float(decay_bias_ptr[head_index * HeadSize + thread]);
       }
+      shared_r[thread] = to_float(r_ptr[index]);
+      shared_decay[thread] = recurrent_retention(decay_logits);
+      shared_k[thread] = to_float(k_ptr[index]);
+      shared_v[thread] = to_float(v_ptr[index]);
+      shared_a[thread] = to_float(a_ptr[index]);
+      shared_b[thread] = to_float(b_ptr[index]);
+    }
+    __syncthreads();
+
+    float a_state = 0.0f;
+#pragma unroll
+    for (int slot = 0; slot < kStatesPerLane; ++slot) {
+      const int key_index = slot * kWarpThreads + lane;
+      a_state += state[slot] * shared_a[key_index];
+    }
+    a_state = warp_sum_broadcast(a_state);
+
+    const float value = shared_v[value_index];
+    float result = 0.0f;
+#pragma unroll
+    for (int slot = 0; slot < kStatesPerLane; ++slot) {
+      const int key_index = slot * kWarpThreads + lane;
       const float updated =
-          state_base[static_cast<int64_t>(key_index) * HeadSize + row] *
-              recurrent_retention(decay_logits) +
-          a_state * to_float(b_ptr[index]) +
-          value * to_float(k_ptr[index]);
-      state_base[static_cast<int64_t>(key_index) * HeadSize + row] = updated;
-      result += updated * to_float(r_ptr[index]);
+          state[slot] * shared_decay[key_index] +
+          value * shared_k[key_index] +
+          a_state * shared_b[key_index];
+      state[slot] = updated;
+      result += updated * shared_r[key_index];
     }
     result = warp_sum(result);
     if (lane == 0) {
-      output_ptr[token_base + row] = from_float<io_t>(scale * result);
+      output_ptr[token_base + value_index] =
+          from_float<io_t>(scale * result);
     }
+    __syncthreads();
+  }
+
+#pragma unroll
+  for (int slot = 0; slot < kStatesPerLane; ++slot) {
+    const int key_index = slot * kWarpThreads + lane;
+    state_tile[key_index * kSmallValuesPerBlock + warp] = state[slot];
+  }
+  __syncthreads();
+  for (int linear = thread;
+       linear < kSmallValuesPerBlock * HeadSize;
+       linear += kSmallThreads) {
+    const int key_index = linear / kSmallValuesPerBlock;
+    const int value_offset = linear % kSmallValuesPerBlock;
+    state_base[
+        static_cast<int64_t>(key_index) * HeadSize +
+        value_tile * kSmallValuesPerBlock + value_offset] = state_tile[linear];
   }
 }
 
@@ -782,19 +849,20 @@ bool use_small_auto(
     int total_tokens,
     int max_seqlen,
     bool io_fp16) {
-  // Albatross tunes this family for its row-major [V,K] state.  FlashRWKV2's
-  // canonical [K,V] state turns the fixed-V warp's lane traversal into
-  // HeadSize-strided loads and stores.  On SM120 this loses to the cooperative
-  // large family at every rectangular selector point, including B=1/16/64,
-  // while the large family already exceeds Albatross at B=320/960.  Keep the
-  // imported body above for provenance, but fail closed to the measured family
-  // until a layout-native small kernel has its own correctness and benchmark
-  // evidence.
-  (void)batch_size;
-  (void)total_tokens;
-  (void)max_seqlen;
-  (void)io_fp16;
-  return false;
+  if (!io_fp16 || max_seqlen <= 0 ||
+      static_cast<int64_t>(batch_size) * max_seqlen != total_tokens) {
+    return false;
+  }
+  // Preserve ee3308's FP32IO16 arithmetic selector for rectangular requests.
+  // The [K,V] tile keeps its reduction tree while restoring coalesced state
+  // traffic; selecting another tree changes every later layer's FP16 inputs
+  // and amplifies into model-level state and logits drift. Ragged requests keep
+  // the other layout-native families because ee3308 has no matching contract.
+  return (max_seqlen == 1 && batch_size <= 96) ||
+      (max_seqlen == 2 && batch_size <= 21) ||
+      (max_seqlen == 3 && batch_size <= 3) ||
+      (max_seqlen == 4 && (batch_size == 1 || batch_size == 3)) ||
+      (batch_size == 1 && max_seqlen >= 5 && max_seqlen <= 11);
 }
 
 int group4_value_tile_auto(
@@ -841,7 +909,7 @@ void launch_recurrent_fp32(
     cudaStream_t stream) {
   const int64_t output_elements = output.numel();
   const bool io_fp16 = r.scalar_type() == at::ScalarType::Half;
-  const bool use_small = use_small_auto(
+  const bool use_small = HeadSize == 64 && use_small_auto(
       num_sequences, total_tokens, max_seqlen, io_fp16);
   const int group4_value_tile = group4_value_tile_auto(
       num_sequences, num_heads, max_seqlen, io_fp16);
@@ -865,6 +933,17 @@ void launch_recurrent_fp32(
             output.data_ptr<io_t>(), scale);
   }
 #endif
+  if (use_small) {
+    wkv_fp32_v2_small_warp_kernel<HeadSize, io_t>
+        <<<dim3(HeadSize / kSmallValuesPerBlock, num_heads, num_sequences),
+               dim3(kSmallThreads), 0, stream>>>(
+            num_heads, output_elements, query_ptr, state_indices_ptr,
+            status_ptr, state_ptr, r.data_ptr<io_t>(),
+            decay_logits.data_ptr<io_t>(), decay_bias_ptr, k.data_ptr<io_t>(),
+            v.data_ptr<io_t>(), a.data_ptr<io_t>(), b.data_ptr<io_t>(),
+            output.data_ptr<io_t>(), scale);
+    return;
+  }
   if constexpr (HeadSize == 64) {
     if (num_sequences == 1 && total_tokens == 1 && max_seqlen == 1) {
       wkv_fp32_v2_kv_tile_kernel<HeadSize, io_t>
@@ -910,24 +989,13 @@ void launch_recurrent_fp32(
       return;
     }
   }
-  if (use_small) {
-    wkv_fp32_v2_small_warp_kernel<HeadSize, io_t>
-        <<<dim3(HeadSize, num_heads, num_sequences), dim3(kWarpThreads), 0,
-               stream>>>(
-            num_heads, output_elements, query_ptr, state_indices_ptr,
-            status_ptr, state_ptr, r.data_ptr<io_t>(),
-            decay_logits.data_ptr<io_t>(), decay_bias_ptr, k.data_ptr<io_t>(),
-            v.data_ptr<io_t>(), a.data_ptr<io_t>(), b.data_ptr<io_t>(),
-            output.data_ptr<io_t>(), scale);
-  } else {
-    wkv_fp32_v2_kernel<HeadSize, io_t>
-        <<<dim3(num_heads, num_sequences), dim3(HeadSize), 0, stream>>>(
-            num_heads, output_elements, query_ptr, state_indices_ptr,
-            status_ptr, state_ptr, r.data_ptr<io_t>(),
-            decay_logits.data_ptr<io_t>(), decay_bias_ptr, k.data_ptr<io_t>(),
-            v.data_ptr<io_t>(), a.data_ptr<io_t>(), b.data_ptr<io_t>(),
-            output.data_ptr<io_t>(), scale);
-  }
+  wkv_fp32_v2_kernel<HeadSize, io_t>
+      <<<dim3(num_heads, num_sequences), dim3(HeadSize), 0, stream>>>(
+          num_heads, output_elements, query_ptr, state_indices_ptr,
+          status_ptr, state_ptr, r.data_ptr<io_t>(),
+          decay_logits.data_ptr<io_t>(), decay_bias_ptr, k.data_ptr<io_t>(),
+          v.data_ptr<io_t>(), a.data_ptr<io_t>(), b.data_ptr<io_t>(),
+          output.data_ptr<io_t>(), scale);
 }
 
 }  // namespace

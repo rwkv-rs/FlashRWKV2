@@ -437,6 +437,15 @@ def _selected_fp32_family(
 ) -> str:
     """Report the measured family selected for canonical [K,V] state."""
 
+    uniform_t = workload.uniform_t
+    if dtype == torch.float16 and uniform_t is not None and (
+        (uniform_t == 1 and workload.batch_size <= 96)
+        or (uniform_t == 2 and workload.batch_size <= 21)
+        or (uniform_t == 3 and workload.batch_size <= 3)
+        or (uniform_t == 4 and workload.batch_size in {1, 3})
+        or (workload.batch_size == 1 and 5 <= uniform_t <= 11)
+    ):
+        return "wkv_fp32_v2_small_warp_kv8"
     if workload.batch_size == 1 and workload.uniform_t == 1:
         return "wkv_fp32_v2_kv_tile"
     sequence_heads = workload.batch_size * num_heads
