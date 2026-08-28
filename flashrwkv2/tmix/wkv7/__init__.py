@@ -43,16 +43,39 @@ _DELTALOG_TUNED_M = {
     (4096, 512): 4,
 }
 
+# The ordinary FlashRWKV2 FP16-state launcher is faster than DeltaLog for
+# these upstream candidates on PRO6000.  Keep the exact Albatross table above
+# as the source policy, then fail closed to the ordinary launcher at the
+# locally unprofitable points.  FP32IO16 benefits at every upstream point.
+_DELTALOG_FP16_UNPROFITABLE_SHAPES = frozenset(
+    {
+        (768, 64),
+        (768, 128),
+        (1024, 64),
+        (2048, 32),
+        (2048, 64),
+        (2560, 32),
+        (4096, 32),
+    }
+)
+
 
 def _select_deltalog_merge_interval(
     channels: int,
     sequence_capacity: int,
     head_size: int,
     capability: tuple[int, int],
+    numerical_mode: str,
 ) -> int:
     if capability[0] != 12 or head_size != 64:
         return 0
-    return _DELTALOG_TUNED_M.get((channels, sequence_capacity), 0)
+    shape = (channels, sequence_capacity)
+    if (
+        numerical_mode == "fp16"
+        and shape in _DELTALOG_FP16_UNPROFITABLE_SHAPES
+    ):
+        return 0
+    return _DELTALOG_TUNED_M.get(shape, 0)
 
 
 def _extension():
@@ -344,6 +367,7 @@ def _prepare_recurrent_state(
         sequence_capacity,
         head_size,
         capability,
+        "fp16" if state_pool.dtype == torch.float16 else "fp32io16",
     )
     return _TmixWkv7RecurrentState(
         state_pool,

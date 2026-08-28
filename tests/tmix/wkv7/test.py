@@ -2058,6 +2058,37 @@ def test_unified_fp32io16_exact_policy_and_complete_state_lifecycle() -> None:
     assert _relative_rmse(selected_state, ordinary_state) <= 4.0e-3
 
 
+def test_state_prepare_uses_mode_specific_profitable_policy() -> None:
+    _require_deltalog_extension()
+    _require_fp32io16_deltalog_extension()
+    sequence_capacity, num_heads, head_size = 64, 12, 64
+    fp16_state_pool = torch.zeros(
+        (sequence_capacity, num_heads, head_size, head_size),
+        device="cuda",
+        dtype=torch.float16,
+    )
+    elapsed_state_pool = torch.zeros(
+        sequence_capacity,
+        device="cuda",
+        dtype=torch.int32,
+    )
+    fp16_state = prepare_tmix_wkv7_recurrent_fp16_state(
+        fp16_state_pool,
+        elapsed_state_pool,
+        sequence_capacity=sequence_capacity,
+    )
+    fp32io16_state = prepare_tmix_wkv7_recurrent_fp32io16_state(
+        fp16_state_pool.float(),
+        sequence_capacity=sequence_capacity,
+    )
+    assert fp16_state._merge_interval == 0
+    assert fp16_state._deltalog_phase_pool is None
+    assert fp16_state._deltalog_pool is None
+    assert fp32io16_state._merge_interval == 3
+    assert fp32io16_state._deltalog_phase_pool is not None
+    assert fp32io16_state._deltalog_pool is not None
+
+
 @pytest.mark.parametrize("operator", ("fp16", "fp32io16"))
 def test_unified_deltalog_policy_falls_back_for_non_t1(operator: str) -> None:
     if operator == "fp16":

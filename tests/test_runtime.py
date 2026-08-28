@@ -174,16 +174,50 @@ def test_deltalog_policy_matches_pinned_albatross_exact_table() -> None:
         "3465da5070beceb4bab9e07b03abee1642a0bdf8"
     )
     assert module._DELTALOG_TUNED_M == expected
+    fp16_unprofitable = {
+        (768, 64),
+        (768, 128),
+        (1024, 64),
+        (2048, 32),
+        (2048, 64),
+        (2560, 32),
+        (4096, 32),
+    }
+    assert module._DELTALOG_FP16_UNPROFITABLE_SHAPES == fp16_unprofitable
     for (channels, batch_size), merge_interval in expected.items():
         assert (
             module._select_deltalog_merge_interval(
-                channels, batch_size, 64, (12, 0)
+                channels, batch_size, 64, (12, 0), "fp32io16"
             )
             == merge_interval
         )
-    assert module._select_deltalog_merge_interval(4096, 320, 64, (12, 0)) == 0
-    assert module._select_deltalog_merge_interval(4096, 64, 128, (12, 0)) == 0
-    assert module._select_deltalog_merge_interval(4096, 64, 64, (9, 0)) == 0
+        expected_fp16 = (
+            0 if (channels, batch_size) in fp16_unprofitable else merge_interval
+        )
+        assert (
+            module._select_deltalog_merge_interval(
+                channels, batch_size, 64, (12, 0), "fp16"
+            )
+            == expected_fp16
+        )
+    assert (
+        module._select_deltalog_merge_interval(
+            4096, 320, 64, (12, 0), "fp32io16"
+        )
+        == 0
+    )
+    assert (
+        module._select_deltalog_merge_interval(
+            4096, 64, 128, (12, 0), "fp32io16"
+        )
+        == 0
+    )
+    assert (
+        module._select_deltalog_merge_interval(
+            4096, 64, 64, (9, 0), "fp32io16"
+        )
+        == 0
+    )
 
 
 def test_retired_public_aliases_are_absent() -> None:

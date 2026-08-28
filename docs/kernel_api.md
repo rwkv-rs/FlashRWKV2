@@ -31,14 +31,16 @@ FP16 handle 持有调用方提供的 FP16 基础 state 与 elapsed state；FP32I
 DeltaLog phase/log workspace；`clone()`、`copy_()` 和 `zero_()` 始终覆盖完整逻辑
 状态包。下游不得读取、移动或单独管理 DeltaLog policy、`M`、phase 或 logs。
 
-策略固定自 Albatross `3465da5070beceb4bab9e07b03abee1642a0bdf8` 的普通
-`WKV_DELTALOG_TUNED_M` 精确表。只有 SM120、FP16 token IO、FP16 或 FP32
-state、`D=64`、固定容量 `T=1` 且 `(C, sequence_capacity)` 精确命中该表时，
-对应统一入口才调用私有 DeltaLog launcher；FP32 state 的 BF16 IO、`T>1`、其他
-device/head size 或表外 shape 自动调用对应普通 launcher。策略不插值，不接受
-外部 `M` override，也不包含依赖模型级 CUDA Graph 调度的 APW-only 表。策略与
-workspace 在 state preparation 阶段确定；统一入口不会在热路径查询主机侧 CUDA
-数据。native 校验异常继续令整套 state fail-closed。
+策略保留 Albatross `3465da5070beceb4bab9e07b03abee1642a0bdf8` 的普通
+`WKV_DELTALOG_TUNED_M` 精确表作为候选表。FP32IO16 在 SM120、FP16 token IO、
+`D=64`、固定容量 `T=1` 且 `(C, sequence_capacity)` 精确命中时使用对应 `M`。
+FlashRWKV2 的普通 FP16-state launcher 在 `(768,64)`、`(768,128)`、`(1024,64)`、
+`(2048,32)`、`(2048,64)`、`(2560,32)` 与 `(4096,32)` 上更快，因此这些候选点
+自动回退普通 FP16；其余表内 FP16 点使用 DeltaLog。FP32 state 的 BF16 IO、
+`T>1`、其他 device/head size 或表外 shape 也自动调用对应普通 launcher。策略
+不插值，不接受外部 `M` override，也不包含依赖模型级 CUDA Graph 调度的
+APW-only 表。策略与 workspace 在 state preparation 阶段确定；统一入口不会在
+热路径查询主机侧 CUDA 数据。native 校验异常继续令整套 state fail-closed。
 
 `prepare_tmix_wkv7_recurrent_fp16_state`、
 `prepare_tmix_wkv7_recurrent_fp32io16_state`、

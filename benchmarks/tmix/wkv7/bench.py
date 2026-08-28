@@ -451,6 +451,7 @@ def _selected_fp32_family(
             workload.batch_size,
             operator_shape.head_size,
             tuple(torch.cuda.get_device_capability()),
+            "fp32io16",
         )
         if merge_interval:
             return f"wkv_deltalog_fp32_m{merge_interval}"
@@ -486,6 +487,7 @@ def _selected_fp16_family(workload: Workload, operator_shape: OperatorShape) -> 
             workload.batch_size,
             operator_shape.head_size,
             tuple(torch.cuda.get_device_capability()),
+            "fp16",
         )
     if merge_interval:
         return f"wkv_deltalog_m{merge_interval}"
@@ -502,14 +504,23 @@ def _selected_fp16_family(workload: Workload, operator_shape: OperatorShape) -> 
     return "wkv_fp16_existing_family"
 
 
-DELTALOG_EXPERIMENTS = tuple(
-    (channels, batch_size, merge_interval, False)
-    for (channels, batch_size), merge_interval in sorted(
-        wkv7_module._DELTALOG_TUNED_M.items()
+def _deltalog_experiments(
+    operator: str,
+) -> tuple[tuple[int, int, int, bool], ...]:
+    experiments = tuple(
+        (channels, batch_size, merge_interval, False)
+        for (channels, batch_size), merge_interval in sorted(
+            wkv7_module._DELTALOG_TUNED_M.items()
+        )
+        if wkv7_module._select_deltalog_merge_interval(
+            channels,
+            batch_size,
+            64,
+            (12, 0),
+            operator,
+        )
     )
-) + (
-    (4096, 256, 3, True),
-)
+    return experiments + ((4096, 256, 3, True),)
 
 
 def _measure_deltalog_experiment(
@@ -868,7 +879,7 @@ def main(argv: list[str] | None = None) -> int:
             merge_interval,
             staggered,
         ) in enumerate(
-            DELTALOG_EXPERIMENTS
+            _deltalog_experiments(args.operator)
         ):
             experiment = _measure_deltalog_experiment(
                 channels=channels,
