@@ -152,7 +152,8 @@ std::vector<torch::Tensor> tmix_postnorm_tokenshift_forward_varlen(
     metadata_status = std::move(prepared.status);
     token_predecessor = std::move(prepared.token_predecessor);
   }
-  if (channels == 4096 && total_tokens == batch_size && max_seqlen == 1) {
+  if (batch_size == 1 && channels == 4096 && total_tokens == 1 &&
+      max_seqlen == 1) {
     return tmix_res_ln_tokenshift_fused_forward_cuda(
         x, res, shift_state_pool, weight, bias, x_r, x_w, x_k, x_v,
         x_a, x_g, token_predecessor, metadata_status, eps);

@@ -195,28 +195,26 @@ bool use_tmix_tokenshift_grid3d(
 }
 
 template <int Threads>
-__device__ __forceinline__ float block_sum(float value) {
-  __shared__ float partial[Threads / 32];
+__device__ __forceinline__ float block_sum(float value, int slot) {
+  __shared__ float partial[2][Threads / 32];
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
 #pragma unroll
   for (int offset = 16; offset > 0; offset >>= 1) {
     value += __shfl_down_sync(0xffffffffu, value, offset);
   }
-  if (lane == 0) partial[warp] = value;
+  if (lane == 0) partial[slot][warp] = value;
   __syncthreads();
-  value = threadIdx.x < Threads / 32 ? partial[lane] : 0.0f;
+  value = threadIdx.x < Threads / 32 ? partial[slot][lane] : 0.0f;
   if (warp == 0) {
 #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
       value += __shfl_down_sync(0xffffffffu, value, offset);
     }
   }
-  if (threadIdx.x == 0) partial[0] = value;
+  if (threadIdx.x == 0) partial[slot][0] = value;
   __syncthreads();
-  const float result = partial[0];
-  __syncthreads();
-  return result;
+  return partial[slot][0];
 }
 
 template <int Threads>
@@ -275,7 +273,7 @@ __global__ __launch_bounds__(Threads, 1) void res_ln_tmix_tokenshift_fused_kerne
     sum += __half2float(*reinterpret_cast<const __half*>(x + base + c)) +
            __half2float(*reinterpret_cast<const __half*>(res + base + c));
   }
-  const float mean = block_sum<Threads>(sum) / C;
+  const float mean = block_sum<Threads>(sum, 0) / C;
   float var = 0.0f;
 #pragma unroll
   for (int k = 0; k < C / Threads; ++k) {
@@ -286,7 +284,7 @@ __global__ __launch_bounds__(Threads, 1) void res_ln_tmix_tokenshift_fused_kerne
     const float delta = value - mean;
     var += delta * delta;
   }
-  const float rstd = rsqrtf(block_sum<Threads>(var) / C + eps);
+  const float rstd = rsqrtf(block_sum<Threads>(var, 1) / C + eps);
 #pragma unroll
   for (int p = threadIdx.x; p < pairs; p += Threads) {
     const float2 xv = __half22float2(reinterpret_cast<const __half2*>(x)[base2 + p]);

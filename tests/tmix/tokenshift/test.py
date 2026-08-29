@@ -264,8 +264,8 @@ def test_infer_tmix_postnorm_tokenshift_matches_albatross_t1_path() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.sm120
-@pytest.mark.parametrize("batch_size", (16, 64, 320, 960))
-def test_infer_tmix_t1_fused_varlen_preserves_fragmented_slots(
+@pytest.mark.parametrize("batch_size", (4, 16, 64, 320, 960))
+def test_infer_tmix_t1_varlen_preserves_fragmented_slots(
     batch_size: int,
 ) -> None:
     torch.manual_seed(20260823 + batch_size)
