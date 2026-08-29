@@ -57,12 +57,12 @@ RACECHECK_TARGETS = {
     "tmix/wkv7/rl_infctx",
 }
 CUDA_GRAPH_TARGETS = {"sampling", "tmix/tokenshift", "tmix/wkv7"}
-SHARED_FILES = {
-    "setup.py",
+RELEASE_METADATA_FILES = {
     "pyproject.toml",
     "uv.lock",
     "flashrwkv2/__init__.py",
 }
+SHARED_FILES = {"setup.py", *RELEASE_METADATA_FILES}
 TEST_SHARED_FILES = {"tests/fixtures/tolerances-v1.json"}
 SHARED_PREFIXES = (
     ".github/workflows/",
@@ -394,12 +394,21 @@ def _git_changed_files(base_sha: str, head_sha: str) -> list[str]:
     return result.stdout.splitlines()
 
 
-def _release_metadata_only(
-    paths: list[str], base_sha: str, head_sha: str
-) -> bool:
-    allowed = {"pyproject.toml", "flashrwkv2/__init__.py", "uv.lock"}
+def _release_metadata_paths(paths: list[str]) -> tuple[str, ...]:
     changed = {path.strip().removeprefix("./") for path in paths if path.strip()}
-    if not base_sha or not head_sha or not changed or not changed <= allowed:
+    runtime_changes = {
+        path
+        for path in changed
+        if path not in DOC_FILES and not path.startswith(DOC_PREFIXES)
+    }
+    if not runtime_changes or not runtime_changes <= RELEASE_METADATA_FILES:
+        return ()
+    return tuple(sorted(runtime_changes))
+
+
+def _release_metadata_only(paths: list[str], base_sha: str, head_sha: str) -> bool:
+    changed = _release_metadata_paths(paths)
+    if not base_sha or not head_sha or not changed:
         return False
     versions: dict[str, str] = {}
 
@@ -592,11 +601,23 @@ def _self_test() -> None:
     unknown = classify(["flashrwkv2/new_family.py"])
     assert unknown.run_all and unknown.run_sanitizer
     release = classify(
-        ["pyproject.toml", "flashrwkv2/__init__.py", "uv.lock"],
+        [
+            "docs/kernel_api.md",
+            "pyproject.toml",
+            "flashrwkv2/__init__.py",
+            "uv.lock",
+        ],
         release_metadata_only=True,
     )
     assert release.package_smoke_only and release.run_gpu
     assert not release.run_benchmark and not release.affected_modules
+    assert _release_metadata_paths(list(release.changed_files)) == (
+        "flashrwkv2/__init__.py",
+        "pyproject.toml",
+        "uv.lock",
+    )
+    assert not _release_metadata_paths(["docs/kernel_api.md"])
+    assert not _release_metadata_paths(["pyproject.toml", "setup.py"])
 
 
 def main() -> int:
