@@ -187,6 +187,28 @@ def test_rl_infctx_backward_replay_matches_recurrence(d: int) -> None:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.sm90
 @pytest.mark.sm120
+def test_rl_infctx_backward_replay_preserves_native_defaults() -> None:
+    device = torch.device("cuda")
+    shape = (1, 1, 64)
+    inputs = [torch.zeros(shape, device=device, dtype=torch.float16) for _ in range(6)]
+    output = torch.empty_like(inputs[3])
+    state_dot_a = torch.empty_like(inputs[0], dtype=torch.float32)
+    _extension().rl_infctx_tmix_wkv7_chunk_fp32io16_backward_replay(
+        torch.tensor([0], device=device, dtype=torch.int32),
+        torch.tensor([1], device=device, dtype=torch.int32),
+        torch.zeros((1, 1, 64, 64), device=device),
+        *inputs,
+        output,
+        state_dot_a,
+    )
+    torch.cuda.synchronize()
+    assert torch.isfinite(output).all()
+    assert torch.isfinite(state_dot_a).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.sm90
+@pytest.mark.sm120
 @pytest.mark.parametrize("d", (64, 128, 256))
 def test_rl_infctx_bf16_chunk_sizes_and_tail_match_reference(d: int) -> None:
     torch.manual_seed(43)

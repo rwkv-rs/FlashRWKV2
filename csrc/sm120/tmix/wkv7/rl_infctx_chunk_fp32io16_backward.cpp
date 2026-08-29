@@ -124,7 +124,7 @@ void rl_infctx_tmix_wkv7_chunk_fp32io16_backward_replay(
 }
 
 STABLE_TORCH_LIBRARY_FRAGMENT(flashrwkv2, module) {
-  module.def("rl_infctx_tmix_wkv7_chunk_fp32io16_backward_replay(Tensor chunk_token_starts, Tensor chunk_token_ends, Tensor boundary, Tensor r, Tensor decay_logits, Tensor k, Tensor v, Tensor a, Tensor b, Tensor(a!) output, Tensor state_dot_a, float scale, Tensor? decay_bias) -> ()");
+  module.def("rl_infctx_tmix_wkv7_chunk_fp32io16_backward_replay(Tensor chunk_token_starts, Tensor chunk_token_ends, Tensor boundary, Tensor r, Tensor decay_logits, Tensor k, Tensor v, Tensor a, Tensor b, Tensor(a!) output, Tensor state_dot_a, float scale=1.0, Tensor? decay_bias=None) -> ()");
 }
 
 STABLE_TORCH_LIBRARY_IMPL(flashrwkv2, CUDA, module) {
