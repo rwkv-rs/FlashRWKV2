@@ -1,4 +1,4 @@
-# FlashRWKV2 0.1.0a10 operator contract
+# FlashRWKV2 0.1.0a11 operator contract
 
 推理公共接口只包含模型调用者需要的最高融合岛。内部 launcher 不属于 Python 或 native 公共契约，也不会从根包导出。
 
@@ -40,6 +40,14 @@ elapsed、phase 与 logs 的完整逻辑状态包。`copy_slots_` 具有同时�
 把指定 slot 的 pending logs 合入 base state 并清空其 phase/log，不改变 elapsed；
 统一入口从 DeltaLog 回退普通 kernel 前会自动完成同一操作。
 
+`prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor(state)` 为普通模型 cache
+绑定调用方已有的连续 CUDA FP32 `[slots,H,D,D]` tensor。返回的 handle 直接持有并
+原位更新该 tensor，不复制基础 state，也不要求调用方提供 `sequence_capacity`。
+caller-backed handle 固定使用完整 materialized FP32IO16 state，不分配 DeltaLog
+phase/log workspace；因此每次推理返回时，调用方 tensor 都是完整的当前 state。
+该入口用于维持调用方已有 tensor 的公开 cache 契约，不用于 server state-pool
+显存预算；调用方必须在 handle 存活期间保持 tensor storage 地址不变。
+
 handle 的 `memory_layout` 是唯一显存统计入口，返回实际分配的
 `base_bytes_per_slot`、`private_bytes_per_slot`、`bytes_per_slot`、
 `fixed_workspace_nbytes` 与 `total_nbytes`。state preparation 同时完成内部 policy
@@ -59,6 +67,7 @@ APW-only 表。策略与 workspace 在 state preparation 阶段确定；统一�
 
 `prepare_tmix_wkv7_recurrent_fp16_state`、
 `prepare_tmix_wkv7_recurrent_fp32io16_state`、
+`prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor`、
 `prepare_tmix_wkv7_recurrent_metadata` 和 `setup_sampling_states` 是上述推理入口
 需要的状态 preparation API。
 
@@ -69,14 +78,14 @@ APW-only 表。策略与 workspace 在 state preparation 阶段确定；统一�
 `pretrain_tmix_kk_pre_bf16`、`pretrain_tmix_readout_bf16`、
 `pretrain_tmix_tokenshift_bf16`、`statetune_tmix_tokenshift_bf16`、
 `pretrain_tmix_vres_gate_bf16`、`pretrain_l2wrap_ce_bf16` 和
-`pretrain_head_l2wrap_ce_bf16`。根包总计导出 31 个唯一名称：13 个推理入口、
-14 个训练入口和上述 4 个状态 preparation 入口。
+`pretrain_head_l2wrap_ce_bf16`。根包总计导出 32 个唯一名称：13 个推理入口、
+14 个训练入口和上述 5 个状态 preparation 入口。
 
 TMix 的 `B=1,T=1,C=4096` 与 CMix 的 `T=1,C=4096` 使用 Albatross 派生的单次 Res+LN+TokenShift fused launch；其他 packed varlen 形状在同一公共入口内部顺序启动 PostNorm 与 TokenShift。CMix 的 dense/sparse 选择也完全由 `infer_cmix_forward_varlen` 内部完成。
 
 ## Downstream handoff
 
-`transformers-rwkv` 必须精确依赖 `FlashRWKV2==0.1.0a10`，只检查和调用上述公共
+`transformers-rwkv` 必须精确依赖 `FlashRWKV2==0.1.0a11`，只检查和调用上述公共
 接口。server 侧通过统一 handle 的 slot lifecycle 与 memory layout 完成 cache
 调度；模型侧不得为 FP16 或 FP32IO16 选择普通/DeltaLog、传入 `M`、管理
 phase/logs，或调用

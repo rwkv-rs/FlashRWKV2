@@ -236,6 +236,11 @@ def test_wkv7_state_preparation_owns_memory_accounting() -> None:
             "head_size",
             "device",
         )
+    assert tuple(
+        inspect.signature(
+            module.prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor
+        ).parameters
+    ) == ("state",)
 
 
 def test_retired_public_aliases_are_absent() -> None:

@@ -248,7 +248,7 @@ class _TmixWkv7RecurrentState:
         self,
         state_pool: torch.Tensor,
         elapsed_state_pool: torch.Tensor | None,
-        sequence_capacity: int,
+        sequence_capacity: int | None,
         merge_interval: int,
     ) -> None:
         self._state_pool = state_pool
@@ -665,6 +665,20 @@ def prepare_tmix_wkv7_recurrent_fp32io16_state(
     )
 
 
+def prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor(
+    state: torch.Tensor,
+) -> object:
+    """Bind an opaque materialized FP32IO16 handle to a caller-owned tensor."""
+
+    _validate_state(state)
+    return _TmixWkv7RecurrentState(
+        state,
+        elapsed_state_pool=None,
+        sequence_capacity=None,
+        merge_interval=0,
+    )
+
+
 def _check_metadata_inputs(
     cu_seqlens: torch.Tensor,
     state_indices: torch.Tensor,
@@ -885,8 +899,10 @@ def infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
         or state._elapsed_state_pool is not None
     ):
         raise TypeError(
-            "state must come from prepare_tmix_wkv7_recurrent_fp32io16_state"
-    )
+            "state must come from "
+            "prepare_tmix_wkv7_recurrent_fp32io16_state or "
+            "prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor"
+        )
     packed = _validate_packed_inputs(r, decay_logits, k, v, a, b)
     _check_metadata_inputs(cu_seqlens, state_indices)
     launch_max_seqlen = _dispatch_max_seqlen(max_seqlen, validated_metadata)
@@ -1208,6 +1224,7 @@ __all__ = [
     "infer_tmix_wkv7_recurrent_fp32io16_forward_varlen",
     "prepare_tmix_wkv7_recurrent_fp16_state",
     "prepare_tmix_wkv7_recurrent_fp32io16_state",
+    "prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor",
     "prepare_tmix_wkv7_recurrent_metadata",
     "pretrain_tmix_wkv7_recurrent_bf16",
     "rl_infctx_tmix_wkv7_chunk_fp32io16",
