@@ -956,16 +956,18 @@ def prepare_tmix_wkv7_recurrent_metadata(
         raise ValueError(
             "cu_seqlens must be strictly increasing with non-empty sequences"
         )
-    if len(set(slots)) != len(slots) or any(
-        slot < 0 or slot >= state_pool_size for slot in slots
-    ):
-        raise ValueError("state_indices must be unique and within the state pool")
+    if any(slot < 0 or slot >= state_pool_size for slot in slots):
+        raise RuntimeError("state_indices entries must be within the state pool")
+    if len(set(slots)) != len(slots):
+        raise RuntimeError("state_indices must be unique within one call")
     inferred_max_seqlen = max(end - start for start, end in pairwise(offsets))
-    resolved_max_seqlen = (
-        inferred_max_seqlen if max_seqlen is None else int(max_seqlen)
-    )
-    if resolved_max_seqlen != inferred_max_seqlen:
-        raise ValueError("max_seqlen must equal the largest packed sequence length")
+    resolved_max_seqlen = -1 if max_seqlen is None else int(max_seqlen)
+    if resolved_max_seqlen <= 0:
+        resolved_max_seqlen = inferred_max_seqlen
+    elif resolved_max_seqlen != inferred_max_seqlen:
+        raise RuntimeError(
+            "max_seqlen must equal the largest packed sequence length"
+        )
     prepared = _extension().prepare_tmix_wkv7_recurrent_metadata(
         cu_seqlens,
         state_indices,
