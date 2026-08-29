@@ -254,7 +254,13 @@ def build_plan(base_sha: str, head_sha: str) -> dict[str, Any]:
         "impact": asdict(impact),
         "contract_required": impact.change_class != "documentation",
         "package_required": impact.run_gpu,
-        "scope": "function" if function_targets else "tree",
+        "scope": (
+            "function"
+            if function_targets
+            else "control"
+            if impact.change_class == "control_plane"
+            else "tree"
+        ),
         "function_targets": function_targets or [],
         "sm90_correctness_nodeids": [
             target["nodeid"] for target in function_targets or [] if target["backend"] == "sm90"
@@ -644,7 +650,7 @@ def finalize(
                 )
             coverage[backend][module] = entry
 
-    if plan.get("scope") != "function":
+    if plan.get("scope") not in {"function", "control"}:
         for module in TARGETS:
             for backend in BACKENDS_BY_TARGET[module]:
                 entry = coverage[backend].get(module)
@@ -674,9 +680,9 @@ def finalize(
             **recorded_checks,
             "contract": "passed" if plan["contract_required"] else "not-required",
             "package": "passed" if plan["package_required"] else "not-required",
-            "sm90": "PTX-on-SM120",
-            "sm120": "native-sm120",
-            "sanitizer": "passed",
+            "sm90": recorded_checks.get("sm90", "not-required"),
+            "sm120": recorded_checks.get("sm120", "not-required"),
+            "sanitizer": "passed" if impact["run_sanitizer"] else "not-required",
         },
         "coverage": coverage,
         "function_coverage": [
