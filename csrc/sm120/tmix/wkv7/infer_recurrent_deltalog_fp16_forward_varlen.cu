@@ -189,8 +189,8 @@ __global__ __launch_bounds__(kHeadSize, 1) void materialize_slots_kernel(
     const half old_v = deltalog_pool[log_index(
         log_slot, kVKind, state_slot, head_index, thread,
         state_pool_slots, num_heads)];
-    const half2 old_u_pair = __halves2half2(old_u, old_u);
-    const half2 old_v_pair = __halves2half2(old_v, old_v);
+    // Match the public FP16-state contract: accumulate one recurrence in
+    // FP32, then quantize once when the pending log becomes physical state.
 #pragma unroll
     for (int key_pair = 0; key_pair < kHalf2HeadSize; ++key_pair) {
       const int key = 2 * key_pair;
@@ -207,11 +207,21 @@ __global__ __launch_bounds__(kHeadSize, 1) void materialize_slots_kernel(
           deltalog_pool +
           log_index(log_slot, kKKind, state_slot, head_index, key,
                     state_pool_slots, num_heads)));
-      state[key_pair] = __hfma2(
-          old_state, delta,
-          __hfma2(
-              old_k, old_v_pair,
-              __hfma2(old_u_pair, old_b, old_state)));
+      const float old_state0 = __half2float(old_state.x);
+      const float old_state1 = __half2float(old_state.y);
+      float updated0 = fmaf(
+          old_state0, __half2float(delta.x), old_state0);
+      float updated1 = fmaf(
+          old_state1, __half2float(delta.y), old_state1);
+      updated0 = fmaf(
+          __half2float(old_u), __half2float(old_b.x), updated0);
+      updated1 = fmaf(
+          __half2float(old_u), __half2float(old_b.y), updated1);
+      updated0 = fmaf(
+          __half2float(old_k.x), __half2float(old_v), updated0);
+      updated1 = fmaf(
+          __half2float(old_k.y), __half2float(old_v), updated1);
+      state[key_pair] = __floats2half2_rn(updated0, updated1);
     }
   }
   if (phase != 0) {
@@ -230,8 +240,25 @@ __global__ __launch_bounds__(kHeadSize, 1) void materialize_slots_kernel(
           state_pool_slots, num_heads)] = zero;
     }
   }
-  if (head_index == 0 && thread == 0) {
-    phase_pool[state_slot] = 0;
+}
+
+// phase_pool is slot-wide.  Reset it only after every per-head materialize
+// block in the preceding launch has consumed the same phase snapshot.
+__global__ void reset_materialized_phases_kernel(
+    const int* __restrict__ state_indices,
+    int* __restrict__ phase_pool,
+    const int* __restrict__ metadata_status,
+    const int* __restrict__ deltalog_status,
+    int num_entries) {
+  if (deltalog_status[0] != 0) {
+    return;
+  }
+  const int active_entries =
+      metadata_status == nullptr ? num_entries : metadata_status[2];
+  for (int entry = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+       entry < active_entries;
+       entry += static_cast<int>(gridDim.x) * blockDim.x) {
+    phase_pool[state_indices[entry]] = 0;
   }
 }
 
@@ -845,5 +872,9 @@ void tmix_wkv7_recurrent_deltalog_fp16_materialize_slots_cuda(
       TORCH_CHECK(false, "unsupported DeltaLog merge interval");
   }
 #undef DISPATCH_MATERIALIZE_M
+  reset_materialized_phases_kernel<<<1, validation_threads, 0, stream>>>(
+      state_indices.data_ptr<int>(), phase_pool.data_ptr<int>(),
+      metadata_status.defined() ? metadata_status.data_ptr<int>() : nullptr,
+      deltalog_status.data_ptr<int>(), num_entries);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

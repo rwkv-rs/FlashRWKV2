@@ -218,7 +218,7 @@ print(json.dumps({
             "nvidia-smi",
             f"--query-gpu={query}",
             "--format=csv,noheader,nounits",
-            "--id=0",
+            f"--id={_physical_gpu()}",
         ),
         check=True,
         capture_output=True,
@@ -237,7 +237,7 @@ def _assert_gpu_idle() -> None:
             "nvidia-smi",
             "--query-compute-apps=pid",
             "--format=csv,noheader,nounits",
-            "--id=0",
+            f"--id={_physical_gpu()}",
         ),
         check=True,
         capture_output=True,
@@ -246,6 +246,10 @@ def _assert_gpu_idle() -> None:
     pids = [line.strip() for line in result.stdout.splitlines() if line.strip()]
     if pids:
         raise SystemExit(f"benchmark GPU is not idle; active compute PIDs: {pids}")
+
+
+def _physical_gpu() -> str:
+    return os.environ.get("FLASHRWKV_PHYSICAL_GPU", "0")
 
 
 def _last_json(stdout: str) -> dict[str, Any]:
@@ -534,6 +538,10 @@ def run_suite(
     }
 
 
+def _suite_complete(summary: dict[str, Any], modules: list[str]) -> bool:
+    return summary.get("completed_modules") == modules
+
+
 def _compatible(baseline: dict[str, Any], candidate: dict[str, Any]) -> None:
     for key in ("schema_version", "module", "target", "benchmark_contract_sha256"):
         if baseline.get(key) != candidate.get(key):
@@ -662,17 +670,15 @@ def fetch_main_baselines(
             (
                 row
                 for row in artifacts
-                if row.get("name", "").startswith("flashrwkv2-quality-v2-")
+                if row.get("name", "").startswith("flashrwkv2-quality-v3-")
                 and not row.get("expired")
             ),
             None,
         )
         if evidence is None:
             continue
-        request = urllib.request.Request(
-            evidence["archive_download_url"],
-            headers={"Authorization": f"Bearer {token}"},
-        )
+        request = urllib.request.Request(evidence["archive_download_url"])
+        request.add_unredirected_header("Authorization", f"Bearer {token}")
         with urllib.request.urlopen(request) as response, tempfile.NamedTemporaryFile() as archive:
             archive.write(response.read())
             archive.flush()
@@ -737,6 +743,20 @@ def _self_test() -> None:
     assert _last_json('diagnostic\n{"status":"compact"}\n') == {
         "status": "compact"
     }
+    request = urllib.request.Request("https://api.github.com/artifact")
+    request.add_unredirected_header("Authorization", "Bearer test-token")
+    redirected = urllib.request.HTTPRedirectHandler().redirect_request(
+        request,
+        None,
+        302,
+        "Found",
+        {},
+        "https://example.blob.core.windows.net/artifact.zip?signature=test",
+    )
+    assert redirected is not None
+    assert redirected.get_header("Authorization") is None
+    assert _suite_complete({"completed_modules": ["cmix"]}, ["cmix"])
+    assert not _suite_complete({"completed_modules": []}, ["cmix"])
     environment = {
         "gpu": "gpu",
         "capability": [12, 0],
@@ -818,6 +838,7 @@ def main() -> int:
     run_parser.add_argument("--status", choices=("candidate", "baseline"), required=True)
     run_parser.add_argument("--output", type=Path, required=True)
     run_parser.add_argument("--summary", type=Path, required=True)
+    run_parser.add_argument("--require-complete", action="store_true")
 
     fetch_parser = commands.add_parser("fetch-baselines")
     fetch_parser.add_argument("--repository", required=True)
@@ -850,6 +871,8 @@ def main() -> int:
         )
         _write_json(args.summary, summary)
         print(json.dumps(summary, separators=(",", ":")))
+        if args.require_complete and not _suite_complete(summary, modules):
+            return 1
         return 0
     if args.command == "compare-suite":
         payload = compare_suite(modules, args.baseline, args.candidate)

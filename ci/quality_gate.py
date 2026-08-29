@@ -27,7 +27,7 @@ from select_targets import (
 )
 
 ROOT = Path(__file__).resolve().parents[1]
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 WORKFLOW_NAME = "Quality Gate"
 BUILD_INPUT_PATHS = (
     "setup.py",
@@ -279,8 +279,8 @@ def _artifact_covers_plan(
 def resolve_reuse(
     plan: dict[str, Any], repository: str, token: str, current_run: int
 ) -> dict[str, Any]:
-    evidence_name = f"flashrwkv2-quality-v2-{plan['source_tree_sha']}"
-    wheel_name = f"flashrwkv2-wheel-v2-{plan['build_input_hash']}"
+    evidence_name = f"flashrwkv2-quality-v3-{plan['source_tree_sha']}"
+    wheel_name = f"flashrwkv2-wheel-v3-{plan['build_input_hash']}"
     evidence_run_id = _artifact_run(
         repository,
         token,
@@ -310,7 +310,7 @@ def resolve_reuse(
 def resolve_tree_evidence(
     tree: str, repository: str, token: str, current_run: int
 ) -> dict[str, Any]:
-    artifact_name = f"flashrwkv2-quality-v2-{tree}"
+    artifact_name = f"flashrwkv2-quality-v3-{tree}"
     run_id = _artifact_run(
         repository,
         token,
@@ -342,7 +342,7 @@ def finalize(
         artifacts["wheel"] = {
             "name": wheel.name,
             "sha256": _sha256(wheel),
-            "artifact": f"flashrwkv2-wheel-v2-{plan['build_input_hash']}",
+            "artifact": f"flashrwkv2-wheel-v3-{plan['build_input_hash']}",
         }
     if sdist is not None:
         artifacts["sdist"] = {"name": sdist.name, "sha256": _sha256(sdist)}
@@ -365,6 +365,16 @@ def finalize(
     }
     if benchmark is not None:
         benchmark_payload = json.loads(benchmark.read_text(encoding="utf-8"))
+    if impact.get("run_benchmark"):
+        if benchmark is None:
+            raise SystemExit("benchmark-required evidence lacks a comparison summary")
+        unavailable = [
+            warning
+            for warning in benchmark_payload.get("warnings", [])
+            if warning.get("kind") == "benchmark-unavailable"
+        ]
+        if unavailable:
+            raise SystemExit("benchmark-required evidence lacks complete candidate results")
 
     validation_payload: dict[str, Any] = {
         "environment": {},
@@ -374,6 +384,20 @@ def finalize(
     if validation is not None:
         validation_payload = json.loads(validation.read_text(encoding="utf-8"))
     recorded_checks = validation_payload.get("checks", {})
+    recorded_results = validation_payload.get("results", [])
+
+    def require_result(
+        kind: str, backend: str, modules: list[str]
+    ) -> None:
+        matches = [
+            result
+            for result in recorded_results
+            if result.get("kind") == kind and result.get("backend") == backend
+        ]
+        if len(matches) != 1 or matches[0].get("status") != "passed":
+            raise SystemExit(f"validation lacks passed {backend} {kind} result")
+        if sorted(matches[0].get("modules", [])) != sorted(modules):
+            raise SystemExit(f"validation {backend} {kind} module coverage mismatch")
     if plan["package_required"]:
         for check in ("package_identity", "binary_contents"):
             if recorded_checks.get(check) != "passed":
@@ -390,6 +414,11 @@ def finalize(
         and recorded_checks.get("sm90") != "PTX-on-SM120"
     ):
         raise SystemExit("SM90 validation was not recorded as PTX-on-SM120")
+    if not impact["package_smoke_only"]:
+        for backend in ("sm90", "sm120"):
+            modules = impact[f"affected_{backend}_modules"]
+            if modules:
+                require_result("correctness", backend, modules)
     if impact["run_sanitizer"]:
         if recorded_checks.get("memcheck") != "passed":
             raise SystemExit("sanitizer evidence lacks passed memcheck")
@@ -398,6 +427,13 @@ def finalize(
         )
         if racecheck_required and recorded_checks.get("racecheck") != "passed":
             raise SystemExit("sanitizer evidence lacks required racecheck")
+        for backend in ("sm90", "sm120"):
+            modules = impact[f"affected_{backend}_modules"]
+            if modules:
+                require_result("memcheck", backend, modules)
+            race_modules = plan[f"{backend}_racecheck_modules"]
+            if race_modules:
+                require_result("racecheck", backend, race_modules)
     if plan["cuda_graph_modules"] and recorded_checks.get("cuda_graph") != "passed":
         raise SystemExit("CUDA Graph evidence was not recorded as passed")
 
@@ -604,6 +640,7 @@ def _self_test() -> None:
                     module for module in TARGETS if "sm120" in BACKENDS_BY_TARGET[module]
                 ],
                 "package_smoke_only": False,
+                "run_benchmark": False,
                 "run_sanitizer": True,
                 "run_all": True,
             },
@@ -619,7 +656,37 @@ def _self_test() -> None:
                         "sm120": "native-sm120",
                         "memcheck": "passed",
                         "racecheck": "passed",
-                    }
+                    },
+                    "results": [
+                        {
+                            "kind": "correctness",
+                            "backend": backend,
+                            "status": "passed",
+                            "modules": plan["impact"][f"affected_{backend}_modules"],
+                        }
+                        for backend in ("sm90", "sm120")
+                        if plan["impact"][f"affected_{backend}_modules"]
+                    ]
+                    + [
+                        {
+                            "kind": "memcheck",
+                            "backend": backend,
+                            "status": "passed",
+                            "modules": plan["impact"][f"affected_{backend}_modules"],
+                        }
+                        for backend in ("sm90", "sm120")
+                        if plan["impact"][f"affected_{backend}_modules"]
+                    ]
+                    + [
+                        {
+                            "kind": "racecheck",
+                            "backend": backend,
+                            "status": "passed",
+                            "modules": plan[f"{backend}_racecheck_modules"],
+                        }
+                        for backend in ("sm90", "sm120")
+                        if plan[f"{backend}_racecheck_modules"]
+                    ],
                 }
             ),
             encoding="utf-8",
@@ -640,6 +707,67 @@ def _self_test() -> None:
             wheel=wheel,
             sdist=sdist,
         )
+        old_manifest = {**manifest, "schema_version": 2}
+        try:
+            verify_manifest(
+                old_manifest,
+                expected_tree=plan["source_tree_sha"],
+                wheel=wheel,
+                sdist=sdist,
+            )
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("v2 quality evidence was accepted")
+        missing_results = root / "missing-results.json"
+        missing_results.write_text(
+            json.dumps({"checks": json.loads(validation.read_text())["checks"]}),
+            encoding="utf-8",
+        )
+        try:
+            finalize(
+                plan,
+                wheel=wheel,
+                sdist=sdist,
+                benchmark=None,
+                validation=missing_results,
+                inherit_manifest=None,
+                requirements=requirements,
+                audit=audit,
+            )
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("validation without structured results was accepted")
+        benchmark = root / "benchmark.json"
+        benchmark.write_text(
+            json.dumps(
+                {
+                    "status": "warning",
+                    "warnings": [{"kind": "benchmark-unavailable", "module": "cmix"}],
+                }
+            ),
+            encoding="utf-8",
+        )
+        benchmark_plan = {
+            **plan,
+            "impact": {**plan["impact"], "run_benchmark": True},
+        }
+        try:
+            finalize(
+                benchmark_plan,
+                wheel=wheel,
+                sdist=sdist,
+                benchmark=benchmark,
+                validation=validation,
+                inherit_manifest=None,
+                requirements=requirements,
+                audit=audit,
+            )
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("incomplete candidate benchmark was accepted")
         inherited_path = root / "inherited.json"
         inherited_path.write_text(json.dumps(manifest), encoding="utf-8")
         incremental_plan = {
@@ -660,7 +788,19 @@ def _self_test() -> None:
         }
         incremental_validation = root / "incremental-validation.json"
         incremental_validation.write_text(
-            json.dumps({"checks": {"sm120": "native-sm120"}}),
+            json.dumps(
+                {
+                    "checks": {"sm120": "native-sm120"},
+                    "results": [
+                        {
+                            "kind": "correctness",
+                            "backend": "sm120",
+                            "status": "passed",
+                            "modules": ["cmix"],
+                        }
+                    ],
+                }
+            ),
             encoding="utf-8",
         )
         incremental = finalize(

@@ -2,7 +2,7 @@ name: Quality Gate
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
   push:
     branches: [main]
   workflow_dispatch:
@@ -69,18 +69,72 @@ jobs:
           DISPATCH_SHA: ${{ inputs.source_revision }}
         with:
           script: |
+            const trustedAssociations = new Set(['OWNER', 'MEMBER', 'COLLABORATOR']);
+            const trustedPermissions = new Set(['admin', 'maintain', 'write']);
+            const isTrustedPull = (pull, repositoryId, authorPermission = '') =>
+              !pull.draft && pull.head.repo?.id === repositoryId &&
+              (trustedAssociations.has(pull.author_association) ||
+                (pull.author_association === 'CONTRIBUTOR' &&
+                  trustedPermissions.has(authorPermission)));
+            const authorPermission = async pull => {
+              if (pull.author_association !== 'CONTRIBUTOR') return '';
+              const {data} = await github.rest.repos.getCollaboratorPermissionLevel({
+                ...context.repo, username: pull.user.login,
+              });
+              return data.permission;
+            };
+            const matchesCurrentRevision = (pull, eventPull) =>
+              pull.state === 'open' && pull.head.sha === eventPull.head.sha &&
+              pull.base.sha === eventPull.base.sha;
+            const trustCases = [
+              [{draft: false, head: {repo: {id: 7}}, author_association: 'MEMBER'}, 7, '', true],
+              [{draft: true, head: {repo: {id: 7}}, author_association: 'MEMBER'}, 7, '', false],
+              [{draft: false, head: {repo: {id: 8}}, author_association: 'MEMBER'}, 7, '', false],
+              [{draft: false, head: {repo: {id: 7}}, author_association: 'NONE'}, 7, 'admin', false],
+              [{draft: false, head: {repo: {id: 7}}, author_association: 'CONTRIBUTOR'}, 7, 'admin', true],
+              [{draft: false, head: {repo: {id: 7}}, author_association: 'CONTRIBUTOR'}, 7, 'read', false],
+            ];
+            if (trustCases.some(([pull, repositoryId, permission, expected]) =>
+                isTrustedPull(pull, repositoryId, permission) !== expected)) {
+              core.setFailed('trust boundary self-test failed');
+              return;
+            }
+            if (matchesCurrentRevision(
+                {state: 'open', head: {sha: 'current'}, base: {sha: 'base'}},
+                {head: {sha: 'stale'}, base: {sha: 'base'}})) {
+              core.setFailed('stale revision self-test failed');
+              return;
+            }
             let baseSha;
             let headSha;
             let prNumber = '';
             let trusted = true;
             if (context.eventName === 'pull_request') {
-              const pull = context.payload.pull_request;
+              const eventPull = context.payload.pull_request;
+              prNumber = String(context.payload.number);
+              const {data: pull} = await github.rest.pulls.get({
+                ...context.repo, pull_number: Number(prNumber),
+              });
+              if (!matchesCurrentRevision(pull, eventPull)) {
+                core.setFailed('pull request event no longer matches the current open revision');
+                return;
+              }
               baseSha = pull.base.sha;
               headSha = pull.head.sha;
-              prNumber = String(pull.number);
-              trusted = !pull.draft &&
-                pull.head.repo.full_name === `${context.repo.owner}/${context.repo.repo}` &&
-                ['OWNER', 'MEMBER', 'COLLABORATOR'].includes(pull.author_association);
+              const permission = await authorPermission(pull);
+              trusted = isTrustedPull(
+                pull, context.payload.repository.id, permission
+              );
+              core.info(JSON.stringify({
+                prNumber,
+                draft: pull.draft,
+                headSha,
+                headRepositoryId: pull.head.repo?.id,
+                repositoryId: context.payload.repository.id,
+                authorAssociation: pull.author_association,
+                authorPermission: permission,
+                trusted,
+              }));
             } else if (context.eventName === 'push') {
               baseSha = context.payload.before;
               headSha = context.sha;
@@ -106,11 +160,16 @@ jobs:
                   ...context.repo, pull_number: Number(prNumber),
                 });
                 if (pull.state !== 'open' || pull.head.sha !== headSha ||
-                    pull.head.repo.full_name !== `${context.repo.owner}/${context.repo.repo}`) {
+                    pull.head.repo?.id !== context.payload.repository.id) {
                   core.setFailed('dispatch target is not the current head of an open in-repository PR');
                   return;
                 }
                 baseSha = pull.base.sha;
+                trusted = isTrustedPull(
+                  pull,
+                  context.payload.repository.id,
+                  await authorPermission(pull),
+                );
               } else {
                 const {data: main} = await github.rest.repos.getBranch({
                   ...context.repo, branch: 'main',
@@ -243,14 +302,31 @@ jobs:
       reuse_evidence: ${{ steps.locked_reuse.outputs.reuse_evidence }}
       evidence_name: ${{ steps.locked_reuse.outputs.evidence_name }}
       evidence_run_id: ${{ steps.locked_reuse.outputs.evidence_run_id }}
-    env:
-      CUDA_VISIBLE_DEVICES: "0"
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.plan.outputs.head_sha }}
           fetch-depth: 0
           persist-credentials: false
+      - name: Select an idle physical GPU
+        run: |
+          declare -A busy=()
+          while IFS= read -r uuid; do
+            uuid="${uuid//[[:space:]]/}"
+            [[ -z "$uuid" ]] || busy["$uuid"]=1
+          done < <(nvidia-smi --query-compute-apps=gpu_uuid --format=csv,noheader,nounits)
+          while IFS=, read -r index uuid; do
+            index="${index//[[:space:]]/}"
+            uuid="${uuid//[[:space:]]/}"
+            if [[ -z "${busy[$uuid]+present}" ]]; then
+              echo "CUDA_VISIBLE_DEVICES=$index" >> "$GITHUB_ENV"
+              echo "FLASHRWKV_PHYSICAL_GPU=$index" >> "$GITHUB_ENV"
+              echo "selected physical GPU $index ($uuid)"
+              exit 0
+            fi
+          done < <(nvidia-smi --query-gpu=index,uuid --format=csv,noheader,nounits)
+          echo 'no idle physical GPU is available' >&2
+          exit 1
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: false
@@ -282,6 +358,7 @@ jobs:
       - name: Build and repair the final wheel once
         if: steps.locked_reuse.outputs.reuse_evidence != 'true' && steps.locked_reuse.outputs.reuse_wheel != 'true'
         run: |
+          set -o pipefail
           mkdir -p artifacts/package/dist artifacts/raw-wheel
           uv sync --frozen --no-install-project --group dev
           uv export --frozen --group dev --no-emit-project \
@@ -339,7 +416,7 @@ jobs:
         if: steps.locked_reuse.outputs.reuse_evidence != 'true' && steps.locked_reuse.outputs.reuse_wheel != 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: flashrwkv2-wheel-v2-${{ needs.plan.outputs.build_input_hash }}
+          name: flashrwkv2-wheel-v3-${{ needs.plan.outputs.build_input_hash }}
           path: |
             artifacts/package/dist/*.whl
             artifacts/package/locked-requirements.txt
@@ -360,6 +437,7 @@ jobs:
       - name: Verify package identity and native binary contents
         if: steps.locked_reuse.outputs.reuse_evidence != 'true'
         run: |
+          set -o pipefail
           package_root="$RUNNER_TEMP/flashrwkv2-package-$GITHUB_RUN_ID"
           mkdir -p "$package_root/unpacked"
           wheel="$(find artifacts/package -name '*.whl' -print -quit)"
@@ -416,6 +494,7 @@ jobs:
           SM120_JSON: ${{ needs.plan.outputs.affected_sm120_modules }}
           PYTHONPATH: ${{ github.workspace }}/tests:${{ github.workspace }}/benchmarks
         run: |
+          set -o pipefail
           test_root="$RUNNER_TEMP/flashrwkv2-correctness-$GITHUB_RUN_ID"
           mkdir -p "$test_root" artifacts/validation
           run_modules() {
@@ -440,6 +519,23 @@ jobs:
           }
           run_modules _C_sm120 sm120 "$SM120_JSON"
           run_modules _C_sm90 sm90 "$SM90_JSON"
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          results = []
+          for backend, name in (("sm120", "SM120_JSON"), ("sm90", "SM90_JSON")):
+              modules = json.loads(os.environ[name])
+              if modules:
+                  results.append({
+                      "kind": "correctness",
+                      "backend": backend,
+                      "status": "passed",
+                      "modules": modules,
+                  })
+          Path("artifacts/validation/correctness-results.json").write_text(
+              json.dumps(results, indent=2) + "\n"
+          )
+          PY
       - name: Run only marked sanitizer cases
         if: steps.locked_reuse.outputs.reuse_evidence != 'true' && needs.plan.outputs.run_sanitizer == 'true'
         env:
@@ -449,6 +545,7 @@ jobs:
           SM120_RACE_JSON: ${{ needs.plan.outputs.sm120_racecheck_modules }}
           PYTHONPATH: ${{ github.workspace }}/tests:${{ github.workspace }}/benchmarks
         run: |
+          set -o pipefail
           command -v compute-sanitizer
           test_root="$RUNNER_TEMP/flashrwkv2-sanitizer-$GITHUB_RUN_ID"
           mkdir -p "$test_root" artifacts/validation
@@ -477,9 +574,36 @@ jobs:
           sanitize_modules _C_sm90 sm90 memcheck "$SM90_JSON"
           sanitize_modules _C_sm120 sm120 racecheck "$SM120_RACE_JSON"
           sanitize_modules _C_sm90 sm90 racecheck "$SM90_RACE_JSON"
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          results = []
+          for backend, modules_name, race_name in (
+              ("sm120", "SM120_JSON", "SM120_RACE_JSON"),
+              ("sm90", "SM90_JSON", "SM90_RACE_JSON"),
+          ):
+              modules = json.loads(os.environ[modules_name])
+              if modules:
+                  results.append({
+                      "kind": "memcheck",
+                      "backend": backend,
+                      "status": "passed",
+                      "modules": modules,
+                  })
+              race_modules = json.loads(os.environ[race_name])
+              if race_modules:
+                  results.append({
+                      "kind": "racecheck",
+                      "backend": backend,
+                      "status": "passed",
+                      "modules": race_modules,
+                  })
+          Path("artifacts/validation/sanitizer-results.json").write_text(
+              json.dumps(results, indent=2) + "\n"
+          )
+          PY
       - name: Run affected SM120 benchmark suite and advisory comparison
         if: steps.locked_reuse.outputs.reuse_evidence != 'true' && needs.plan.outputs.run_benchmark == 'true'
-        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
           MODULES_JSON: ${{ needs.plan.outputs.benchmark_modules }}
@@ -530,29 +654,13 @@ jobs:
             --modules "$MODULES_JSON" --python .runtime-venv/bin/python \
             --revision "$HEAD_SHA" --status candidate \
             --output artifacts/benchmark/candidate \
-            --summary artifacts/benchmark/candidate-summary.json || true
+            --summary artifacts/benchmark/candidate-summary.json \
+            --require-complete
           .runtime-venv/bin/python ci/benchmark_gate.py compare-suite \
             --modules "$MODULES_JSON" \
             --baseline artifacts/benchmark/baseline \
             --candidate artifacts/benchmark/candidate \
-            --output artifacts/benchmark/summary.json || \
-            MODULES_JSON="$MODULES_JSON" python3 - <<'PY'
-          import json, os
-          from pathlib import Path
-          modules = json.loads(os.environ['MODULES_JSON'])
-          payload = {
-              'schema_version': 2,
-              'status': 'warning',
-              'modules': modules,
-              'warnings': [
-                  {'kind': 'benchmark-unavailable', 'module': module}
-                  for module in modules
-              ],
-          }
-          Path('artifacts/benchmark/summary.json').write_text(
-              json.dumps(payload, indent=2) + '\n'
-          )
-          PY
+            --output artifacts/benchmark/summary.json
       - name: Preserve benchmark failures as warnings
         if: always() && steps.locked_reuse.outputs.reuse_evidence != 'true' && needs.plan.outputs.run_benchmark == 'true'
         env:
@@ -590,6 +698,17 @@ jobs:
           import torch
           plan = json.loads(Path(os.environ['PLAN_PATH']).read_text())
           impact = plan['impact']
+          results = []
+          if not impact['package_smoke_only']:
+              path = Path(os.environ['GITHUB_WORKSPACE'], 'artifacts/validation/correctness-results.json')
+              if not path.is_file():
+                  raise SystemExit('correctness result record is missing')
+              results.extend(json.loads(path.read_text()))
+          if impact['run_sanitizer']:
+              path = Path(os.environ['GITHUB_WORKSPACE'], 'artifacts/validation/sanitizer-results.json')
+              if not path.is_file():
+                  raise SystemExit('sanitizer result record is missing')
+              results.extend(json.loads(path.read_text()))
           checks = {
               'package_identity': 'passed',
               'binary_contents': 'passed',
@@ -605,19 +724,18 @@ jobs:
                   'gpu': torch.cuda.get_device_name(0),
                   'capability': list(torch.cuda.get_device_capability(0)),
                   'driver': subprocess.check_output(
-                      ['nvidia-smi', '--query-gpu=driver_version', '--format=csv,noheader', '--id=0'],
+                      [
+                          'nvidia-smi', '--query-gpu=driver_version',
+                          '--format=csv,noheader',
+                          f"--id={os.environ['FLASHRWKV_PHYSICAL_GPU']}",
+                      ],
                       text=True,
                   ).strip(),
                   'torch': torch.__version__,
                   'torch_cuda': torch.version.cuda,
                   'python': platform.python_version(),
               },
-              'results': [
-                  {'kind': 'correctness', 'backend': 'sm120', 'modules': impact['affected_sm120_modules']},
-                  {'kind': 'correctness', 'backend': 'sm90', 'mode': 'PTX-on-SM120', 'modules': impact['affected_sm90_modules']},
-                  {'kind': 'memcheck', 'modules': impact['affected_modules']} if impact['run_sanitizer'] else {'kind': 'memcheck', 'status': 'not-required'},
-                  {'kind': 'racecheck', 'modules': plan['sm90_racecheck_modules'] + plan['sm120_racecheck_modules']},
-              ],
+              'results': results,
           }
           Path(os.environ['GITHUB_WORKSPACE'], 'artifacts/validation/validation.json').write_text(
               json.dumps(payload, indent=2) + '\n'
@@ -712,7 +830,7 @@ jobs:
         run: |
           python3 ci/quality_gate.py extract \
             --repository "$GITHUB_REPOSITORY" \
-            --artifact 'flashrwkv2-quality-v2-${{ needs.plan.outputs.source_tree_sha }}' \
+            --artifact 'flashrwkv2-quality-v3-${{ needs.plan.outputs.source_tree_sha }}' \
             --run-id '${{ steps.source.outputs.run_id }}' \
             --output evidence/final
       - uses: actions/download-artifact@v4
@@ -774,7 +892,7 @@ jobs:
           PY
       - uses: actions/upload-artifact@v4
         with:
-          name: flashrwkv2-quality-v2-${{ needs.plan.outputs.source_tree_sha }}
+          name: flashrwkv2-quality-v3-${{ needs.plan.outputs.source_tree_sha }}
           path: evidence/final/
           if-no-files-found: error
           retention-days: 90
@@ -809,7 +927,7 @@ jobs:
         with:
           script: |
             const fs = require('fs');
-            const marker = '<!-- flashrwkv2-quality-v2 -->';
+            const marker = '<!-- flashrwkv2-quality-v3 -->';
             const body = `${marker}\n${fs.readFileSync('evidence/comment.md', 'utf8')}`;
             const issue_number = Number(process.env.PR_NUMBER);
             const comments = await github.paginate(github.rest.issues.listComments, {

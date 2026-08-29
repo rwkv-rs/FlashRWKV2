@@ -1208,6 +1208,7 @@ def test_packed_fp16_state_family_correctness(
         state_indices=state_indices,
         decay_bias=decay_bias,
     )
+    state.materialize_slots_(state_indices.contiguous())
     torch.cuda.synchronize()
     assert observed_output.dtype == torch.float16
     assert observed_state.dtype == torch.float16
@@ -1292,6 +1293,7 @@ def test_fp16_dispatch_covers_albatross_grid_and_family_boundaries(
         state_indices=state_indices,
         decay_bias=decay_bias,
     )
+    state.materialize_slots_(state_indices.contiguous())
     torch.cuda.synchronize()
     assert torch.isfinite(observed_output).all()
     assert torch.isfinite(observed_state).all()
@@ -1374,11 +1376,16 @@ def test_fp16_public_rejects_non_fp16_state_and_tokens() -> None:
     _require_fp16_extension()
     case = _make_case(dtype=torch.float16, head_size=64, lengths=(2,))
     args = _args(case)
-    with pytest.raises(TypeError, match="FP16-state state_pool"):
-        _bind_fp16_state(
-            case["state_pool"],
-            case["elapsed_state_pool"],
-            sequence_capacity=case["state_indices"].numel(),
+    wrong_state = _bind_fp32io16_state(
+        case["state_pool"],
+        sequence_capacity=case["state_indices"].numel(),
+    )
+    with pytest.raises(TypeError, match="recurrent_fp16_state"):
+        infer_tmix_wkv7_recurrent_fp16_forward_varlen(
+            *args,
+            state=wrong_state,
+            cu_seqlens=case["cu_seqlens"],
+            state_indices=case["state_indices"],
         )
     state = _bind_fp16_state(
         case["state_pool"].half(),
@@ -2377,9 +2384,12 @@ def test_unified_state_materialize_and_pending_log_fallback(
         selected_handle._deltalog_phase_pool[:4]
     ).item() == 0
     assert torch.equal(
-        selected_handle._deltalog_phase_pool[4:],
-        torch.ones_like(selected_handle._deltalog_phase_pool[4:]),
+        selected_handle._deltalog_phase_pool[4:8],
+        torch.ones_like(selected_handle._deltalog_phase_pool[4:8]),
     )
+    assert torch.count_nonzero(
+        selected_handle._deltalog_phase_pool[8:]
+    ).item() == 0
 
     fallback_slots = slots[4:].contiguous()
     fallback_cu = torch.arange(

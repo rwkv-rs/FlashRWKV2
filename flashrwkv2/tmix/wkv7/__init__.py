@@ -1003,6 +1003,8 @@ def infer_tmix_wkv7_recurrent_fp16_forward_varlen(
         )
 
     packed = _validate_packed_inputs(r, decay_logits, k, v, a, b)
+    if any(tensor.dtype != torch.float16 for tensor in packed):
+        raise TypeError("FP16-state token tensors must have dtype float16")
     _check_metadata_inputs(cu_seqlens, state_indices)
     launch_max_seqlen = _dispatch_max_seqlen(max_seqlen, validated_metadata)
     use_deltalog = (

@@ -142,7 +142,7 @@ jobs:
               digest = hashlib.sha256(path.read_bytes()).hexdigest()
               if expected.get('name') != path.name or expected.get('sha256') != digest:
                   raise SystemExit(f'{kind} is not the quality-tested original')
-          if artifacts['wheel'].get('artifact') != f"flashrwkv2-wheel-v2-{os.environ['BUILD_INPUT_HASH']}":
+          if artifacts['wheel'].get('artifact') != f"flashrwkv2-wheel-v3-{os.environ['BUILD_INPUT_HASH']}":
               raise SystemExit('wheel artifact identity mismatch')
           destination = Path('release/payload/dist')
           destination.mkdir(parents=True)
@@ -157,7 +157,7 @@ jobs:
             --sdist release/payload/dist/*.tar.gz
       - uses: actions/upload-artifact@v4
         with:
-          name: flashrwkv2-release-v2-${{ steps.plan.outputs.source_tree_sha }}
+          name: flashrwkv2-release-v3-${{ steps.plan.outputs.source_tree_sha }}
           path: release/payload/
           if-no-files-found: error
           retention-days: 90
@@ -176,7 +176,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: flashrwkv2-release-v2-${{ needs.prepare.outputs.source_tree_sha }}
+          name: flashrwkv2-release-v3-${{ needs.prepare.outputs.source_tree_sha }}
           path: release/payload
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
@@ -190,7 +190,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: flashrwkv2-release-v2-${{ needs.prepare.outputs.source_tree_sha }}
+          name: flashrwkv2-release-v3-${{ needs.prepare.outputs.source_tree_sha }}
           path: release/payload
       - name: Compare public files with quality evidence
         env:
