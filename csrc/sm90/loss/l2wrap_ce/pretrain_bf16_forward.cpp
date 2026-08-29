@@ -34,7 +34,8 @@ void check_inputs(const torch::stable::Tensor& logits, const torch::stable::Tens
 auto pretrain_l2wrap_ce_forward(
     torch::stable::Tensor logits, torch::stable::Tensor targets) {
   check_inputs(logits, targets);
-  return l2wrap_ce_forward_cuda(logits, targets, logits.size(-1));
+  return flashrwkv2::validation::tensor_tuple<4>(
+      l2wrap_ce_forward_cuda(logits, targets, logits.size(-1)));
 }
 
 STABLE_TORCH_LIBRARY_FRAGMENT(flashrwkv2, module) {
