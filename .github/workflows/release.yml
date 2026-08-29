@@ -79,19 +79,19 @@ jobs:
               raise SystemExit('quality evidence final wheel artifact is unavailable')
           PY
       - name: Download exact quality evidence
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          python3 release-tools/ci/quality_gate.py extract \
-            --repository "$GITHUB_REPOSITORY" \
-            --artifact '${{ steps.reuse.outputs.evidence_name }}' \
-            --run-id '${{ steps.reuse.outputs.evidence_run_id }}' \
-            --output release/evidence
-          python3 release-tools/ci/quality_gate.py extract \
-            --repository "$GITHUB_REPOSITORY" \
-            --artifact '${{ steps.reuse.outputs.wheel_name }}' \
-            --run-id '${{ steps.reuse.outputs.wheel_run_id }}' \
-            --output release/build
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ steps.reuse.outputs.evidence_name }}
+          run-id: ${{ steps.reuse.outputs.evidence_run_id }}
+          github-token: ${{ github.token }}
+          path: release/evidence
+      - name: Download exact final wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ steps.reuse.outputs.wheel_name }}
+          run-id: ${{ steps.reuse.outputs.wheel_run_id }}
+          github-token: ${{ github.token }}
+          path: release/build
       - name: Verify filenames, tree, coverage, and SHA256
         env:
           VERSION: ${{ steps.identity.outputs.version }}

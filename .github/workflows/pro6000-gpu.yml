@@ -339,14 +339,12 @@ jobs:
             --github-output "$GITHUB_OUTPUT"
       - name: Download a reusable final wheel
         if: steps.locked_reuse.outputs.reuse_evidence != 'true' && steps.locked_reuse.outputs.reuse_wheel == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          python3 ci/quality_gate.py extract \
-            --repository "$GITHUB_REPOSITORY" \
-            --artifact '${{ steps.locked_reuse.outputs.wheel_name }}' \
-            --run-id '${{ steps.locked_reuse.outputs.wheel_run_id }}' \
-            --output artifacts/package
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ steps.locked_reuse.outputs.wheel_name }}
+          run-id: ${{ steps.locked_reuse.outputs.wheel_run_id }}
+          github-token: ${{ github.token }}
+          path: artifacts/package
       - name: Build and repair the final wheel once
         if: steps.locked_reuse.outputs.reuse_evidence != 'true' && steps.locked_reuse.outputs.reuse_wheel != 'true'
         run: |
@@ -924,11 +922,14 @@ jobs:
             --output evidence/control/inherited.json \
             --github-output "$GITHUB_OUTPUT"
           test "$(python3 -c 'import json; print(str(json.load(open("evidence/control/inherited.json"))["found"]).lower())')" = true
-          python3 ci/quality_gate.py extract \
-            --repository "$GITHUB_REPOSITORY" \
-            --artifact "$(python3 -c 'import json; print(json.load(open("evidence/control/inherited.json"))["evidence_name"])')" \
-            --run-id "$(python3 -c 'import json; print(json.load(open("evidence/control/inherited.json"))["evidence_run_id"])')" \
-            --output evidence/inherited
+      - name: Download inherited base-tree evidence
+        if: needs.plan.outputs.reuse_evidence != 'true' && needs.plan.outputs.coverage_requires_parent == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ steps.inherited.outputs.evidence_name }}
+          run-id: ${{ steps.inherited.outputs.evidence_run_id }}
+          github-token: ${{ github.token }}
+          path: evidence/inherited
       - name: Resolve the evidence source
         id: source
         env:
@@ -948,14 +949,12 @@ jobs:
           fi
       - name: Download reusable evidence
         if: steps.source.outputs.reuse == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          python3 ci/quality_gate.py extract \
-            --repository "$GITHUB_REPOSITORY" \
-            --artifact 'flashrwkv2-quality-v5-${{ needs.plan.outputs.source_tree_sha }}' \
-            --run-id '${{ steps.source.outputs.run_id }}' \
-            --output evidence/final
+        uses: actions/download-artifact@v4
+        with:
+          name: flashrwkv2-quality-v5-${{ needs.plan.outputs.source_tree_sha }}
+          run-id: ${{ steps.source.outputs.run_id }}
+          github-token: ${{ github.token }}
+          path: evidence/final
       - uses: actions/download-artifact@v4
         if: steps.source.outputs.reuse != 'true' && needs.plan.outputs.run_gpu == 'true'
         with:
