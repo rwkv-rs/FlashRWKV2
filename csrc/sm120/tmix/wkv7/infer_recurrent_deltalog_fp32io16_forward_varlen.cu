@@ -176,6 +176,7 @@ __global__ __launch_bounds__(kHeadSize, 2) void materialize_slots_kernel(
       state_base[key * kHeadSize + thread] = state[key];
     }
   }
+  __syncthreads();
 #pragma unroll
   for (int log_slot = 0; log_slot < M - 1; ++log_slot) {
 #pragma unroll

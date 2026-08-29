@@ -2314,6 +2314,7 @@ def test_unified_state_slot_checkpoint_cow_reset_and_memory(
 @pytest.mark.parametrize("operator", ("fp16", "fp32io16"))
 def test_unified_state_materialize_and_pending_log_fallback(
     operator: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     if operator == "fp16":
         _require_deltalog_extension()
@@ -2337,11 +2338,21 @@ def test_unified_state_materialize_and_pending_log_fallback(
     selected_state = ordinary_state.clone()
     ordinary_elapsed = initial_elapsed.clone()
     selected_elapsed = initial_elapsed.clone()
+    monkeypatch.setattr(
+        wkv7_module,
+        "_select_deltalog_merge_interval",
+        lambda *_: 0,
+    )
     if operator == "fp16":
         ordinary_handle = _bind_fp16_state(
             ordinary_state,
             ordinary_elapsed,
             sequence_capacity=8,
+        )
+        monkeypatch.setattr(
+            wkv7_module,
+            "_select_deltalog_merge_interval",
+            lambda *_: 2,
         )
         selected_handle = _bind_fp16_state(
             selected_state,
@@ -2353,6 +2364,11 @@ def test_unified_state_materialize_and_pending_log_fallback(
         ordinary_handle = _bind_fp32io16_state(
             ordinary_state,
             sequence_capacity=8,
+        )
+        monkeypatch.setattr(
+            wkv7_module,
+            "_select_deltalog_merge_interval",
+            lambda *_: 2,
         )
         selected_handle = _bind_fp32io16_state(
             selected_state,
@@ -2376,6 +2392,12 @@ def test_unified_state_materialize_and_pending_log_fallback(
         decay_bias=decay_bias,
         max_seqlen=1,
     )
+    assert ordinary_handle._deltalog_phase_pool is None
+    assert selected_handle._deltalog_phase_pool is not None
+    assert selected_handle._deltalog_pool is not None
+    state_before_materialize = selected_state.clone()
+    phase_before_materialize = selected_handle._deltalog_phase_pool.clone()
+    logs_before_materialize = selected_handle._deltalog_pool.clone()
     ordinary_handle.materialize_slots_(slots[:4].contiguous())
     selected_handle.materialize_slots_(slots[:4].contiguous())
     torch.cuda.synchronize()
@@ -2386,6 +2408,18 @@ def test_unified_state_materialize_and_pending_log_fallback(
     assert torch.equal(
         selected_handle._deltalog_phase_pool[4:8],
         torch.ones_like(selected_handle._deltalog_phase_pool[4:8]),
+    )
+    assert torch.equal(selected_state[4:], state_before_materialize[4:])
+    assert torch.equal(
+        selected_handle._deltalog_phase_pool[4:],
+        phase_before_materialize[4:],
+    )
+    assert torch.count_nonzero(
+        selected_handle._deltalog_pool[:, :, :4]
+    ).item() == 0
+    assert torch.equal(
+        selected_handle._deltalog_pool[:, :, 4:],
+        logs_before_materialize[:, :, 4:],
     )
     assert torch.count_nonzero(
         selected_handle._deltalog_phase_pool[8:]

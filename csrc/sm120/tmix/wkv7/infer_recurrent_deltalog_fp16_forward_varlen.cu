@@ -230,6 +230,7 @@ __global__ __launch_bounds__(kHeadSize, 1) void materialize_slots_kernel(
       store_state_kv(state_base, thread, key_pair, state[key_pair]);
     }
   }
+  __syncthreads();
   const half zero = __float2half_rn(0.0f);
 #pragma unroll
   for (int log_slot = 0; log_slot < M - 1; ++log_slot) {
