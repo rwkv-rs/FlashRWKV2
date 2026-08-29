@@ -5,9 +5,7 @@
 // families and dispatches D128/256 to the local 64-wide tiled recurrence. The
 // public decay boundary is raw logits.
 
-#include "../../../validation.h"
-
-#include <torch/extension.h>
+#include "validation.h"
 
 #include <cmath>
 #include <cstdint>
@@ -16,51 +14,51 @@
 #include <utility>
 
 void materialized_chunk_fp32_from_decay_logits_cuda(
-    torch::Tensor sequence_chunk_offsets,
-    torch::Tensor chunk_token_starts,
-    torch::Tensor chunk_token_ends,
-    torch::Tensor state_indices,
-    torch::Tensor state,
-    torch::Tensor r,
-    torch::Tensor decay_logits,
-    torch::Tensor decay_bias,
-    torch::Tensor k,
-    torch::Tensor v,
-    torch::Tensor a,
-    torch::Tensor b,
-    torch::Tensor output,
-    torch::Tensor transform,
-    torch::Tensor bias,
-    torch::Tensor boundary,
-    torch::Tensor state_dot_a,
+    torch::stable::Tensor sequence_chunk_offsets,
+    torch::stable::Tensor chunk_token_starts,
+    torch::stable::Tensor chunk_token_ends,
+    torch::stable::Tensor state_indices,
+    torch::stable::Tensor state,
+    torch::stable::Tensor r,
+    torch::stable::Tensor decay_logits,
+    torch::stable::Tensor decay_bias,
+    torch::stable::Tensor k,
+    torch::stable::Tensor v,
+    torch::stable::Tensor a,
+    torch::stable::Tensor b,
+    torch::stable::Tensor output,
+    torch::stable::Tensor transform,
+    torch::stable::Tensor bias,
+    torch::stable::Tensor boundary,
+    torch::stable::Tensor state_dot_a,
     int64_t build_warps,
     int64_t stages,
     int64_t state_tile,
     double scale);
 
 void recompute_chunk_fp32_from_decay_logits_cuda(
-    torch::Tensor sequence_chunk_offsets,
-    torch::Tensor chunk_token_starts,
-    torch::Tensor chunk_token_ends,
-    torch::Tensor state_indices,
-    torch::Tensor state,
-    torch::Tensor r,
-    torch::Tensor decay_logits,
-    torch::Tensor decay_bias,
-    torch::Tensor k,
-    torch::Tensor v,
-    torch::Tensor a,
-    torch::Tensor b,
-    torch::Tensor output,
-    torch::Tensor boundary,
+    torch::stable::Tensor sequence_chunk_offsets,
+    torch::stable::Tensor chunk_token_starts,
+    torch::stable::Tensor chunk_token_ends,
+    torch::stable::Tensor state_indices,
+    torch::stable::Tensor state,
+    torch::stable::Tensor r,
+    torch::stable::Tensor decay_logits,
+    torch::stable::Tensor decay_bias,
+    torch::stable::Tensor k,
+    torch::stable::Tensor v,
+    torch::stable::Tensor a,
+    torch::stable::Tensor b,
+    torch::stable::Tensor output,
+    torch::stable::Tensor boundary,
     double scale);
 
 void tiled_chunk_fp32_from_decay_logits_cuda(
-    torch::Tensor sequence_chunk_offsets,torch::Tensor chunk_token_starts,
-    torch::Tensor chunk_token_ends,torch::Tensor state_indices,torch::Tensor state,
-    torch::Tensor r,torch::Tensor decay_logits,torch::Tensor decay_bias,
-    torch::Tensor k,torch::Tensor v,torch::Tensor a,torch::Tensor b,
-    torch::Tensor output,torch::Tensor boundary,torch::Tensor state_dot_a,double scale);
+    torch::stable::Tensor sequence_chunk_offsets,torch::stable::Tensor chunk_token_starts,
+    torch::stable::Tensor chunk_token_ends,torch::stable::Tensor state_indices,torch::stable::Tensor state,
+    torch::stable::Tensor r,torch::stable::Tensor decay_logits,torch::stable::Tensor decay_bias,
+    torch::stable::Tensor k,torch::stable::Tensor v,torch::stable::Tensor a,torch::stable::Tensor b,
+    torch::stable::Tensor output,torch::stable::Tensor boundary,torch::stable::Tensor state_dot_a,double scale);
 
 using flashrwkv2::validation::check_cuda_contiguous;
 using flashrwkv2::validation::check_recurrent_layout;
@@ -69,83 +67,50 @@ using flashrwkv2::validation::check_same_device;
 namespace {
 
 void check_chunk_metadata(
-    const torch::Tensor& sequence_chunk_offsets,
-    const torch::Tensor& chunk_token_starts,
-    const torch::Tensor& chunk_token_ends,
+    const torch::stable::Tensor& sequence_chunk_offsets,
+    const torch::stable::Tensor& chunk_token_starts,
+    const torch::stable::Tensor& chunk_token_ends,
     int64_t num_sequences,
     int64_t total_tokens,
-    const torch::Tensor& state) {
+    const torch::stable::Tensor& state) {
   for (const auto& item : {
-           std::pair<const torch::Tensor*, const char*>{
+           std::pair<const torch::stable::Tensor*, const char*>{
                &sequence_chunk_offsets, "sequence_chunk_offsets"},
            {&chunk_token_starts, "chunk_token_starts"},
            {&chunk_token_ends, "chunk_token_ends"},
        }) {
     check_cuda_contiguous(*item.first, item.second);
     check_same_device(state, *item.first, item.second);
-    TORCH_CHECK(item.first->scalar_type() == torch::kInt32,
+    STD_TORCH_CHECK(item.first->scalar_type() == torch::headeronly::ScalarType::Int,
                 item.second, " must be int32");
   }
-  TORCH_CHECK(
+  STD_TORCH_CHECK(
       sequence_chunk_offsets.dim() == 1 &&
           sequence_chunk_offsets.numel() == num_sequences + 1,
       "sequence_chunk_offsets must have shape [B+1]");
-  TORCH_CHECK(
+  STD_TORCH_CHECK(
       chunk_token_starts.dim() == 1 && chunk_token_starts.numel() > 0 &&
           chunk_token_starts.sizes() == chunk_token_ends.sizes(),
       "chunk token metadata must have matching shape [C]");
-  TORCH_CHECK(
+  STD_TORCH_CHECK(
       chunk_token_starts.numel() * state.size(1) <=
           std::numeric_limits<int>::max(),
       "chunk/head grid must fit in int32");
 
-  // Chunk metadata is prepared once per RL request.  This explicit host read
-  // is retained at the preparation boundary; it is not part of a recurrent
-  // launch and does not copy token or state tensors.
-  auto sequence_cpu = sequence_chunk_offsets.to(torch::kCPU).contiguous();
-  auto starts_cpu = chunk_token_starts.to(torch::kCPU).contiguous();
-  auto ends_cpu = chunk_token_ends.to(torch::kCPU).contiguous();
-  const auto* sequence = sequence_cpu.data_ptr<int32_t>();
-  const auto* starts = starts_cpu.data_ptr<int32_t>();
-  const auto* ends = ends_cpu.data_ptr<int32_t>();
-  const int64_t chunks = chunk_token_starts.numel();
-  TORCH_CHECK(sequence[0] == 0 && sequence[num_sequences] == chunks,
-              "sequence_chunk_offsets must cover all chunks");
-  int32_t previous_token_end = 0;
-  for (int64_t sequence_index = 0; sequence_index < num_sequences;
-       ++sequence_index) {
-    const int32_t chunk_start = sequence[sequence_index];
-    const int32_t chunk_end = sequence[sequence_index + 1];
-    TORCH_CHECK(chunk_start >= 0 && chunk_end > chunk_start &&
-                    chunk_end <= chunks,
-                "each sequence must own at least one ordered chunk");
-    TORCH_CHECK(starts[chunk_start] == previous_token_end,
-                "chunks must cover packed tokens without gaps");
-    for (int32_t chunk = chunk_start; chunk < chunk_end; ++chunk) {
-      TORCH_CHECK(starts[chunk] >= 0 && ends[chunk] > starts[chunk] &&
-                      ends[chunk] <= total_tokens &&
-                      (chunk == chunk_start ||
-                       starts[chunk] == ends[chunk - 1]),
-                  "chunk token ranges must be contiguous and non-empty");
-    }
-    previous_token_end = ends[chunk_end - 1];
-  }
-  TORCH_CHECK(previous_token_end == total_tokens,
-              "chunks must cover exactly all packed tokens");
 }
 
 void check_decay_bias(
-    const std::optional<torch::Tensor>& decay_bias,
-    const torch::Tensor& state,
-    const torch::Tensor& reference) {
+    const std::optional<torch::stable::Tensor>& decay_bias,
+    const torch::stable::Tensor& state,
+    const torch::stable::Tensor& reference) {
   if (!decay_bias.has_value()) {
     return;
   }
   check_cuda_contiguous(*decay_bias, "decay_bias");
   check_same_device(state, *decay_bias, "decay_bias");
-  TORCH_CHECK(decay_bias->scalar_type() == reference.scalar_type(),
+  STD_TORCH_CHECK(decay_bias->scalar_type() == reference.scalar_type(),
               "decay_bias must match token dtype");
-  TORCH_CHECK(
+  STD_TORCH_CHECK(
       (decay_bias->dim() == 1 &&
        decay_bias->numel() == state.size(1) * state.size(2)) ||
           (decay_bias->dim() == 2 && decay_bias->size(0) == state.size(1) &&
@@ -155,37 +120,35 @@ void check_decay_bias(
 
 }  // namespace
 
-py::tuple rl_infctx_tmix_wkv7_chunk_fp32io16_forward(
-    torch::Tensor sequence_chunk_offsets,
-    torch::Tensor chunk_token_starts,
-    torch::Tensor chunk_token_ends,
-    torch::Tensor state,
-    torch::Tensor r,
-    torch::Tensor decay_logits,
-    torch::Tensor k,
-    torch::Tensor v,
-    torch::Tensor a,
-    torch::Tensor b,
+std::tuple<torch::stable::Tensor, torch::stable::Tensor> rl_infctx_tmix_wkv7_chunk_fp32io16_forward(
+    torch::stable::Tensor sequence_chunk_offsets,
+    torch::stable::Tensor chunk_token_starts,
+    torch::stable::Tensor chunk_token_ends,
+    torch::stable::Tensor state_indices,
+    torch::stable::Tensor state,
+    torch::stable::Tensor r,
+    torch::stable::Tensor decay_logits,
+    torch::stable::Tensor k,
+    torch::stable::Tensor v,
+    torch::stable::Tensor a,
+    torch::stable::Tensor b,
     int64_t strategy,
     double scale,
-    std::optional<torch::Tensor> decay_bias) {
-  TORCH_CHECK(strategy == 0 || strategy == 1,
+    std::optional<torch::stable::Tensor> decay_bias) {
+  STD_TORCH_CHECK(strategy == 0 || strategy == 1,
               "strategy must be 0 (materialized) or 1 (recompute)");
-  TORCH_CHECK(state.is_cuda() && state.is_contiguous() &&
-                  state.scalar_type() == torch::kFloat32,
+  STD_TORCH_CHECK(state.is_cuda() && state.is_contiguous() &&
+                  state.scalar_type() == torch::headeronly::ScalarType::Float,
               "RL/Infctx state must be contiguous CUDA float32");
-  TORCH_CHECK(state.dim() == 4 && state.size(0) > 0 && state.size(1) > 0 &&
+  STD_TORCH_CHECK(state.dim() == 4 && state.size(0) > 0 && state.size(1) > 0 &&
                   state.size(2) == state.size(3) &&
                   (state.size(2) == 64 || state.size(2) == 128 || state.size(2) == 256),
               "RL/Infctx state must have shape [B,H,D,D], D in {64,128,256}");
 
-  auto working_state = state.clone();
-  auto output = torch::empty_like(v);
-  auto internal_state_indices = torch::arange(
-      state.size(0),
-      torch::TensorOptions().device(state.device()).dtype(torch::kInt32));
+  auto working_state = torch::stable::clone(state);
+  auto output = torch::stable::empty_like(v);
   check_recurrent_layout(
-      sequence_chunk_offsets, internal_state_indices, working_state, r,
+      sequence_chunk_offsets, state_indices, working_state, r,
       decay_logits, k, v, a, b, output, scale);
   check_chunk_metadata(
       sequence_chunk_offsets, chunk_token_starts, chunk_token_ends,
@@ -193,50 +156,47 @@ py::tuple rl_infctx_tmix_wkv7_chunk_fp32io16_forward(
   check_decay_bias(decay_bias, working_state, r);
 
   const int64_t num_chunks = chunk_token_starts.numel();
-  auto boundary = torch::empty(
+  auto boundary = torch::stable::new_empty(
+      state,
       {num_chunks, state.size(1), state.size(2), state.size(2)},
-      torch::TensorOptions().device(state.device()).dtype(torch::kFloat32));
+      torch::headeronly::ScalarType::Float);
 
   if (state.size(2) != 64) {
     auto state_dot_a = strategy == 0
-        ? torch::empty(r.sizes(), r.options().dtype(torch::kFloat32))
-        : torch::Tensor();
+        ? torch::stable::new_empty(r, r.sizes(), torch::headeronly::ScalarType::Float)
+        : torch::stable::Tensor();
     tiled_chunk_fp32_from_decay_logits_cuda(
         sequence_chunk_offsets, chunk_token_starts, chunk_token_ends,
-        internal_state_indices, working_state, r, decay_logits,
-        decay_bias.value_or(torch::Tensor()), k, v, a, b, output, boundary,
+        state_indices, working_state, r, decay_logits,
+        decay_bias.value_or(torch::stable::Tensor()), k, v, a, b, output, boundary,
         state_dot_a, scale);
   } else if (strategy == 0) {
-    auto transform = torch::empty_like(boundary);
-    auto bias = torch::empty_like(boundary);
-    auto state_dot_a = torch::empty(
-        r.sizes(), r.options().dtype(torch::kFloat32));
+    auto transform = torch::stable::empty_like(boundary);
+    auto bias = torch::stable::empty_like(boundary);
+    auto state_dot_a = torch::stable::new_empty(
+        r, r.sizes(), torch::headeronly::ScalarType::Float);
     // This is the retained old explicit-chunk selection: (2 warps, one
     // stage, 64-row state tile).  It is a canonical source configuration,
     // not a generic replacement for the materialized family.
     materialized_chunk_fp32_from_decay_logits_cuda(
         sequence_chunk_offsets, chunk_token_starts, chunk_token_ends,
-        internal_state_indices, working_state, r, decay_logits,
-        decay_bias.value_or(torch::Tensor()), k, v, a, b, output, transform,
+        state_indices, working_state, r, decay_logits,
+        decay_bias.value_or(torch::stable::Tensor()), k, v, a, b, output, transform,
         bias, boundary, state_dot_a, 2, 1, 64, scale);
   } else {
     recompute_chunk_fp32_from_decay_logits_cuda(
         sequence_chunk_offsets, chunk_token_starts, chunk_token_ends,
-        internal_state_indices, working_state, r, decay_logits,
-        decay_bias.value_or(torch::Tensor()), k, v, a, b, output, boundary,
+        state_indices, working_state, r, decay_logits,
+        decay_bias.value_or(torch::stable::Tensor()), k, v, a, b, output, boundary,
         scale);
   }
-  return py::make_tuple(output, working_state);
+  return std::make_tuple(std::move(output), std::move(working_state));
 }
 
-void register_rl_infctx_tmix_wkv7_chunk_forward_bindings(py::module_& module) {
-  module.def(
-      "rl_infctx_tmix_wkv7_chunk_fp32io16_forward",
-      &rl_infctx_tmix_wkv7_chunk_fp32io16_forward,
-      "RL/Infctx raw-decay chunk forward",
-      py::arg("sequence_chunk_offsets"), py::arg("chunk_token_starts"),
-      py::arg("chunk_token_ends"), py::arg("state"), py::arg("r"),
-      py::arg("decay_logits"), py::arg("k"), py::arg("v"), py::arg("a"),
-      py::arg("b"), py::arg("strategy") = 1, py::arg("scale") = 1.0,
-      py::arg("decay_bias") = py::none());
+STABLE_TORCH_LIBRARY_FRAGMENT(flashrwkv2, module) {
+  module.def("rl_infctx_tmix_wkv7_chunk_fp32io16_forward(Tensor sequence_chunk_offsets, Tensor chunk_token_starts, Tensor chunk_token_ends, Tensor state_indices, Tensor state, Tensor r, Tensor decay_logits, Tensor k, Tensor v, Tensor a, Tensor b, int strategy, float scale, Tensor? decay_bias) -> (Tensor, Tensor)");
+}
+
+STABLE_TORCH_LIBRARY_IMPL(flashrwkv2, CUDA, module) {
+  module.impl("rl_infctx_tmix_wkv7_chunk_fp32io16_forward", TORCH_BOX(&rl_infctx_tmix_wkv7_chunk_fp32io16_forward));
 }

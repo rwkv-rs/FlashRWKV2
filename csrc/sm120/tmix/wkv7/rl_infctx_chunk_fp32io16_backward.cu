@@ -9,12 +9,7 @@
 
 #include "rl_infctx_chunk_fp32io16_replay.cuh"
 
-#include <ATen/ATen.h>
-#include <ATen/Dispatch.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
-#include <c10/cuda/CUDAException.h>
-#include <torch/extension.h>
+#include "validation.h"
 
 #include "../../../sm120/tmix/wkv7/recurrent_decay.cuh"
 
@@ -131,37 +126,37 @@ template <typename io_t>
 void launch_replay(
     int num_chunks,
     int num_heads,
-    const torch::Tensor& chunk_token_starts,
-    const torch::Tensor& chunk_token_ends,
-    const torch::Tensor& boundary,
-    const torch::Tensor& r,
-    const torch::Tensor& decay,
-    const torch::Tensor& decay_bias,
-    const torch::Tensor& k,
-    const torch::Tensor& v,
-    const torch::Tensor& a,
-    const torch::Tensor& b,
-    torch::Tensor& output,
-    torch::Tensor* state_dot_a,
+    const torch::stable::Tensor& chunk_token_starts,
+    const torch::stable::Tensor& chunk_token_ends,
+    const torch::stable::Tensor& boundary,
+    const torch::stable::Tensor& r,
+    const torch::stable::Tensor& decay,
+    const torch::stable::Tensor& decay_bias,
+    const torch::stable::Tensor& k,
+    const torch::stable::Tensor& v,
+    const torch::stable::Tensor& a,
+    const torch::stable::Tensor& b,
+    torch::stable::Tensor& output,
+    torch::stable::Tensor* state_dot_a,
     float scale,
     cudaStream_t stream) {
   emit_outputs_kernel<io_t>
       <<<num_chunks * num_heads, kHeadSize, 0, stream>>>(
           num_heads,
-          chunk_token_starts.data_ptr<int>(),
-          chunk_token_ends.data_ptr<int>(),
-          boundary.data_ptr<float>(),
-          r.data_ptr<io_t>(),
-          decay.data_ptr<io_t>(),
-          decay_bias.defined() ? decay_bias.data_ptr<io_t>() : nullptr,
-          k.data_ptr<io_t>(),
-          v.data_ptr<io_t>(),
-          a.data_ptr<io_t>(),
-          b.data_ptr<io_t>(),
-          output.data_ptr<io_t>(),
+          chunk_token_starts.mutable_data_ptr<int>(),
+          chunk_token_ends.mutable_data_ptr<int>(),
+          boundary.mutable_data_ptr<float>(),
+          r.mutable_data_ptr<io_t>(),
+          decay.mutable_data_ptr<io_t>(),
+          decay_bias.defined() ? decay_bias.mutable_data_ptr<io_t>() : nullptr,
+          k.mutable_data_ptr<io_t>(),
+          v.mutable_data_ptr<io_t>(),
+          a.mutable_data_ptr<io_t>(),
+          b.mutable_data_ptr<io_t>(),
+          output.mutable_data_ptr<io_t>(),
           state_dot_a == nullptr
               ? nullptr
-              : state_dot_a->data_ptr<float>(),
+              : state_dot_a->mutable_data_ptr<float>(),
           scale);
 }
 
@@ -204,52 +199,58 @@ __global__ void replay_columns(int num_heads,const int* starts,const int* ends,
 void launch_rl_infctx_chunk_replay_fp32_from_decay_logits(
     int num_chunks,
     int num_heads,
-    const torch::Tensor& chunk_token_starts,
-    const torch::Tensor& chunk_token_ends,
-    const torch::Tensor& boundary,
-    const torch::Tensor& r,
-    const torch::Tensor& decay_logits,
-    const torch::Tensor& decay_bias,
-    const torch::Tensor& k,
-    const torch::Tensor& v,
-    const torch::Tensor& a,
-    const torch::Tensor& b,
-    torch::Tensor& output,
-    torch::Tensor* state_dot_a,
+    const torch::stable::Tensor& chunk_token_starts,
+    const torch::stable::Tensor& chunk_token_ends,
+    const torch::stable::Tensor& boundary,
+    const torch::stable::Tensor& r,
+    const torch::stable::Tensor& decay_logits,
+    const torch::stable::Tensor& decay_bias,
+    const torch::stable::Tensor& k,
+    const torch::stable::Tensor& v,
+    const torch::stable::Tensor& a,
+    const torch::stable::Tensor& b,
+    torch::stable::Tensor& output,
+    torch::stable::Tensor* state_dot_a,
     float scale,
     cudaStream_t stream) {
-  AT_DISPATCH_FLOATING_TYPES_AND2(
-      at::ScalarType::Half,
-      at::ScalarType::BFloat16,
-      r.scalar_type(),
-      "flashrwkv2_rl_infctx_chunk_replay_fp32",
-      [&] {
+  auto dispatch_launch = [&](auto scalar_value) {
+    using scalar_t = decltype(scalar_value);
         rl_infctx_replay_detail::launch_replay<scalar_t>(
             num_chunks, num_heads, chunk_token_starts, chunk_token_ends,
             boundary, r, decay_logits, decay_bias, k, v, a, b, output,
             state_dot_a, scale, stream);
-      });
+      };
+  switch (r.scalar_type()) {
+    case torch::headeronly::ScalarType::Half:
+      dispatch_launch(torch::headeronly::Half{});
+      break;
+    case torch::headeronly::ScalarType::BFloat16:
+      dispatch_launch(torch::headeronly::BFloat16{});
+      break;
+    default:
+      STD_TORCH_CHECK(false, "token dtype must be float16 or bfloat16");
+  }
 }
 
 
 
 
 void rl_infctx_tmix_wkv7_chunk_fp32io16_backward_replay_cuda(
-    torch::Tensor chunk_token_starts,
-    torch::Tensor chunk_token_ends,
-    torch::Tensor boundary,
-    torch::Tensor r,
-    torch::Tensor decay_logits,
-    torch::Tensor decay_bias,
-    torch::Tensor k,
-    torch::Tensor v,
-    torch::Tensor a,
-    torch::Tensor b,
-    torch::Tensor output,
-    torch::Tensor state_dot_a,
+    torch::stable::Tensor chunk_token_starts,
+    torch::stable::Tensor chunk_token_ends,
+    torch::stable::Tensor boundary,
+    torch::stable::Tensor r,
+    torch::stable::Tensor decay_logits,
+    torch::stable::Tensor decay_bias,
+    torch::stable::Tensor k,
+    torch::stable::Tensor v,
+    torch::stable::Tensor a,
+    torch::stable::Tensor b,
+    torch::stable::Tensor output,
+    torch::stable::Tensor state_dot_a,
     double scale) {
-  const c10::cuda::CUDAGuard device_guard(boundary.device());
-  const auto stream = at::cuda::getCurrentCUDAStream();
+  const torch::stable::accelerator::DeviceGuard device_guard(boundary.device().index());
+  const auto stream = flashrwkv2::validation::current_cuda_stream();
   const int num_chunks = static_cast<int>(chunk_token_starts.numel());
   const int num_heads = static_cast<int>(r.size(1));
   const int head_size = static_cast<int>(r.size(2));
@@ -259,15 +260,24 @@ void rl_infctx_tmix_wkv7_chunk_fp32io16_backward_replay_cuda(
       r, decay_logits, decay_bias, k, v, a, b, output, &state_dot_a,
       static_cast<float>(scale), stream);
   } else {
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-        at::ScalarType::Half, at::ScalarType::BFloat16, r.scalar_type(),
-        "flashrwkv2_rl_replay_tiled", [&] {
+    auto dispatch_launch = [&](auto scalar_value) {
+    using scalar_t = decltype(scalar_value);
           const dim3 grid(head_size, num_heads, num_chunks);
           if (head_size == 128)
-            rl_infctx_replay_tiled_detail::replay_columns<scalar_t,128><<<grid,32,0,stream>>>(num_heads,chunk_token_starts.data_ptr<int>(),chunk_token_ends.data_ptr<int>(),boundary.data_ptr<float>(),r.data_ptr<scalar_t>(),decay_logits.data_ptr<scalar_t>(),decay_bias.defined()?decay_bias.data_ptr<scalar_t>():nullptr,k.data_ptr<scalar_t>(),v.data_ptr<scalar_t>(),a.data_ptr<scalar_t>(),b.data_ptr<scalar_t>(),output.data_ptr<scalar_t>(),state_dot_a.data_ptr<float>(),static_cast<float>(scale));
+            rl_infctx_replay_tiled_detail::replay_columns<scalar_t,128><<<grid,32,0,stream>>>(num_heads,chunk_token_starts.mutable_data_ptr<int>(),chunk_token_ends.mutable_data_ptr<int>(),boundary.mutable_data_ptr<float>(),r.mutable_data_ptr<scalar_t>(),decay_logits.mutable_data_ptr<scalar_t>(),decay_bias.defined()?decay_bias.mutable_data_ptr<scalar_t>():nullptr,k.mutable_data_ptr<scalar_t>(),v.mutable_data_ptr<scalar_t>(),a.mutable_data_ptr<scalar_t>(),b.mutable_data_ptr<scalar_t>(),output.mutable_data_ptr<scalar_t>(),state_dot_a.mutable_data_ptr<float>(),static_cast<float>(scale));
           else
-            rl_infctx_replay_tiled_detail::replay_columns<scalar_t,256><<<grid,32,0,stream>>>(num_heads,chunk_token_starts.data_ptr<int>(),chunk_token_ends.data_ptr<int>(),boundary.data_ptr<float>(),r.data_ptr<scalar_t>(),decay_logits.data_ptr<scalar_t>(),decay_bias.defined()?decay_bias.data_ptr<scalar_t>():nullptr,k.data_ptr<scalar_t>(),v.data_ptr<scalar_t>(),a.data_ptr<scalar_t>(),b.data_ptr<scalar_t>(),output.data_ptr<scalar_t>(),state_dot_a.data_ptr<float>(),static_cast<float>(scale));
-        });
+            rl_infctx_replay_tiled_detail::replay_columns<scalar_t,256><<<grid,32,0,stream>>>(num_heads,chunk_token_starts.mutable_data_ptr<int>(),chunk_token_ends.mutable_data_ptr<int>(),boundary.mutable_data_ptr<float>(),r.mutable_data_ptr<scalar_t>(),decay_logits.mutable_data_ptr<scalar_t>(),decay_bias.defined()?decay_bias.mutable_data_ptr<scalar_t>():nullptr,k.mutable_data_ptr<scalar_t>(),v.mutable_data_ptr<scalar_t>(),a.mutable_data_ptr<scalar_t>(),b.mutable_data_ptr<scalar_t>(),output.mutable_data_ptr<scalar_t>(),state_dot_a.mutable_data_ptr<float>(),static_cast<float>(scale));
+        };
+  switch (r.scalar_type()) {
+    case torch::headeronly::ScalarType::Half:
+      dispatch_launch(torch::headeronly::Half{});
+      break;
+    case torch::headeronly::ScalarType::BFloat16:
+      dispatch_launch(torch::headeronly::BFloat16{});
+      break;
+    default:
+      STD_TORCH_CHECK(false, "token dtype must be float16 or bfloat16");
   }
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+  FLASHRWKV_CUDA_CHECK(cudaGetLastError());
 }

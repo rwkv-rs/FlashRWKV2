@@ -4,10 +4,12 @@
 // TMix Readout owns caller-specific dispatch and the public fusion contract.
 // Shared SM120 CUDA primitives live in the unregistered native-private provider.
 
+#include "validation.h"
+
 #include "../../../../internal/linear/backend.cuh"
 
-at::Tensor tmix_readout_projection_dispatch_f16_cuda(
-    at::Tensor x, at::Tensor weight_orig) {
+torch::stable::Tensor tmix_readout_projection_dispatch_f16_cuda(
+    torch::stable::Tensor x, torch::stable::Tensor weight_orig) {
   const int64_t c = x.size(-1);
   const int64_t rows = x.numel() / c;
 

@@ -7,6 +7,8 @@
 //   - D=128 follows rwkv7_clampw128_v2's 64-wide segmented recurrence;
 //   - D=256 is a local warp-tiled extension of the same math and layout.
 
+#include "validation.h"
+
 #include <assert.h>
 #include <cuda_runtime.h>
 

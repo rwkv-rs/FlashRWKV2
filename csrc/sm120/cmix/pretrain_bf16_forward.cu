@@ -5,9 +5,8 @@
 // Local adaptation: ChannelMix-owned FlashRWKV2 binding names; tensor contract
 // remains the canonical train_temp [B,T,C] BF16 contract.
 
-#include <torch/extension.h>
+#include "validation.h"
 
-#include <ATen/cuda/CUDAContext.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -16,11 +15,11 @@
 
 namespace {
 
-__device__ inline __nv_bfloat162 load_bf16x2(const at::BFloat16* ptr) {
+__device__ inline __nv_bfloat162 load_bf16x2(const torch::headeronly::BFloat16* ptr) {
     return *reinterpret_cast<const __nv_bfloat162*>(ptr);
 }
 
-__device__ inline void store_bf16x2(at::BFloat16* ptr, __nv_bfloat162 value) {
+__device__ inline void store_bf16x2(torch::headeronly::BFloat16* ptr, __nv_bfloat162 value) {
     *reinterpret_cast<__nv_bfloat162*>(ptr) = value;
 }
 
@@ -33,9 +32,9 @@ inline int64_t ceil_div(int64_t n, int64_t d) {
 }
 
 __global__ void cmix_tokenshift_forward_vec2_kernel(
-    const at::BFloat16* __restrict__ x,
-    const at::BFloat16* __restrict__ x_k,
-    at::BFloat16* __restrict__ out,
+    const torch::headeronly::BFloat16* __restrict__ x,
+    const torch::headeronly::BFloat16* __restrict__ x_k,
+    torch::headeronly::BFloat16* __restrict__ out,
     int64_t bt_size,
     int64_t t_size,
     int64_t c_size) {
@@ -64,10 +63,10 @@ constexpr int CMIX_THREADS = 256;
 
 template<int BT_TILE>
 __global__ void cmix_tokenshift_backward_fused_vec2_kernel(
-    const at::BFloat16* __restrict__ grad_out,
-    const at::BFloat16* __restrict__ x,
-    const at::BFloat16* __restrict__ x_k,
-    at::BFloat16* __restrict__ grad_x,
+    const torch::headeronly::BFloat16* __restrict__ grad_out,
+    const torch::headeronly::BFloat16* __restrict__ x,
+    const torch::headeronly::BFloat16* __restrict__ x_k,
+    torch::headeronly::BFloat16* __restrict__ grad_x,
     float* __restrict__ grad_x_k,
     int64_t bt_size,
     int64_t t_size,
@@ -132,10 +131,10 @@ __global__ void cmix_tokenshift_backward_fused_vec2_kernel(
 
 template<int BT_TILE>
 void launch_cmix_tokenshift_backward_fused_vec2_kernel(
-    const at::BFloat16* grad_out,
-    const at::BFloat16* x,
-    const at::BFloat16* x_k,
-    at::BFloat16* grad_x,
+    const torch::headeronly::BFloat16* grad_out,
+    const torch::headeronly::BFloat16* x,
+    const torch::headeronly::BFloat16* x_k,
+    torch::headeronly::BFloat16* grad_x,
     float* grad_x_k,
     int64_t bt_size,
     int64_t t_size,
@@ -158,7 +157,7 @@ void launch_cmix_tokenshift_backward_fused_vec2_kernel(
 
 __global__ void cast_float_to_bf16_vec2_kernel(
     const float* __restrict__ src,
-    at::BFloat16* __restrict__ dst,
+    torch::headeronly::BFloat16* __restrict__ dst,
     int64_t total_pairs) {
     int64_t pair_idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (pair_idx >= total_pairs) {
@@ -168,7 +167,7 @@ __global__ void cast_float_to_bf16_vec2_kernel(
     store_bf16x2(dst + idx, __floats2bfloat162_rn(src[idx], src[idx + 1]));
 }
 
-__global__ void relu_sq_inplace_vec2_kernel(at::BFloat16* __restrict__ x, int64_t total_pairs) {
+__global__ void relu_sq_inplace_vec2_kernel(torch::headeronly::BFloat16* __restrict__ x, int64_t total_pairs) {
     int64_t pair_idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (pair_idx >= total_pairs) {
         return;
@@ -182,8 +181,8 @@ __global__ void relu_sq_inplace_vec2_kernel(at::BFloat16* __restrict__ x, int64_
 }
 
 __global__ void relu_sq_backward_from_output_inplace_vec2_kernel(
-    at::BFloat16* __restrict__ grad_out,
-    const at::BFloat16* __restrict__ out,
+    torch::headeronly::BFloat16* __restrict__ grad_out,
+    const torch::headeronly::BFloat16* __restrict__ out,
     int64_t total_pairs) {
     int64_t pair_idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (pair_idx >= total_pairs) {
@@ -198,32 +197,32 @@ __global__ void relu_sq_backward_from_output_inplace_vec2_kernel(
     store_bf16x2(grad_out + idx, __floats2bfloat162_rn(g0, g1));
 }
 
-torch::Tensor cmix_tokenshift_forward_cuda(torch::Tensor x, torch::Tensor x_k) {
-    auto out = torch::empty_like(x);
+torch::stable::Tensor cmix_tokenshift_forward_cuda(torch::stable::Tensor x, torch::stable::Tensor x_k) {
+    auto out = torch::stable::empty_like(x);
     const int64_t bt_size = x.size(0) * x.size(1);
     const int64_t c_size = x.size(2);
     const int64_t total_pairs = bt_size * (c_size / 2);
-    auto stream = at::cuda::getCurrentCUDAStream();
+    auto stream = flashrwkv2::validation::current_cuda_stream();
     const int blocks = static_cast<int>(ceil_div(total_pairs, static_cast<int64_t>(CMIX_THREADS)));
     cmix_tokenshift_forward_vec2_kernel<<<blocks, CMIX_THREADS, 0, stream>>>(
-        x.data_ptr<at::BFloat16>(),
-        x_k.data_ptr<at::BFloat16>(),
-        out.data_ptr<at::BFloat16>(),
+        x.mutable_data_ptr<torch::headeronly::BFloat16>(),
+        x_k.mutable_data_ptr<torch::headeronly::BFloat16>(),
+        out.mutable_data_ptr<torch::headeronly::BFloat16>(),
         bt_size,
         x.size(1),
         c_size);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    FLASHRWKV_CUDA_CHECK(cudaGetLastError());
     return out;
 }
 
-std::vector<torch::Tensor> cmix_tokenshift_backward_cuda(torch::Tensor grad_out, torch::Tensor x, torch::Tensor x_k) {
-    auto grad_x = torch::empty_like(x);
-    auto grad_x_k_fp32 = torch::zeros({x.size(2)}, x.options().dtype(torch::kFloat32));
-    auto grad_x_k = torch::empty({x.size(2)}, x.options());
+std::vector<torch::stable::Tensor> cmix_tokenshift_backward_cuda(torch::stable::Tensor grad_out, torch::stable::Tensor x, torch::stable::Tensor x_k) {
+    auto grad_x = torch::stable::empty_like(x);
+    auto grad_x_k_fp32 = torch::stable::new_zeros(x, {x.size(2)}, torch::headeronly::ScalarType::Float);
+    auto grad_x_k = torch::stable::new_empty(x, {x.size(2)});
 
     const int64_t bt_size = x.size(0) * x.size(1);
     const int64_t c_size = x.size(2);
-    auto stream = at::cuda::getCurrentCUDAStream();
+    auto stream = flashrwkv2::validation::current_cuda_stream();
 
     int bt_tile = 16;
     if (const char* env = std::getenv("CMIX_V5_BT_TILE")) {
@@ -231,64 +230,67 @@ std::vector<torch::Tensor> cmix_tokenshift_backward_cuda(torch::Tensor grad_out,
     }
     if (bt_tile == 16) {
         launch_cmix_tokenshift_backward_fused_vec2_kernel<16>(
-            grad_out.data_ptr<at::BFloat16>(), x.data_ptr<at::BFloat16>(), x_k.data_ptr<at::BFloat16>(),
-            grad_x.data_ptr<at::BFloat16>(), grad_x_k_fp32.data_ptr<float>(), bt_size, x.size(1), c_size, stream);
+            grad_out.mutable_data_ptr<torch::headeronly::BFloat16>(), x.mutable_data_ptr<torch::headeronly::BFloat16>(), x_k.mutable_data_ptr<torch::headeronly::BFloat16>(),
+            grad_x.mutable_data_ptr<torch::headeronly::BFloat16>(), grad_x_k_fp32.mutable_data_ptr<float>(), bt_size, x.size(1), c_size, stream);
     } else if (bt_tile == 64) {
         launch_cmix_tokenshift_backward_fused_vec2_kernel<64>(
-            grad_out.data_ptr<at::BFloat16>(), x.data_ptr<at::BFloat16>(), x_k.data_ptr<at::BFloat16>(),
-            grad_x.data_ptr<at::BFloat16>(), grad_x_k_fp32.data_ptr<float>(), bt_size, x.size(1), c_size, stream);
+            grad_out.mutable_data_ptr<torch::headeronly::BFloat16>(), x.mutable_data_ptr<torch::headeronly::BFloat16>(), x_k.mutable_data_ptr<torch::headeronly::BFloat16>(),
+            grad_x.mutable_data_ptr<torch::headeronly::BFloat16>(), grad_x_k_fp32.mutable_data_ptr<float>(), bt_size, x.size(1), c_size, stream);
     } else if (bt_tile == 128) {
         launch_cmix_tokenshift_backward_fused_vec2_kernel<128>(
-            grad_out.data_ptr<at::BFloat16>(), x.data_ptr<at::BFloat16>(), x_k.data_ptr<at::BFloat16>(),
-            grad_x.data_ptr<at::BFloat16>(), grad_x_k_fp32.data_ptr<float>(), bt_size, x.size(1), c_size, stream);
+            grad_out.mutable_data_ptr<torch::headeronly::BFloat16>(), x.mutable_data_ptr<torch::headeronly::BFloat16>(), x_k.mutable_data_ptr<torch::headeronly::BFloat16>(),
+            grad_x.mutable_data_ptr<torch::headeronly::BFloat16>(), grad_x_k_fp32.mutable_data_ptr<float>(), bt_size, x.size(1), c_size, stream);
     } else {
         launch_cmix_tokenshift_backward_fused_vec2_kernel<32>(
-            grad_out.data_ptr<at::BFloat16>(), x.data_ptr<at::BFloat16>(), x_k.data_ptr<at::BFloat16>(),
-            grad_x.data_ptr<at::BFloat16>(), grad_x_k_fp32.data_ptr<float>(), bt_size, x.size(1), c_size, stream);
+            grad_out.mutable_data_ptr<torch::headeronly::BFloat16>(), x.mutable_data_ptr<torch::headeronly::BFloat16>(), x_k.mutable_data_ptr<torch::headeronly::BFloat16>(),
+            grad_x.mutable_data_ptr<torch::headeronly::BFloat16>(), grad_x_k_fp32.mutable_data_ptr<float>(), bt_size, x.size(1), c_size, stream);
     }
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    FLASHRWKV_CUDA_CHECK(cudaGetLastError());
 
     const int64_t total_pairs = c_size / 2;
     const int cast_blocks = static_cast<int>(ceil_div(total_pairs, static_cast<int64_t>(CMIX_THREADS)));
     cast_float_to_bf16_vec2_kernel<<<cast_blocks, CMIX_THREADS, 0, stream>>>(
-        grad_x_k_fp32.data_ptr<float>(),
-        grad_x_k.data_ptr<at::BFloat16>(),
+        grad_x_k_fp32.mutable_data_ptr<float>(),
+        grad_x_k.mutable_data_ptr<torch::headeronly::BFloat16>(),
         total_pairs);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    FLASHRWKV_CUDA_CHECK(cudaGetLastError());
 
     return {grad_x, grad_x_k};
 }
 
-void relu_sq_inplace_cuda(torch::Tensor x) {
+void relu_sq_inplace_cuda(torch::stable::Tensor x) {
     const int64_t total_pairs = x.numel() / 2;
-    auto stream = at::cuda::getCurrentCUDAStream();
+    auto stream = flashrwkv2::validation::current_cuda_stream();
     const int blocks = static_cast<int>(ceil_div(total_pairs, static_cast<int64_t>(CMIX_THREADS)));
-    relu_sq_inplace_vec2_kernel<<<blocks, CMIX_THREADS, 0, stream>>>(x.data_ptr<at::BFloat16>(), total_pairs);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    relu_sq_inplace_vec2_kernel<<<blocks, CMIX_THREADS, 0, stream>>>(x.mutable_data_ptr<torch::headeronly::BFloat16>(), total_pairs);
+    FLASHRWKV_CUDA_CHECK(cudaGetLastError());
 }
 
-void relu_sq_backward_from_output_inplace_cuda(torch::Tensor grad_out, torch::Tensor out) {
+void relu_sq_backward_from_output_inplace_cuda(torch::stable::Tensor grad_out, torch::stable::Tensor out) {
     const int64_t total_pairs = out.numel() / 2;
-    auto stream = at::cuda::getCurrentCUDAStream();
+    auto stream = flashrwkv2::validation::current_cuda_stream();
     const int blocks = static_cast<int>(ceil_div(total_pairs, static_cast<int64_t>(CMIX_THREADS)));
     relu_sq_backward_from_output_inplace_vec2_kernel<<<blocks, CMIX_THREADS, 0, stream>>>(
-        grad_out.data_ptr<at::BFloat16>(),
-        out.data_ptr<at::BFloat16>(),
+        grad_out.mutable_data_ptr<torch::headeronly::BFloat16>(),
+        out.mutable_data_ptr<torch::headeronly::BFloat16>(),
         total_pairs);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    FLASHRWKV_CUDA_CHECK(cudaGetLastError());
 }
 
 }
-std::vector<torch::Tensor> pretrain_cmix_forward_cuda(
-    torch::Tensor x,
-    torch::Tensor x_k,
-    torch::Tensor key_weight,
-    torch::Tensor value_weight) {
+std::vector<torch::stable::Tensor> pretrain_cmix_forward_cuda(
+    torch::stable::Tensor x,
+    torch::stable::Tensor x_k,
+    torch::stable::Tensor key_weight,
+    torch::stable::Tensor value_weight) {
     auto mixed = cmix_tokenshift_forward_cuda(x, x_k);
-    auto mixed_2d = mixed.view({-1, mixed.size(2)});
-    auto act = at::matmul(mixed_2d, key_weight.transpose(0, 1)).contiguous();
+    auto mixed_2d = torch::stable::view(mixed, {-1, mixed.size(2)});
+    auto key_weight_t = torch::stable::transpose(key_weight, 0, 1);
+    auto act = torch::stable::contiguous(torch::stable::matmul(mixed_2d, key_weight_t));
     relu_sq_inplace_cuda(act);
-    auto out_2d = at::matmul(act, value_weight.transpose(0, 1));
-    auto out = out_2d.view({x.size(0), x.size(1), value_weight.size(0)}).contiguous();
+    auto value_weight_t = torch::stable::transpose(value_weight, 0, 1);
+    auto out_2d = torch::stable::matmul(act, value_weight_t);
+    auto out = torch::stable::contiguous(torch::stable::view(
+        out_2d, {x.size(0), x.size(1), value_weight.size(0)}));
     return {out, mixed, act};
 }

@@ -9,6 +9,7 @@ import torch
 from . import (
     _check_metadata_inputs,
     _extension,
+    _metadata_launch_args,
     _resolve_max_seqlen,
     prepare_tmix_wkv7_recurrent_metadata,
 )
@@ -100,15 +101,24 @@ def infer_tmix_wkv7_chunk_bf16_forward_varlen(
             max_seqlen=launch_max_seqlen,
         )
     )
-    if decay_bias is not None:
-        if (
-            decay_bias.dtype != torch.bfloat16
-            or not decay_bias.is_cuda
-            or not decay_bias.is_contiguous()
-            or decay_bias.device != r.device
-            or decay_bias.shape not in {(r.shape[1], 64), (r.shape[1] * 64,)}
-        ):
-            raise ValueError("decay_bias must be contiguous CUDA bfloat16 [H,64] or [H*64]")
+    if decay_bias is not None and (
+        decay_bias.dtype != torch.bfloat16
+        or not decay_bias.is_cuda
+        or not decay_bias.is_contiguous()
+        or decay_bias.device != r.device
+        or decay_bias.shape not in {(r.shape[1], 64), (r.shape[1] * 64,)}
+    ):
+        raise ValueError(
+            "decay_bias must be contiguous CUDA bfloat16 [H,64] or [H*64]"
+        )
+    launch_metadata = _metadata_launch_args(
+        ticket,
+        cu_seqlens,
+        state_indices,
+        r.shape[0],
+        state_pool.shape[0],
+        launch_max_seqlen,
+    )
     output, _ = _extension().infer_tmix_wkv7_chunk_bf16_forward_varlen(
         r,
         decay_logits,
@@ -117,13 +127,13 @@ def infer_tmix_wkv7_chunk_bf16_forward_varlen(
         a,
         b,
         state_pool,
-        cu_seqlens,
-        state_indices,
+        launch_metadata[0],
+        launch_metadata[1],
+        launch_metadata[2],
         int(chunk_size),
         int(launch_max_seqlen),
         float(scale),
-        decay_bias=decay_bias,
-        validated_metadata=ticket,
+        decay_bias,
     )
     return output
 

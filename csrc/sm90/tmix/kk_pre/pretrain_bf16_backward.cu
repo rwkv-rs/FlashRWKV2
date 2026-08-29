@@ -5,9 +5,8 @@
 // Local adaptation: module-local FlashRWKV2 binding names only; tensor contract
 // remains the canonical train_temp [B,T,C] BF16 contract.
 
-#include <torch/extension.h>
+#include "validation.h"
 
-#include <ATen/cuda/CUDAContext.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -20,15 +19,15 @@ constexpr float kInvNormalizeEps = 1.0e12f;
 constexpr int kHeadSize = 64;
 constexpr int kWarpsPerBlock = 4;
 
-__device__ inline __nv_bfloat162 load_bf16x2(const at::BFloat16* ptr) {
+__device__ inline __nv_bfloat162 load_bf16x2(const torch::headeronly::BFloat16* ptr) {
     return *reinterpret_cast<const __nv_bfloat162*>(ptr);
 }
 
-__device__ inline void store_bf16x2(at::BFloat16* ptr, float x0, float x1) {
+__device__ inline void store_bf16x2(torch::headeronly::BFloat16* ptr, float x0, float x1) {
     *reinterpret_cast<__nv_bfloat162*>(ptr) = __floats2bfloat162_rn(x0, x1);
 }
 
-__device__ inline void store_bf16(at::BFloat16* ptr, float value) {
+__device__ inline void store_bf16(torch::headeronly::BFloat16* ptr, float value) {
     *reinterpret_cast<__nv_bfloat16*>(ptr) = __float2bfloat16(value);
 }
 
@@ -62,13 +61,13 @@ inline int64_t ceil_div(int64_t n, int64_t d) {
 }
 
 __global__ void tmix_kk_pre_forward64_v5_kernel(
-    const at::BFloat16* __restrict__ k,
-    const at::BFloat16* __restrict__ k_k,
-    const at::BFloat16* __restrict__ a,
-    const at::BFloat16* __restrict__ k_a,
-    at::BFloat16* __restrict__ new_k,
-    at::BFloat16* __restrict__ neg_kk,
-    at::BFloat16* __restrict__ kka,
+    const torch::headeronly::BFloat16* __restrict__ k,
+    const torch::headeronly::BFloat16* __restrict__ k_k,
+    const torch::headeronly::BFloat16* __restrict__ a,
+    const torch::headeronly::BFloat16* __restrict__ k_a,
+    torch::headeronly::BFloat16* __restrict__ new_k,
+    torch::headeronly::BFloat16* __restrict__ neg_kk,
+    torch::headeronly::BFloat16* __restrict__ kka,
     float* __restrict__ inv_d_out,
     int64_t bth_size,
     int64_t h_size) {
@@ -117,17 +116,17 @@ __global__ void tmix_kk_pre_forward64_v5_kernel(
 }
 
 __global__ void tmix_kk_pre_backward64_v5_kernel(
-    const at::BFloat16* __restrict__ grad_new_k,
-    const at::BFloat16* __restrict__ grad_neg_kk,
-    const at::BFloat16* __restrict__ grad_kka,
-    const at::BFloat16* __restrict__ k,
-    const at::BFloat16* __restrict__ k_k,
-    const at::BFloat16* __restrict__ a,
-    const at::BFloat16* __restrict__ k_a,
+    const torch::headeronly::BFloat16* __restrict__ grad_new_k,
+    const torch::headeronly::BFloat16* __restrict__ grad_neg_kk,
+    const torch::headeronly::BFloat16* __restrict__ grad_kka,
+    const torch::headeronly::BFloat16* __restrict__ k,
+    const torch::headeronly::BFloat16* __restrict__ k_k,
+    const torch::headeronly::BFloat16* __restrict__ a,
+    const torch::headeronly::BFloat16* __restrict__ k_a,
     const float* __restrict__ inv_d_buf,
-    at::BFloat16* __restrict__ grad_k,
+    torch::headeronly::BFloat16* __restrict__ grad_k,
     float* __restrict__ grad_k_k,
-    at::BFloat16* __restrict__ grad_a,
+    torch::headeronly::BFloat16* __restrict__ grad_a,
     float* __restrict__ grad_k_a,
     int64_t bth_size,
     int64_t h_size) {
@@ -192,17 +191,17 @@ __global__ void tmix_kk_pre_backward64_v5_kernel(
 
 template <int HeadSize>
 __global__ void tmix_kk_pre_backward_tiled_kernel(
-    const at::BFloat16* __restrict__ grad_new_k,
-    const at::BFloat16* __restrict__ grad_neg_kk,
-    const at::BFloat16* __restrict__ grad_kka,
-    const at::BFloat16* __restrict__ k,
-    const at::BFloat16* __restrict__ k_k,
-    const at::BFloat16* __restrict__ a,
-    const at::BFloat16* __restrict__ k_a,
+    const torch::headeronly::BFloat16* __restrict__ grad_new_k,
+    const torch::headeronly::BFloat16* __restrict__ grad_neg_kk,
+    const torch::headeronly::BFloat16* __restrict__ grad_kka,
+    const torch::headeronly::BFloat16* __restrict__ k,
+    const torch::headeronly::BFloat16* __restrict__ k_k,
+    const torch::headeronly::BFloat16* __restrict__ a,
+    const torch::headeronly::BFloat16* __restrict__ k_a,
     const float* __restrict__ inv_d_buf,
-    at::BFloat16* __restrict__ grad_k,
+    torch::headeronly::BFloat16* __restrict__ grad_k,
     float* __restrict__ grad_k_k,
-    at::BFloat16* __restrict__ grad_a,
+    torch::headeronly::BFloat16* __restrict__ grad_a,
     float* __restrict__ grad_k_a,
     int64_t h_size) {
     const int64_t bth = blockIdx.x;
@@ -245,7 +244,7 @@ __global__ void tmix_kk_pre_backward_tiled_kernel(
 
 __global__ void cast_float_to_bf16_kernel(
     const float* __restrict__ src,
-    at::BFloat16* __restrict__ dst,
+    torch::headeronly::BFloat16* __restrict__ dst,
     int64_t size) {
     const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= size) {
@@ -255,75 +254,75 @@ __global__ void cast_float_to_bf16_kernel(
 }
 
 }
-std::vector<torch::Tensor> pretrain_tmix_kk_pre_backward_cuda(
-    torch::Tensor grad_new_k,
-    torch::Tensor grad_neg_kk,
-    torch::Tensor grad_kka,
-    torch::Tensor k,
-    torch::Tensor k_k,
-    torch::Tensor a,
-    torch::Tensor k_a,
-    torch::Tensor inv_d,
+std::vector<torch::stable::Tensor> pretrain_tmix_kk_pre_backward_cuda(
+    torch::stable::Tensor grad_new_k,
+    torch::stable::Tensor grad_neg_kk,
+    torch::stable::Tensor grad_kka,
+    torch::stable::Tensor k,
+    torch::stable::Tensor k_k,
+    torch::stable::Tensor a,
+    torch::stable::Tensor k_a,
+    torch::stable::Tensor inv_d,
     int64_t head_size) {
-    auto grad_k = torch::empty_like(k);
-    auto grad_a = torch::empty_like(a);
-    auto grad_k_k_fp32 = torch::zeros({k.size(2)}, k.options().dtype(torch::kFloat32));
-    auto grad_k_a_fp32 = torch::zeros({k.size(2)}, k.options().dtype(torch::kFloat32));
-    auto grad_k_k = torch::empty_like(k_k);
-    auto grad_k_a = torch::empty_like(k_a);
+    auto grad_k = torch::stable::empty_like(k);
+    auto grad_a = torch::stable::empty_like(a);
+    auto grad_k_k_fp32 = torch::stable::new_zeros(k, {k.size(2)}, torch::headeronly::ScalarType::Float);
+    auto grad_k_a_fp32 = torch::stable::new_zeros(k, {k.size(2)}, torch::headeronly::ScalarType::Float);
+    auto grad_k_k = torch::stable::empty_like(k_k);
+    auto grad_k_a = torch::stable::empty_like(k_a);
 
     const int64_t c_size = k.size(2);
     const int64_t h_size = c_size / head_size;
     const int64_t bth_size = k.size(0) * k.size(1) * h_size;
     const int blocks = static_cast<int>(ceil_div(bth_size, static_cast<int64_t>(kWarpsPerBlock)));
-    auto stream = at::cuda::getCurrentCUDAStream();
+    auto stream = flashrwkv2::validation::current_cuda_stream();
     if (head_size == 64) {
       tmix_kk_pre_backward64_v5_kernel<<<blocks, kWarpsPerBlock * 32, 0, stream>>>(
-        grad_new_k.data_ptr<at::BFloat16>(),
-        grad_neg_kk.data_ptr<at::BFloat16>(),
-        grad_kka.data_ptr<at::BFloat16>(),
-        k.data_ptr<at::BFloat16>(),
-        k_k.data_ptr<at::BFloat16>(),
-        a.data_ptr<at::BFloat16>(),
-        k_a.data_ptr<at::BFloat16>(),
-        inv_d.data_ptr<float>(),
-        grad_k.data_ptr<at::BFloat16>(),
-        grad_k_k_fp32.data_ptr<float>(),
-        grad_a.data_ptr<at::BFloat16>(),
-        grad_k_a_fp32.data_ptr<float>(),
+        grad_new_k.mutable_data_ptr<torch::headeronly::BFloat16>(),
+        grad_neg_kk.mutable_data_ptr<torch::headeronly::BFloat16>(),
+        grad_kka.mutable_data_ptr<torch::headeronly::BFloat16>(),
+        k.mutable_data_ptr<torch::headeronly::BFloat16>(),
+        k_k.mutable_data_ptr<torch::headeronly::BFloat16>(),
+        a.mutable_data_ptr<torch::headeronly::BFloat16>(),
+        k_a.mutable_data_ptr<torch::headeronly::BFloat16>(),
+        inv_d.mutable_data_ptr<float>(),
+        grad_k.mutable_data_ptr<torch::headeronly::BFloat16>(),
+        grad_k_k_fp32.mutable_data_ptr<float>(),
+        grad_a.mutable_data_ptr<torch::headeronly::BFloat16>(),
+        grad_k_a_fp32.mutable_data_ptr<float>(),
         bth_size,
         h_size);
     } else if (head_size == 128) {
       tmix_kk_pre_backward_tiled_kernel<128><<<bth_size, 64, 0, stream>>>(
-        grad_new_k.data_ptr<at::BFloat16>(), grad_neg_kk.data_ptr<at::BFloat16>(),
-        grad_kka.data_ptr<at::BFloat16>(), k.data_ptr<at::BFloat16>(),
-        k_k.data_ptr<at::BFloat16>(), a.data_ptr<at::BFloat16>(),
-        k_a.data_ptr<at::BFloat16>(), inv_d.data_ptr<float>(),
-        grad_k.data_ptr<at::BFloat16>(), grad_k_k_fp32.data_ptr<float>(),
-        grad_a.data_ptr<at::BFloat16>(), grad_k_a_fp32.data_ptr<float>(), h_size);
+        grad_new_k.mutable_data_ptr<torch::headeronly::BFloat16>(), grad_neg_kk.mutable_data_ptr<torch::headeronly::BFloat16>(),
+        grad_kka.mutable_data_ptr<torch::headeronly::BFloat16>(), k.mutable_data_ptr<torch::headeronly::BFloat16>(),
+        k_k.mutable_data_ptr<torch::headeronly::BFloat16>(), a.mutable_data_ptr<torch::headeronly::BFloat16>(),
+        k_a.mutable_data_ptr<torch::headeronly::BFloat16>(), inv_d.mutable_data_ptr<float>(),
+        grad_k.mutable_data_ptr<torch::headeronly::BFloat16>(), grad_k_k_fp32.mutable_data_ptr<float>(),
+        grad_a.mutable_data_ptr<torch::headeronly::BFloat16>(), grad_k_a_fp32.mutable_data_ptr<float>(), h_size);
     } else {
       tmix_kk_pre_backward_tiled_kernel<256><<<bth_size, 128, 0, stream>>>(
-        grad_new_k.data_ptr<at::BFloat16>(), grad_neg_kk.data_ptr<at::BFloat16>(),
-        grad_kka.data_ptr<at::BFloat16>(), k.data_ptr<at::BFloat16>(),
-        k_k.data_ptr<at::BFloat16>(), a.data_ptr<at::BFloat16>(),
-        k_a.data_ptr<at::BFloat16>(), inv_d.data_ptr<float>(),
-        grad_k.data_ptr<at::BFloat16>(), grad_k_k_fp32.data_ptr<float>(),
-        grad_a.data_ptr<at::BFloat16>(), grad_k_a_fp32.data_ptr<float>(), h_size);
+        grad_new_k.mutable_data_ptr<torch::headeronly::BFloat16>(), grad_neg_kk.mutable_data_ptr<torch::headeronly::BFloat16>(),
+        grad_kka.mutable_data_ptr<torch::headeronly::BFloat16>(), k.mutable_data_ptr<torch::headeronly::BFloat16>(),
+        k_k.mutable_data_ptr<torch::headeronly::BFloat16>(), a.mutable_data_ptr<torch::headeronly::BFloat16>(),
+        k_a.mutable_data_ptr<torch::headeronly::BFloat16>(), inv_d.mutable_data_ptr<float>(),
+        grad_k.mutable_data_ptr<torch::headeronly::BFloat16>(), grad_k_k_fp32.mutable_data_ptr<float>(),
+        grad_a.mutable_data_ptr<torch::headeronly::BFloat16>(), grad_k_a_fp32.mutable_data_ptr<float>(), h_size);
     }
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    FLASHRWKV_CUDA_CHECK(cudaGetLastError());
 
     constexpr int threads = 256;
     const int cast_blocks = static_cast<int>(ceil_div(c_size, static_cast<int64_t>(threads)));
     cast_float_to_bf16_kernel<<<cast_blocks, threads, 0, stream>>>(
-        grad_k_k_fp32.data_ptr<float>(),
-        grad_k_k.data_ptr<at::BFloat16>(),
+        grad_k_k_fp32.mutable_data_ptr<float>(),
+        grad_k_k.mutable_data_ptr<torch::headeronly::BFloat16>(),
         c_size);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    FLASHRWKV_CUDA_CHECK(cudaGetLastError());
     cast_float_to_bf16_kernel<<<cast_blocks, threads, 0, stream>>>(
-        grad_k_a_fp32.data_ptr<float>(),
-        grad_k_a.data_ptr<at::BFloat16>(),
+        grad_k_a_fp32.mutable_data_ptr<float>(),
+        grad_k_a.mutable_data_ptr<torch::headeronly::BFloat16>(),
         c_size);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    FLASHRWKV_CUDA_CHECK(cudaGetLastError());
 
     return {grad_k, grad_k_k, grad_a, grad_k_a};
 }

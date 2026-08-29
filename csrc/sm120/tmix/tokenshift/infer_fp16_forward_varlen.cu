@@ -10,15 +10,13 @@
 // slot.  The final-token state closure is the upstream update-shift stage with
 // those two address calculations changed for packed storage.
 
-#include <ATen/ATen.h>
-#include <ATen/cuda/CUDAContext.h>
 #include <cuda_fp16.h>
-#include <torch/extension.h>
+#include "validation.h"
 
 #include <cstdint>
 #include <vector>
 
-using dtype = at::Half;
+using dtype = torch::headeronly::Half;
 
 namespace {
 
@@ -325,20 +323,20 @@ void tmix_tokenshift_forward_varlen(
     int total_tokens,
     int channels,
     int max_seqlen,
-    torch::Tensor x,
-    torch::Tensor shift_state,
-    torch::Tensor x_r,
-    torch::Tensor x_w,
-    torch::Tensor x_k,
-    torch::Tensor x_v,
-    torch::Tensor x_a,
-    torch::Tensor x_g,
-    torch::Tensor query_start_loc,
-    torch::Tensor state_indices,
-    torch::Tensor metadata_status,
-    torch::Tensor token_predecessor,
-    std::vector<torch::Tensor>& outputs) {
-  const auto stream = at::cuda::getCurrentCUDAStream();
+    torch::stable::Tensor x,
+    torch::stable::Tensor shift_state,
+    torch::stable::Tensor x_r,
+    torch::stable::Tensor x_w,
+    torch::stable::Tensor x_k,
+    torch::stable::Tensor x_v,
+    torch::stable::Tensor x_a,
+    torch::stable::Tensor x_g,
+    torch::stable::Tensor query_start_loc,
+    torch::stable::Tensor state_indices,
+    torch::stable::Tensor metadata_status,
+    torch::stable::Tensor token_predecessor,
+    std::vector<torch::stable::Tensor>& outputs) {
+  const auto stream = flashrwkv2::validation::current_cuda_stream();
   const int pairs = channels / 2;
   const bool use_grid3d =
       use_tmix_tokenshift_grid3d(
@@ -351,85 +349,85 @@ void tmix_tokenshift_forward_varlen(
         static_cast<unsigned int>(total_tokens));
     tmix_tokenshift_kernel<true, false><<<grid, 256, 0, stream>>>(
         batch_size, total_tokens, channels,
-        x.data_ptr<dtype>(), shift_state.data_ptr<dtype>(),
-        x_r.data_ptr<dtype>(), x_w.data_ptr<dtype>(), x_k.data_ptr<dtype>(),
-        x_v.data_ptr<dtype>(), x_a.data_ptr<dtype>(), x_g.data_ptr<dtype>(),
-        outputs[0].data_ptr<dtype>(), outputs[1].data_ptr<dtype>(),
-        outputs[2].data_ptr<dtype>(), outputs[3].data_ptr<dtype>(),
-        outputs[4].data_ptr<dtype>(), outputs[5].data_ptr<dtype>(),
-        token_predecessor.data_ptr<int>(),
-        metadata_status.data_ptr<int>());
+        x.mutable_data_ptr<dtype>(), shift_state.mutable_data_ptr<dtype>(),
+        x_r.mutable_data_ptr<dtype>(), x_w.mutable_data_ptr<dtype>(), x_k.mutable_data_ptr<dtype>(),
+        x_v.mutable_data_ptr<dtype>(), x_a.mutable_data_ptr<dtype>(), x_g.mutable_data_ptr<dtype>(),
+        outputs[0].mutable_data_ptr<dtype>(), outputs[1].mutable_data_ptr<dtype>(),
+        outputs[2].mutable_data_ptr<dtype>(), outputs[3].mutable_data_ptr<dtype>(),
+        outputs[4].mutable_data_ptr<dtype>(), outputs[5].mutable_data_ptr<dtype>(),
+        token_predecessor.mutable_data_ptr<int>(),
+        metadata_status.mutable_data_ptr<int>());
   } else {
     const dim3 grid(static_cast<unsigned int>(ceil_div(
         static_cast<int64_t>(total_tokens) * pairs, 256)));
     if (update_in_mix) {
       tmix_tokenshift_kernel<false, true><<<grid, 256, 0, stream>>>(
           batch_size, total_tokens, channels,
-          x.data_ptr<dtype>(), shift_state.data_ptr<dtype>(),
-          x_r.data_ptr<dtype>(), x_w.data_ptr<dtype>(), x_k.data_ptr<dtype>(),
-          x_v.data_ptr<dtype>(), x_a.data_ptr<dtype>(), x_g.data_ptr<dtype>(),
-          outputs[0].data_ptr<dtype>(), outputs[1].data_ptr<dtype>(),
-          outputs[2].data_ptr<dtype>(), outputs[3].data_ptr<dtype>(),
-          outputs[4].data_ptr<dtype>(), outputs[5].data_ptr<dtype>(),
-          token_predecessor.data_ptr<int>(),
-          metadata_status.data_ptr<int>());
+          x.mutable_data_ptr<dtype>(), shift_state.mutable_data_ptr<dtype>(),
+          x_r.mutable_data_ptr<dtype>(), x_w.mutable_data_ptr<dtype>(), x_k.mutable_data_ptr<dtype>(),
+          x_v.mutable_data_ptr<dtype>(), x_a.mutable_data_ptr<dtype>(), x_g.mutable_data_ptr<dtype>(),
+          outputs[0].mutable_data_ptr<dtype>(), outputs[1].mutable_data_ptr<dtype>(),
+          outputs[2].mutable_data_ptr<dtype>(), outputs[3].mutable_data_ptr<dtype>(),
+          outputs[4].mutable_data_ptr<dtype>(), outputs[5].mutable_data_ptr<dtype>(),
+          token_predecessor.mutable_data_ptr<int>(),
+          metadata_status.mutable_data_ptr<int>());
     } else {
       tmix_tokenshift_kernel<false, false><<<grid, 256, 0, stream>>>(
           batch_size, total_tokens, channels,
-          x.data_ptr<dtype>(), shift_state.data_ptr<dtype>(),
-          x_r.data_ptr<dtype>(), x_w.data_ptr<dtype>(), x_k.data_ptr<dtype>(),
-          x_v.data_ptr<dtype>(), x_a.data_ptr<dtype>(), x_g.data_ptr<dtype>(),
-          outputs[0].data_ptr<dtype>(), outputs[1].data_ptr<dtype>(),
-          outputs[2].data_ptr<dtype>(), outputs[3].data_ptr<dtype>(),
-          outputs[4].data_ptr<dtype>(), outputs[5].data_ptr<dtype>(),
-          token_predecessor.data_ptr<int>(),
-          metadata_status.data_ptr<int>());
+          x.mutable_data_ptr<dtype>(), shift_state.mutable_data_ptr<dtype>(),
+          x_r.mutable_data_ptr<dtype>(), x_w.mutable_data_ptr<dtype>(), x_k.mutable_data_ptr<dtype>(),
+          x_v.mutable_data_ptr<dtype>(), x_a.mutable_data_ptr<dtype>(), x_g.mutable_data_ptr<dtype>(),
+          outputs[0].mutable_data_ptr<dtype>(), outputs[1].mutable_data_ptr<dtype>(),
+          outputs[2].mutable_data_ptr<dtype>(), outputs[3].mutable_data_ptr<dtype>(),
+          outputs[4].mutable_data_ptr<dtype>(), outputs[5].mutable_data_ptr<dtype>(),
+          token_predecessor.mutable_data_ptr<int>(),
+          metadata_status.mutable_data_ptr<int>());
     }
   }
 
   if (!update_in_mix) {
     update_shift_state_last_kernel<<<batch_size, 256, 0, stream>>>(
-        batch_size, channels, x.data_ptr<dtype>(), shift_state.data_ptr<dtype>(),
-        query_start_loc.data_ptr<int>(), state_indices.data_ptr<int>(),
-        metadata_status.data_ptr<int>());
+        batch_size, channels, x.mutable_data_ptr<dtype>(), shift_state.mutable_data_ptr<dtype>(),
+        query_start_loc.mutable_data_ptr<int>(), state_indices.mutable_data_ptr<int>(),
+        metadata_status.mutable_data_ptr<int>());
   }
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  FLASHRWKV_CUDA_CHECK(cudaGetLastError());
 }
 
-std::vector<torch::Tensor> tmix_res_ln_tokenshift_fused_forward_cuda(
-    torch::Tensor x,
-    torch::Tensor res,
-    torch::Tensor shift_state,
-    torch::Tensor weight,
-    torch::Tensor bias,
-    torch::Tensor x_r,
-    torch::Tensor x_w,
-    torch::Tensor x_k,
-    torch::Tensor x_v,
-    torch::Tensor x_a,
-    torch::Tensor x_g,
-    torch::Tensor token_predecessor,
-    torch::Tensor metadata_status,
+std::vector<torch::stable::Tensor> tmix_res_ln_tokenshift_fused_forward_cuda(
+    torch::stable::Tensor x,
+    torch::stable::Tensor res,
+    torch::stable::Tensor shift_state,
+    torch::stable::Tensor weight,
+    torch::stable::Tensor bias,
+    torch::stable::Tensor x_r,
+    torch::stable::Tensor x_w,
+    torch::stable::Tensor x_k,
+    torch::stable::Tensor x_v,
+    torch::stable::Tensor x_a,
+    torch::stable::Tensor x_g,
+    torch::stable::Tensor token_predecessor,
+    torch::stable::Tensor metadata_status,
     double eps) {
-  std::vector<torch::Tensor> outputs;
+  std::vector<torch::stable::Tensor> outputs;
   outputs.reserve(7);
-  for (int i = 0; i < 7; ++i) outputs.push_back(torch::empty_like(x));
+  for (int i = 0; i < 7; ++i) outputs.push_back(torch::stable::empty_like(x));
   // Match Albatross's C=4096 scalar-statistics launch.  The predecessor
   // descriptor changes only the previous-row address; it does not reduce the
   // channel work available to this row-owned block.
   res_ln_tmix_tokenshift_fused_kernel<1024><<<
       static_cast<int>(x.size(0)), 1024, 0,
-      at::cuda::getCurrentCUDAStream()>>>(
-      x.data_ptr<dtype>(), res.data_ptr<dtype>(), shift_state.data_ptr<dtype>(),
-      weight.data_ptr<dtype>(), bias.data_ptr<dtype>(), x_r.data_ptr<dtype>(),
-      x_w.data_ptr<dtype>(), x_k.data_ptr<dtype>(), x_v.data_ptr<dtype>(),
-      x_a.data_ptr<dtype>(), x_g.data_ptr<dtype>(), outputs[0].data_ptr<dtype>(),
-      outputs[1].data_ptr<dtype>(), outputs[2].data_ptr<dtype>(),
-      outputs[3].data_ptr<dtype>(), outputs[4].data_ptr<dtype>(),
-      outputs[5].data_ptr<dtype>(), outputs[6].data_ptr<dtype>(),
-      token_predecessor.data_ptr<int>(), metadata_status.data_ptr<int>(),
+      flashrwkv2::validation::current_cuda_stream()>>>(
+      x.mutable_data_ptr<dtype>(), res.mutable_data_ptr<dtype>(), shift_state.mutable_data_ptr<dtype>(),
+      weight.mutable_data_ptr<dtype>(), bias.mutable_data_ptr<dtype>(), x_r.mutable_data_ptr<dtype>(),
+      x_w.mutable_data_ptr<dtype>(), x_k.mutable_data_ptr<dtype>(), x_v.mutable_data_ptr<dtype>(),
+      x_a.mutable_data_ptr<dtype>(), x_g.mutable_data_ptr<dtype>(), outputs[0].mutable_data_ptr<dtype>(),
+      outputs[1].mutable_data_ptr<dtype>(), outputs[2].mutable_data_ptr<dtype>(),
+      outputs[3].mutable_data_ptr<dtype>(), outputs[4].mutable_data_ptr<dtype>(),
+      outputs[5].mutable_data_ptr<dtype>(), outputs[6].mutable_data_ptr<dtype>(),
+      token_predecessor.mutable_data_ptr<int>(), metadata_status.mutable_data_ptr<int>(),
       x.size(0),
       static_cast<float>(eps));
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  FLASHRWKV_CUDA_CHECK(cudaGetLastError());
   return outputs;
 }

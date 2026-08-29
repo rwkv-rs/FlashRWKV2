@@ -351,6 +351,11 @@ jobs:
         if: steps.locked_reuse.outputs.reuse_evidence != 'true' && steps.locked_reuse.outputs.reuse_wheel != 'true'
         run: |
           set -o pipefail
+          forbidden='torch/extension\.h|torch/csrc/api/|ATen/|c10/cuda/|pybind11|torch::Tensor|at::Tensor|py::'
+          if rg -n "$forbidden" csrc; then
+            echo 'native source contains a non-Stable ABI dependency' >&2
+            exit 1
+          fi
           mkdir -p artifacts/package/dist artifacts/raw-wheel
           command -v ccache
           export CCACHE_COMPILERCHECK=content
@@ -416,7 +421,7 @@ jobs:
         if: steps.locked_reuse.outputs.reuse_evidence != 'true' && steps.locked_reuse.outputs.reuse_wheel != 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: flashrwkv2-wheel-v4-${{ needs.plan.outputs.build_input_hash }}
+          name: flashrwkv2-wheel-v5-${{ needs.plan.outputs.build_input_hash }}
           path: |
             artifacts/package/dist/*.whl
             artifacts/package/locked-requirements.txt
@@ -435,6 +440,13 @@ jobs:
           uv venv --python 3.12 .runtime-venv
           uv pip install --python .runtime-venv/bin/python -r "$requirements"
           uv pip install --python .runtime-venv/bin/python --no-deps "$wheel"
+          for version in 2.11 2.12; do
+            runtime=".runtime-torch${version/./}"
+            uv venv --python 3.12 "$runtime"
+            uv pip install --python "$runtime/bin/python" \
+              "torch==$version.*" 'pytest>=8'
+            uv pip install --python "$runtime/bin/python" --no-deps "$wheel"
+          done
       - name: Verify package identity and native binary contents
         if: steps.locked_reuse.outputs.reuse_evidence != 'true'
         run: |
@@ -453,10 +465,22 @@ jobs:
           grep -q 'sm_90' artifacts/package/sm90-elf.txt
           grep -q '\.target sm_90' artifacts/package/sm90-ptx.txt
           grep -q 'sm_120' artifacts/package/sm120-elf.txt
+          for binary in "$sm90" "$sm120"; do
+            if readelf -d "$binary" | grep -q 'torch_python'; then
+              echo "$binary depends on torch_python" >&2
+              exit 1
+            fi
+            symbols="artifacts/package/$(basename "$binary").undefined.txt"
+            nm -D --undefined-only "$binary" | c++filt | tee "$symbols"
+            if grep -E '(^|[[:space:]])(at::|c10::|pybind11::|THP)' "$symbols"; then
+              echo "$binary exposes non-Stable PyTorch undefined symbols" >&2
+              exit 1
+            fi
+          done
           (
             cd "$RUNNER_TEMP"
             "$GITHUB_WORKSPACE/.runtime-venv/bin/python" - <<'PY'
-          import importlib, importlib.util, os, tomllib
+          import importlib.util, os, tomllib
           from pathlib import Path
           import flashrwkv2, torch
           project = tomllib.loads(
@@ -468,64 +492,122 @@ jobs:
               raise SystemExit(f'unexpected GPU capability: {torch.cuda.get_device_capability(0)}')
           if flashrwkv2._C is None or flashrwkv2._C.__name__ != 'flashrwkv2._C_sm120':
               raise SystemExit('native SM120 backend was not selected')
-          backends = {}
           for backend in ('flashrwkv2._C_sm90', 'flashrwkv2._C_sm120'):
               if importlib.util.find_spec(backend) is None:
                   raise SystemExit(f'wheel lacks {backend}')
-              backends[backend] = importlib.import_module(backend)
-          public_sm90 = {
-              name for name in dir(backends['flashrwkv2._C_sm90'])
-              if not name.startswith('_')
-          }
-          public_sm120 = {
-              name for name in dir(backends['flashrwkv2._C_sm120'])
-              if not name.startswith('_')
-          }
-          missing_sm120 = sorted(public_sm90 - public_sm120)
-          if missing_sm120:
-              raise SystemExit(
-                  f'SM120 backend lacks SM90 workload symbols: {missing_sm120}'
-              )
+          if [name for name in dir(flashrwkv2._C) if not name.startswith('_')]:
+              raise SystemExit('private backend module exposes callable API')
           PY
           )
-      - name: Run affected correctness and CUDA Graph tests once
-        if: steps.locked_reuse.outputs.reuse_evidence != 'true' && needs.plan.outputs.package_smoke_only != 'true'
+          for backend in flashrwkv2._C_sm90 flashrwkv2._C_sm120; do
+            (
+              cd "$package_root"
+              BACKEND="$backend" FLASHRWKV_TEST_BACKEND="${backend##*.}" \
+                "$GITHUB_WORKSPACE/.runtime-venv/bin/python" - <<'PY'
+          import importlib, os, re
+          from pathlib import Path
+          import torch
+          backend = importlib.import_module(os.environ['BACKEND'])
+          if [name for name in dir(backend) if not name.startswith('_')]:
+              raise SystemExit(f'{backend.__name__} exposes callable API')
+          namespace = torch.ops.flashrwkv2
+          architecture = os.environ['BACKEND'].rsplit('_', 1)[-1]
+          source_root = Path(os.environ['GITHUB_WORKSPACE'], 'csrc', architecture)
+          required = set()
+          for path in source_root.rglob('*.cpp'):
+              required.update(
+                  schema.split('(', 1)[0]
+                  for schema in re.findall(
+                      r'module\.def\(\s*"([^"]+)"\s*\)', path.read_text()
+                  )
+              )
+          expected_count = {'sm90': 25, 'sm120': 47}[architecture]
+          if len(required) != expected_count:
+              raise SystemExit(
+                  f'{architecture} source has {len(required)} schemas, expected {expected_count}'
+              )
+          missing = sorted(name for name in required if not hasattr(namespace, name))
+          if missing:
+              raise SystemExit(f'{backend.__name__} lacks dispatcher schemas: {missing}')
+          PY
+            )
+          done
+      - name: Validate the same wheel on Torch 2.11, 2.12, and 2.13
+        if: steps.locked_reuse.outputs.reuse_evidence != 'true'
         env:
-          SM90_JSON: ${{ needs.plan.outputs.sm90_correctness_nodeids }}
-          SM120_JSON: ${{ needs.plan.outputs.sm120_correctness_nodeids }}
           PYTHONPATH: ${{ github.workspace }}/tests:${{ github.workspace }}/benchmarks
+          SCOPE: ${{ needs.plan.outputs.scope }}
+          SM90_MODULES: ${{ needs.plan.outputs.affected_sm90_modules }}
+          SM120_MODULES: ${{ needs.plan.outputs.affected_sm120_modules }}
+          SM90_NODEIDS: ${{ needs.plan.outputs.sm90_correctness_nodeids }}
+          SM120_NODEIDS: ${{ needs.plan.outputs.sm120_correctness_nodeids }}
         run: |
           set -o pipefail
-          test_root="$RUNNER_TEMP/flashrwkv2-correctness-$GITHUB_RUN_ID"
-          mkdir -p "$test_root" artifacts/validation
-          run_nodeids() {
-            local backend="$1" marker="$2" nodeids_json="$3"
-            mapfile -t nodeids < <(NODEIDS_JSON="$nodeids_json" python3 -c 'import json,os; print("\n".join(json.loads(os.environ["NODEIDS_JSON"])))')
-            (( ${#nodeids[@]} )) || return 0
-            for index in "${!nodeids[@]}"; do
-              nodeids[$index]="$GITHUB_WORKSPACE/${nodeids[$index]}"
-            done
+          mkdir -p artifacts/validation
+          test_root="$RUNNER_TEMP/flashrwkv2-stable-abi-$GITHUB_RUN_ID"
+          mkdir -p "$test_root"
+          wheel="$(find artifacts/package -name '*.whl' -print -quit)"
+          wheel_sha="$(sha256sum "$wheel" | awk '{print $1}')"
+          for version in 2.11 2.12 2.13; do
+            if [[ "$version" == 2.13 ]]; then
+              python="$GITHUB_WORKSPACE/.runtime-venv/bin/python"
+            else
+              runtime=".runtime-torch${version/./}"
+              python="$GITHUB_WORKSPACE/$runtime/bin/python"
+            fi
             (
               cd "$test_root"
-              FLASHRWKV_TEST_BACKEND="$backend" \
-                "$GITHUB_WORKSPACE/.runtime-venv/bin/python" -m pytest -p utils -q \
-                "${nodeids[@]}" -m "$marker" -c /dev/null --rootdir="$test_root"
-            ) 2>&1 | tee "$GITHUB_WORKSPACE/artifacts/validation/function-$marker.log"
-          }
-          run_nodeids _C_sm120 sm120 "$SM120_JSON"
-          run_nodeids _C_sm90 sm90 "$SM90_JSON"
-          python3 - <<'PY'
+              "$python" - <<PY
+          import torch
+          if not torch.__version__.startswith('$version.'):
+              raise SystemExit(f'expected Torch $version, found {torch.__version__}')
+          import flashrwkv2
+          if flashrwkv2._C is None:
+              raise SystemExit('native backend was not selected')
+          PY
+            )
+            (
+              cd "$test_root"
+              "$python" -m pytest -p utils -q --import-mode=importlib --strict-markers \
+                -m 'not sm90 and not sm120 and not resource and not memcheck and not racecheck' \
+                "$GITHUB_WORKSPACE/tests" -c /dev/null --rootdir="$test_root"
+            )
+            for backend in _C_sm90 _C_sm120; do
+              architecture="${backend#_C_}"
+              (
+                cd "$test_root"
+                FLASHRWKV_TEST_BACKEND="$backend" "$python" -m pytest -p utils -q \
+                  --import-mode=importlib --strict-markers \
+                  -m "$architecture and not resource and not memcheck and not racecheck" \
+                  "$GITHUB_WORKSPACE/tests" -c /dev/null --rootdir="$test_root"
+              )
+            done
+          done
+          WHEEL_SHA="$wheel_sha" python3 - <<'PY'
           import json, os
           from pathlib import Path
+          Path('artifacts/validation/stable-abi-runtime.json').write_text(
+              json.dumps({
+                  'target': '0x020b000000000000',
+                  'build_torch': '2.13',
+                  'runtimes': {version: 'passed' for version in ('2.11', '2.12', '2.13')},
+                  'wheel_sha256': os.environ['WHEEL_SHA'],
+              }, indent=2) + '\n'
+          )
           results = []
-          for backend, name in (("sm120", "SM120_JSON"), ("sm90", "SM90_JSON")):
-              nodeids = json.loads(os.environ[name])
-              if nodeids:
+          for backend in ('sm90', 'sm120'):
+              key = 'nodeids' if os.environ['SCOPE'] == 'function' else 'modules'
+              values = json.loads(
+                  os.environ[f'{backend.upper()}_NODEIDS']
+                  if key == 'nodeids'
+                  else os.environ[f'{backend.upper()}_MODULES']
+              )
+              if values:
                   results.append({
-                      "kind": "correctness",
-                      "backend": backend,
-                      "status": "passed",
-                      "nodeids": nodeids,
+                      'kind': 'correctness',
+                      'backend': backend,
+                      'status': 'passed',
+                      key: values,
                   })
           Path("artifacts/validation/correctness-results.json").write_text(
               json.dumps(results, indent=2) + "\n"
@@ -534,6 +616,11 @@ jobs:
       - name: Run only marked sanitizer cases
         if: steps.locked_reuse.outputs.reuse_evidence != 'true' && needs.plan.outputs.run_sanitizer == 'true'
         env:
+          SCOPE: ${{ needs.plan.outputs.scope }}
+          SM90_MODULES: ${{ needs.plan.outputs.affected_sm90_modules }}
+          SM120_MODULES: ${{ needs.plan.outputs.affected_sm120_modules }}
+          SM90_RACE_MODULES: ${{ needs.plan.outputs.sm90_racecheck_modules }}
+          SM120_RACE_MODULES: ${{ needs.plan.outputs.sm120_racecheck_modules }}
           SM90_JSON: ${{ needs.plan.outputs.sm90_memcheck_nodeids }}
           SM120_JSON: ${{ needs.plan.outputs.sm120_memcheck_nodeids }}
           SM90_RACE_JSON: ${{ needs.plan.outputs.sm90_racecheck_nodeids }}
@@ -556,14 +643,36 @@ jobs:
               FLASHRWKV_TEST_BACKEND="$backend" compute-sanitizer \
                 --tool "$tool" --target-processes all --error-exitcode 97 \
                 "$GITHUB_WORKSPACE/.runtime-venv/bin/python" -m pytest -p utils -q \
+                --import-mode=importlib --strict-markers \
                 "${nodeids[@]}" -m "$arch and $tool" -x -c /dev/null \
                 --rootdir="$test_root"
             ) 2>&1 | tee "$GITHUB_WORKSPACE/artifacts/validation/function-$arch-$tool.log"
           }
-          sanitize_nodeids _C_sm120 sm120 memcheck "$SM120_JSON"
-          sanitize_nodeids _C_sm90 sm90 memcheck "$SM90_JSON"
-          sanitize_nodeids _C_sm120 sm120 racecheck "$SM120_RACE_JSON"
-          sanitize_nodeids _C_sm90 sm90 racecheck "$SM90_RACE_JSON"
+          sanitize_marker() {
+            local backend="$1" arch="$2" tool="$3"
+            (
+              cd "$test_root"
+              FLASHRWKV_TEST_BACKEND="$backend" compute-sanitizer \
+                --tool "$tool" --target-processes all --error-exitcode 97 \
+                "$GITHUB_WORKSPACE/.runtime-venv/bin/python" -m pytest -p utils -q \
+                --import-mode=importlib --strict-markers \
+                "$GITHUB_WORKSPACE/tests" -m "$arch and $tool" -x -c /dev/null \
+                --rootdir="$test_root"
+            ) 2>&1 | tee "$GITHUB_WORKSPACE/artifacts/validation/tree-$arch-$tool.log"
+          }
+          if [[ "$SCOPE" == function ]]; then
+            sanitize_nodeids _C_sm120 sm120 memcheck "$SM120_JSON"
+            sanitize_nodeids _C_sm90 sm90 memcheck "$SM90_JSON"
+            sanitize_nodeids _C_sm120 sm120 racecheck "$SM120_RACE_JSON"
+            sanitize_nodeids _C_sm90 sm90 racecheck "$SM90_RACE_JSON"
+          else
+            sanitize_marker _C_sm120 sm120 memcheck
+            sanitize_marker _C_sm90 sm90 memcheck
+            [[ "$SM120_RACE_MODULES" == '[]' ]] || \
+              sanitize_marker _C_sm120 sm120 racecheck
+            [[ "$SM90_RACE_MODULES" == '[]' ]] || \
+              sanitize_marker _C_sm90 sm90 racecheck
+          fi
           python3 - <<'PY'
           import json, os
           from pathlib import Path
@@ -572,21 +681,30 @@ jobs:
               ("sm120", "SM120_JSON", "SM120_RACE_JSON"),
               ("sm90", "SM90_JSON", "SM90_RACE_JSON"),
           ):
-              nodeids = json.loads(os.environ[modules_name])
-              if nodeids:
+              key = "nodeids" if os.environ["SCOPE"] == "function" else "modules"
+              covered = json.loads(
+                  os.environ[modules_name]
+                  if key == "nodeids"
+                  else os.environ[f"{backend.upper()}_MODULES"]
+              )
+              if covered:
                   results.append({
                       "kind": "memcheck",
                       "backend": backend,
                       "status": "passed",
-                      "nodeids": nodeids,
+                      key: covered,
                   })
-              race_nodeids = json.loads(os.environ[race_name])
-              if race_nodeids:
+              race_covered = json.loads(
+                  os.environ[race_name]
+                  if key == "nodeids"
+                  else os.environ[f"{backend.upper()}_RACE_MODULES"]
+              )
+              if race_covered:
                   results.append({
                       "kind": "racecheck",
                       "backend": backend,
                       "status": "passed",
-                      "nodeids": race_nodeids,
+                      key: race_covered,
                   })
           Path("artifacts/validation/sanitizer-results.json").write_text(
               json.dumps(results, indent=2) + "\n"
@@ -688,6 +806,13 @@ jobs:
           import torch
           plan = json.loads(Path(os.environ['PLAN_PATH']).read_text())
           impact = plan['impact']
+          stable_abi_path = Path(
+              os.environ['GITHUB_WORKSPACE'],
+              'artifacts/validation/stable-abi-runtime.json',
+          )
+          if not stable_abi_path.is_file():
+              raise SystemExit('Stable ABI runtime matrix record is missing')
+          stable_abi = json.loads(stable_abi_path.read_text())
           results = []
           if not impact['package_smoke_only']:
               path = Path(os.environ['GITHUB_WORKSPACE'], 'artifacts/validation/correctness-results.json')
@@ -713,6 +838,7 @@ jobs:
           }
           payload = {
               'checks': checks,
+              'stable_abi': stable_abi,
               'environment': {
                   'gpu': torch.cuda.get_device_name(0),
                   'capability': list(torch.cuda.get_device_capability(0)),
@@ -823,7 +949,7 @@ jobs:
         run: |
           python3 ci/quality_gate.py extract \
             --repository "$GITHUB_REPOSITORY" \
-            --artifact 'flashrwkv2-quality-v4-${{ needs.plan.outputs.source_tree_sha }}' \
+            --artifact 'flashrwkv2-quality-v5-${{ needs.plan.outputs.source_tree_sha }}' \
             --run-id '${{ steps.source.outputs.run_id }}' \
             --output evidence/final
       - uses: actions/download-artifact@v4
@@ -885,7 +1011,7 @@ jobs:
           PY
       - uses: actions/upload-artifact@v4
         with:
-          name: flashrwkv2-quality-v4-${{ needs.plan.outputs.source_tree_sha }}
+          name: flashrwkv2-quality-v5-${{ needs.plan.outputs.source_tree_sha }}
           path: evidence/final/
           if-no-files-found: error
           retention-days: 90
@@ -920,7 +1046,7 @@ jobs:
         with:
           script: |
             const fs = require('fs');
-            const marker = '<!-- flashrwkv2-quality-v4 -->';
+            const marker = '<!-- flashrwkv2-quality-v5 -->';
             const body = `${marker}\n${fs.readFileSync('evidence/comment.md', 'utf8')}`;
             const issue_number = Number(process.env.PR_NUMBER);
             const comments = await github.paginate(github.rest.issues.listComments, {

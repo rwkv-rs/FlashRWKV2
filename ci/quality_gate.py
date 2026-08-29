@@ -27,7 +27,7 @@ from select_targets import (
 )
 
 ROOT = Path(__file__).resolve().parents[1]
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 WORKFLOW_NAME = "Quality Gate"
 BUILD_INPUT_PATHS = (
     "setup.py",
@@ -200,7 +200,11 @@ def build_plan(base_sha: str, head_sha: str) -> dict[str, Any]:
         head_sha=head_sha,
         release_metadata_only=release_only,
     )
-    function_targets = _build_function_targets(base_sha, head_sha, changed)
+    function_targets = (
+        None
+        if impact.run_all
+        else _build_function_targets(base_sha, head_sha, changed)
+    )
     if function_targets:
         modules = tuple(sorted({target["module"] for target in function_targets}))
         sm90_modules = tuple(
@@ -222,6 +226,8 @@ def build_plan(base_sha: str, head_sha: str) -> dict[str, Any]:
             package_smoke_only=False,
             reasons=tuple(sorted({*impact.reasons, "function-ledger"})),
         )
+    elif impact.run_all:
+        pass
     elif changed and all(
         path in {"AGENTS.md", "README.md", "RTK.md"}
         or path.startswith(("ci/", ".github/workflows/", "docs/"))
@@ -440,8 +446,8 @@ def _artifact_covers_plan(
 def resolve_reuse(
     plan: dict[str, Any], repository: str, token: str, current_run: int
 ) -> dict[str, Any]:
-    evidence_name = f"flashrwkv2-quality-v4-{plan['source_tree_sha']}"
-    wheel_name = f"flashrwkv2-wheel-v4-{plan['build_input_hash']}"
+    evidence_name = f"flashrwkv2-quality-v5-{plan['source_tree_sha']}"
+    wheel_name = f"flashrwkv2-wheel-v5-{plan['build_input_hash']}"
     evidence_run_id = _artifact_run(
         repository,
         token,
@@ -471,7 +477,7 @@ def resolve_reuse(
 def resolve_tree_evidence(
     tree: str, repository: str, token: str, current_run: int
 ) -> dict[str, Any]:
-    artifact_name = f"flashrwkv2-quality-v4-{tree}"
+    artifact_name = f"flashrwkv2-quality-v5-{tree}"
     run_id = _artifact_run(
         repository,
         token,
@@ -503,7 +509,7 @@ def finalize(
         artifacts["wheel"] = {
             "name": wheel.name,
             "sha256": _sha256(wheel),
-            "artifact": f"flashrwkv2-wheel-v4-{plan['build_input_hash']}",
+            "artifact": f"flashrwkv2-wheel-v5-{plan['build_input_hash']}",
         }
     if sdist is not None:
         artifacts["sdist"] = {"name": sdist.name, "sha256": _sha256(sdist)}
@@ -566,6 +572,16 @@ def finalize(
         for check in ("package_identity", "binary_contents"):
             if recorded_checks.get(check) != "passed":
                 raise SystemExit(f"package-required evidence lacks passed {check}")
+        stable_abi = validation_payload.get("stable_abi", {})
+        if stable_abi.get("target") != "0x020b000000000000":
+            raise SystemExit("package-required evidence has the wrong Stable ABI target")
+        if stable_abi.get("build_torch") != "2.13":
+            raise SystemExit("package-required evidence was not built with Torch 2.13")
+        runtimes = stable_abi.get("runtimes", {})
+        if runtimes != {version: "passed" for version in ("2.11", "2.12", "2.13")}:
+            raise SystemExit("package-required evidence lacks the complete runtime matrix")
+        if stable_abi.get("wheel_sha256") != artifacts["wheel"]["sha256"]:
+            raise SystemExit("Stable ABI runtime matrix did not use the final wheel")
     if (
         impact["affected_sm120_modules"]
         and not impact["package_smoke_only"]
@@ -696,6 +712,7 @@ def finalize(
             for target in plan.get("function_targets", [])
         ],
         "environment": validation_payload.get("environment", {}),
+        "stable_abi": validation_payload.get("stable_abi", {}),
         "results": validation_payload.get("results", []),
         "artifacts": artifacts,
         "benchmark": benchmark_payload,
@@ -842,6 +859,15 @@ def _self_test() -> None:
                         "sm120": "native-sm120",
                         "memcheck": "passed",
                         "racecheck": "passed",
+                    },
+                    "stable_abi": {
+                        "target": "0x020b000000000000",
+                        "build_torch": "2.13",
+                        "runtimes": {
+                            version: "passed"
+                            for version in ("2.11", "2.12", "2.13")
+                        },
+                        "wheel_sha256": _sha256(wheel),
                     },
                     "results": [
                         {

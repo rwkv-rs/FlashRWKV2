@@ -5,9 +5,8 @@
 // Local adaptation: module-local FlashRWKV2 binding names only; tensor contract
 // remains the canonical train_temp [B,T,C] BF16 contract.
 
-#include <torch/extension.h>
+#include "validation.h"
 
-#include <ATen/cuda/CUDAContext.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -24,11 +23,11 @@ inline bool is_power_of_two(int64_t n) {
     return n > 0 && (n & (n - 1)) == 0;
 }
 
-__device__ inline float bf16_to_float(const at::BFloat16* ptr) {
+__device__ inline float bf16_to_float(const torch::headeronly::BFloat16* ptr) {
     return __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(ptr));
 }
 
-__device__ inline void store_bf16(at::BFloat16* ptr, float value) {
+__device__ inline void store_bf16(torch::headeronly::BFloat16* ptr, float value) {
     *reinterpret_cast<__nv_bfloat16*>(ptr) = __float2bfloat16_rn(value);
 }
 
@@ -37,9 +36,9 @@ __device__ inline float sigmoidf_fast(float x) {
 }
 
 __global__ void a_gate_forward_kernel(
-    const at::BFloat16* __restrict__ a0,
-    const at::BFloat16* __restrict__ a12,
-    at::BFloat16* __restrict__ out,
+    const torch::headeronly::BFloat16* __restrict__ a0,
+    const torch::headeronly::BFloat16* __restrict__ a12,
+    torch::headeronly::BFloat16* __restrict__ out,
     int64_t total,
     int64_t c_size) {
     int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -53,9 +52,9 @@ __global__ void a_gate_forward_kernel(
 }
 
 __global__ void a_gate_forward_pow2c_kernel(
-    const at::BFloat16* __restrict__ a0,
-    const at::BFloat16* __restrict__ a12,
-    at::BFloat16* __restrict__ out,
+    const torch::headeronly::BFloat16* __restrict__ a0,
+    const torch::headeronly::BFloat16* __restrict__ a12,
+    torch::headeronly::BFloat16* __restrict__ out,
     int64_t total,
     int64_t c_mask) {
     int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -72,10 +71,10 @@ constexpr int kBackwardTileM = 16;
 constexpr int kDefaultThreads = 256;
 
 __global__ void a_gate_backward_full_kernel(
-    const at::BFloat16* __restrict__ grad_out,
-    const at::BFloat16* __restrict__ a0,
-    const at::BFloat16* __restrict__ a12,
-    at::BFloat16* __restrict__ grad_a12,
+    const torch::headeronly::BFloat16* __restrict__ grad_out,
+    const torch::headeronly::BFloat16* __restrict__ a0,
+    const torch::headeronly::BFloat16* __restrict__ a12,
+    torch::headeronly::BFloat16* __restrict__ grad_a12,
     float* __restrict__ partial_a0,
     int64_t rows,
     int64_t c_size) {
@@ -105,7 +104,7 @@ __global__ void a_gate_backward_full_kernel(
 
 __global__ void a_gate_reduce_a0_kernel(
     const float* __restrict__ partial_a0,
-    at::BFloat16* __restrict__ grad_a0,
+    torch::headeronly::BFloat16* __restrict__ grad_a0,
     int64_t num_tiles,
     int64_t c_size) {
     int64_t c = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -121,8 +120,8 @@ __global__ void a_gate_reduce_a0_kernel(
 }
 
 }
-torch::Tensor pretrain_tmix_a_gate_forward_cuda(torch::Tensor a0, torch::Tensor a12) {
-    auto out = torch::empty_like(a12);
+torch::stable::Tensor pretrain_tmix_a_gate_forward_cuda(torch::stable::Tensor a0, torch::stable::Tensor a12) {
+    auto out = torch::stable::empty_like(a12);
     int64_t total = a12.numel();
     int64_t c_size = a12.size(2);
     int threads = kDefaultThreads;
@@ -130,22 +129,22 @@ torch::Tensor pretrain_tmix_a_gate_forward_cuda(torch::Tensor a0, torch::Tensor 
         threads = std::atoi(env);
     }
     int blocks = static_cast<int>(ceil_div(total, static_cast<int64_t>(threads)));
-    auto stream = at::cuda::getCurrentCUDAStream();
+    auto stream = flashrwkv2::validation::current_cuda_stream();
     if (is_power_of_two(c_size)) {
         a_gate_forward_pow2c_kernel<<<blocks, threads, 0, stream>>>(
-            a0.data_ptr<at::BFloat16>(),
-            a12.data_ptr<at::BFloat16>(),
-            out.data_ptr<at::BFloat16>(),
+            a0.mutable_data_ptr<torch::headeronly::BFloat16>(),
+            a12.mutable_data_ptr<torch::headeronly::BFloat16>(),
+            out.mutable_data_ptr<torch::headeronly::BFloat16>(),
             total,
             c_size - 1);
     } else {
         a_gate_forward_kernel<<<blocks, threads, 0, stream>>>(
-            a0.data_ptr<at::BFloat16>(),
-            a12.data_ptr<at::BFloat16>(),
-            out.data_ptr<at::BFloat16>(),
+            a0.mutable_data_ptr<torch::headeronly::BFloat16>(),
+            a12.mutable_data_ptr<torch::headeronly::BFloat16>(),
+            out.mutable_data_ptr<torch::headeronly::BFloat16>(),
             total,
             c_size);
     }
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    FLASHRWKV_CUDA_CHECK(cudaGetLastError());
     return out;
 }

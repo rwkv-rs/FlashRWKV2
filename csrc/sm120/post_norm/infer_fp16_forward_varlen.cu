@@ -6,15 +6,14 @@
 // Mechanical migration boundary: the active upstream Res, LN, and statistics
 // bodies are retained. Simple row-wise operations need no request metadata.
 // No ATen fallback is present.
-#include <ATen/ATen.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAException.h>
+#include "validation.h"
+
 #include <cuda_fp16.h>
 
 #include <climits>
 #include <vector>
 
-using dtype = at::Half;
+using dtype = torch::headeronly::Half;
 
 
 namespace {
@@ -445,116 +444,116 @@ __global__ __launch_bounds__(256, 1) void res_ln_f16_welford_kernel(
 
 } // namespace
 
-at::Tensor res_forward_varlen_cuda(at::Tensor x, at::Tensor res) {
-  TORCH_CHECK((x.numel() % 2) == 0, "res_f16 requires even numel");
-  auto out = at::empty_like(x);
+torch::stable::Tensor res_forward_varlen_cuda(torch::stable::Tensor x, torch::stable::Tensor res) {
+  STD_TORCH_CHECK((x.numel() % 2) == 0, "res_f16 requires even numel");
+  auto out = torch::stable::empty_like(x);
   constexpr int threads = 256;
   const int64_t n_pairs = x.numel() / 2;
-  auto stream = at::cuda::getCurrentCUDAStream();
+  auto stream = flashrwkv2::validation::current_cuda_stream();
   res_f16_kernel<<<static_cast<int>((n_pairs + threads - 1) / threads), threads, 0, stream>>>(
-      x.data_ptr<dtype>(), res.data_ptr<dtype>(), out.data_ptr<dtype>(), n_pairs);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+      x.mutable_data_ptr<dtype>(), res.mutable_data_ptr<dtype>(), out.mutable_data_ptr<dtype>(), n_pairs);
+  FLASHRWKV_CUDA_CHECK(cudaGetLastError());
   return out;
 }
 
-at::Tensor ln_forward_varlen_cuda(at::Tensor x, at::Tensor weight, at::Tensor bias, double eps) {
-  auto y = at::empty_like(x);
+torch::stable::Tensor ln_forward_varlen_cuda(torch::stable::Tensor x, torch::stable::Tensor weight, torch::stable::Tensor bias, double eps) {
+  auto y = torch::stable::empty_like(x);
   const int64_t c64 = x.size(-1);
-  TORCH_CHECK(c64 <= INT_MAX, "C too large");
+  STD_TORCH_CHECK(c64 <= INT_MAX, "C too large");
   const int C = static_cast<int>(c64);
   const int64_t rows = x.numel() / C;
-  auto stream = at::cuda::getCurrentCUDAStream();
+  auto stream = flashrwkv2::validation::current_cuda_stream();
   if (C == LN_SMALL_C) {
     if (rows >= 1024) {
       ln_f16_small_kernel<LN_SMALL512_THREADS, true, true><<<static_cast<int>(rows), LN_SMALL512_THREADS, 0, stream>>>(
-          x.data_ptr<dtype>(),
-          weight.data_ptr<dtype>(),
-          bias.data_ptr<dtype>(),
-          y.data_ptr<dtype>(),
+          x.mutable_data_ptr<dtype>(),
+          weight.mutable_data_ptr<dtype>(),
+          bias.mutable_data_ptr<dtype>(),
+          y.mutable_data_ptr<dtype>(),
           rows,
           static_cast<float>(eps));
     } else if (rows >= 512) {
       ln_f16_small_kernel<LN_SMALL512_THREADS, false, false><<<static_cast<int>(rows), LN_SMALL512_THREADS, 0, stream>>>(
-          x.data_ptr<dtype>(),
-          weight.data_ptr<dtype>(),
-          bias.data_ptr<dtype>(),
-          y.data_ptr<dtype>(),
+          x.mutable_data_ptr<dtype>(),
+          weight.mutable_data_ptr<dtype>(),
+          bias.mutable_data_ptr<dtype>(),
+          y.mutable_data_ptr<dtype>(),
           rows,
           static_cast<float>(eps));
     } else {
       ln_f16_small_kernel<LN_SMALL_THREADS, false, false><<<static_cast<int>(rows), LN_SMALL_THREADS, 0, stream>>>(
-          x.data_ptr<dtype>(),
-          weight.data_ptr<dtype>(),
-          bias.data_ptr<dtype>(),
-          y.data_ptr<dtype>(),
+          x.mutable_data_ptr<dtype>(),
+          weight.mutable_data_ptr<dtype>(),
+          bias.mutable_data_ptr<dtype>(),
+          y.mutable_data_ptr<dtype>(),
           rows,
           static_cast<float>(eps));
     }
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    FLASHRWKV_CUDA_CHECK(cudaGetLastError());
     return y;
   }
   ln_f16_kernel<<<static_cast<int>(rows), LN_THREADS, 0, stream>>>(
       C,
-      x.data_ptr<dtype>(),
-      weight.data_ptr<dtype>(),
-      bias.data_ptr<dtype>(),
-      y.data_ptr<dtype>(),
+      x.mutable_data_ptr<dtype>(),
+      weight.mutable_data_ptr<dtype>(),
+      bias.mutable_data_ptr<dtype>(),
+      y.mutable_data_ptr<dtype>(),
       rows,
       static_cast<float>(eps));
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  FLASHRWKV_CUDA_CHECK(cudaGetLastError());
   return y;
 }
 
-std::vector<at::Tensor> res_ln_f16_cuda(at::Tensor x, at::Tensor res, at::Tensor weight, at::Tensor bias, double eps) {
-  auto x_out = at::empty_like(x);
-  auto y = at::empty_like(x);
+std::vector<torch::stable::Tensor> res_ln_f16_cuda(torch::stable::Tensor x, torch::stable::Tensor res, torch::stable::Tensor weight, torch::stable::Tensor bias, double eps) {
+  auto x_out = torch::stable::empty_like(x);
+  auto y = torch::stable::empty_like(x);
   const int64_t c64 = x.size(-1);
-  TORCH_CHECK(c64 <= INT_MAX, "C too large");
+  STD_TORCH_CHECK(c64 <= INT_MAX, "C too large");
   const int C = static_cast<int>(c64);
   const int64_t rows = x.numel() / C;
-  auto stream = at::cuda::getCurrentCUDAStream();
+  auto stream = flashrwkv2::validation::current_cuda_stream();
   // Canonical Albatross add_ln owner policy: C=4096 and rows<1024 use the
   // 256-thread vectorized owner.  This is the automatic caller policy, not a
   // public forced/config entry point.
   if (C == LN_SMALL_C && rows < 1024) {
     res_ln_f16_small_kernel<LN_SMALL512_THREADS / 2, true, true>
         <<<static_cast<int>(rows), LN_SMALL512_THREADS / 2, 0, stream>>>(
-            x.data_ptr<dtype>(), res.data_ptr<dtype>(),
-            weight.data_ptr<dtype>(), bias.data_ptr<dtype>(),
-            x_out.data_ptr<dtype>(), y.data_ptr<dtype>(), rows,
+            x.mutable_data_ptr<dtype>(), res.mutable_data_ptr<dtype>(),
+            weight.mutable_data_ptr<dtype>(), bias.mutable_data_ptr<dtype>(),
+            x_out.mutable_data_ptr<dtype>(), y.mutable_data_ptr<dtype>(), rows,
             static_cast<float>(eps));
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    FLASHRWKV_CUDA_CHECK(cudaGetLastError());
     return {x_out, y};
   }
   if (C == LN_SMALL_C) {
     res_ln_f16_small_kernel<LN_SMALL512_THREADS, true, true>
         <<<static_cast<int>(rows), LN_SMALL512_THREADS, 0, stream>>>(
-            x.data_ptr<dtype>(), res.data_ptr<dtype>(),
-            weight.data_ptr<dtype>(), bias.data_ptr<dtype>(),
-            x_out.data_ptr<dtype>(), y.data_ptr<dtype>(), rows,
+            x.mutable_data_ptr<dtype>(), res.mutable_data_ptr<dtype>(),
+            weight.mutable_data_ptr<dtype>(), bias.mutable_data_ptr<dtype>(),
+            x_out.mutable_data_ptr<dtype>(), y.mutable_data_ptr<dtype>(), rows,
             static_cast<float>(eps));
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    FLASHRWKV_CUDA_CHECK(cudaGetLastError());
     return {x_out, y};
   }
   res_ln_f16_kernel<<<static_cast<int>(rows), LN_THREADS, 0, stream>>>(
       C,
-      x.data_ptr<dtype>(),
-      res.data_ptr<dtype>(),
-      weight.data_ptr<dtype>(),
-      bias.data_ptr<dtype>(),
-      x_out.data_ptr<dtype>(),
-      y.data_ptr<dtype>(),
+      x.mutable_data_ptr<dtype>(),
+      res.mutable_data_ptr<dtype>(),
+      weight.mutable_data_ptr<dtype>(),
+      bias.mutable_data_ptr<dtype>(),
+      x_out.mutable_data_ptr<dtype>(),
+      y.mutable_data_ptr<dtype>(),
       rows,
       static_cast<float>(eps));
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  FLASHRWKV_CUDA_CHECK(cudaGetLastError());
   return {x_out, y};
 }
 
-std::vector<at::Tensor> post_norm_forward_varlen_cuda(
-    at::Tensor x,
-    at::Tensor res,
-    at::Tensor weight,
-    at::Tensor bias,
+std::vector<torch::stable::Tensor> post_norm_forward_varlen_cuda(
+    torch::stable::Tensor x,
+    torch::stable::Tensor res,
+    torch::stable::Tensor weight,
+    torch::stable::Tensor bias,
     double eps,
     int64_t batch_size) {
   const int64_t C = x.size(-1);
@@ -564,35 +563,35 @@ std::vector<at::Tensor> post_norm_forward_varlen_cuda(
     // Welford and rows >= 192 selects cache-rounded Welford.  The caller must
     // provide the real packed batch size; guessing it from total_tokens would
     // change the Albatross policy for ragged requests.
-    auto x_out = at::empty_like(x);
-    auto y = at::empty_like(x);
-    auto stream = at::cuda::getCurrentCUDAStream();
+    auto x_out = torch::stable::empty_like(x);
+    auto y = torch::stable::empty_like(x);
+    auto stream = flashrwkv2::validation::current_cuda_stream();
     if (rows < 192) {
       res_ln_f16_welford_kernel<false>
           <<<static_cast<int>(rows), 256, 0, stream>>>(
-              x.data_ptr<dtype>(), res.data_ptr<dtype>(),
-              weight.data_ptr<dtype>(), bias.data_ptr<dtype>(),
-              x_out.data_ptr<dtype>(), y.data_ptr<dtype>(), rows,
+              x.mutable_data_ptr<dtype>(), res.mutable_data_ptr<dtype>(),
+              weight.mutable_data_ptr<dtype>(), bias.mutable_data_ptr<dtype>(),
+              x_out.mutable_data_ptr<dtype>(), y.mutable_data_ptr<dtype>(), rows,
               static_cast<float>(eps));
     } else {
       res_ln_f16_welford_kernel<true>
           <<<static_cast<int>(rows), 256, 0, stream>>>(
-              x.data_ptr<dtype>(), res.data_ptr<dtype>(),
-              weight.data_ptr<dtype>(), bias.data_ptr<dtype>(),
-              x_out.data_ptr<dtype>(), y.data_ptr<dtype>(), rows,
+              x.mutable_data_ptr<dtype>(), res.mutable_data_ptr<dtype>(),
+              weight.mutable_data_ptr<dtype>(), bias.mutable_data_ptr<dtype>(),
+              x_out.mutable_data_ptr<dtype>(), y.mutable_data_ptr<dtype>(), rows,
               static_cast<float>(eps));
     }
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    FLASHRWKV_CUDA_CHECK(cudaGetLastError());
     return {x_out, y};
   }
   return res_ln_f16_cuda(x, res, weight, bias, eps);
 }
 
-at::Tensor post_norm_output_forward_varlen_cuda(
-    at::Tensor x,
-    at::Tensor res,
-    at::Tensor weight,
-    at::Tensor bias,
+torch::stable::Tensor post_norm_output_forward_varlen_cuda(
+    torch::stable::Tensor x,
+    torch::stable::Tensor res,
+    torch::stable::Tensor weight,
+    torch::stable::Tensor bias,
     double eps) {
   // The final output contract returns one normalized row per packed token.
   auto outputs = res_ln_f16_cuda(x, res, weight, bias, eps);

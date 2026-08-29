@@ -4,15 +4,12 @@
 // Internal activation implementation owned by the complete CMix operator.
 // Albatross source revision: ee3308f6922e59f2166c7fac3c5a192340a2b48e.
 
-#include <ATen/ATen.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAException.h>
 #include <cuda_fp16.h>
-#include <torch/extension.h>
+#include "validation.h"
 
 namespace {
 
-using dtype = at::Half;
+using dtype = torch::headeronly::Half;
 
 __global__ void cmix_relu_square_varlen_kernel(
     const dtype* __restrict__ x,
@@ -34,19 +31,19 @@ __global__ void cmix_relu_square_varlen_kernel(
 
 }  // namespace
 
-torch::Tensor cmix_relu_square_forward_varlen_cuda(torch::Tensor x) {
-  auto out = torch::empty_like(x);
+torch::stable::Tensor cmix_relu_square_forward_varlen_cuda(torch::stable::Tensor x) {
+  auto out = torch::stable::empty_like(x);
   constexpr int threads = 256;
   const int64_t total_pairs = x.numel() / 2;
-  auto stream = at::cuda::getCurrentCUDAStream();
+  auto stream = flashrwkv2::validation::current_cuda_stream();
   cmix_relu_square_varlen_kernel<<<
       static_cast<int>((total_pairs + threads - 1) / threads),
       threads,
       0,
       stream>>>(
-      reinterpret_cast<const dtype*>(x.data_ptr()),
-      reinterpret_cast<dtype*>(out.data_ptr()),
+      reinterpret_cast<const dtype*>(x.mutable_data_ptr()),
+      reinterpret_cast<dtype*>(out.mutable_data_ptr()),
       total_pairs);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  FLASHRWKV_CUDA_CHECK(cudaGetLastError());
   return out;
 }

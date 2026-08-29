@@ -9,6 +9,7 @@ import torch
 from ..tmix.wkv7 import (
     _check_metadata_inputs,
     _extension,
+    _metadata_launch_args,
     _resolve_max_seqlen,
     prepare_tmix_wkv7_recurrent_metadata,
 )
@@ -101,6 +102,15 @@ def infer_cmix_forward_varlen(
         else:
             launch_max_seqlen = int(max_seqlen)
         ticket = validated_metadata
+    launch_metadata = _metadata_launch_args(
+        ticket,
+        cu_seqlens,
+        state_indices,
+        x.shape[0],
+        shift_state_pool.shape[0],
+        launch_max_seqlen,
+    )
+    token_predecessor = ticket._token_predecessor()
     return tuple(
         _extension().cmix_forward_varlen(
             x,
@@ -111,11 +121,9 @@ def infer_cmix_forward_varlen(
             x_k,
             key_weight,
             value_weight,
-            cu_seqlens,
-            state_indices,
-            launch_max_seqlen,
+            *launch_metadata,
+            token_predecessor,
             float(eps),
-            ticket,
             deterministic,
         )
     )

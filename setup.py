@@ -80,7 +80,6 @@ NATIVE_BUILD = bool(BUILD_COMMANDS.intersection(sys.argv[1:]))
 
 def _native_sources(architecture: str) -> list[str]:
     shared = [
-        "csrc/bindings.cpp",
         "csrc/registration.cpp",
         "csrc/validation.cpp",
     ]
@@ -102,7 +101,13 @@ def _compile_args(architecture: str) -> dict[str, list[str]]:
         else f"sm_{capability}"
     )
     return {
-        "cxx": ["-O3", "-Wno-psabi"],
+        "cxx": [
+            "-O3",
+            "-Wno-psabi",
+            "-DTORCH_TARGET_VERSION=0x020b000000000000",
+            "-DTORCH_STABLE_ONLY",
+            "-DUSE_CUDA",
+        ],
         "nvcc": [
             "-O3",
             "--expt-relaxed-constexpr",
@@ -111,6 +116,9 @@ def _compile_args(architecture: str) -> dict[str, list[str]]:
             "-Xptxas=-v",
             "-D_N_=64",
             "-D_CHUNK_LEN_=16",
+            "-DTORCH_TARGET_VERSION=0x020b000000000000",
+            "-DTORCH_STABLE_ONLY",
+            "-DUSE_CUDA",
             # CUDA 13 nvcc ICEs on the unmodified canonical Albatross v3a
             # body under C++20. Keep the translation unit on C++17.
             "-std=c++17",
@@ -119,22 +127,23 @@ def _compile_args(architecture: str) -> dict[str, list[str]]:
     }
 
 
+def _native_extension(architecture: str) -> CUDAExtension:
+    extension = CUDAExtension(
+        name=f"flashrwkv2._C_{architecture}",
+        define_macros=[(f"FLASHRWKV_BACKEND_{architecture.upper()}", "1")],
+        include_dirs=[str(Path(__file__).resolve().parent / "csrc")],
+        sources=_native_sources(architecture),
+        extra_compile_args=_compile_args(architecture),
+        extra_link_args=["-Wl,--strip-debug"],
+    )
+    extension.libraries.remove("torch_python")
+    return extension
+
+
 EXT_MODULES = (
     [
-        CUDAExtension(
-            name="flashrwkv2._C_sm90",
-            define_macros=[("FLASHRWKV_BACKEND_SM90", "1")],
-            sources=_native_sources("sm90"),
-            extra_compile_args=_compile_args("sm90"),
-            extra_link_args=["-Wl,--strip-debug"],
-        ),
-        CUDAExtension(
-            name="flashrwkv2._C_sm120",
-            define_macros=[("FLASHRWKV_BACKEND_SM120", "1")],
-            sources=_native_sources("sm120"),
-            extra_compile_args=_compile_args("sm120"),
-            extra_link_args=["-Wl,--strip-debug"],
-        ),
+        _native_extension("sm90"),
+        _native_extension("sm120"),
     ]
     if NATIVE_BUILD
     else []

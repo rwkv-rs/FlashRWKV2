@@ -17,13 +17,9 @@
 #undef __CUDA_NO_HALF_CONVERSIONS__
 #undef __CUDA_NO_HALF_OPERATORS__
 
-#include <ATen/ATen.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
-#include <c10/cuda/CUDAException.h>
 #include <cooperative_groups.h>
 #include <cuda_fp16.h>
-#include <torch/extension.h>
+#include "validation.h"
 
 #include <cstdint>
 
@@ -624,16 +620,16 @@ bool cooperative_grid_fits(int block_count, int device) {
   int cooperative_launch = 0;
   int multiprocessor_count = 0;
   int blocks_per_multiprocessor = 0;
-  C10_CUDA_CHECK(cudaDeviceGetAttribute(
+  FLASHRWKV_CUDA_CHECK(cudaDeviceGetAttribute(
       &cooperative_launch, cudaDevAttrCooperativeLaunch, device));
   if (cooperative_launch == 0) {
     cached_device = device;
     cached_resident_blocks = 0;
     return false;
   }
-  C10_CUDA_CHECK(cudaDeviceGetAttribute(
+  FLASHRWKV_CUDA_CHECK(cudaDeviceGetAttribute(
       &multiprocessor_count, cudaDevAttrMultiProcessorCount, device));
-  C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+  FLASHRWKV_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
       &blocks_per_multiprocessor,
       deltalog_slot_kernel<M, AddBias, true>, kHeadSize, 0));
   cached_device = device;
@@ -648,22 +644,22 @@ void launch_deltalog_specialization(
     int num_heads,
     int state_pool_slots,
     int device,
-    const torch::Tensor& query_start_loc,
-    const torch::Tensor& state_indices,
-    torch::Tensor& elapsed_pool,
-    torch::Tensor& phase_pool,
-    torch::Tensor& state_pool,
-    torch::Tensor& deltalog_pool,
-    const torch::Tensor& r,
-    const torch::Tensor& decay,
-    const torch::Tensor& decay_bias,
-    const torch::Tensor& k,
-    const torch::Tensor& v,
-    const torch::Tensor& a,
-    const torch::Tensor& b,
-    torch::Tensor& output,
-    const torch::Tensor& metadata_status,
-    torch::Tensor& deltalog_status,
+    const torch::stable::Tensor& query_start_loc,
+    const torch::stable::Tensor& state_indices,
+    torch::stable::Tensor& elapsed_pool,
+    torch::stable::Tensor& phase_pool,
+    torch::stable::Tensor& state_pool,
+    torch::stable::Tensor& deltalog_pool,
+    const torch::stable::Tensor& r,
+    const torch::stable::Tensor& decay,
+    const torch::stable::Tensor& decay_bias,
+    const torch::stable::Tensor& k,
+    const torch::stable::Tensor& v,
+    const torch::stable::Tensor& a,
+    const torch::stable::Tensor& b,
+    torch::stable::Tensor& output,
+    const torch::stable::Tensor& metadata_status,
+    torch::stable::Tensor& deltalog_status,
     float scale,
     cudaStream_t stream) {
   const dim3 grid(num_heads, num_sequences);
@@ -671,25 +667,25 @@ void launch_deltalog_specialization(
   const int block_count = num_sequences * num_heads;
   if (cooperative_grid_fits<M, AddBias>(block_count, device)) {
     int64_t output_elements = output.numel();
-    const int* query_start_loc_ptr = query_start_loc.data_ptr<int>();
-    const int* state_indices_ptr = state_indices.data_ptr<int>();
-    int* elapsed_pool_ptr = elapsed_pool.data_ptr<int>();
-    int* phase_pool_ptr = phase_pool.data_ptr<int>();
-    const int* metadata_status_ptr = metadata_status.data_ptr<int>();
-    int* deltalog_status_ptr = deltalog_status.data_ptr<int>();
-    half* state_pool_ptr = reinterpret_cast<half*>(state_pool.data_ptr());
+    const int* query_start_loc_ptr = query_start_loc.mutable_data_ptr<int>();
+    const int* state_indices_ptr = state_indices.mutable_data_ptr<int>();
+    int* elapsed_pool_ptr = elapsed_pool.mutable_data_ptr<int>();
+    int* phase_pool_ptr = phase_pool.mutable_data_ptr<int>();
+    const int* metadata_status_ptr = metadata_status.mutable_data_ptr<int>();
+    int* deltalog_status_ptr = deltalog_status.mutable_data_ptr<int>();
+    half* state_pool_ptr = reinterpret_cast<half*>(state_pool.mutable_data_ptr());
     half* deltalog_pool_ptr =
-        reinterpret_cast<half*>(deltalog_pool.data_ptr());
-    const half* r_ptr = reinterpret_cast<const half*>(r.data_ptr());
-    const half* decay_ptr = reinterpret_cast<const half*>(decay.data_ptr());
+        reinterpret_cast<half*>(deltalog_pool.mutable_data_ptr());
+    const half* r_ptr = reinterpret_cast<const half*>(r.mutable_data_ptr());
+    const half* decay_ptr = reinterpret_cast<const half*>(decay.mutable_data_ptr());
     const half* decay_bias_ptr = AddBias
-        ? reinterpret_cast<const half*>(decay_bias.data_ptr())
+        ? reinterpret_cast<const half*>(decay_bias.mutable_data_ptr())
         : nullptr;
-    const half* k_ptr = reinterpret_cast<const half*>(k.data_ptr());
-    const half* v_ptr = reinterpret_cast<const half*>(v.data_ptr());
-    const half* a_ptr = reinterpret_cast<const half*>(a.data_ptr());
-    const half* b_ptr = reinterpret_cast<const half*>(b.data_ptr());
-    half* output_ptr = reinterpret_cast<half*>(output.data_ptr());
+    const half* k_ptr = reinterpret_cast<const half*>(k.mutable_data_ptr());
+    const half* v_ptr = reinterpret_cast<const half*>(v.mutable_data_ptr());
+    const half* a_ptr = reinterpret_cast<const half*>(a.mutable_data_ptr());
+    const half* b_ptr = reinterpret_cast<const half*>(b.mutable_data_ptr());
+    half* output_ptr = reinterpret_cast<half*>(output.mutable_data_ptr());
     void* kernel_arguments[] = {
         &num_heads,
         &state_pool_slots,
@@ -712,7 +708,7 @@ void launch_deltalog_specialization(
         &output_ptr,
         &scale,
     };
-    C10_CUDA_CHECK(cudaLaunchCooperativeKernel(
+    FLASHRWKV_CUDA_CHECK(cudaLaunchCooperativeKernel(
         deltalog_slot_kernel<M, AddBias, true>,
         grid, block, kernel_arguments, 0, stream));
     return;
@@ -720,27 +716,27 @@ void launch_deltalog_specialization(
 
   constexpr int validation_threads = 256;
   validate_deltalog_slots_kernel<<<1, validation_threads, 0, stream>>>(
-      query_start_loc.data_ptr<int>(), state_indices.data_ptr<int>(),
-      elapsed_pool.data_ptr<int>(), phase_pool.data_ptr<int>(),
-      metadata_status.data_ptr<int>(), deltalog_status.data_ptr<int>(),
+      query_start_loc.mutable_data_ptr<int>(), state_indices.mutable_data_ptr<int>(),
+      elapsed_pool.mutable_data_ptr<int>(), phase_pool.mutable_data_ptr<int>(),
+      metadata_status.mutable_data_ptr<int>(), deltalog_status.mutable_data_ptr<int>(),
       num_sequences, M);
   deltalog_slot_kernel<M, AddBias, false>
       <<<grid, block, 0, stream>>>(
           num_heads, state_pool_slots, output.numel(),
-          query_start_loc.data_ptr<int>(), state_indices.data_ptr<int>(),
-          elapsed_pool.data_ptr<int>(), phase_pool.data_ptr<int>(),
-          metadata_status.data_ptr<int>(), deltalog_status.data_ptr<int>(),
-          reinterpret_cast<half*>(state_pool.data_ptr()),
-          reinterpret_cast<half*>(deltalog_pool.data_ptr()),
-          reinterpret_cast<const half*>(r.data_ptr()),
-          reinterpret_cast<const half*>(decay.data_ptr()),
-          AddBias ? reinterpret_cast<const half*>(decay_bias.data_ptr())
+          query_start_loc.mutable_data_ptr<int>(), state_indices.mutable_data_ptr<int>(),
+          elapsed_pool.mutable_data_ptr<int>(), phase_pool.mutable_data_ptr<int>(),
+          metadata_status.mutable_data_ptr<int>(), deltalog_status.mutable_data_ptr<int>(),
+          reinterpret_cast<half*>(state_pool.mutable_data_ptr()),
+          reinterpret_cast<half*>(deltalog_pool.mutable_data_ptr()),
+          reinterpret_cast<const half*>(r.mutable_data_ptr()),
+          reinterpret_cast<const half*>(decay.mutable_data_ptr()),
+          AddBias ? reinterpret_cast<const half*>(decay_bias.mutable_data_ptr())
                   : nullptr,
-          reinterpret_cast<const half*>(k.data_ptr()),
-          reinterpret_cast<const half*>(v.data_ptr()),
-          reinterpret_cast<const half*>(a.data_ptr()),
-          reinterpret_cast<const half*>(b.data_ptr()),
-          reinterpret_cast<half*>(output.data_ptr()), scale);
+          reinterpret_cast<const half*>(k.mutable_data_ptr()),
+          reinterpret_cast<const half*>(v.mutable_data_ptr()),
+          reinterpret_cast<const half*>(a.mutable_data_ptr()),
+          reinterpret_cast<const half*>(b.mutable_data_ptr()),
+          reinterpret_cast<half*>(output.mutable_data_ptr()), scale);
 }
 
 template <int M>
@@ -750,22 +746,22 @@ void launch_deltalog_step(
     int num_heads,
     int state_pool_slots,
     int device,
-    const torch::Tensor& query_start_loc,
-    const torch::Tensor& state_indices,
-    torch::Tensor& elapsed_pool,
-    torch::Tensor& phase_pool,
-    torch::Tensor& state_pool,
-    torch::Tensor& deltalog_pool,
-    const torch::Tensor& r,
-    const torch::Tensor& decay,
-    const torch::Tensor& decay_bias,
-    const torch::Tensor& k,
-    const torch::Tensor& v,
-    const torch::Tensor& a,
-    const torch::Tensor& b,
-    torch::Tensor& output,
-    const torch::Tensor& metadata_status,
-    torch::Tensor& deltalog_status,
+    const torch::stable::Tensor& query_start_loc,
+    const torch::stable::Tensor& state_indices,
+    torch::stable::Tensor& elapsed_pool,
+    torch::stable::Tensor& phase_pool,
+    torch::stable::Tensor& state_pool,
+    torch::stable::Tensor& deltalog_pool,
+    const torch::stable::Tensor& r,
+    const torch::stable::Tensor& decay,
+    const torch::stable::Tensor& decay_bias,
+    const torch::stable::Tensor& k,
+    const torch::stable::Tensor& v,
+    const torch::stable::Tensor& a,
+    const torch::stable::Tensor& b,
+    torch::stable::Tensor& output,
+    const torch::stable::Tensor& metadata_status,
+    torch::stable::Tensor& deltalog_status,
     float scale,
     cudaStream_t stream) {
   if (add_bias) {
@@ -786,29 +782,29 @@ void launch_deltalog_step(
 }  // namespace
 
 void tmix_wkv7_recurrent_deltalog_fp16_from_decay_logits_cuda(
-    torch::Tensor query_start_loc,
-    torch::Tensor state_indices,
-    torch::Tensor elapsed_pool,
-    torch::Tensor phase_pool,
-    torch::Tensor state_pool,
-    torch::Tensor deltalog_pool,
-    torch::Tensor r,
-    torch::Tensor decay_logits,
-    torch::Tensor decay_bias,
-    torch::Tensor k,
-    torch::Tensor v,
-    torch::Tensor a,
-    torch::Tensor b,
-    torch::Tensor output,
-    torch::Tensor metadata_status,
-    torch::Tensor deltalog_status,
+    torch::stable::Tensor query_start_loc,
+    torch::stable::Tensor state_indices,
+    torch::stable::Tensor elapsed_pool,
+    torch::stable::Tensor phase_pool,
+    torch::stable::Tensor state_pool,
+    torch::stable::Tensor deltalog_pool,
+    torch::stable::Tensor r,
+    torch::stable::Tensor decay_logits,
+    torch::stable::Tensor decay_bias,
+    torch::stable::Tensor k,
+    torch::stable::Tensor v,
+    torch::stable::Tensor a,
+    torch::stable::Tensor b,
+    torch::stable::Tensor output,
+    torch::stable::Tensor metadata_status,
+    torch::stable::Tensor deltalog_status,
     double scale) {
-  const c10::cuda::CUDAGuard device_guard(state_pool.device());
-  const auto stream = at::cuda::getCurrentCUDAStream();
+  const torch::stable::accelerator::DeviceGuard device_guard(state_pool.device().index());
+  const auto stream = flashrwkv2::validation::current_cuda_stream();
   const int num_sequences = static_cast<int>(state_indices.numel());
   const int num_heads = static_cast<int>(state_pool.size(1));
   const int state_pool_slots = static_cast<int>(state_pool.size(0));
-  const int device = state_pool.get_device();
+  const int device = state_pool.device().index();
   const int merge_interval = static_cast<int>(deltalog_pool.size(0) + 1);
 #define DISPATCH_M(Value) \
   case Value: \
@@ -826,42 +822,42 @@ void tmix_wkv7_recurrent_deltalog_fp16_from_decay_logits_cuda(
     DISPATCH_M(6);
     DISPATCH_M(8);
     default:
-      TORCH_CHECK(false, "unsupported DeltaLog merge interval");
+      STD_TORCH_CHECK(false, "unsupported DeltaLog merge interval");
   }
 #undef DISPATCH_M
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  FLASHRWKV_CUDA_CHECK(cudaGetLastError());
 }
 
 void tmix_wkv7_recurrent_deltalog_fp16_materialize_slots_cuda(
-    torch::Tensor state_indices,
-    torch::Tensor phase_pool,
-    torch::Tensor state_pool,
-    torch::Tensor deltalog_pool,
-    torch::Tensor deltalog_status,
-    torch::Tensor metadata_status) {
-  const c10::cuda::CUDAGuard device_guard(state_pool.device());
-  const auto stream = at::cuda::getCurrentCUDAStream();
+    torch::stable::Tensor state_indices,
+    torch::stable::Tensor phase_pool,
+    torch::stable::Tensor state_pool,
+    torch::stable::Tensor deltalog_pool,
+    torch::stable::Tensor deltalog_status,
+    torch::stable::Tensor metadata_status) {
+  const torch::stable::accelerator::DeviceGuard device_guard(state_pool.device().index());
+  const auto stream = flashrwkv2::validation::current_cuda_stream();
   const int num_entries = static_cast<int>(state_indices.numel());
   const int num_heads = static_cast<int>(state_pool.size(1));
   const int state_pool_slots = static_cast<int>(state_pool.size(0));
   const int merge_interval = static_cast<int>(deltalog_pool.size(0) + 1);
   constexpr int validation_threads = 256;
   validate_materialize_slots_kernel<<<1, validation_threads, 0, stream>>>(
-      state_indices.data_ptr<int>(), phase_pool.data_ptr<int>(),
-      metadata_status.defined() ? metadata_status.data_ptr<int>() : nullptr,
-      deltalog_status.data_ptr<int>(), num_entries, state_pool_slots,
+      state_indices.mutable_data_ptr<int>(), phase_pool.mutable_data_ptr<int>(),
+      metadata_status.defined() ? metadata_status.mutable_data_ptr<int>() : nullptr,
+      deltalog_status.mutable_data_ptr<int>(), num_entries, state_pool_slots,
       merge_interval);
   const dim3 grid(num_heads, num_entries);
   const dim3 block(kHeadSize);
 #define DISPATCH_MATERIALIZE_M(Value) \
   case Value: \
     materialize_slots_kernel<Value><<<grid, block, 0, stream>>>( \
-        num_heads, state_pool_slots, state_indices.data_ptr<int>(), \
-        phase_pool.data_ptr<int>(), \
-        metadata_status.defined() ? metadata_status.data_ptr<int>() : nullptr, \
-        deltalog_status.data_ptr<int>(), \
-        reinterpret_cast<half*>(state_pool.data_ptr()), \
-        reinterpret_cast<half*>(deltalog_pool.data_ptr())); \
+        num_heads, state_pool_slots, state_indices.mutable_data_ptr<int>(), \
+        phase_pool.mutable_data_ptr<int>(), \
+        metadata_status.defined() ? metadata_status.mutable_data_ptr<int>() : nullptr, \
+        deltalog_status.mutable_data_ptr<int>(), \
+        reinterpret_cast<half*>(state_pool.mutable_data_ptr()), \
+        reinterpret_cast<half*>(deltalog_pool.mutable_data_ptr())); \
     break
   switch (merge_interval) {
     DISPATCH_MATERIALIZE_M(2);
@@ -870,12 +866,12 @@ void tmix_wkv7_recurrent_deltalog_fp16_materialize_slots_cuda(
     DISPATCH_MATERIALIZE_M(6);
     DISPATCH_MATERIALIZE_M(8);
     default:
-      TORCH_CHECK(false, "unsupported DeltaLog merge interval");
+      STD_TORCH_CHECK(false, "unsupported DeltaLog merge interval");
   }
 #undef DISPATCH_MATERIALIZE_M
   reset_materialized_phases_kernel<<<1, validation_threads, 0, stream>>>(
-      state_indices.data_ptr<int>(), phase_pool.data_ptr<int>(),
-      metadata_status.defined() ? metadata_status.data_ptr<int>() : nullptr,
-      deltalog_status.data_ptr<int>(), num_entries);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+      state_indices.mutable_data_ptr<int>(), phase_pool.mutable_data_ptr<int>(),
+      metadata_status.defined() ? metadata_status.mutable_data_ptr<int>() : nullptr,
+      deltalog_status.mutable_data_ptr<int>(), num_entries);
+  FLASHRWKV_CUDA_CHECK(cudaGetLastError());
 }

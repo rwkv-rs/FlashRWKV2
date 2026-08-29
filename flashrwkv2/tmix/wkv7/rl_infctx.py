@@ -135,8 +135,10 @@ def rl_infctx_tmix_wkv7_chunk_fp32io16(
         raise ValueError("state_indices must be within state_pool")
     chunk_metadata = _make_chunk_metadata(cu_seqlens, chunk_size)
     working = state_pool.index_select(0, state_indices.to(torch.int64))
+    working_state_indices = torch.arange(batch, device=r.device, dtype=torch.int32)
     output, final_working = _extension().rl_infctx_tmix_wkv7_chunk_fp32io16_forward(
         *chunk_metadata,
+        working_state_indices,
         working,
         r,
         decay_logits,

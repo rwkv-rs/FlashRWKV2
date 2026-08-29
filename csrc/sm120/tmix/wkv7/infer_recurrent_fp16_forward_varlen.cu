@@ -30,12 +30,8 @@
 #undef __CUDA_NO_HALF_CONVERSIONS__
 #undef __CUDA_NO_HALF_OPERATORS__
 
-#include <ATen/ATen.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
-#include <c10/cuda/CUDAException.h>
 #include <cuda_fp16.h>
-#include <torch/extension.h>
+#include "validation.h"
 
 #include <climits>
 #include <cstdint>
@@ -340,37 +336,37 @@ template <int HeadSize>
 void launch_fp16_tiled_column(
     int num_sequences,
     int num_heads,
-    const torch::Tensor& query_start_loc,
-    const torch::Tensor& state_indices,
-    const torch::Tensor& elapsed_state,
-    torch::Tensor& state,
-    const torch::Tensor& r,
-    const torch::Tensor& decay_logits,
-    const torch::Tensor& decay_bias,
-    const torch::Tensor& k,
-    const torch::Tensor& v,
-    const torch::Tensor& a,
-    const torch::Tensor& b,
-    torch::Tensor& output,
-    const torch::Tensor& metadata_status,
+    const torch::stable::Tensor& query_start_loc,
+    const torch::stable::Tensor& state_indices,
+    const torch::stable::Tensor& elapsed_state,
+    torch::stable::Tensor& state,
+    const torch::stable::Tensor& r,
+    const torch::stable::Tensor& decay_logits,
+    const torch::stable::Tensor& decay_bias,
+    const torch::stable::Tensor& k,
+    const torch::stable::Tensor& v,
+    const torch::stable::Tensor& a,
+    const torch::stable::Tensor& b,
+    torch::stable::Tensor& output,
+    const torch::stable::Tensor& metadata_status,
     float scale,
     cudaStream_t stream) {
   wkv_fp16_tiled_column_kernel<HeadSize>
       <<<dim3(HeadSize, num_heads, num_sequences), 32, 0, stream>>>(
-          num_heads, output.numel(), query_start_loc.data_ptr<int>(),
-          state_indices.data_ptr<int>(), elapsed_state.data_ptr<int>(),
-          metadata_status.data_ptr<int>(),
-          reinterpret_cast<half*>(state.data_ptr()),
-          reinterpret_cast<const half*>(r.data_ptr()),
-          reinterpret_cast<const half*>(decay_logits.data_ptr()),
+          num_heads, output.numel(), query_start_loc.mutable_data_ptr<int>(),
+          state_indices.mutable_data_ptr<int>(), elapsed_state.mutable_data_ptr<int>(),
+          metadata_status.mutable_data_ptr<int>(),
+          reinterpret_cast<half*>(state.mutable_data_ptr()),
+          reinterpret_cast<const half*>(r.mutable_data_ptr()),
+          reinterpret_cast<const half*>(decay_logits.mutable_data_ptr()),
           decay_bias.defined()
-              ? reinterpret_cast<const half*>(decay_bias.data_ptr())
+              ? reinterpret_cast<const half*>(decay_bias.mutable_data_ptr())
               : nullptr,
-          reinterpret_cast<const half*>(k.data_ptr()),
-          reinterpret_cast<const half*>(v.data_ptr()),
-          reinterpret_cast<const half*>(a.data_ptr()),
-          reinterpret_cast<const half*>(b.data_ptr()),
-          reinterpret_cast<half*>(output.data_ptr()), scale);
+          reinterpret_cast<const half*>(k.mutable_data_ptr()),
+          reinterpret_cast<const half*>(v.mutable_data_ptr()),
+          reinterpret_cast<const half*>(a.mutable_data_ptr()),
+          reinterpret_cast<const half*>(b.mutable_data_ptr()),
+          reinterpret_cast<half*>(output.mutable_data_ptr()), scale);
 }
 
 // Albatross 3e41bc4 replaces the old layout-compatibility transpose outright:
@@ -1329,36 +1325,36 @@ void launch_kv_warp_pair(
     bool stream_state,
     int num_sequences,
     int num_heads,
-    const torch::Tensor& query_start_loc,
-    const torch::Tensor& state_indices,
-    const torch::Tensor& elapsed_state,
-    torch::Tensor& state,
-    const torch::Tensor& r,
-    const torch::Tensor& decay,
-    const torch::Tensor& decay_bias,
-    const torch::Tensor& k,
-    const torch::Tensor& v,
-    const torch::Tensor& a,
-    const torch::Tensor& b,
-    torch::Tensor& output,
-    const torch::Tensor& metadata_status,
+    const torch::stable::Tensor& query_start_loc,
+    const torch::stable::Tensor& state_indices,
+    const torch::stable::Tensor& elapsed_state,
+    torch::stable::Tensor& state,
+    const torch::stable::Tensor& r,
+    const torch::stable::Tensor& decay,
+    const torch::stable::Tensor& decay_bias,
+    const torch::stable::Tensor& k,
+    const torch::stable::Tensor& v,
+    const torch::stable::Tensor& a,
+    const torch::stable::Tensor& b,
+    torch::stable::Tensor& output,
+    const torch::stable::Tensor& metadata_status,
     float scale,
     cudaStream_t stream) {
 #define LAUNCH_KV_WARP(StreamState) \
   wkv_fp16_kv_warp_pair_kernel<AddW0, StreamState> \
       <<<dim3(num_heads, num_sequences), dim3(32), 0, stream>>>( \
-          num_heads, output.numel(), query_start_loc.data_ptr<int>(), \
-          state_indices.data_ptr<int>(), elapsed_state.data_ptr<int>(), \
-          metadata_status.data_ptr<int>(), \
-          reinterpret_cast<half*>(state.data_ptr()), \
-          reinterpret_cast<const half*>(r.data_ptr()), \
-          reinterpret_cast<const half*>(decay.data_ptr()), \
-          AddW0 ? reinterpret_cast<const half*>(decay_bias.data_ptr()) : nullptr, \
-          reinterpret_cast<const half*>(k.data_ptr()), \
-          reinterpret_cast<const half*>(v.data_ptr()), \
-          reinterpret_cast<const half*>(a.data_ptr()), \
-          reinterpret_cast<const half*>(b.data_ptr()), \
-          reinterpret_cast<half*>(output.data_ptr()), scale)
+          num_heads, output.numel(), query_start_loc.mutable_data_ptr<int>(), \
+          state_indices.mutable_data_ptr<int>(), elapsed_state.mutable_data_ptr<int>(), \
+          metadata_status.mutable_data_ptr<int>(), \
+          reinterpret_cast<half*>(state.mutable_data_ptr()), \
+          reinterpret_cast<const half*>(r.mutable_data_ptr()), \
+          reinterpret_cast<const half*>(decay.mutable_data_ptr()), \
+          AddW0 ? reinterpret_cast<const half*>(decay_bias.mutable_data_ptr()) : nullptr, \
+          reinterpret_cast<const half*>(k.mutable_data_ptr()), \
+          reinterpret_cast<const half*>(v.mutable_data_ptr()), \
+          reinterpret_cast<const half*>(a.mutable_data_ptr()), \
+          reinterpret_cast<const half*>(b.mutable_data_ptr()), \
+          reinterpret_cast<half*>(output.mutable_data_ptr()), scale)
   if (stream_state) {
     LAUNCH_KV_WARP(true);
   } else {
@@ -1371,35 +1367,35 @@ template <bool AddW0>
 void launch_kv_vector(
     int num_sequences,
     int num_heads,
-    const torch::Tensor& query_start_loc,
-    const torch::Tensor& state_indices,
-    const torch::Tensor& elapsed_state,
-    torch::Tensor& state,
-    const torch::Tensor& r,
-    const torch::Tensor& decay,
-    const torch::Tensor& decay_bias,
-    const torch::Tensor& k,
-    const torch::Tensor& v,
-    const torch::Tensor& a,
-    const torch::Tensor& b,
-    torch::Tensor& output,
-    const torch::Tensor& metadata_status,
+    const torch::stable::Tensor& query_start_loc,
+    const torch::stable::Tensor& state_indices,
+    const torch::stable::Tensor& elapsed_state,
+    torch::stable::Tensor& state,
+    const torch::stable::Tensor& r,
+    const torch::stable::Tensor& decay,
+    const torch::stable::Tensor& decay_bias,
+    const torch::stable::Tensor& k,
+    const torch::stable::Tensor& v,
+    const torch::stable::Tensor& a,
+    const torch::stable::Tensor& b,
+    torch::stable::Tensor& output,
+    const torch::stable::Tensor& metadata_status,
     float scale,
     cudaStream_t stream) {
   wkv_fp16_kv_vector_kernel<AddW0>
       <<<dim3(num_heads, num_sequences), dim3(kHeadSize), 0, stream>>>(
-          num_heads, output.numel(), query_start_loc.data_ptr<int>(),
-          state_indices.data_ptr<int>(), elapsed_state.data_ptr<int>(),
-          metadata_status.data_ptr<int>(),
-          reinterpret_cast<half*>(state.data_ptr()),
-          reinterpret_cast<const half*>(r.data_ptr()),
-          reinterpret_cast<const half*>(decay.data_ptr()),
-          AddW0 ? reinterpret_cast<const half*>(decay_bias.data_ptr()) : nullptr,
-          reinterpret_cast<const half*>(k.data_ptr()),
-          reinterpret_cast<const half*>(v.data_ptr()),
-          reinterpret_cast<const half*>(a.data_ptr()),
-          reinterpret_cast<const half*>(b.data_ptr()),
-          reinterpret_cast<half*>(output.data_ptr()), scale);
+          num_heads, output.numel(), query_start_loc.mutable_data_ptr<int>(),
+          state_indices.mutable_data_ptr<int>(), elapsed_state.mutable_data_ptr<int>(),
+          metadata_status.mutable_data_ptr<int>(),
+          reinterpret_cast<half*>(state.mutable_data_ptr()),
+          reinterpret_cast<const half*>(r.mutable_data_ptr()),
+          reinterpret_cast<const half*>(decay.mutable_data_ptr()),
+          AddW0 ? reinterpret_cast<const half*>(decay_bias.mutable_data_ptr()) : nullptr,
+          reinterpret_cast<const half*>(k.mutable_data_ptr()),
+          reinterpret_cast<const half*>(v.mutable_data_ptr()),
+          reinterpret_cast<const half*>(a.mutable_data_ptr()),
+          reinterpret_cast<const half*>(b.mutable_data_ptr()),
+          reinterpret_cast<half*>(output.mutable_data_ptr()), scale);
 }
 
 bool use_v2_seq(int batch_size, int max_seqlen) {
@@ -1434,19 +1430,19 @@ void launch_fp16_d64(
     Kernel kernel,
     int num_sequences,
     int num_heads,
-    const torch::Tensor& query_start_loc,
-    const torch::Tensor& state_indices,
-    const torch::Tensor& elapsed_state,
-    torch::Tensor& state,
-    const torch::Tensor& r,
-    const torch::Tensor& decay,
-    const torch::Tensor& decay_bias,
-    const torch::Tensor& k,
-    const torch::Tensor& v,
-    const torch::Tensor& a,
-    const torch::Tensor& b,
-    torch::Tensor& output,
-    const torch::Tensor& metadata_status,
+    const torch::stable::Tensor& query_start_loc,
+    const torch::stable::Tensor& state_indices,
+    const torch::stable::Tensor& elapsed_state,
+    torch::stable::Tensor& state,
+    const torch::stable::Tensor& r,
+    const torch::stable::Tensor& decay,
+    const torch::stable::Tensor& decay_bias,
+    const torch::stable::Tensor& k,
+    const torch::stable::Tensor& v,
+    const torch::stable::Tensor& a,
+    const torch::stable::Tensor& b,
+    torch::stable::Tensor& output,
+    const torch::stable::Tensor& metadata_status,
     float scale,
     cudaStream_t stream) {
   const dim3 grid = Grid2D
@@ -1454,20 +1450,20 @@ void launch_fp16_d64(
              static_cast<unsigned int>(num_sequences), 1)
       : dim3(static_cast<unsigned int>(num_heads * num_sequences), 1, 1);
   kernel<<<grid, dim3(kHeadSize), 0, stream>>>(
-      num_heads, output.numel(), query_start_loc.data_ptr<int>(),
-      state_indices.data_ptr<int>(), elapsed_state.data_ptr<int>(),
-      metadata_status.data_ptr<int>(),
-      reinterpret_cast<half*>(state.data_ptr()),
-      reinterpret_cast<const half*>(r.data_ptr()),
-      reinterpret_cast<const half*>(decay.data_ptr()),
+      num_heads, output.numel(), query_start_loc.mutable_data_ptr<int>(),
+      state_indices.mutable_data_ptr<int>(), elapsed_state.mutable_data_ptr<int>(),
+      metadata_status.mutable_data_ptr<int>(),
+      reinterpret_cast<half*>(state.mutable_data_ptr()),
+      reinterpret_cast<const half*>(r.mutable_data_ptr()),
+      reinterpret_cast<const half*>(decay.mutable_data_ptr()),
       decay_bias.defined()
-          ? reinterpret_cast<const half*>(decay_bias.data_ptr())
+          ? reinterpret_cast<const half*>(decay_bias.mutable_data_ptr())
           : nullptr,
-      reinterpret_cast<const half*>(k.data_ptr()),
-      reinterpret_cast<const half*>(v.data_ptr()),
-      reinterpret_cast<const half*>(a.data_ptr()),
-      reinterpret_cast<const half*>(b.data_ptr()),
-      reinterpret_cast<half*>(output.data_ptr()), scale);
+      reinterpret_cast<const half*>(k.mutable_data_ptr()),
+      reinterpret_cast<const half*>(v.mutable_data_ptr()),
+      reinterpret_cast<const half*>(a.mutable_data_ptr()),
+      reinterpret_cast<const half*>(b.mutable_data_ptr()),
+      reinterpret_cast<half*>(output.mutable_data_ptr()), scale);
 }
 
 enum class Fp16Family {
@@ -1499,19 +1495,19 @@ void dispatch_fp16_family(
     bool grid2d,
     int num_sequences,
     int num_heads,
-    const torch::Tensor& query_start_loc,
-    const torch::Tensor& state_indices,
-    const torch::Tensor& elapsed_state,
-    torch::Tensor& state,
-    const torch::Tensor& r,
-    const torch::Tensor& decay,
-    const torch::Tensor& decay_bias,
-    const torch::Tensor& k,
-    const torch::Tensor& v,
-    const torch::Tensor& a,
-    const torch::Tensor& b,
-    torch::Tensor& output,
-    const torch::Tensor& metadata_status,
+    const torch::stable::Tensor& query_start_loc,
+    const torch::stable::Tensor& state_indices,
+    const torch::stable::Tensor& elapsed_state,
+    torch::stable::Tensor& state,
+    const torch::stable::Tensor& r,
+    const torch::stable::Tensor& decay,
+    const torch::stable::Tensor& decay_bias,
+    const torch::stable::Tensor& k,
+    const torch::stable::Tensor& v,
+    const torch::stable::Tensor& a,
+    const torch::stable::Tensor& b,
+    torch::stable::Tensor& output,
+    const torch::stable::Tensor& metadata_status,
     float scale,
     cudaStream_t stream) {
   if (grid2d) {
@@ -1542,40 +1538,40 @@ void dispatch_fp16_family(
 }  // namespace
 
 void recurrent_fp16_advance_i32_varlen_cuda(
-    torch::Tensor query_start_loc,
-    torch::Tensor state_indices,
-    torch::Tensor elapsed_state,
-    torch::Tensor metadata_status) {
-  const c10::cuda::CUDAGuard device_guard(elapsed_state.device());
+    torch::stable::Tensor query_start_loc,
+    torch::stable::Tensor state_indices,
+    torch::stable::Tensor elapsed_state,
+    torch::stable::Tensor metadata_status) {
+  const torch::stable::accelerator::DeviceGuard device_guard(elapsed_state.device().index());
   constexpr int threads = 256;
   const int num_sequences = static_cast<int>(state_indices.numel());
-  auto stream = at::cuda::getCurrentCUDAStream();
+  auto stream = flashrwkv2::validation::current_cuda_stream();
   advance_i32_varlen_kernel<<<
       static_cast<int>(ceil_div(num_sequences, threads)), threads, 0, stream>>>(
-      query_start_loc.data_ptr<int>(), state_indices.data_ptr<int>(),
-      metadata_status.data_ptr<int>(), elapsed_state.data_ptr<int>(),
+      query_start_loc.mutable_data_ptr<int>(), state_indices.mutable_data_ptr<int>(),
+      metadata_status.mutable_data_ptr<int>(), elapsed_state.mutable_data_ptr<int>(),
       num_sequences);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  FLASHRWKV_CUDA_CHECK(cudaGetLastError());
 }
 
 void tmix_wkv7_recurrent_fp16_from_decay_logits_cuda(
-    torch::Tensor query_start_loc,
-    torch::Tensor state_indices,
-    torch::Tensor elapsed_state,
-    torch::Tensor state,
-    torch::Tensor r,
-    torch::Tensor decay_logits,
-    torch::Tensor decay_bias,
-    torch::Tensor k,
-    torch::Tensor v,
-    torch::Tensor a,
-    torch::Tensor b,
-    torch::Tensor output,
-    torch::Tensor metadata_status,
+    torch::stable::Tensor query_start_loc,
+    torch::stable::Tensor state_indices,
+    torch::stable::Tensor elapsed_state,
+    torch::stable::Tensor state,
+    torch::stable::Tensor r,
+    torch::stable::Tensor decay_logits,
+    torch::stable::Tensor decay_bias,
+    torch::stable::Tensor k,
+    torch::stable::Tensor v,
+    torch::stable::Tensor a,
+    torch::stable::Tensor b,
+    torch::stable::Tensor output,
+    torch::stable::Tensor metadata_status,
     double scale,
     int64_t max_seqlen) {
-  const c10::cuda::CUDAGuard device_guard(state.device());
-  const auto stream = at::cuda::getCurrentCUDAStream();
+  const torch::stable::accelerator::DeviceGuard device_guard(state.device().index());
+  const auto stream = flashrwkv2::validation::current_cuda_stream();
   const int num_sequences = static_cast<int>(state_indices.numel());
   const int num_heads = static_cast<int>(state.size(1));
   if (max_seqlen <= 0) {
@@ -1659,9 +1655,9 @@ void tmix_wkv7_recurrent_fp16_from_decay_logits_cuda(
         elapsed_state, state, r, decay_logits, decay_bias, k, v, a, b,
         output, metadata_status, static_cast<float>(scale), stream);
   } else {
-    TORCH_CHECK(
+    STD_TORCH_CHECK(
         false,
         "FP16 recurrent family supports head sizes 64, 128, and 256");
   }
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  FLASHRWKV_CUDA_CHECK(cudaGetLastError());
 }

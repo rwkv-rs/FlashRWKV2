@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Native-private SM120 Linear provider. This translation unit has no pybind
+// Native-private SM120 Linear provider. This translation unit has no Python
 // registration; public ownership remains with TMix, CMix, and Head callers.
 // SPDX-FileCopyrightText: Copyright contributors to BlinkDL/Albatross
 // Upstream repository: https://github.com/BlinkDL/Albatross
@@ -11,11 +11,10 @@
 // below; rows are already contiguous and no sequence metadata is needed for this
 // tokenwise operator family.
 // SPDX and provenance are retained from the upstream source below.
+#include "validation.h"
+
 #include "backend.cuh"
 
-#include <ATen/ATen.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAException.h>
 #include <cublasLt.h>
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
@@ -26,7 +25,7 @@
 #include <optional>
 #include <vector>
 
-using dtype = at::Half;
+using dtype = torch::headeronly::Half;
 namespace wmma = nvcuda::wmma;
 
 namespace {
@@ -41,11 +40,11 @@ inline int64_t ceil_div(int64_t n, int64_t d) {
 }
 
 inline void check_cublas(cublasStatus_t status, const char* what) {
-  TORCH_CHECK(status == CUBLAS_STATUS_SUCCESS, what, " failed with cublas status ", static_cast<int>(status));
+  STD_TORCH_CHECK(status == CUBLAS_STATUS_SUCCESS, what, " failed with cublas status ", static_cast<int>(status));
 }
 
 inline void check_cublaslt(cublasStatus_t status, const char* what) {
-  TORCH_CHECK(status == CUBLAS_STATUS_SUCCESS, what, " failed with cublasLt status ", static_cast<int>(status));
+  STD_TORCH_CHECK(status == CUBLAS_STATUS_SUCCESS, what, " failed with cublasLt status ", static_cast<int>(status));
 }
 
 __device__ __forceinline__ float warp_sum(float x) {
@@ -738,18 +737,18 @@ __global__ __launch_bounds__(Threads, 1) void linear_orig_row2_exact4_f16_kernel
 
 } // namespace
 
-at::Tensor linear_f16_cuda(at::Tensor x, at::Tensor weight) {
+torch::stable::Tensor linear_f16_cuda(torch::stable::Tensor x, torch::stable::Tensor weight) {
   const int64_t k64 = x.size(-1);
   const int64_t n64 = weight.size(1);
-  TORCH_CHECK(k64 <= INT_MAX && n64 <= INT_MAX, "linear_f16 K/N too large");
+  STD_TORCH_CHECK(k64 <= INT_MAX && n64 <= INT_MAX, "linear_f16 K/N too large");
   const int k = static_cast<int>(k64);
   const int n = static_cast<int>(n64);
   const int64_t m64 = x.numel() / k64;
-  TORCH_CHECK(m64 <= INT_MAX, "linear_f16 M too large");
+  STD_TORCH_CHECK(m64 <= INT_MAX, "linear_f16 M too large");
   const int m = static_cast<int>(m64);
   std::vector<int64_t> out_sizes(x.sizes().begin(), x.sizes().end());
   out_sizes.back() = n64;
-  auto y = at::empty(out_sizes, x.options());
+  auto y = torch::stable::new_empty(x, out_sizes);
   if (m == 0 || n == 0 || k == 0) {
     return y;
   }
@@ -758,7 +757,7 @@ at::Tensor linear_f16_cuda(at::Tensor x, at::Tensor weight) {
   // y^T[N,M] = weight^T[N,K] @ x^T[K,M].
   const float alpha = 1.0f;
   const float beta = 0.0f;
-  cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
+  cublasHandle_t handle = flashrwkv2::validation::current_cuda_blas_handle();
   check_cublas(cublasGemmEx(
       handle,
       CUBLAS_OP_N,
@@ -767,14 +766,14 @@ at::Tensor linear_f16_cuda(at::Tensor x, at::Tensor weight) {
       m,
       k,
       &alpha,
-      weight.data_ptr<dtype>(),
+      weight.mutable_data_ptr<dtype>(),
       CUDA_R_16F,
       n,
-      x.data_ptr<dtype>(),
+      x.mutable_data_ptr<dtype>(),
       CUDA_R_16F,
       k,
       &beta,
-      y.data_ptr<dtype>(),
+      y.mutable_data_ptr<dtype>(),
       CUDA_R_16F,
       n,
       CUBLAS_COMPUTE_32F,
@@ -783,18 +782,18 @@ at::Tensor linear_f16_cuda(at::Tensor x, at::Tensor weight) {
   return y;
 }
 
-at::Tensor linear_f16_orig_cuda(at::Tensor x, at::Tensor weight_orig) {
+torch::stable::Tensor linear_f16_orig_cuda(torch::stable::Tensor x, torch::stable::Tensor weight_orig) {
   const int64_t k64 = x.size(-1);
   const int64_t n64 = weight_orig.size(0);
-  TORCH_CHECK(k64 <= INT_MAX && n64 <= INT_MAX, "linear_f16_orig K/N too large");
+  STD_TORCH_CHECK(k64 <= INT_MAX && n64 <= INT_MAX, "linear_f16_orig K/N too large");
   const int k = static_cast<int>(k64);
   const int n = static_cast<int>(n64);
   const int64_t m64 = x.numel() / k64;
-  TORCH_CHECK(m64 <= INT_MAX, "linear_f16_orig M too large");
+  STD_TORCH_CHECK(m64 <= INT_MAX, "linear_f16_orig M too large");
   const int m = static_cast<int>(m64);
   std::vector<int64_t> out_sizes(x.sizes().begin(), x.sizes().end());
   out_sizes.back() = n64;
-  auto y = at::empty(out_sizes, x.options());
+  auto y = torch::stable::new_empty(x, out_sizes);
   if (m == 0 || n == 0 || k == 0) {
     return y;
   }
@@ -804,7 +803,7 @@ at::Tensor linear_f16_orig_cuda(at::Tensor x, at::Tensor weight_orig) {
   // column-major y^T[N,M] = opT(weight_orig_col[K,N]) @ x_col[K,M].
   const float alpha = 1.0f;
   const float beta = 0.0f;
-  cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
+  cublasHandle_t handle = flashrwkv2::validation::current_cuda_blas_handle();
   check_cublas(cublasGemmEx(
       handle,
       CUBLAS_OP_T,
@@ -813,14 +812,14 @@ at::Tensor linear_f16_orig_cuda(at::Tensor x, at::Tensor weight_orig) {
       m,
       k,
       &alpha,
-      weight_orig.data_ptr<dtype>(),
+      weight_orig.mutable_data_ptr<dtype>(),
       CUDA_R_16F,
       k,
-      x.data_ptr<dtype>(),
+      x.mutable_data_ptr<dtype>(),
       CUDA_R_16F,
       k,
       &beta,
-      y.data_ptr<dtype>(),
+      y.mutable_data_ptr<dtype>(),
       CUDA_R_16F,
       n,
       CUBLAS_COMPUTE_32F,
@@ -830,19 +829,19 @@ at::Tensor linear_f16_orig_cuda(at::Tensor x, at::Tensor weight_orig) {
 }
 
 void linear_f16_orig_scaled_accumulate_cuda(
-    at::Tensor x,
-    at::Tensor weight_orig,
-    at::Tensor output,
+    torch::stable::Tensor x,
+    torch::stable::Tensor weight_orig,
+    torch::stable::Tensor output,
     float scale) {
   const int64_t k64 = x.size(-1);
   const int64_t n64 = weight_orig.size(0);
   const int64_t m64 = x.numel() / k64;
-  TORCH_CHECK(k64 <= INT_MAX && n64 <= INT_MAX && m64 <= INT_MAX,
+  STD_TORCH_CHECK(k64 <= INT_MAX && n64 <= INT_MAX && m64 <= INT_MAX,
               "linear_f16_orig_scaled_accumulate shape is too large");
   const int k = static_cast<int>(k64);
   const int n = static_cast<int>(n64);
   const int m = static_cast<int>(m64);
-  TORCH_CHECK(output.dim() == 2 && output.size(0) == m64 &&
+  STD_TORCH_CHECK(output.dim() == 2 && output.size(0) == m64 &&
                   output.size(1) == n64,
               "LoRA accumulation output shape mismatch");
 
@@ -850,7 +849,7 @@ void linear_f16_orig_scaled_accumulate_cuda(
   // FP16 base projection into FP32 accumulation, adds the scaled rank-out,
   // then rounds once back to the same FP16 output buffer.
   const float beta = 1.0f;
-  cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
+  cublasHandle_t handle = flashrwkv2::validation::current_cuda_blas_handle();
   check_cublas(cublasGemmEx(
       handle,
       CUBLAS_OP_T,
@@ -859,14 +858,14 @@ void linear_f16_orig_scaled_accumulate_cuda(
       m,
       k,
       &scale,
-      weight_orig.data_ptr<dtype>(),
+      weight_orig.mutable_data_ptr<dtype>(),
       CUDA_R_16F,
       k,
-      x.data_ptr<dtype>(),
+      x.mutable_data_ptr<dtype>(),
       CUDA_R_16F,
       k,
       &beta,
-      output.data_ptr<dtype>(),
+      output.mutable_data_ptr<dtype>(),
       CUDA_R_16F,
       n,
       CUBLAS_COMPUTE_32F,
@@ -875,52 +874,52 @@ void linear_f16_orig_scaled_accumulate_cuda(
 }
 
 template <int RowTile, int OutTile>
-at::Tensor linear_orig_rows_f16_cuda_impl(at::Tensor x, at::Tensor weight_orig) {
+torch::stable::Tensor linear_orig_rows_f16_cuda_impl(torch::stable::Tensor x, torch::stable::Tensor weight_orig) {
   const int64_t k64 = x.size(-1);
   const int64_t n64 = weight_orig.size(0);
-  TORCH_CHECK(k64 <= INT_MAX && n64 <= INT_MAX, "linear_orig_rows_f16 K/N too large");
+  STD_TORCH_CHECK(k64 <= INT_MAX && n64 <= INT_MAX, "linear_orig_rows_f16 K/N too large");
   const int K = static_cast<int>(k64);
   const int N = static_cast<int>(n64);
   const int64_t m64 = x.numel() / k64;
-  TORCH_CHECK(m64 <= INT_MAX, "linear_orig_rows_f16 M too large");
+  STD_TORCH_CHECK(m64 <= INT_MAX, "linear_orig_rows_f16 M too large");
   const int M = static_cast<int>(m64);
   std::vector<int64_t> out_sizes(x.sizes().begin(), x.sizes().end());
   out_sizes.back() = n64;
-  auto y = at::empty(out_sizes, x.options());
+  auto y = torch::stable::new_empty(x, out_sizes);
   if (M == 0 || N == 0 || K == 0) {
     return y;
   }
-  auto stream = at::cuda::getCurrentCUDAStream();
+  auto stream = flashrwkv2::validation::current_cuda_stream();
   linear_orig_rows_f16_kernel<128, RowTile, OutTile><<<dim3(ceil_div(N, OutTile), ceil_div(M, RowTile), 1), 128, 0, stream>>>(
-      M, K, N, x.data_ptr<dtype>(), weight_orig.data_ptr<dtype>(), y.data_ptr<dtype>());
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+      M, K, N, x.mutable_data_ptr<dtype>(), weight_orig.mutable_data_ptr<dtype>(), y.mutable_data_ptr<dtype>());
+  FLASHRWKV_CUDA_CHECK(cudaGetLastError());
   return y;
 }
 
 template <int Threads, int RowTile, int OutTile>
-at::Tensor linear_orig_rows_cfg_f16_cuda_impl(at::Tensor x, at::Tensor weight_orig) {
+torch::stable::Tensor linear_orig_rows_cfg_f16_cuda_impl(torch::stable::Tensor x, torch::stable::Tensor weight_orig) {
   const int64_t k64 = x.size(-1);
   const int64_t n64 = weight_orig.size(0);
-  TORCH_CHECK(k64 <= INT_MAX && n64 <= INT_MAX, "linear_orig_rows_cfg_f16 K/N too large");
+  STD_TORCH_CHECK(k64 <= INT_MAX && n64 <= INT_MAX, "linear_orig_rows_cfg_f16 K/N too large");
   const int K = static_cast<int>(k64);
   const int N = static_cast<int>(n64);
   const int64_t m64 = x.numel() / k64;
-  TORCH_CHECK(m64 <= INT_MAX, "linear_orig_rows_cfg_f16 M too large");
+  STD_TORCH_CHECK(m64 <= INT_MAX, "linear_orig_rows_cfg_f16 M too large");
   const int M = static_cast<int>(m64);
   std::vector<int64_t> out_sizes(x.sizes().begin(), x.sizes().end());
   out_sizes.back() = n64;
-  auto y = at::empty(out_sizes, x.options());
+  auto y = torch::stable::new_empty(x, out_sizes);
   if (M == 0 || N == 0 || K == 0) {
     return y;
   }
-  auto stream = at::cuda::getCurrentCUDAStream();
+  auto stream = flashrwkv2::validation::current_cuda_stream();
   linear_orig_rows_f16_kernel<Threads, RowTile, OutTile><<<dim3(ceil_div(N, OutTile), ceil_div(M, RowTile), 1), Threads, 0, stream>>>(
-      M, K, N, x.data_ptr<dtype>(), weight_orig.data_ptr<dtype>(), y.data_ptr<dtype>());
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+      M, K, N, x.mutable_data_ptr<dtype>(), weight_orig.mutable_data_ptr<dtype>(), y.mutable_data_ptr<dtype>());
+  FLASHRWKV_CUDA_CHECK(cudaGetLastError());
   return y;
 }
 
-at::Tensor linear_orig_rows_f16_cuda(at::Tensor x, at::Tensor weight_orig, int64_t row_tile, int64_t out_tile) {
+torch::stable::Tensor linear_orig_rows_f16_cuda(torch::stable::Tensor x, torch::stable::Tensor weight_orig, int64_t row_tile, int64_t out_tile) {
   if (row_tile == 1 && out_tile == 2) return linear_orig_rows_f16_cuda_impl<1, 2>(x, weight_orig);
   if (row_tile == 1 && out_tile == 4) return linear_orig_rows_f16_cuda_impl<1, 4>(x, weight_orig);
   if (row_tile == 1 && out_tile == 8) return linear_orig_rows_f16_cuda_impl<1, 8>(x, weight_orig);
@@ -939,10 +938,10 @@ at::Tensor linear_orig_rows_f16_cuda(at::Tensor x, at::Tensor weight_orig, int64
   if (row_tile == 16 && out_tile == 1) return linear_orig_rows_f16_cuda_impl<16, 1>(x, weight_orig);
   if (row_tile == 16 && out_tile == 2) return linear_orig_rows_f16_cuda_impl<16, 2>(x, weight_orig);
   if (row_tile == 16 && out_tile == 4) return linear_orig_rows_f16_cuda_impl<16, 4>(x, weight_orig);
-  TORCH_CHECK(false, "unsupported linear_orig_rows_f16 row_tile/out_tile");
+  STD_TORCH_CHECK(false, "unsupported linear_orig_rows_f16 row_tile/out_tile");
 }
 
-at::Tensor linear_orig_rows_cfg_f16_cuda(at::Tensor x, at::Tensor weight_orig, int64_t threads, int64_t row_tile, int64_t out_tile) {
+torch::stable::Tensor linear_orig_rows_cfg_f16_cuda(torch::stable::Tensor x, torch::stable::Tensor weight_orig, int64_t threads, int64_t row_tile, int64_t out_tile) {
   if (threads == 64 && row_tile == 1 && out_tile == 4) return linear_orig_rows_cfg_f16_cuda_impl<64, 1, 4>(x, weight_orig);
   if (threads == 64 && row_tile == 1 && out_tile == 8) return linear_orig_rows_cfg_f16_cuda_impl<64, 1, 8>(x, weight_orig);
   if (threads == 128 && row_tile == 1 && out_tile == 8) return linear_orig_rows_cfg_f16_cuda_impl<128, 1, 8>(x, weight_orig);
@@ -962,60 +961,60 @@ at::Tensor linear_orig_rows_cfg_f16_cuda(at::Tensor x, at::Tensor weight_orig, i
   if (threads == 96 && row_tile == 3 && out_tile == 4) return linear_orig_rows_cfg_f16_cuda_impl<96, 3, 4>(x, weight_orig);
   if (threads == 32 && row_tile == 3 && out_tile == 8) return linear_orig_rows_cfg_f16_cuda_impl<32, 3, 8>(x, weight_orig);
   if (threads == 64 && row_tile == 3 && out_tile == 8) return linear_orig_rows_cfg_f16_cuda_impl<64, 3, 8>(x, weight_orig);
-  TORCH_CHECK(false, "unsupported linear_orig_rows_cfg_f16 threads/row_tile/out_tile");
+  STD_TORCH_CHECK(false, "unsupported linear_orig_rows_cfg_f16 threads/row_tile/out_tile");
 }
 
 template <int Threads, int OutTile, bool Use4>
-at::Tensor linear_orig_row1_exact_f16_cuda_impl(at::Tensor x, at::Tensor weight_orig) {
+torch::stable::Tensor linear_orig_row1_exact_f16_cuda_impl(torch::stable::Tensor x, torch::stable::Tensor weight_orig) {
   const int64_t k64 = x.size(-1);
   const int64_t n64 = weight_orig.size(0);
-  TORCH_CHECK(k64 <= INT_MAX && n64 <= INT_MAX, "linear_orig_row1_exact_f16 K/N too large");
-  TORCH_CHECK((n64 % OutTile) == 0, "linear_orig_row1_exact_f16 requires N divisible by out_tile");
-  TORCH_CHECK((k64 % (Use4 ? 4 : 2)) == 0, "linear_orig_row1_exact_f16 unsupported K alignment");
+  STD_TORCH_CHECK(k64 <= INT_MAX && n64 <= INT_MAX, "linear_orig_row1_exact_f16 K/N too large");
+  STD_TORCH_CHECK((n64 % OutTile) == 0, "linear_orig_row1_exact_f16 requires N divisible by out_tile");
+  STD_TORCH_CHECK((k64 % (Use4 ? 4 : 2)) == 0, "linear_orig_row1_exact_f16 unsupported K alignment");
   const int K = static_cast<int>(k64);
   const int N = static_cast<int>(n64);
   const int64_t m64 = x.numel() / k64;
-  TORCH_CHECK(m64 == 1, "linear_orig_row1_exact_f16 requires one row");
+  STD_TORCH_CHECK(m64 == 1, "linear_orig_row1_exact_f16 requires one row");
   std::vector<int64_t> out_sizes(x.sizes().begin(), x.sizes().end());
   out_sizes.back() = n64;
-  auto y = at::empty(out_sizes, x.options());
+  auto y = torch::stable::new_empty(x, out_sizes);
   if constexpr (Use4) {
-    linear_orig_row1_exact4_f16_kernel<Threads, OutTile><<<N / OutTile, Threads, 0, at::cuda::getCurrentCUDAStream()>>>(
-        K, N, x.data_ptr<dtype>(), weight_orig.data_ptr<dtype>(), y.data_ptr<dtype>());
+    linear_orig_row1_exact4_f16_kernel<Threads, OutTile><<<N / OutTile, Threads, 0, flashrwkv2::validation::current_cuda_stream()>>>(
+        K, N, x.mutable_data_ptr<dtype>(), weight_orig.mutable_data_ptr<dtype>(), y.mutable_data_ptr<dtype>());
   } else {
-    linear_orig_row1_exact_f16_kernel<Threads, OutTile><<<N / OutTile, Threads, 0, at::cuda::getCurrentCUDAStream()>>>(
-        K, N, x.data_ptr<dtype>(), weight_orig.data_ptr<dtype>(), y.data_ptr<dtype>());
+    linear_orig_row1_exact_f16_kernel<Threads, OutTile><<<N / OutTile, Threads, 0, flashrwkv2::validation::current_cuda_stream()>>>(
+        K, N, x.mutable_data_ptr<dtype>(), weight_orig.mutable_data_ptr<dtype>(), y.mutable_data_ptr<dtype>());
   }
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  FLASHRWKV_CUDA_CHECK(cudaGetLastError());
   return y;
 }
 
 template <int Threads, int OutTile, bool Use4>
-at::Tensor linear_orig_row2_exact_f16_cuda_impl(at::Tensor x, at::Tensor weight_orig) {
+torch::stable::Tensor linear_orig_row2_exact_f16_cuda_impl(torch::stable::Tensor x, torch::stable::Tensor weight_orig) {
   const int64_t k64 = x.size(-1);
   const int64_t n64 = weight_orig.size(0);
-  TORCH_CHECK(k64 <= INT_MAX && n64 <= INT_MAX, "linear_orig_row2_exact_f16 K/N too large");
-  TORCH_CHECK((n64 % OutTile) == 0, "linear_orig_row2_exact_f16 requires N divisible by out_tile");
-  TORCH_CHECK((k64 % (Use4 ? 4 : 2)) == 0, "linear_orig_row2_exact_f16 unsupported K alignment");
+  STD_TORCH_CHECK(k64 <= INT_MAX && n64 <= INT_MAX, "linear_orig_row2_exact_f16 K/N too large");
+  STD_TORCH_CHECK((n64 % OutTile) == 0, "linear_orig_row2_exact_f16 requires N divisible by out_tile");
+  STD_TORCH_CHECK((k64 % (Use4 ? 4 : 2)) == 0, "linear_orig_row2_exact_f16 unsupported K alignment");
   const int K = static_cast<int>(k64);
   const int N = static_cast<int>(n64);
   const int64_t m64 = x.numel() / k64;
-  TORCH_CHECK(m64 == 2, "linear_orig_row2_exact_f16 requires two rows");
+  STD_TORCH_CHECK(m64 == 2, "linear_orig_row2_exact_f16 requires two rows");
   std::vector<int64_t> out_sizes(x.sizes().begin(), x.sizes().end());
   out_sizes.back() = n64;
-  auto y = at::empty(out_sizes, x.options());
+  auto y = torch::stable::new_empty(x, out_sizes);
   if constexpr (Use4) {
-    linear_orig_row2_exact4_f16_kernel<Threads, OutTile><<<N / OutTile, Threads, 0, at::cuda::getCurrentCUDAStream()>>>(
-        K, N, x.data_ptr<dtype>(), weight_orig.data_ptr<dtype>(), y.data_ptr<dtype>());
+    linear_orig_row2_exact4_f16_kernel<Threads, OutTile><<<N / OutTile, Threads, 0, flashrwkv2::validation::current_cuda_stream()>>>(
+        K, N, x.mutable_data_ptr<dtype>(), weight_orig.mutable_data_ptr<dtype>(), y.mutable_data_ptr<dtype>());
   } else {
-    linear_orig_row2_exact_f16_kernel<Threads, OutTile><<<N / OutTile, Threads, 0, at::cuda::getCurrentCUDAStream()>>>(
-        K, N, x.data_ptr<dtype>(), weight_orig.data_ptr<dtype>(), y.data_ptr<dtype>());
+    linear_orig_row2_exact_f16_kernel<Threads, OutTile><<<N / OutTile, Threads, 0, flashrwkv2::validation::current_cuda_stream()>>>(
+        K, N, x.mutable_data_ptr<dtype>(), weight_orig.mutable_data_ptr<dtype>(), y.mutable_data_ptr<dtype>());
   }
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  FLASHRWKV_CUDA_CHECK(cudaGetLastError());
   return y;
 }
 
-at::Tensor linear_orig_rows_exact_f16_cuda(at::Tensor x, at::Tensor weight_orig, int64_t threads, int64_t out_tile, bool use4) {
+torch::stable::Tensor linear_orig_rows_exact_f16_cuda(torch::stable::Tensor x, torch::stable::Tensor weight_orig, int64_t threads, int64_t out_tile, bool use4) {
   const int64_t rows = x.numel() / x.size(-1);
   if (rows == 1) {
     if (!use4 && threads == 128 && out_tile == 2) return linear_orig_row1_exact_f16_cuda_impl<128, 2, false>(x, weight_orig);
@@ -1026,39 +1025,39 @@ at::Tensor linear_orig_rows_exact_f16_cuda(at::Tensor x, at::Tensor weight_orig,
     if (use4 && threads == 256 && out_tile == 1) return linear_orig_row2_exact_f16_cuda_impl<256, 1, true>(x, weight_orig);
     if (!use4 && threads == 128 && out_tile == 2) return linear_orig_row2_exact_f16_cuda_impl<128, 2, false>(x, weight_orig);
   }
-  TORCH_CHECK(false, "unsupported linear_orig_rows_exact_f16 rows/threads/out_tile/use4");
+  STD_TORCH_CHECK(false, "unsupported linear_orig_rows_exact_f16 rows/threads/out_tile/use4");
 }
 
-at::Tensor linear_f16_orig_lt_cfg_impl(
-    at::Tensor x, at::Tensor weight_orig, int64_t workspace_mb, int64_t algo_index, bool strict_algo);
+torch::stable::Tensor linear_f16_orig_lt_cfg_impl(
+    torch::stable::Tensor x, torch::stable::Tensor weight_orig, int64_t workspace_mb, int64_t algo_index, bool strict_algo);
 
-at::Tensor linear_f16_orig_lt_cfg_cuda(at::Tensor x, at::Tensor weight_orig, int64_t workspace_mb, int64_t algo_index) {
+torch::stable::Tensor linear_f16_orig_lt_cfg_cuda(torch::stable::Tensor x, torch::stable::Tensor weight_orig, int64_t workspace_mb, int64_t algo_index) {
   return linear_f16_orig_lt_cfg_impl(x, weight_orig, workspace_mb, algo_index, false);
 }
 
-at::Tensor linear_f16_orig_lt_cfg_impl(
-    at::Tensor x, at::Tensor weight_orig, int64_t workspace_mb, int64_t algo_index, bool strict_algo) {
+torch::stable::Tensor linear_f16_orig_lt_cfg_impl(
+    torch::stable::Tensor x, torch::stable::Tensor weight_orig, int64_t workspace_mb, int64_t algo_index, bool strict_algo) {
   const int64_t k64 = x.size(-1);
   const int64_t n64 = weight_orig.size(0);
-  TORCH_CHECK(k64 <= INT_MAX && n64 <= INT_MAX, "linear_f16_orig_lt_cfg K/N too large");
+  STD_TORCH_CHECK(k64 <= INT_MAX && n64 <= INT_MAX, "linear_f16_orig_lt_cfg K/N too large");
   const int k = static_cast<int>(k64);
   const int n = static_cast<int>(n64);
   const int64_t m64 = x.numel() / k64;
-  TORCH_CHECK(m64 <= INT_MAX, "linear_f16_orig_lt_cfg M too large");
+  STD_TORCH_CHECK(m64 <= INT_MAX, "linear_f16_orig_lt_cfg M too large");
   const int m = static_cast<int>(m64);
   std::vector<int64_t> out_sizes(x.sizes().begin(), x.sizes().end());
   out_sizes.back() = n64;
-  auto y = at::empty(out_sizes, x.options());
+  auto y = torch::stable::new_empty(x, out_sizes);
   if (m == 0 || n == 0 || k == 0) {
     return y;
   }
 
   const size_t workspace_size = static_cast<size_t>(workspace_mb) << 20;
-  at::Tensor workspace;
+  torch::stable::Tensor workspace;
   void* workspace_ptr = nullptr;
   if (workspace_size > 0) {
-    workspace = at::empty({static_cast<int64_t>(workspace_size)}, x.options().dtype(at::kByte));
-    workspace_ptr = workspace.data_ptr();
+    workspace = torch::stable::new_empty(x, {static_cast<int64_t>(workspace_size)}, torch::headeronly::ScalarType::Byte);
+    workspace_ptr = workspace.mutable_data_ptr();
   }
 
   static cublasLtHandle_t lt_handle = nullptr;
@@ -1089,14 +1088,14 @@ at::Tensor linear_f16_orig_lt_cfg_impl(
                  "linear_f16_orig_lt heuristic");
   if (returned <= 0 || (strict_algo && algo_index >= returned)) {
     // Strict tuning intentionally rejects many candidates. Release per-call Lt
-    // objects before TORCH_CHECK throws, otherwise a sweep leaks host resources.
+    // objects before STD_TORCH_CHECK throws, otherwise a sweep leaks host resources.
     cublasLtMatmulPreferenceDestroy(pref);
     cublasLtMatrixLayoutDestroy(c_desc);
     cublasLtMatrixLayoutDestroy(b_desc);
     cublasLtMatrixLayoutDestroy(a_desc);
     cublasLtMatmulDescDestroy(op_desc);
-    TORCH_CHECK(returned > 0, "linear_f16_orig_lt found no algorithm");
-    TORCH_CHECK(algo_index < returned,
+    STD_TORCH_CHECK(returned > 0, "linear_f16_orig_lt found no algorithm");
+    STD_TORCH_CHECK(algo_index < returned,
                 "linear_f16_orig_lt requested algorithm ", algo_index, " but only ", returned, " algorithms are available");
   }
   const int selected_algo = algo_index < returned ? static_cast<int>(algo_index) : 0;
@@ -1106,19 +1105,19 @@ at::Tensor linear_f16_orig_lt_cfg_impl(
       lt_handle,
       op_desc,
       &alpha,
-      weight_orig.data_ptr<dtype>(),
+      weight_orig.mutable_data_ptr<dtype>(),
       a_desc,
-      x.data_ptr<dtype>(),
+      x.mutable_data_ptr<dtype>(),
       b_desc,
       &beta,
-      y.data_ptr<dtype>(),
+      y.mutable_data_ptr<dtype>(),
       c_desc,
-      y.data_ptr<dtype>(),
+      y.mutable_data_ptr<dtype>(),
       c_desc,
       &heuristics[selected_algo].algo,
       workspace_ptr,
       workspace_size,
-      at::cuda::getCurrentCUDAStream()),
+      flashrwkv2::validation::current_cuda_stream()),
       "linear_f16_orig_lt matmul");
   cublasLtMatmulPreferenceDestroy(pref);
   cublasLtMatrixLayoutDestroy(c_desc);
@@ -1128,36 +1127,36 @@ at::Tensor linear_f16_orig_lt_cfg_impl(
   return y;
 }
 
-at::Tensor linear_f16_lt_cfg_impl(
-    at::Tensor x, at::Tensor weight, int64_t workspace_mb, int64_t algo_index, bool strict_algo);
+torch::stable::Tensor linear_f16_lt_cfg_impl(
+    torch::stable::Tensor x, torch::stable::Tensor weight, int64_t workspace_mb, int64_t algo_index, bool strict_algo);
 
-at::Tensor linear_f16_lt_cfg_cuda(at::Tensor x, at::Tensor weight, int64_t workspace_mb, int64_t algo_index) {
+torch::stable::Tensor linear_f16_lt_cfg_cuda(torch::stable::Tensor x, torch::stable::Tensor weight, int64_t workspace_mb, int64_t algo_index) {
   return linear_f16_lt_cfg_impl(x, weight, workspace_mb, algo_index, false);
 }
 
-at::Tensor linear_f16_lt_cfg_impl(
-    at::Tensor x, at::Tensor weight, int64_t workspace_mb, int64_t algo_index, bool strict_algo) {
+torch::stable::Tensor linear_f16_lt_cfg_impl(
+    torch::stable::Tensor x, torch::stable::Tensor weight, int64_t workspace_mb, int64_t algo_index, bool strict_algo) {
   const int64_t k64 = x.size(-1);
   const int64_t n64 = weight.size(1);
-  TORCH_CHECK(k64 <= INT_MAX && n64 <= INT_MAX, "linear_f16_lt K/N too large");
+  STD_TORCH_CHECK(k64 <= INT_MAX && n64 <= INT_MAX, "linear_f16_lt K/N too large");
   const int k = static_cast<int>(k64);
   const int n = static_cast<int>(n64);
   const int64_t m64 = x.numel() / k64;
-  TORCH_CHECK(m64 <= INT_MAX, "linear_f16_lt M too large");
+  STD_TORCH_CHECK(m64 <= INT_MAX, "linear_f16_lt M too large");
   const int m = static_cast<int>(m64);
   std::vector<int64_t> out_sizes(x.sizes().begin(), x.sizes().end());
   out_sizes.back() = n64;
-  auto y = at::empty(out_sizes, x.options());
+  auto y = torch::stable::new_empty(x, out_sizes);
   if (m == 0 || n == 0 || k == 0) {
     return y;
   }
 
   const size_t workspace_size = static_cast<size_t>(workspace_mb) << 20;
-  at::Tensor workspace;
+  torch::stable::Tensor workspace;
   void* workspace_ptr = nullptr;
   if (workspace_size > 0) {
-    workspace = at::empty({static_cast<int64_t>(workspace_size)}, x.options().dtype(at::kByte));
-    workspace_ptr = workspace.data_ptr();
+    workspace = torch::stable::new_empty(x, {static_cast<int64_t>(workspace_size)}, torch::headeronly::ScalarType::Byte);
+    workspace_ptr = workspace.mutable_data_ptr();
   }
 
   static cublasLtHandle_t lt_handle = nullptr;
@@ -1193,8 +1192,8 @@ at::Tensor linear_f16_lt_cfg_impl(
     cublasLtMatrixLayoutDestroy(b_desc);
     cublasLtMatrixLayoutDestroy(a_desc);
     cublasLtMatmulDescDestroy(op_desc);
-    TORCH_CHECK(returned > 0, "cublasLt found no algorithm");
-    TORCH_CHECK(algo_index < returned,
+    STD_TORCH_CHECK(returned > 0, "cublasLt found no algorithm");
+    STD_TORCH_CHECK(algo_index < returned,
                 "linear_f16_lt requested algorithm ", algo_index, " but only ", returned, " algorithms are available");
   }
   const int selected_algo = algo_index < returned ? static_cast<int>(algo_index) : 0;
@@ -1204,19 +1203,19 @@ at::Tensor linear_f16_lt_cfg_impl(
       lt_handle,
       op_desc,
       &alpha,
-      weight.data_ptr<dtype>(),
+      weight.mutable_data_ptr<dtype>(),
       a_desc,
-      x.data_ptr<dtype>(),
+      x.mutable_data_ptr<dtype>(),
       b_desc,
       &beta,
-      y.data_ptr<dtype>(),
+      y.mutable_data_ptr<dtype>(),
       c_desc,
-      y.data_ptr<dtype>(),
+      y.mutable_data_ptr<dtype>(),
       c_desc,
       &heuristics[selected_algo].algo,
       workspace_ptr,
       workspace_size,
-      at::cuda::getCurrentCUDAStream()),
+      flashrwkv2::validation::current_cuda_stream()),
       "cublasLtMatmul");
   cublasLtMatmulPreferenceDestroy(pref);
   cublasLtMatrixLayoutDestroy(c_desc);
@@ -1227,38 +1226,38 @@ at::Tensor linear_f16_lt_cfg_impl(
 }
 
 template <int ChunkK, int Warps, bool WarpReduce = false>
-at::Tensor linear_f16_m1_splitk_cuda_impl(at::Tensor x, at::Tensor weight) {
+torch::stable::Tensor linear_f16_m1_splitk_cuda_impl(torch::stable::Tensor x, torch::stable::Tensor weight) {
   const int64_t k64 = x.size(-1);
   const int64_t n64 = weight.size(1);
-  TORCH_CHECK(k64 <= INT_MAX && n64 <= INT_MAX, "linear_f16_m1_splitk K/N too large");
+  STD_TORCH_CHECK(k64 <= INT_MAX && n64 <= INT_MAX, "linear_f16_m1_splitk K/N too large");
   const int K = static_cast<int>(k64);
   const int N = static_cast<int>(n64);
-  TORCH_CHECK(x.numel() == k64, "linear_f16_m1_splitk requires M=1");
-  TORCH_CHECK((N % 64) == 0, "linear_f16_m1_splitk requires N multiple of 64");
+  STD_TORCH_CHECK(x.numel() == k64, "linear_f16_m1_splitk requires M=1");
+  STD_TORCH_CHECK((N % 64) == 0, "linear_f16_m1_splitk requires N multiple of 64");
   std::vector<int64_t> out_sizes(x.sizes().begin(), x.sizes().end());
   out_sizes.back() = n64;
-  auto y = at::empty(out_sizes, x.options());
+  auto y = torch::stable::new_empty(x, out_sizes);
   if (K == 0 || N == 0) {
     return y;
   }
   const int chunks = static_cast<int>(ceil_div(K, ChunkK));
-  auto partial = at::empty({chunks, n64}, x.options().dtype(at::kFloat));
-  auto stream = at::cuda::getCurrentCUDAStream();
+  auto partial = torch::stable::new_empty(x, {chunks, n64}, torch::headeronly::ScalarType::Float);
+  auto stream = flashrwkv2::validation::current_cuda_stream();
   linear_f16_m1_splitk_partial_kernel<ChunkK, Warps><<<dim3(ceil_div(N, Warps * 64), chunks, 1), Warps * 32, 0, stream>>>(
-      K, N, x.data_ptr<dtype>(), weight.data_ptr<dtype>(), partial.data_ptr<float>());
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+      K, N, x.mutable_data_ptr<dtype>(), weight.mutable_data_ptr<dtype>(), partial.mutable_data_ptr<float>());
+  FLASHRWKV_CUDA_CHECK(cudaGetLastError());
   if constexpr (WarpReduce) {
     linear_f16_m1_splitk_reduce_warp_kernel<<<static_cast<int>(ceil_div(N / 2, 4)), 128, 0, stream>>>(
-        chunks, N, partial.data_ptr<float>(), y.data_ptr<dtype>());
+        chunks, N, partial.mutable_data_ptr<float>(), y.mutable_data_ptr<dtype>());
   } else {
     linear_f16_m1_splitk_reduce_kernel<<<static_cast<int>(ceil_div(N / 2, 128)), 128, 0, stream>>>(
-        chunks, N, partial.data_ptr<float>(), y.data_ptr<dtype>());
+        chunks, N, partial.mutable_data_ptr<float>(), y.mutable_data_ptr<dtype>());
   }
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  FLASHRWKV_CUDA_CHECK(cudaGetLastError());
   return y;
 }
 
-at::Tensor linear_f16_m1_splitk_cuda(at::Tensor x, at::Tensor weight) {
+torch::stable::Tensor linear_f16_m1_splitk_cuda(torch::stable::Tensor x, torch::stable::Tensor weight) {
   const int64_t K = x.size(-1);
   const int64_t N = weight.size(1);
   if (K == 4096 && N == 4096) {
@@ -1276,72 +1275,72 @@ at::Tensor linear_f16_m1_splitk_cuda(at::Tensor x, at::Tensor weight) {
   return linear_f16_m1_splitk_cuda_impl<256, 4>(x, weight);
 }
 
-at::Tensor linear_t_f16_cuda(at::Tensor x, at::Tensor weight_t) {
+torch::stable::Tensor linear_t_f16_cuda(torch::stable::Tensor x, torch::stable::Tensor weight_t) {
   const int64_t k64 = x.size(-1);
   const int64_t n64 = weight_t.size(0);
-  TORCH_CHECK(k64 <= INT_MAX && n64 <= INT_MAX, "linear_t_f16 K/N too large");
+  STD_TORCH_CHECK(k64 <= INT_MAX && n64 <= INT_MAX, "linear_t_f16 K/N too large");
   const int K = static_cast<int>(k64);
   const int N = static_cast<int>(n64);
   const int64_t m64 = x.numel() / k64;
-  TORCH_CHECK(m64 <= INT_MAX, "linear_t_f16 M too large");
+  STD_TORCH_CHECK(m64 <= INT_MAX, "linear_t_f16 M too large");
   const int M = static_cast<int>(m64);
   std::vector<int64_t> out_sizes(x.sizes().begin(), x.sizes().end());
   out_sizes.back() = n64;
-  auto y = at::empty(out_sizes, x.options());
+  auto y = torch::stable::new_empty(x, out_sizes);
   if (M == 0 || N == 0 || K == 0) {
     return y;
   }
-  auto stream = at::cuda::getCurrentCUDAStream();
+  auto stream = flashrwkv2::validation::current_cuda_stream();
   if (K <= 512 && N >= 1024 && M <= 4) {
     if (M == 1) {
       linear_t_f16_ntile_scalar_kernel<128, 2><<<dim3(ceil_div(N, 2), M, 1), 128, 0, stream>>>(
-          M, K, N, x.data_ptr<dtype>(), weight_t.data_ptr<dtype>(), y.data_ptr<dtype>());
+          M, K, N, x.mutable_data_ptr<dtype>(), weight_t.mutable_data_ptr<dtype>(), y.mutable_data_ptr<dtype>());
     } else {
       linear_t_f16_ntile_kernel<128, 4><<<dim3(ceil_div(N, 4), M, 1), 128, 0, stream>>>(
-          M, K, N, x.data_ptr<dtype>(), weight_t.data_ptr<dtype>(), y.data_ptr<dtype>());
+          M, K, N, x.mutable_data_ptr<dtype>(), weight_t.mutable_data_ptr<dtype>(), y.mutable_data_ptr<dtype>());
     }
   } else if (K >= 1024) {
     linear_t_f16_kernel<256><<<dim3(N, M, 1), 256, 0, stream>>>(
-        M, K, N, x.data_ptr<dtype>(), weight_t.data_ptr<dtype>(), y.data_ptr<dtype>());
+        M, K, N, x.mutable_data_ptr<dtype>(), weight_t.mutable_data_ptr<dtype>(), y.mutable_data_ptr<dtype>());
   } else {
     linear_t_f16_kernel<128><<<dim3(N, M, 1), 128, 0, stream>>>(
-        M, K, N, x.data_ptr<dtype>(), weight_t.data_ptr<dtype>(), y.data_ptr<dtype>());
+        M, K, N, x.mutable_data_ptr<dtype>(), weight_t.mutable_data_ptr<dtype>(), y.mutable_data_ptr<dtype>());
   }
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  FLASHRWKV_CUDA_CHECK(cudaGetLastError());
   return y;
 }
 
 void linear_t_f16_scaled_accumulate_cuda(
-    at::Tensor x,
-    at::Tensor weight_t,
-    at::Tensor output,
+    torch::stable::Tensor x,
+    torch::stable::Tensor weight_t,
+    torch::stable::Tensor output,
     float scale) {
   const int64_t k64 = x.size(-1);
   const int64_t n64 = weight_t.size(0);
   const int64_t m64 = x.numel() / k64;
-  TORCH_CHECK(k64 <= 512 && n64 >= 1024 && m64 >= 1 && m64 <= 4,
+  STD_TORCH_CHECK(k64 <= 512 && n64 >= 1024 && m64 >= 1 && m64 <= 4,
               "small-row LoRA accumulation shape is unsupported");
-  TORCH_CHECK(k64 <= INT_MAX && n64 <= INT_MAX,
+  STD_TORCH_CHECK(k64 <= INT_MAX && n64 <= INT_MAX,
               "small-row LoRA accumulation shape is too large");
-  TORCH_CHECK(output.dim() == 2 && output.size(0) == m64 &&
+  STD_TORCH_CHECK(output.dim() == 2 && output.size(0) == m64 &&
                   output.size(1) == n64,
               "LoRA accumulation output shape mismatch");
   const int K = static_cast<int>(k64);
   const int N = static_cast<int>(n64);
   const int M = static_cast<int>(m64);
-  auto stream = at::cuda::getCurrentCUDAStream();
+  auto stream = flashrwkv2::validation::current_cuda_stream();
   if (M == 1) {
     linear_t_f16_ntile_scaled_accumulate_kernel<128, 2, true>
         <<<dim3(ceil_div(N, 2), M, 1), 128, 0, stream>>>(
-            M, K, N, x.data_ptr<dtype>(), weight_t.data_ptr<dtype>(),
-            output.data_ptr<dtype>(), scale);
+            M, K, N, x.mutable_data_ptr<dtype>(), weight_t.mutable_data_ptr<dtype>(),
+            output.mutable_data_ptr<dtype>(), scale);
   } else {
     linear_t_f16_ntile_scaled_accumulate_kernel<128, 4, false>
         <<<dim3(ceil_div(N, 4), M, 1), 128, 0, stream>>>(
-            M, K, N, x.data_ptr<dtype>(), weight_t.data_ptr<dtype>(),
-            output.data_ptr<dtype>(), scale);
+            M, K, N, x.mutable_data_ptr<dtype>(), weight_t.mutable_data_ptr<dtype>(),
+            output.mutable_data_ptr<dtype>(), scale);
   }
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  FLASHRWKV_CUDA_CHECK(cudaGetLastError());
 }
 
 enum class RankProjectionBackend : uint8_t {
@@ -1441,12 +1440,12 @@ const RankProjectionConfig* find_rank_projection_config(
   return nullptr;
 }
 
-at::Tensor internal_linear_rank_projection_f16_cuda(
-    at::Tensor x,
-    const std::optional<at::Tensor>& weight,
-    const std::optional<at::Tensor>& weight_orig,
+torch::stable::Tensor internal_linear_rank_projection_f16_cuda(
+    torch::stable::Tensor x,
+    const std::optional<torch::stable::Tensor>& weight,
+    const std::optional<torch::stable::Tensor>& weight_orig,
     bool input_projection) {
-  TORCH_CHECK(weight.has_value() || weight_orig.has_value(),
+  STD_TORCH_CHECK(weight.has_value() || weight_orig.has_value(),
               "one of weight or weight_t must be provided");
   const int64_t input_features = x.size(-1);
   const int64_t rows64 = x.numel() / input_features;
@@ -1456,7 +1455,7 @@ at::Tensor internal_linear_rank_projection_f16_cuda(
   const int64_t rank64 = input_projection
       ? (weight.has_value() ? weight->size(1) : weight_orig->size(0))
       : (weight.has_value() ? weight->size(0) : weight_orig->size(1));
-  TORCH_CHECK(rows64 <= INT_MAX && rank64 <= INT_MAX,
+  STD_TORCH_CHECK(rows64 <= INT_MAX && rank64 <= INT_MAX,
               "rank projection shape exceeds int32");
 
   const RankProjectionConfig* config = nullptr;
@@ -1498,19 +1497,19 @@ at::Tensor internal_linear_rank_projection_f16_cuda(
 
 
 
-at::Tensor internal_linear_transposed_f16_cuda(
-    at::Tensor x, at::Tensor weight) {
+torch::stable::Tensor internal_linear_transposed_f16_cuda(
+    torch::stable::Tensor x, torch::stable::Tensor weight) {
   if (x.numel() == x.size(-1) && weight.size(1) % 64 == 0) {
     return linear_f16_m1_splitk_cuda(x, weight);
   }
   return linear_f16_cuda(x, weight);
 }
 
-at::Tensor internal_linear_lora_accumulate_f16_cuda(
-    at::Tensor x,
-    at::Tensor lora_a,
-    at::Tensor lora_b,
-    at::Tensor output,
+torch::stable::Tensor internal_linear_lora_accumulate_f16_cuda(
+    torch::stable::Tensor x,
+    torch::stable::Tensor lora_a,
+    torch::stable::Tensor lora_b,
+    torch::stable::Tensor output,
     double lora_scale) {
   const int64_t rows = x.size(0);
   const float scale = static_cast<float>(lora_scale);

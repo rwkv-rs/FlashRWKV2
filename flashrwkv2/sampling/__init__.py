@@ -16,7 +16,7 @@ def _extension():
             "FlashRWKV2 CUDA extension is not built; build flashrwkv2._C before "
             "using the sampling operators"
         )
-    return extension
+    return torch.ops.flashrwkv2
 
 
 def _scalar(value: object, name: str) -> int | float | None:
@@ -136,7 +136,8 @@ def setup_sampling_states(seed: int, num_slots: int) -> torch.Tensor:
         raise TypeError("seed must be an int")
     if not isinstance(num_slots, int) or isinstance(num_slots, bool) or num_slots <= 0:
         raise ValueError("num_slots must be a positive int")
-    return _extension().setup_sampling_states(seed, num_slots)
+    anchor = torch.empty(0, device="cuda")
+    return _extension().setup_sampling_states(anchor, seed, num_slots)
 
 
 def infer_sampling_temperature_topk_topp_forward_varlen(
@@ -165,7 +166,7 @@ def infer_sampling_temperature_topk_topp_forward_varlen(
     scalar_top_k = _scalar(top_k, "top_k")
     scalar_top_p = _scalar(top_p, "top_p")
     if None not in (scalar_temperature, scalar_top_k, scalar_top_p):
-        return _extension().sampling_temperature_topk_topp_forward_varlen(
+        return _extension().sampling_temperature_topk_topp_scalar_forward_varlen(
             logits,
             states,
             slot_indices,
@@ -176,7 +177,7 @@ def infer_sampling_temperature_topk_topp_forward_varlen(
             active_samples,
         )
     batch_size = logits.shape[0]
-    return _extension().sampling_temperature_topk_topp_forward_varlen(
+    return _extension().sampling_temperature_topk_topp_per_request_forward_varlen(
         logits,
         states,
         slot_indices,
@@ -250,7 +251,7 @@ def infer_sampling_six_parameter_forward_varlen(
     )
     scalars = tuple(_scalar(value, name) for value, name in zip(values, names, strict=True))
     if all(value is not None for value in scalars):
-        return _extension().sampling_six_parameter_forward_varlen(
+        return _extension().sampling_six_parameter_scalar_forward_varlen(
             logits,
             penalties,
             states,
@@ -276,7 +277,7 @@ def infer_sampling_six_parameter_forward_varlen(
         )
         for value, name in zip(values, names, strict=True)
     )
-    return _extension().sampling_six_parameter_forward_varlen(
+    return _extension().sampling_six_parameter_per_request_forward_varlen(
         logits,
         penalties,
         states,

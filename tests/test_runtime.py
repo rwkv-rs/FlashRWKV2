@@ -105,6 +105,27 @@ def test_backend_loader_handles_cpu_and_publishes_alias(monkeypatch) -> None:
         sys.modules.pop("flashrwkv2._C", None)
 
 
+def test_backend_loader_honors_isolated_test_backend(monkeypatch) -> None:
+    import flashrwkv2
+
+    sentinel = object()
+    monkeypatch.setenv("FLASHRWKV_TEST_BACKEND", "_C_sm90")
+    monkeypatch.setattr(flashrwkv2._torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        flashrwkv2._torch.cuda, "get_device_capability", lambda: (12, 0)
+    )
+    monkeypatch.setattr(
+        flashrwkv2._importlib,
+        "import_module",
+        lambda name: sentinel if name == "flashrwkv2._C_sm90" else None,
+    )
+    try:
+        assert flashrwkv2._load_native_backend() is sentinel
+        assert sys.modules["flashrwkv2._C"] is sentinel
+    finally:
+        sys.modules.pop("flashrwkv2._C", None)
+
+
 def test_missing_backend_reports_capability_and_selection(monkeypatch) -> None:
     import flashrwkv2
 

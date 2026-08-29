@@ -4,10 +4,12 @@
 // TMix WKV Prepare owns caller-specific projection dispatch and the public
 // fusion contract. Shared GEMM primitives remain native-private.
 
+#include "validation.h"
+
 #include "../../internal/linear/backend.cuh"
 
-at::Tensor tmix_wkv_prepare_projection_dispatch_f16_cuda(
-    at::Tensor x, at::Tensor weight_orig) {
+torch::stable::Tensor tmix_wkv_prepare_projection_dispatch_f16_cuda(
+    torch::stable::Tensor x, torch::stable::Tensor weight_orig) {
   const int64_t c = x.size(-1);
   const int64_t rows = x.numel() / c;
 

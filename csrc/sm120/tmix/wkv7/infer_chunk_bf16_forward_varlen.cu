@@ -4,11 +4,7 @@
 // K1 prepares RWKV-7 chunk transforms and K2 applies them to the request
 // state.  The packed boundary is supplied by cu_seqlens; no padding is used.
 
-#include <ATen/ATen.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
-#include <c10/cuda/CUDAException.h>
-#include <torch/extension.h>
+#include "validation.h"
 
 #include "recurrent_decay.cuh"
 
@@ -274,67 +270,67 @@ void infer_chunk_bf16_k2_kernel(
 }  // namespace
 
 void infer_tmix_wkv7_chunk_bf16_forward_varlen_cuda(
-    torch::Tensor query_start_loc,
-    torch::Tensor state_indices,
-    torch::Tensor state_pool,
-    torch::Tensor r,
-    torch::Tensor decay_logits,
-    torch::Tensor decay_bias,
-    torch::Tensor k,
-    torch::Tensor v,
-    torch::Tensor a,
-    torch::Tensor b,
-    torch::Tensor output,
-    torch::Tensor chunk_transform,
-    torch::Tensor chunk_bias,
-    torch::Tensor token_transform,
-    torch::Tensor token_bias,
+    torch::stable::Tensor query_start_loc,
+    torch::stable::Tensor state_indices,
+    torch::stable::Tensor state_pool,
+    torch::stable::Tensor r,
+    torch::stable::Tensor decay_logits,
+    torch::stable::Tensor decay_bias,
+    torch::stable::Tensor k,
+    torch::stable::Tensor v,
+    torch::stable::Tensor a,
+    torch::stable::Tensor b,
+    torch::stable::Tensor output,
+    torch::stable::Tensor chunk_transform,
+    torch::stable::Tensor chunk_bias,
+    torch::stable::Tensor token_transform,
+    torch::stable::Tensor token_bias,
     int64_t chunk_size,
     int64_t max_seqlen,
     double scale,
-    torch::Tensor metadata_status) {
-  const c10::cuda::CUDAGuard device_guard(r.device());
-  const auto stream = at::cuda::getCurrentCUDAStream();
+    torch::stable::Tensor metadata_status) {
+  const torch::stable::accelerator::DeviceGuard device_guard(r.device().index());
+  const auto stream = flashrwkv2::validation::current_cuda_stream();
   const int num_sequences = static_cast<int>(state_indices.numel());
   const int num_heads = static_cast<int>(r.size(1));
   const int max_chunks = static_cast<int>(
       (max_seqlen + chunk_size - 1) / chunk_size);
-  using io_t = at::BFloat16;
+  using io_t = torch::headeronly::BFloat16;
 
   infer_chunk_bf16_k1_kernel<io_t><<<
       num_sequences * num_heads, kHeadSize, 0, stream>>>(
       num_heads,
       static_cast<int>(chunk_size),
       max_chunks,
-      query_start_loc.data_ptr<int>(),
-      metadata_status.data_ptr<int>(),
-      r.data_ptr<io_t>(),
-      decay_logits.data_ptr<io_t>(),
-      decay_bias.defined() ? decay_bias.data_ptr<io_t>() : nullptr,
-      k.data_ptr<io_t>(),
-      v.data_ptr<io_t>(),
-      a.data_ptr<io_t>(),
-      b.data_ptr<io_t>(),
-      chunk_transform.data_ptr<float>(),
-      chunk_bias.data_ptr<float>(),
-      token_transform.data_ptr<float>(),
-      token_bias.data_ptr<float>(),
+      query_start_loc.mutable_data_ptr<int>(),
+      metadata_status.mutable_data_ptr<int>(),
+      r.mutable_data_ptr<io_t>(),
+      decay_logits.mutable_data_ptr<io_t>(),
+      decay_bias.defined() ? decay_bias.mutable_data_ptr<io_t>() : nullptr,
+      k.mutable_data_ptr<io_t>(),
+      v.mutable_data_ptr<io_t>(),
+      a.mutable_data_ptr<io_t>(),
+      b.mutable_data_ptr<io_t>(),
+      chunk_transform.mutable_data_ptr<float>(),
+      chunk_bias.mutable_data_ptr<float>(),
+      token_transform.mutable_data_ptr<float>(),
+      token_bias.mutable_data_ptr<float>(),
       static_cast<float>(scale));
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  FLASHRWKV_CUDA_CHECK(cudaGetLastError());
 
   infer_chunk_bf16_k2_kernel<io_t><<<
       num_sequences * num_heads, kHeadSize, 0, stream>>>(
       num_heads,
       static_cast<int>(chunk_size),
       max_chunks,
-      query_start_loc.data_ptr<int>(),
-      state_indices.data_ptr<int>(),
-      metadata_status.data_ptr<int>(),
-      state_pool.data_ptr<io_t>(),
-      output.data_ptr<io_t>(),
-      chunk_transform.data_ptr<float>(),
-      chunk_bias.data_ptr<float>(),
-      token_transform.data_ptr<float>(),
-      token_bias.data_ptr<float>());
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+      query_start_loc.mutable_data_ptr<int>(),
+      state_indices.mutable_data_ptr<int>(),
+      metadata_status.mutable_data_ptr<int>(),
+      state_pool.mutable_data_ptr<io_t>(),
+      output.mutable_data_ptr<io_t>(),
+      chunk_transform.mutable_data_ptr<float>(),
+      chunk_bias.mutable_data_ptr<float>(),
+      token_transform.mutable_data_ptr<float>(),
+      token_bias.mutable_data_ptr<float>());
+  FLASHRWKV_CUDA_CHECK(cudaGetLastError());
 }

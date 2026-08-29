@@ -5,9 +5,8 @@
 // Local adaptation: module-local FlashRWKV2 binding names only; tensor contract
 // remains the canonical train_temp [B,T,C] BF16 contract.
 
-#include <torch/extension.h>
+#include "validation.h"
 
-#include <ATen/cuda/CUDAContext.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -20,15 +19,15 @@ constexpr float kInvNormalizeEps = 1.0e12f;
 constexpr int kHeadSize = 64;
 constexpr int kWarpsPerBlock = 4;
 
-__device__ inline __nv_bfloat162 load_bf16x2(const at::BFloat16* ptr) {
+__device__ inline __nv_bfloat162 load_bf16x2(const torch::headeronly::BFloat16* ptr) {
     return *reinterpret_cast<const __nv_bfloat162*>(ptr);
 }
 
-__device__ inline void store_bf16x2(at::BFloat16* ptr, float x0, float x1) {
+__device__ inline void store_bf16x2(torch::headeronly::BFloat16* ptr, float x0, float x1) {
     *reinterpret_cast<__nv_bfloat162*>(ptr) = __floats2bfloat162_rn(x0, x1);
 }
 
-__device__ inline void store_bf16(at::BFloat16* ptr, float value) {
+__device__ inline void store_bf16(torch::headeronly::BFloat16* ptr, float value) {
     *reinterpret_cast<__nv_bfloat16*>(ptr) = __float2bfloat16(value);
 }
 
@@ -62,13 +61,13 @@ inline int64_t ceil_div(int64_t n, int64_t d) {
 }
 
 __global__ void tmix_kk_pre_forward64_v5_kernel(
-    const at::BFloat16* __restrict__ k,
-    const at::BFloat16* __restrict__ k_k,
-    const at::BFloat16* __restrict__ a,
-    const at::BFloat16* __restrict__ k_a,
-    at::BFloat16* __restrict__ new_k,
-    at::BFloat16* __restrict__ neg_kk,
-    at::BFloat16* __restrict__ kka,
+    const torch::headeronly::BFloat16* __restrict__ k,
+    const torch::headeronly::BFloat16* __restrict__ k_k,
+    const torch::headeronly::BFloat16* __restrict__ a,
+    const torch::headeronly::BFloat16* __restrict__ k_a,
+    torch::headeronly::BFloat16* __restrict__ new_k,
+    torch::headeronly::BFloat16* __restrict__ neg_kk,
+    torch::headeronly::BFloat16* __restrict__ kka,
     float* __restrict__ inv_d_out,
     int64_t bth_size,
     int64_t h_size) {
@@ -118,13 +117,13 @@ __global__ void tmix_kk_pre_forward64_v5_kernel(
 
 template <int HeadSize>
 __global__ void tmix_kk_pre_forward_tiled_kernel(
-    const at::BFloat16* __restrict__ k,
-    const at::BFloat16* __restrict__ k_k,
-    const at::BFloat16* __restrict__ a,
-    const at::BFloat16* __restrict__ k_a,
-    at::BFloat16* __restrict__ new_k,
-    at::BFloat16* __restrict__ neg_kk,
-    at::BFloat16* __restrict__ kka,
+    const torch::headeronly::BFloat16* __restrict__ k,
+    const torch::headeronly::BFloat16* __restrict__ k_k,
+    const torch::headeronly::BFloat16* __restrict__ a,
+    const torch::headeronly::BFloat16* __restrict__ k_a,
+    torch::headeronly::BFloat16* __restrict__ new_k,
+    torch::headeronly::BFloat16* __restrict__ neg_kk,
+    torch::headeronly::BFloat16* __restrict__ kka,
     float* __restrict__ inv_d_out,
     int64_t bth_size,
     int64_t h_size) {
@@ -152,17 +151,17 @@ __global__ void tmix_kk_pre_forward_tiled_kernel(
 }
 
 __global__ void tmix_kk_pre_backward64_v5_kernel(
-    const at::BFloat16* __restrict__ grad_new_k,
-    const at::BFloat16* __restrict__ grad_neg_kk,
-    const at::BFloat16* __restrict__ grad_kka,
-    const at::BFloat16* __restrict__ k,
-    const at::BFloat16* __restrict__ k_k,
-    const at::BFloat16* __restrict__ a,
-    const at::BFloat16* __restrict__ k_a,
+    const torch::headeronly::BFloat16* __restrict__ grad_new_k,
+    const torch::headeronly::BFloat16* __restrict__ grad_neg_kk,
+    const torch::headeronly::BFloat16* __restrict__ grad_kka,
+    const torch::headeronly::BFloat16* __restrict__ k,
+    const torch::headeronly::BFloat16* __restrict__ k_k,
+    const torch::headeronly::BFloat16* __restrict__ a,
+    const torch::headeronly::BFloat16* __restrict__ k_a,
     const float* __restrict__ inv_d_buf,
-    at::BFloat16* __restrict__ grad_k,
+    torch::headeronly::BFloat16* __restrict__ grad_k,
     float* __restrict__ grad_k_k,
-    at::BFloat16* __restrict__ grad_a,
+    torch::headeronly::BFloat16* __restrict__ grad_a,
     float* __restrict__ grad_k_a,
     int64_t bth_size,
     int64_t h_size) {
@@ -227,7 +226,7 @@ __global__ void tmix_kk_pre_backward64_v5_kernel(
 
 __global__ void cast_float_to_bf16_kernel(
     const float* __restrict__ src,
-    at::BFloat16* __restrict__ dst,
+    torch::headeronly::BFloat16* __restrict__ dst,
     int64_t size) {
     const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= size) {
@@ -237,46 +236,46 @@ __global__ void cast_float_to_bf16_kernel(
 }
 
 }
-std::vector<torch::Tensor> pretrain_tmix_kk_pre_cuda(
-    torch::Tensor k,
-    torch::Tensor k_k,
-    torch::Tensor a,
-    torch::Tensor k_a,
+std::vector<torch::stable::Tensor> pretrain_tmix_kk_pre_cuda(
+    torch::stable::Tensor k,
+    torch::stable::Tensor k_k,
+    torch::stable::Tensor a,
+    torch::stable::Tensor k_a,
     int64_t head_size) {
-    auto new_k = torch::empty_like(k);
-    auto neg_kk = torch::empty_like(k);
-    auto kka = torch::empty_like(k);
-    auto inv_d = torch::empty({k.size(0), k.size(1), k.size(2) / head_size}, k.options().dtype(torch::kFloat32));
+    auto new_k = torch::stable::empty_like(k);
+    auto neg_kk = torch::stable::empty_like(k);
+    auto kka = torch::stable::empty_like(k);
+    auto inv_d = torch::stable::new_empty(k, {k.size(0), k.size(1), k.size(2) / head_size}, torch::headeronly::ScalarType::Float);
 
     const int64_t h_size = k.size(2) / head_size;
     const int64_t bth_size = k.size(0) * k.size(1) * h_size;
     const int blocks = static_cast<int>(ceil_div(bth_size, static_cast<int64_t>(kWarpsPerBlock)));
-    auto stream = at::cuda::getCurrentCUDAStream();
+    auto stream = flashrwkv2::validation::current_cuda_stream();
     if (head_size == 64) {
       tmix_kk_pre_forward64_v5_kernel<<<blocks, kWarpsPerBlock * 32, 0, stream>>>(
-        k.data_ptr<at::BFloat16>(),
-        k_k.data_ptr<at::BFloat16>(),
-        a.data_ptr<at::BFloat16>(),
-        k_a.data_ptr<at::BFloat16>(),
-        new_k.data_ptr<at::BFloat16>(),
-        neg_kk.data_ptr<at::BFloat16>(),
-        kka.data_ptr<at::BFloat16>(),
-        inv_d.data_ptr<float>(),
+        k.mutable_data_ptr<torch::headeronly::BFloat16>(),
+        k_k.mutable_data_ptr<torch::headeronly::BFloat16>(),
+        a.mutable_data_ptr<torch::headeronly::BFloat16>(),
+        k_a.mutable_data_ptr<torch::headeronly::BFloat16>(),
+        new_k.mutable_data_ptr<torch::headeronly::BFloat16>(),
+        neg_kk.mutable_data_ptr<torch::headeronly::BFloat16>(),
+        kka.mutable_data_ptr<torch::headeronly::BFloat16>(),
+        inv_d.mutable_data_ptr<float>(),
         bth_size,
         h_size);
     } else if (head_size == 128) {
       tmix_kk_pre_forward_tiled_kernel<128><<<bth_size, 64, 0, stream>>>(
-        k.data_ptr<at::BFloat16>(), k_k.data_ptr<at::BFloat16>(),
-        a.data_ptr<at::BFloat16>(), k_a.data_ptr<at::BFloat16>(),
-        new_k.data_ptr<at::BFloat16>(), neg_kk.data_ptr<at::BFloat16>(),
-        kka.data_ptr<at::BFloat16>(), inv_d.data_ptr<float>(), bth_size, h_size);
+        k.mutable_data_ptr<torch::headeronly::BFloat16>(), k_k.mutable_data_ptr<torch::headeronly::BFloat16>(),
+        a.mutable_data_ptr<torch::headeronly::BFloat16>(), k_a.mutable_data_ptr<torch::headeronly::BFloat16>(),
+        new_k.mutable_data_ptr<torch::headeronly::BFloat16>(), neg_kk.mutable_data_ptr<torch::headeronly::BFloat16>(),
+        kka.mutable_data_ptr<torch::headeronly::BFloat16>(), inv_d.mutable_data_ptr<float>(), bth_size, h_size);
     } else {
       tmix_kk_pre_forward_tiled_kernel<256><<<bth_size, 128, 0, stream>>>(
-        k.data_ptr<at::BFloat16>(), k_k.data_ptr<at::BFloat16>(),
-        a.data_ptr<at::BFloat16>(), k_a.data_ptr<at::BFloat16>(),
-        new_k.data_ptr<at::BFloat16>(), neg_kk.data_ptr<at::BFloat16>(),
-        kka.data_ptr<at::BFloat16>(), inv_d.data_ptr<float>(), bth_size, h_size);
+        k.mutable_data_ptr<torch::headeronly::BFloat16>(), k_k.mutable_data_ptr<torch::headeronly::BFloat16>(),
+        a.mutable_data_ptr<torch::headeronly::BFloat16>(), k_a.mutable_data_ptr<torch::headeronly::BFloat16>(),
+        new_k.mutable_data_ptr<torch::headeronly::BFloat16>(), neg_kk.mutable_data_ptr<torch::headeronly::BFloat16>(),
+        kka.mutable_data_ptr<torch::headeronly::BFloat16>(), inv_d.mutable_data_ptr<float>(), bth_size, h_size);
     }
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    FLASHRWKV_CUDA_CHECK(cudaGetLastError());
     return {new_k, neg_kk, kka, inv_d};
 }

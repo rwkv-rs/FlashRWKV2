@@ -4,10 +4,8 @@
 // Source revision: 952102498e9ed367ea0a59ee64106916d474d30f.
 // Local adaptation: use the caller's initial shift and return the last input.
 
-#include <torch/extension.h>
+#include "validation.h"
 
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAException.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -15,11 +13,11 @@
 
 namespace {
 
-__device__ inline __nv_bfloat162 load_bf16x2(const at::BFloat16* ptr) {
+__device__ inline __nv_bfloat162 load_bf16x2(const torch::headeronly::BFloat16* ptr) {
   return *reinterpret_cast<const __nv_bfloat162*>(ptr);
 }
 
-__device__ inline void store_bf16x2(at::BFloat16* ptr,
+__device__ inline void store_bf16x2(torch::headeronly::BFloat16* ptr,
                                     __nv_bfloat162 value) {
   *reinterpret_cast<__nv_bfloat162*>(ptr) = value;
 }
@@ -27,20 +25,20 @@ __device__ inline void store_bf16x2(at::BFloat16* ptr,
 inline int64_t ceil_div(int64_t n, int64_t d) { return (n + d - 1) / d; }
 
 __global__ void statetune_tmix_tokenshift_forward_kernel(
-    const at::BFloat16* __restrict__ x,
-    const at::BFloat16* __restrict__ initial_shift,
-    const at::BFloat16* __restrict__ x_r,
-    const at::BFloat16* __restrict__ x_w,
-    const at::BFloat16* __restrict__ x_k,
-    const at::BFloat16* __restrict__ x_v,
-    const at::BFloat16* __restrict__ x_a,
-    const at::BFloat16* __restrict__ x_g,
-    at::BFloat16* __restrict__ out_r,
-    at::BFloat16* __restrict__ out_w,
-    at::BFloat16* __restrict__ out_k,
-    at::BFloat16* __restrict__ out_v,
-    at::BFloat16* __restrict__ out_a,
-    at::BFloat16* __restrict__ out_g, int64_t bt_size, int64_t t_size,
+    const torch::headeronly::BFloat16* __restrict__ x,
+    const torch::headeronly::BFloat16* __restrict__ initial_shift,
+    const torch::headeronly::BFloat16* __restrict__ x_r,
+    const torch::headeronly::BFloat16* __restrict__ x_w,
+    const torch::headeronly::BFloat16* __restrict__ x_k,
+    const torch::headeronly::BFloat16* __restrict__ x_v,
+    const torch::headeronly::BFloat16* __restrict__ x_a,
+    const torch::headeronly::BFloat16* __restrict__ x_g,
+    torch::headeronly::BFloat16* __restrict__ out_r,
+    torch::headeronly::BFloat16* __restrict__ out_w,
+    torch::headeronly::BFloat16* __restrict__ out_k,
+    torch::headeronly::BFloat16* __restrict__ out_v,
+    torch::headeronly::BFloat16* __restrict__ out_a,
+    torch::headeronly::BFloat16* __restrict__ out_g, int64_t bt_size, int64_t t_size,
     int64_t c_size) {
   const int64_t pair_idx =
       static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -75,31 +73,32 @@ __global__ void statetune_tmix_tokenshift_forward_kernel(
 
 }  // namespace
 
-std::vector<torch::Tensor> statetune_tmix_tokenshift_forward_cuda(
-    torch::Tensor x, torch::Tensor initial_shift, torch::Tensor x_r,
-    torch::Tensor x_w, torch::Tensor x_k, torch::Tensor x_v,
-    torch::Tensor x_a, torch::Tensor x_g) {
-  auto out_r = torch::empty_like(x);
-  auto out_w = torch::empty_like(x);
-  auto out_k = torch::empty_like(x);
-  auto out_v = torch::empty_like(x);
-  auto out_a = torch::empty_like(x);
-  auto out_g = torch::empty_like(x);
+std::vector<torch::stable::Tensor> statetune_tmix_tokenshift_forward_cuda(
+    torch::stable::Tensor x, torch::stable::Tensor initial_shift, torch::stable::Tensor x_r,
+    torch::stable::Tensor x_w, torch::stable::Tensor x_k, torch::stable::Tensor x_v,
+    torch::stable::Tensor x_a, torch::stable::Tensor x_g) {
+  auto out_r = torch::stable::empty_like(x);
+  auto out_w = torch::stable::empty_like(x);
+  auto out_k = torch::stable::empty_like(x);
+  auto out_v = torch::stable::empty_like(x);
+  auto out_a = torch::stable::empty_like(x);
+  auto out_g = torch::stable::empty_like(x);
   const int64_t bt_size = x.size(0) * x.size(1);
   const int64_t total_pairs = bt_size * (x.size(2) / 2);
   constexpr int threads = 256;
   const int blocks = static_cast<int>(ceil_div(total_pairs, threads));
-  auto stream = at::cuda::getCurrentCUDAStream();
+  auto stream = flashrwkv2::validation::current_cuda_stream();
   statetune_tmix_tokenshift_forward_kernel<<<blocks, threads, 0, stream>>>(
-      x.data_ptr<at::BFloat16>(), initial_shift.data_ptr<at::BFloat16>(),
-      x_r.data_ptr<at::BFloat16>(), x_w.data_ptr<at::BFloat16>(),
-      x_k.data_ptr<at::BFloat16>(), x_v.data_ptr<at::BFloat16>(),
-      x_a.data_ptr<at::BFloat16>(), x_g.data_ptr<at::BFloat16>(),
-      out_r.data_ptr<at::BFloat16>(), out_w.data_ptr<at::BFloat16>(),
-      out_k.data_ptr<at::BFloat16>(), out_v.data_ptr<at::BFloat16>(),
-      out_a.data_ptr<at::BFloat16>(), out_g.data_ptr<at::BFloat16>(), bt_size,
+      x.mutable_data_ptr<torch::headeronly::BFloat16>(), initial_shift.mutable_data_ptr<torch::headeronly::BFloat16>(),
+      x_r.mutable_data_ptr<torch::headeronly::BFloat16>(), x_w.mutable_data_ptr<torch::headeronly::BFloat16>(),
+      x_k.mutable_data_ptr<torch::headeronly::BFloat16>(), x_v.mutable_data_ptr<torch::headeronly::BFloat16>(),
+      x_a.mutable_data_ptr<torch::headeronly::BFloat16>(), x_g.mutable_data_ptr<torch::headeronly::BFloat16>(),
+      out_r.mutable_data_ptr<torch::headeronly::BFloat16>(), out_w.mutable_data_ptr<torch::headeronly::BFloat16>(),
+      out_k.mutable_data_ptr<torch::headeronly::BFloat16>(), out_v.mutable_data_ptr<torch::headeronly::BFloat16>(),
+      out_a.mutable_data_ptr<torch::headeronly::BFloat16>(), out_g.mutable_data_ptr<torch::headeronly::BFloat16>(), bt_size,
       x.size(1), x.size(2));
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-  auto next_shift = x.select(1, x.size(1) - 1).contiguous();
+  FLASHRWKV_CUDA_CHECK(cudaGetLastError());
+  auto next_shift = torch::stable::contiguous(
+      torch::stable::select(x, 1, x.size(1) - 1));
   return {out_r, out_w, out_k, out_v, out_a, out_g, next_shift};
 }

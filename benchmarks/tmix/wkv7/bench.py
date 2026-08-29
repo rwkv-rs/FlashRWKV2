@@ -184,8 +184,6 @@ def _sha256_paths(paths: Iterable[Path]) -> str:
 
 def _native_source_set_hash(root: Path) -> str:
     relative_paths = (
-        "csrc/bindings.cpp",
-        "csrc/bindings.h",
         "csrc/registration.cpp",
         "csrc/validation.cpp",
         "csrc/validation.h",
@@ -563,9 +561,13 @@ def _measure_deltalog_experiment(
         state_pool_size=state_template.shape[0],
         max_seqlen=1,
     )
-    extension = flashrwkv2._C
-    if extension is None:
+    backend = flashrwkv2._C
+    if backend is None:
         raise RuntimeError("flashrwkv2._C is not loaded")
+    extension = torch.ops.flashrwkv2
+    launch_query_start_loc = ticket._query_start_loc_snapshot()
+    launch_state_indices = ticket._state_indices_snapshot()
+    metadata_status = ticket._status()
     output = torch.empty_like(packed[3])
 
     normal_state = state_template.clone()
@@ -579,28 +581,28 @@ def _measure_deltalog_experiment(
         for _ in range(merge_interval):
             if operator == "fp16":
                 extension.tmix_wkv7_recurrent_fp16_from_decay_logits(
-                    cu_seqlens,
-                    state_indices,
+                    launch_query_start_loc,
+                    launch_state_indices,
                     normal_elapsed,
                     normal_state,
                     *packed,
                     output,
                     1.0,
-                    decay_bias=decay_bias,
-                    validated_metadata=ticket,
-                    max_seqlen=1,
+                    decay_bias,
+                    metadata_status,
+                    1,
                 )
             else:
                 extension.tmix_wkv7_recurrent_fp32_from_decay_logits(
-                    cu_seqlens,
-                    state_indices,
+                    launch_query_start_loc,
+                    launch_state_indices,
                     normal_state,
                     *packed,
                     output,
                     1.0,
-                    decay_bias=decay_bias,
-                    validated_metadata=ticket,
-                    max_seqlen=1,
+                    decay_bias,
+                    metadata_status,
+                    1,
                 )
 
     normal_timing = measure_cuda(run_normal_cycle, before_batch=reset_normal)
@@ -636,8 +638,8 @@ def _measure_deltalog_experiment(
         for _ in range(merge_interval):
             if operator == "fp16":
                 extension.tmix_wkv7_recurrent_deltalog_fp16_from_decay_logits(
-                    cu_seqlens,
-                    state_indices,
+                    launch_query_start_loc,
+                    launch_state_indices,
                     deltalog_elapsed,
                     phase,
                     deltalog_state,
@@ -645,21 +647,23 @@ def _measure_deltalog_experiment(
                     *packed,
                     output,
                     1.0,
-                    decay_bias=decay_bias,
-                    validated_metadata=ticket,
+                    decay_bias,
+                    metadata_status,
+                    None,
                 )
             else:
                 extension.tmix_wkv7_recurrent_deltalog_fp32io16_from_decay_logits(
-                    cu_seqlens,
-                    state_indices,
+                    launch_query_start_loc,
+                    launch_state_indices,
                     phase,
                     deltalog_state,
                     logs,
                     *packed,
                     output,
                     1.0,
-                    decay_bias=decay_bias,
-                    validated_metadata=ticket,
+                    decay_bias,
+                    metadata_status,
+                    None,
                 )
 
     deltalog_timing = measure_cuda(

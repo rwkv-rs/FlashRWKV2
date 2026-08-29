@@ -5,9 +5,8 @@
 // Local adaptation: module-local FlashRWKV2 binding names only; tensor contract
 // remains the canonical train_temp [B,T,C] BF16 contract.
 
-#include <torch/extension.h>
+#include "validation.h"
 
-#include <ATen/cuda/CUDAContext.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -33,17 +32,17 @@ inline int read_backward_threads() {
     if (const char* env = std::getenv("VRES_GATE_BWD_THREADS")) {
         threads = std::atoi(env);
     }
-    TORCH_CHECK(
+    STD_TORCH_CHECK(
         threads == 64 || threads == 128 || threads == 256 || threads == 512,
         "VRES_GATE_BWD_THREADS must be one of 64, 128, 256, 512");
     return threads;
 }
 
-__device__ inline float load_bf16(const at::BFloat16* ptr) {
+__device__ inline float load_bf16(const torch::headeronly::BFloat16* ptr) {
     return __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(ptr));
 }
 
-__device__ inline void store_bf16(at::BFloat16* ptr, float value) {
+__device__ inline void store_bf16(torch::headeronly::BFloat16* ptr, float value) {
     *reinterpret_cast<__nv_bfloat16*>(ptr) = __float2bfloat16_rn(value);
 }
 
@@ -53,11 +52,11 @@ __device__ inline float sigmoidf_fast(float x) {
 
 template <bool kPow2C>
 __global__ void vres_gate_v3_forward_kernel(
-    const at::BFloat16* __restrict__ v,
-    const at::BFloat16* __restrict__ v_first,
-    const at::BFloat16* __restrict__ v0,
-    const at::BFloat16* __restrict__ v12,
-    at::BFloat16* __restrict__ out,
+    const torch::headeronly::BFloat16* __restrict__ v,
+    const torch::headeronly::BFloat16* __restrict__ v_first,
+    const torch::headeronly::BFloat16* __restrict__ v0,
+    const torch::headeronly::BFloat16* __restrict__ v12,
+    torch::headeronly::BFloat16* __restrict__ out,
     int64_t total,
     int64_t c_size_or_mask) {
     const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -77,14 +76,14 @@ __global__ void vres_gate_v3_forward_kernel(
 // partials. Do not replace this with a full FP32 grad_pre tensor: at the main
 // B4T8192C4096 shape that intermediate alone is 512 MiB.
 __global__ void vres_gate_v3_backward_tiled_kernel(
-    const at::BFloat16* __restrict__ grad_out,
-    const at::BFloat16* __restrict__ v,
-    const at::BFloat16* __restrict__ v_first,
-    const at::BFloat16* __restrict__ v0,
-    const at::BFloat16* __restrict__ v12,
-    at::BFloat16* __restrict__ grad_v,
-    at::BFloat16* __restrict__ grad_v_first,
-    at::BFloat16* __restrict__ grad_v12,
+    const torch::headeronly::BFloat16* __restrict__ grad_out,
+    const torch::headeronly::BFloat16* __restrict__ v,
+    const torch::headeronly::BFloat16* __restrict__ v_first,
+    const torch::headeronly::BFloat16* __restrict__ v0,
+    const torch::headeronly::BFloat16* __restrict__ v12,
+    torch::headeronly::BFloat16* __restrict__ grad_v,
+    torch::headeronly::BFloat16* __restrict__ grad_v_first,
+    torch::headeronly::BFloat16* __restrict__ grad_v12,
     float* __restrict__ partial_v0,
     int64_t rows,
     int64_t c_size) {
@@ -121,7 +120,7 @@ __global__ void vres_gate_v3_backward_tiled_kernel(
 
 __global__ void vres_gate_v3_reduce_v0_kernel(
     const float* __restrict__ partial_v0,
-    at::BFloat16* __restrict__ grad_v0,
+    torch::headeronly::BFloat16* __restrict__ grad_v0,
     int64_t num_tiles,
     int64_t c_size) {
     const int64_t c = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -137,49 +136,48 @@ __global__ void vres_gate_v3_reduce_v0_kernel(
 }
 
 }
-std::vector<torch::Tensor> pretrain_tmix_vres_gate_backward_cuda(
-    torch::Tensor grad_out,
-    torch::Tensor v,
-    torch::Tensor v_first,
-    torch::Tensor v0,
-    torch::Tensor v12) {
-    auto grad_v = torch::empty_like(v);
-    auto grad_v_first = torch::empty_like(v_first);
-    auto grad_v0 = torch::empty_like(v0);
-    auto grad_v12 = torch::empty_like(v12);
+std::vector<torch::stable::Tensor> pretrain_tmix_vres_gate_backward_cuda(
+    torch::stable::Tensor grad_out,
+    torch::stable::Tensor v,
+    torch::stable::Tensor v_first,
+    torch::stable::Tensor v0,
+    torch::stable::Tensor v12) {
+    auto grad_v = torch::stable::empty_like(v);
+    auto grad_v_first = torch::stable::empty_like(v_first);
+    auto grad_v0 = torch::stable::empty_like(v0);
+    auto grad_v12 = torch::stable::empty_like(v12);
 
     const int64_t rows = v.numel() / v.size(2);
     const int64_t c_size = v.size(2);
     const int64_t num_tiles = ceil_div(rows, static_cast<int64_t>(kBackwardTileRows));
-    auto partial_v0 = torch::empty(
-        {num_tiles, c_size},
-        v.options().dtype(torch::kFloat32));
+    auto partial_v0 = torch::stable::new_empty(
+        v, {num_tiles, c_size}, torch::headeronly::ScalarType::Float);
     const int threads = read_backward_threads();
     const dim3 blocks(
         static_cast<unsigned int>(ceil_div(c_size, static_cast<int64_t>(threads))),
         static_cast<unsigned int>(num_tiles));
-    auto stream = at::cuda::getCurrentCUDAStream();
+    auto stream = flashrwkv2::validation::current_cuda_stream();
 
     vres_gate_v3_backward_tiled_kernel<<<blocks, threads, 0, stream>>>(
-        grad_out.data_ptr<at::BFloat16>(),
-        v.data_ptr<at::BFloat16>(),
-        v_first.data_ptr<at::BFloat16>(),
-        v0.data_ptr<at::BFloat16>(),
-        v12.data_ptr<at::BFloat16>(),
-        grad_v.data_ptr<at::BFloat16>(),
-        grad_v_first.data_ptr<at::BFloat16>(),
-        grad_v12.data_ptr<at::BFloat16>(),
-        partial_v0.data_ptr<float>(),
+        grad_out.mutable_data_ptr<torch::headeronly::BFloat16>(),
+        v.mutable_data_ptr<torch::headeronly::BFloat16>(),
+        v_first.mutable_data_ptr<torch::headeronly::BFloat16>(),
+        v0.mutable_data_ptr<torch::headeronly::BFloat16>(),
+        v12.mutable_data_ptr<torch::headeronly::BFloat16>(),
+        grad_v.mutable_data_ptr<torch::headeronly::BFloat16>(),
+        grad_v_first.mutable_data_ptr<torch::headeronly::BFloat16>(),
+        grad_v12.mutable_data_ptr<torch::headeronly::BFloat16>(),
+        partial_v0.mutable_data_ptr<float>(),
         rows,
         c_size);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    FLASHRWKV_CUDA_CHECK(cudaGetLastError());
 
     const int reduce_blocks = static_cast<int>(ceil_div(c_size, static_cast<int64_t>(threads)));
     vres_gate_v3_reduce_v0_kernel<<<reduce_blocks, threads, 0, stream>>>(
-        partial_v0.data_ptr<float>(),
-        grad_v0.data_ptr<at::BFloat16>(),
+        partial_v0.mutable_data_ptr<float>(),
+        grad_v0.mutable_data_ptr<torch::headeronly::BFloat16>(),
         num_tiles,
         c_size);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    FLASHRWKV_CUDA_CHECK(cudaGetLastError());
     return {grad_v, grad_v_first, grad_v0, grad_v12};
 }

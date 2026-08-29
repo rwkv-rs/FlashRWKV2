@@ -5,9 +5,8 @@
 // Local adaptation: module-local FlashRWKV2 binding names only; tensor contract
 // remains the canonical train_temp [B,T,C] BF16 contract.
 
-#include <torch/extension.h>
+#include "validation.h"
 
-#include <ATen/cuda/CUDAContext.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -24,15 +23,15 @@ constexpr int kRowsPerBlock = TMIX_LNX_RKVRES_XG_ROWS_PER_BLOCK;
 constexpr int kThreads = kWarpSize * kRowsPerBlock;
 constexpr float kLnXEps = 64e-5f;
 
-__device__ inline __nv_bfloat162 load_bf16x2(const at::BFloat16* ptr) {
+__device__ inline __nv_bfloat162 load_bf16x2(const torch::headeronly::BFloat16* ptr) {
     return *reinterpret_cast<const __nv_bfloat162*>(ptr);
 }
 
-__device__ inline void store_bf16(at::BFloat16* ptr, float value) {
+__device__ inline void store_bf16(torch::headeronly::BFloat16* ptr, float value) {
     *reinterpret_cast<__nv_bfloat16*>(ptr) = __float2bfloat16(value);
 }
 
-__device__ inline void store_bf16x2(at::BFloat16* ptr, float v0, float v1) {
+__device__ inline void store_bf16x2(torch::headeronly::BFloat16* ptr, float v0, float v1) {
     *reinterpret_cast<__nv_bfloat162*>(ptr) = __floats2bfloat162_rn(v0, v1);
 }
 
@@ -61,15 +60,15 @@ inline int64_t ceil_div(int64_t n, int64_t d) {
 }
 
 __global__ void tmix_lnx_rkvres_xg_v1_forward_kernel(
-    const at::BFloat16* __restrict__ x,
-    const at::BFloat16* __restrict__ r,
-    const at::BFloat16* __restrict__ k,
-    const at::BFloat16* __restrict__ v,
-    const at::BFloat16* __restrict__ r_k,
-    const at::BFloat16* __restrict__ weight,
-    const at::BFloat16* __restrict__ bias,
-    const at::BFloat16* __restrict__ g,
-    at::BFloat16* __restrict__ xg,
+    const torch::headeronly::BFloat16* __restrict__ x,
+    const torch::headeronly::BFloat16* __restrict__ r,
+    const torch::headeronly::BFloat16* __restrict__ k,
+    const torch::headeronly::BFloat16* __restrict__ v,
+    const torch::headeronly::BFloat16* __restrict__ r_k,
+    const torch::headeronly::BFloat16* __restrict__ weight,
+    const torch::headeronly::BFloat16* __restrict__ bias,
+    const torch::headeronly::BFloat16* __restrict__ g,
+    torch::headeronly::BFloat16* __restrict__ xg,
     float* __restrict__ mean,
     float* __restrict__ rstd,
     int64_t ngroups,
@@ -126,9 +125,9 @@ __global__ void tmix_lnx_rkvres_xg_v1_forward_kernel(
 
 template<int HeadSize>
 __global__ void tmix_lnx_forward_tiled_kernel(
-    const at::BFloat16* x,const at::BFloat16* r,const at::BFloat16* k,
-    const at::BFloat16* v,const at::BFloat16* r_k,const at::BFloat16* weight,
-    const at::BFloat16* bias,const at::BFloat16* g,at::BFloat16* xg,
+    const torch::headeronly::BFloat16* x,const torch::headeronly::BFloat16* r,const torch::headeronly::BFloat16* k,
+    const torch::headeronly::BFloat16* v,const torch::headeronly::BFloat16* r_k,const torch::headeronly::BFloat16* weight,
+    const torch::headeronly::BFloat16* bias,const torch::headeronly::BFloat16* g,torch::headeronly::BFloat16* xg,
     float* mean,float* rstd,int64_t ngroups) {
     const int64_t group=blockIdx.x,row=blockIdx.y;
     const int pair=threadIdx.x;
@@ -153,25 +152,25 @@ __global__ void tmix_lnx_forward_tiled_kernel(
 }
 
 __global__ void tmix_lnx_rkvres_xg_v1_backward_kernel(
-    const at::BFloat16* __restrict__ grad_xg,
-    const at::BFloat16* __restrict__ x,
-    const at::BFloat16* __restrict__ r,
-    const at::BFloat16* __restrict__ k,
-    const at::BFloat16* __restrict__ v,
-    const at::BFloat16* __restrict__ r_k,
-    const at::BFloat16* __restrict__ weight,
-    const at::BFloat16* __restrict__ bias,
-    const at::BFloat16* __restrict__ g,
+    const torch::headeronly::BFloat16* __restrict__ grad_xg,
+    const torch::headeronly::BFloat16* __restrict__ x,
+    const torch::headeronly::BFloat16* __restrict__ r,
+    const torch::headeronly::BFloat16* __restrict__ k,
+    const torch::headeronly::BFloat16* __restrict__ v,
+    const torch::headeronly::BFloat16* __restrict__ r_k,
+    const torch::headeronly::BFloat16* __restrict__ weight,
+    const torch::headeronly::BFloat16* __restrict__ bias,
+    const torch::headeronly::BFloat16* __restrict__ g,
     const float* __restrict__ mean,
     const float* __restrict__ rstd,
-    at::BFloat16* __restrict__ grad_x,
-    at::BFloat16* __restrict__ grad_r,
-    at::BFloat16* __restrict__ grad_k,
-    at::BFloat16* __restrict__ grad_v,
+    torch::headeronly::BFloat16* __restrict__ grad_x,
+    torch::headeronly::BFloat16* __restrict__ grad_r,
+    torch::headeronly::BFloat16* __restrict__ grad_k,
+    torch::headeronly::BFloat16* __restrict__ grad_v,
     float* __restrict__ grad_r_k,
     float* __restrict__ grad_weight,
     float* __restrict__ grad_bias,
-    at::BFloat16* __restrict__ grad_g,
+    torch::headeronly::BFloat16* __restrict__ grad_g,
     int64_t ngroups,
     int64_t nrows) {
     __shared__ float s_gw0[kRowsPerBlock][kWarpSize];
@@ -305,7 +304,7 @@ __global__ void tmix_lnx_rkvres_xg_v1_backward_kernel(
 
 __global__ void cast_float_to_bf16_kernel(
     const float* __restrict__ src,
-    at::BFloat16* __restrict__ dst,
+    torch::headeronly::BFloat16* __restrict__ dst,
     int64_t size) {
     const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= size) {
@@ -315,48 +314,48 @@ __global__ void cast_float_to_bf16_kernel(
 }
 
 }
-std::vector<torch::Tensor> pretrain_tmix_readout_cuda(
-    torch::Tensor x,
-    torch::Tensor r,
-    torch::Tensor k,
-    torch::Tensor v,
-    torch::Tensor r_k,
-    torch::Tensor weight,
-    torch::Tensor bias,
-    torch::Tensor g,
+std::vector<torch::stable::Tensor> pretrain_tmix_readout_cuda(
+    torch::stable::Tensor x,
+    torch::stable::Tensor r,
+    torch::stable::Tensor k,
+    torch::stable::Tensor v,
+    torch::stable::Tensor r_k,
+    torch::stable::Tensor weight,
+    torch::stable::Tensor bias,
+    torch::stable::Tensor g,
     int64_t head_size) {
-    auto xg = torch::empty_like(x);
+    auto xg = torch::stable::empty_like(x);
     const int64_t b = x.size(0);
     const int64_t t = x.size(1);
     const int64_t c = x.size(2);
     const int64_t ngroups = c / head_size;
-    auto mean = torch::empty({b, t, ngroups}, x.options().dtype(torch::kFloat32));
-    auto rstd = torch::empty({b, t, ngroups}, x.options().dtype(torch::kFloat32));
+    auto mean = torch::stable::new_empty(x, {b, t, ngroups}, torch::headeronly::ScalarType::Float);
+    auto rstd = torch::stable::new_empty(x, {b, t, ngroups}, torch::headeronly::ScalarType::Float);
 
-    auto stream = at::cuda::getCurrentCUDAStream();
+    auto stream = flashrwkv2::validation::current_cuda_stream();
     if (head_size == 64) {
       const dim3 blocks(static_cast<unsigned int>(ngroups), static_cast<unsigned int>(ceil_div(b * t, static_cast<int64_t>(kRowsPerBlock))));
       tmix_lnx_rkvres_xg_v1_forward_kernel<<<blocks, kThreads, 0, stream>>>(
-        x.data_ptr<at::BFloat16>(),
-        r.data_ptr<at::BFloat16>(),
-        k.data_ptr<at::BFloat16>(),
-        v.data_ptr<at::BFloat16>(),
-        r_k.data_ptr<at::BFloat16>(),
-        weight.data_ptr<at::BFloat16>(),
-        bias.data_ptr<at::BFloat16>(),
-        g.data_ptr<at::BFloat16>(),
-        xg.data_ptr<at::BFloat16>(),
-        mean.data_ptr<float>(),
-        rstd.data_ptr<float>(),
+        x.mutable_data_ptr<torch::headeronly::BFloat16>(),
+        r.mutable_data_ptr<torch::headeronly::BFloat16>(),
+        k.mutable_data_ptr<torch::headeronly::BFloat16>(),
+        v.mutable_data_ptr<torch::headeronly::BFloat16>(),
+        r_k.mutable_data_ptr<torch::headeronly::BFloat16>(),
+        weight.mutable_data_ptr<torch::headeronly::BFloat16>(),
+        bias.mutable_data_ptr<torch::headeronly::BFloat16>(),
+        g.mutable_data_ptr<torch::headeronly::BFloat16>(),
+        xg.mutable_data_ptr<torch::headeronly::BFloat16>(),
+        mean.mutable_data_ptr<float>(),
+        rstd.mutable_data_ptr<float>(),
         ngroups,
         b * t);
     } else if (head_size == 128) {
       tmix_lnx_forward_tiled_kernel<128><<<dim3(ngroups,b*t),64,0,stream>>>(
-        x.data_ptr<at::BFloat16>(),r.data_ptr<at::BFloat16>(),k.data_ptr<at::BFloat16>(),v.data_ptr<at::BFloat16>(),r_k.data_ptr<at::BFloat16>(),weight.data_ptr<at::BFloat16>(),bias.data_ptr<at::BFloat16>(),g.data_ptr<at::BFloat16>(),xg.data_ptr<at::BFloat16>(),mean.data_ptr<float>(),rstd.data_ptr<float>(),ngroups);
+        x.mutable_data_ptr<torch::headeronly::BFloat16>(),r.mutable_data_ptr<torch::headeronly::BFloat16>(),k.mutable_data_ptr<torch::headeronly::BFloat16>(),v.mutable_data_ptr<torch::headeronly::BFloat16>(),r_k.mutable_data_ptr<torch::headeronly::BFloat16>(),weight.mutable_data_ptr<torch::headeronly::BFloat16>(),bias.mutable_data_ptr<torch::headeronly::BFloat16>(),g.mutable_data_ptr<torch::headeronly::BFloat16>(),xg.mutable_data_ptr<torch::headeronly::BFloat16>(),mean.mutable_data_ptr<float>(),rstd.mutable_data_ptr<float>(),ngroups);
     } else {
       tmix_lnx_forward_tiled_kernel<256><<<dim3(ngroups,b*t),128,0,stream>>>(
-        x.data_ptr<at::BFloat16>(),r.data_ptr<at::BFloat16>(),k.data_ptr<at::BFloat16>(),v.data_ptr<at::BFloat16>(),r_k.data_ptr<at::BFloat16>(),weight.data_ptr<at::BFloat16>(),bias.data_ptr<at::BFloat16>(),g.data_ptr<at::BFloat16>(),xg.data_ptr<at::BFloat16>(),mean.data_ptr<float>(),rstd.data_ptr<float>(),ngroups);
+        x.mutable_data_ptr<torch::headeronly::BFloat16>(),r.mutable_data_ptr<torch::headeronly::BFloat16>(),k.mutable_data_ptr<torch::headeronly::BFloat16>(),v.mutable_data_ptr<torch::headeronly::BFloat16>(),r_k.mutable_data_ptr<torch::headeronly::BFloat16>(),weight.mutable_data_ptr<torch::headeronly::BFloat16>(),bias.mutable_data_ptr<torch::headeronly::BFloat16>(),g.mutable_data_ptr<torch::headeronly::BFloat16>(),xg.mutable_data_ptr<torch::headeronly::BFloat16>(),mean.mutable_data_ptr<float>(),rstd.mutable_data_ptr<float>(),ngroups);
     }
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    FLASHRWKV_CUDA_CHECK(cudaGetLastError());
     return {xg, mean, rstd};
 }

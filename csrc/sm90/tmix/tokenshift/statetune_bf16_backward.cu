@@ -4,10 +4,8 @@
 // Source revision: 952102498e9ed367ea0a59ee64106916d474d30f.
 // Local adaptation: propagate nonzero initial and returned shift gradients.
 
-#include <torch/extension.h>
+#include "validation.h"
 
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAException.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -15,10 +13,10 @@
 
 namespace {
 
-__device__ inline __nv_bfloat162 load_bf16x2(const at::BFloat16* ptr) {
+__device__ inline __nv_bfloat162 load_bf16x2(const torch::headeronly::BFloat16* ptr) {
   return *reinterpret_cast<const __nv_bfloat162*>(ptr);
 }
-__device__ inline void store_bf16x2(at::BFloat16* ptr,
+__device__ inline void store_bf16x2(torch::headeronly::BFloat16* ptr,
                                     __nv_bfloat162 value) {
   *reinterpret_cast<__nv_bfloat162*>(ptr) = value;
 }
@@ -28,23 +26,23 @@ __device__ inline void atomic_add_float2(float* ptr, float2 value) {
 inline int64_t ceil_div(int64_t n, int64_t d) { return (n + d - 1) / d; }
 
 __global__ void statetune_tmix_tokenshift_backward_kernel(
-    const at::BFloat16* __restrict__ grad_r,
-    const at::BFloat16* __restrict__ grad_w,
-    const at::BFloat16* __restrict__ grad_k,
-    const at::BFloat16* __restrict__ grad_v,
-    const at::BFloat16* __restrict__ grad_a,
-    const at::BFloat16* __restrict__ grad_g,
-    const at::BFloat16* __restrict__ grad_next,
-    const at::BFloat16* __restrict__ x,
-    const at::BFloat16* __restrict__ initial_shift,
-    const at::BFloat16* __restrict__ x_r,
-    const at::BFloat16* __restrict__ x_w,
-    const at::BFloat16* __restrict__ x_k,
-    const at::BFloat16* __restrict__ x_v,
-    const at::BFloat16* __restrict__ x_a,
-    const at::BFloat16* __restrict__ x_g,
-    at::BFloat16* __restrict__ grad_x,
-    at::BFloat16* __restrict__ grad_initial, float* __restrict__ grad_x_r,
+    const torch::headeronly::BFloat16* __restrict__ grad_r,
+    const torch::headeronly::BFloat16* __restrict__ grad_w,
+    const torch::headeronly::BFloat16* __restrict__ grad_k,
+    const torch::headeronly::BFloat16* __restrict__ grad_v,
+    const torch::headeronly::BFloat16* __restrict__ grad_a,
+    const torch::headeronly::BFloat16* __restrict__ grad_g,
+    const torch::headeronly::BFloat16* __restrict__ grad_next,
+    const torch::headeronly::BFloat16* __restrict__ x,
+    const torch::headeronly::BFloat16* __restrict__ initial_shift,
+    const torch::headeronly::BFloat16* __restrict__ x_r,
+    const torch::headeronly::BFloat16* __restrict__ x_w,
+    const torch::headeronly::BFloat16* __restrict__ x_k,
+    const torch::headeronly::BFloat16* __restrict__ x_v,
+    const torch::headeronly::BFloat16* __restrict__ x_a,
+    const torch::headeronly::BFloat16* __restrict__ x_g,
+    torch::headeronly::BFloat16* __restrict__ grad_x,
+    torch::headeronly::BFloat16* __restrict__ grad_initial, float* __restrict__ grad_x_r,
     float* __restrict__ grad_x_w, float* __restrict__ grad_x_k,
     float* __restrict__ grad_x_v, float* __restrict__ grad_x_a,
     float* __restrict__ grad_x_g, int64_t b_size, int64_t t_size,
@@ -172,7 +170,7 @@ __global__ void statetune_tmix_tokenshift_backward_kernel(
 }
 
 __global__ void cast_float_to_bf16_vec2_kernel(
-    const float* __restrict__ source, at::BFloat16* __restrict__ target,
+    const float* __restrict__ source, torch::headeronly::BFloat16* __restrict__ target,
     int64_t pairs) {
   const int64_t pair =
       static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -184,48 +182,46 @@ __global__ void cast_float_to_bf16_vec2_kernel(
 
 }  // namespace
 
-std::vector<torch::Tensor> statetune_tmix_tokenshift_backward_cuda(
-    torch::Tensor grad_r, torch::Tensor grad_w, torch::Tensor grad_k,
-    torch::Tensor grad_v, torch::Tensor grad_a, torch::Tensor grad_g,
-    torch::Tensor grad_next_shift, torch::Tensor x,
-    torch::Tensor initial_shift, torch::Tensor x_r, torch::Tensor x_w,
-    torch::Tensor x_k, torch::Tensor x_v, torch::Tensor x_a,
-    torch::Tensor x_g) {
-  auto grad_x = torch::empty_like(x);
-  auto grad_initial = torch::empty_like(initial_shift);
-  auto fp32 = x.options().dtype(torch::kFloat32);
-  std::vector<torch::Tensor> accumulators;
-  std::vector<torch::Tensor> coefficient_grads;
+std::vector<torch::stable::Tensor> statetune_tmix_tokenshift_backward_cuda(
+    torch::stable::Tensor grad_r, torch::stable::Tensor grad_w, torch::stable::Tensor grad_k,
+    torch::stable::Tensor grad_v, torch::stable::Tensor grad_a, torch::stable::Tensor grad_g,
+    torch::stable::Tensor grad_next_shift, torch::stable::Tensor x,
+    torch::stable::Tensor initial_shift, torch::stable::Tensor x_r, torch::stable::Tensor x_w,
+    torch::stable::Tensor x_k, torch::stable::Tensor x_v, torch::stable::Tensor x_a,
+    torch::stable::Tensor x_g) {
+  auto grad_x = torch::stable::empty_like(x);
+  auto grad_initial = torch::stable::empty_like(initial_shift);  std::vector<torch::stable::Tensor> accumulators;
+  std::vector<torch::stable::Tensor> coefficient_grads;
   for (int i = 0; i < 6; ++i) {
-    accumulators.push_back(torch::zeros({x.size(2)}, fp32));
-    coefficient_grads.push_back(torch::empty({x.size(2)}, x.options()));
+    accumulators.push_back(torch::stable::new_zeros(x, {x.size(2)}, torch::headeronly::ScalarType::Float));
+    coefficient_grads.push_back(torch::stable::new_empty(x, {x.size(2)}));
   }
   constexpr int threads = 256;
   const int64_t bc_pairs = x.size(0) * (x.size(2) / 2);
   const int blocks = static_cast<int>(ceil_div(bc_pairs, threads));
-  auto stream = at::cuda::getCurrentCUDAStream();
+  auto stream = flashrwkv2::validation::current_cuda_stream();
   statetune_tmix_tokenshift_backward_kernel<<<blocks, threads, 0, stream>>>(
-      grad_r.data_ptr<at::BFloat16>(), grad_w.data_ptr<at::BFloat16>(),
-      grad_k.data_ptr<at::BFloat16>(), grad_v.data_ptr<at::BFloat16>(),
-      grad_a.data_ptr<at::BFloat16>(), grad_g.data_ptr<at::BFloat16>(),
-      grad_next_shift.data_ptr<at::BFloat16>(), x.data_ptr<at::BFloat16>(),
-      initial_shift.data_ptr<at::BFloat16>(), x_r.data_ptr<at::BFloat16>(),
-      x_w.data_ptr<at::BFloat16>(), x_k.data_ptr<at::BFloat16>(),
-      x_v.data_ptr<at::BFloat16>(), x_a.data_ptr<at::BFloat16>(),
-      x_g.data_ptr<at::BFloat16>(), grad_x.data_ptr<at::BFloat16>(),
-      grad_initial.data_ptr<at::BFloat16>(), accumulators[0].data_ptr<float>(),
-      accumulators[1].data_ptr<float>(), accumulators[2].data_ptr<float>(),
-      accumulators[3].data_ptr<float>(), accumulators[4].data_ptr<float>(),
-      accumulators[5].data_ptr<float>(), x.size(0), x.size(1), x.size(2));
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+      grad_r.mutable_data_ptr<torch::headeronly::BFloat16>(), grad_w.mutable_data_ptr<torch::headeronly::BFloat16>(),
+      grad_k.mutable_data_ptr<torch::headeronly::BFloat16>(), grad_v.mutable_data_ptr<torch::headeronly::BFloat16>(),
+      grad_a.mutable_data_ptr<torch::headeronly::BFloat16>(), grad_g.mutable_data_ptr<torch::headeronly::BFloat16>(),
+      grad_next_shift.mutable_data_ptr<torch::headeronly::BFloat16>(), x.mutable_data_ptr<torch::headeronly::BFloat16>(),
+      initial_shift.mutable_data_ptr<torch::headeronly::BFloat16>(), x_r.mutable_data_ptr<torch::headeronly::BFloat16>(),
+      x_w.mutable_data_ptr<torch::headeronly::BFloat16>(), x_k.mutable_data_ptr<torch::headeronly::BFloat16>(),
+      x_v.mutable_data_ptr<torch::headeronly::BFloat16>(), x_a.mutable_data_ptr<torch::headeronly::BFloat16>(),
+      x_g.mutable_data_ptr<torch::headeronly::BFloat16>(), grad_x.mutable_data_ptr<torch::headeronly::BFloat16>(),
+      grad_initial.mutable_data_ptr<torch::headeronly::BFloat16>(), accumulators[0].mutable_data_ptr<float>(),
+      accumulators[1].mutable_data_ptr<float>(), accumulators[2].mutable_data_ptr<float>(),
+      accumulators[3].mutable_data_ptr<float>(), accumulators[4].mutable_data_ptr<float>(),
+      accumulators[5].mutable_data_ptr<float>(), x.size(0), x.size(1), x.size(2));
+  FLASHRWKV_CUDA_CHECK(cudaGetLastError());
   const int cast_blocks =
       static_cast<int>(ceil_div(x.size(2) / 2, threads));
   for (int i = 0; i < 6; ++i) {
     cast_float_to_bf16_vec2_kernel<<<cast_blocks, threads, 0, stream>>>(
-        accumulators[i].data_ptr<float>(),
-        coefficient_grads[i].data_ptr<at::BFloat16>(), x.size(2) / 2);
+        accumulators[i].mutable_data_ptr<float>(),
+        coefficient_grads[i].mutable_data_ptr<torch::headeronly::BFloat16>(), x.size(2) / 2);
   }
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  FLASHRWKV_CUDA_CHECK(cudaGetLastError());
   return {grad_x, grad_initial, coefficient_grads[0], coefficient_grads[1],
           coefficient_grads[2], coefficient_grads[3], coefficient_grads[4],
           coefficient_grads[5]};

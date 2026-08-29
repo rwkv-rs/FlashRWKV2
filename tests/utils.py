@@ -82,7 +82,7 @@ def require_cuda_backend(
                 f"does not own any of {expected_backends}"
             )
         missing = [
-            name for name in required_symbols if not hasattr(forced_backend, name)
+            name for name in required_symbols if not hasattr(torch.ops.flashrwkv2, name)
         ]
         assert not missing, (
             f"{forced_backend.__name__} is missing required symbols: {missing}"
@@ -101,7 +101,9 @@ def require_cuda_backend(
     backend = flashrwkv2._C
     assert backend is not None, "matching CUDA hardware did not load a backend"
     assert backend.__name__ == f"flashrwkv2.{expected_for_device}"
-    missing = [name for name in required_symbols if not hasattr(backend, name)]
+    missing = [
+        name for name in required_symbols if not hasattr(torch.ops.flashrwkv2, name)
+    ]
     assert not missing, (
         f"{expected_for_device} is missing required symbols: {missing}"
     )

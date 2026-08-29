@@ -8,11 +8,12 @@
 // by the private Linear provider and post_norm. Packed-row selection is local
 // varlen adaptation; no generic GEMM or LN body is implemented here.
 
+#include "validation.h"
+
 #include "../../internal/linear/backend.cuh"
 
-#include <ATen/ATen.h>
-at::Tensor head_linear_dispatch_f16_cuda(
-    at::Tensor x, at::Tensor weight_orig) {
+torch::stable::Tensor head_linear_dispatch_f16_cuda(
+    torch::stable::Tensor x, torch::stable::Tensor weight_orig) {
   const int64_t c = x.size(-1);
   const int64_t rows = x.numel() / c;
 
@@ -78,8 +79,8 @@ at::Tensor head_linear_dispatch_f16_cuda(
   return linear_f16_orig_cuda(x, weight_orig);
 }
 
-at::Tensor head_linear_all_forward_varlen_cuda(
-    at::Tensor x, at::Tensor weight) {
+torch::stable::Tensor head_linear_all_forward_varlen_cuda(
+    torch::stable::Tensor x, torch::stable::Tensor weight) {
   // Mechanical copy of HEAD_ALL_LOGITS_GEMM_4096 from the canonical
   // Albatross caller.  The table selects the existing original-layout Lt
   // body; an unlisted row count follows the existing head caller dispatch.
@@ -100,8 +101,8 @@ at::Tensor head_linear_all_forward_varlen_cuda(
   return head_linear_dispatch_f16_cuda(x, weight);
 }
 
-at::Tensor head_linear_last_forward_varlen_cuda(
-    at::Tensor x, at::Tensor weight, int64_t tokens_count) {
+torch::stable::Tensor head_linear_last_forward_varlen_cuda(
+    torch::stable::Tensor x, torch::stable::Tensor weight, int64_t tokens_count) {
   // Mechanical copy of HEAD_LAST_LOGITS_GEMM_4096.  This is deliberately
   // keyed by (rows, tokens_count): the last-logits GEMM has B rows even when
   // the preceding packed request contained B*T tokens.

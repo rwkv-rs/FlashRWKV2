@@ -10,10 +10,8 @@
 // cu_seqlens identifies the request boundary and state_indices identifies the
 // request's shift-state slot.  No alternate CMix implementation is kept here.
 
-#include <ATen/ATen.h>
-#include <ATen/cuda/CUDAContext.h>
 #include <cuda_fp16.h>
-#include <torch/extension.h>
+#include "validation.h"
 
 #include <cstdint>
 #include <vector>
@@ -22,7 +20,7 @@ namespace {
 
 constexpr unsigned int kMaxGridDimYZ = 65535;
 
-using dtype = at::Half;
+using dtype = torch::headeronly::Half;
 
 __device__ inline __half2 load_h2(const dtype* ptr) {
   return *reinterpret_cast<const __half2*>(ptr);
@@ -222,14 +220,14 @@ void cmix_tokenshift_forward_varlen_cuda(
     int total_tokens,
     int channels,
     int max_seqlen,
-    torch::Tensor x,
-    torch::Tensor shift_state,
-    torch::Tensor x_k,
-    torch::Tensor output,
-    torch::Tensor query_start_loc,
-    torch::Tensor state_indices,
-    torch::Tensor metadata_status,
-    torch::Tensor token_predecessor) {
+    torch::stable::Tensor x,
+    torch::stable::Tensor shift_state,
+    torch::stable::Tensor x_k,
+    torch::stable::Tensor output,
+    torch::stable::Tensor query_start_loc,
+    torch::stable::Tensor state_indices,
+    torch::stable::Tensor metadata_status,
+    torch::stable::Tensor token_predecessor) {
   constexpr int threads = 256;
   constexpr int cmix_tokenshift_3d_b1_t_4096[] = {2, 4, 16, 64, 512};
   // Albatross uses grid=(channel_tiles,T,B).  This packed adaptation places
@@ -248,7 +246,7 @@ void cmix_tokenshift_forward_varlen_cuda(
     }
   }
 
-  const auto stream = at::cuda::getCurrentCUDAStream();
+  const auto stream = flashrwkv2::validation::current_cuda_stream();
   const int pairs = channels >> 1;
   if (use_3d) {
     // The upstream 3-D family is retained; y addresses packed tokens instead
@@ -261,12 +259,12 @@ void cmix_tokenshift_forward_varlen_cuda(
         batch_size,
         total_tokens,
         channels,
-        reinterpret_cast<const dtype*>(x.data_ptr()),
-        reinterpret_cast<dtype*>(shift_state.data_ptr()),
-        reinterpret_cast<const dtype*>(x_k.data_ptr()),
-        reinterpret_cast<dtype*>(output.data_ptr()),
-        token_predecessor.data_ptr<int>(),
-        metadata_status.data_ptr<int>());
+        reinterpret_cast<const dtype*>(x.mutable_data_ptr()),
+        reinterpret_cast<dtype*>(shift_state.mutable_data_ptr()),
+        reinterpret_cast<const dtype*>(x_k.mutable_data_ptr()),
+        reinterpret_cast<dtype*>(output.mutable_data_ptr()),
+        token_predecessor.mutable_data_ptr<int>(),
+        metadata_status.mutable_data_ptr<int>());
   } else {
     const int64_t total_pairs = static_cast<int64_t>(total_tokens) * pairs;
     if (max_seqlen == 1) {
@@ -278,12 +276,12 @@ void cmix_tokenshift_forward_varlen_cuda(
           batch_size,
           total_tokens,
           channels,
-          reinterpret_cast<const dtype*>(x.data_ptr()),
-          reinterpret_cast<dtype*>(shift_state.data_ptr()),
-          reinterpret_cast<const dtype*>(x_k.data_ptr()),
-          reinterpret_cast<dtype*>(output.data_ptr()),
-          token_predecessor.data_ptr<int>(),
-          metadata_status.data_ptr<int>());
+          reinterpret_cast<const dtype*>(x.mutable_data_ptr()),
+          reinterpret_cast<dtype*>(shift_state.mutable_data_ptr()),
+          reinterpret_cast<const dtype*>(x_k.mutable_data_ptr()),
+          reinterpret_cast<dtype*>(output.mutable_data_ptr()),
+          token_predecessor.mutable_data_ptr<int>(),
+          metadata_status.mutable_data_ptr<int>());
     } else {
       cmix_tokenshift_varlen_kernel<false, false><<<
           static_cast<int>((total_pairs + threads - 1) / threads),
@@ -293,12 +291,12 @@ void cmix_tokenshift_forward_varlen_cuda(
           batch_size,
           total_tokens,
           channels,
-          reinterpret_cast<const dtype*>(x.data_ptr()),
-          reinterpret_cast<dtype*>(shift_state.data_ptr()),
-          reinterpret_cast<const dtype*>(x_k.data_ptr()),
-          reinterpret_cast<dtype*>(output.data_ptr()),
-          token_predecessor.data_ptr<int>(),
-          metadata_status.data_ptr<int>());
+          reinterpret_cast<const dtype*>(x.mutable_data_ptr()),
+          reinterpret_cast<dtype*>(shift_state.mutable_data_ptr()),
+          reinterpret_cast<const dtype*>(x_k.mutable_data_ptr()),
+          reinterpret_cast<dtype*>(output.mutable_data_ptr()),
+          token_predecessor.mutable_data_ptr<int>(),
+          metadata_status.mutable_data_ptr<int>());
     }
   }
 
@@ -306,37 +304,37 @@ void cmix_tokenshift_forward_varlen_cuda(
     update_shift_state_last_varlen_kernel<<<batch_size, threads, 0, stream>>>(
         batch_size,
         channels,
-        reinterpret_cast<const dtype*>(x.data_ptr()),
-        reinterpret_cast<dtype*>(shift_state.data_ptr()),
-        query_start_loc.data_ptr<int>(),
-        state_indices.data_ptr<int>(),
-        metadata_status.data_ptr<int>());
+        reinterpret_cast<const dtype*>(x.mutable_data_ptr()),
+        reinterpret_cast<dtype*>(shift_state.mutable_data_ptr()),
+        query_start_loc.mutable_data_ptr<int>(),
+        state_indices.mutable_data_ptr<int>(),
+        metadata_status.mutable_data_ptr<int>());
   }
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  FLASHRWKV_CUDA_CHECK(cudaGetLastError());
 }
 
-std::vector<torch::Tensor> cmix_res_ln_tokenshift_fused_forward_cuda(
-    torch::Tensor x,
-    torch::Tensor res,
-    torch::Tensor shift_state,
-    torch::Tensor weight,
-    torch::Tensor bias,
-    torch::Tensor x_k,
-    torch::Tensor token_predecessor,
-    torch::Tensor metadata_status,
+std::vector<torch::stable::Tensor> cmix_res_ln_tokenshift_fused_forward_cuda(
+    torch::stable::Tensor x,
+    torch::stable::Tensor res,
+    torch::stable::Tensor shift_state,
+    torch::stable::Tensor weight,
+    torch::stable::Tensor bias,
+    torch::stable::Tensor x_k,
+    torch::stable::Tensor token_predecessor,
+    torch::stable::Tensor metadata_status,
     double eps) {
-  auto res_out = torch::empty_like(x);
-  auto mixed = torch::empty_like(x);
+  auto res_out = torch::stable::empty_like(x);
+  auto mixed = torch::stable::empty_like(x);
   // Match Albatross's C=4096 scalar-statistics launch.  Packed predecessor
   // addressing does not change the per-row channel parallelism.
   res_ln_cmix_tokenshift_fused_kernel<1024><<<
       static_cast<int>(x.size(0)), 1024, 0,
-      at::cuda::getCurrentCUDAStream()>>>(
-      x.data_ptr<dtype>(), res.data_ptr<dtype>(), shift_state.data_ptr<dtype>(),
-      weight.data_ptr<dtype>(), bias.data_ptr<dtype>(), x_k.data_ptr<dtype>(),
-      res_out.data_ptr<dtype>(), mixed.data_ptr<dtype>(),
-      token_predecessor.data_ptr<int>(), metadata_status.data_ptr<int>(),
+      flashrwkv2::validation::current_cuda_stream()>>>(
+      x.mutable_data_ptr<dtype>(), res.mutable_data_ptr<dtype>(), shift_state.mutable_data_ptr<dtype>(),
+      weight.mutable_data_ptr<dtype>(), bias.mutable_data_ptr<dtype>(), x_k.mutable_data_ptr<dtype>(),
+      res_out.mutable_data_ptr<dtype>(), mixed.mutable_data_ptr<dtype>(),
+      token_predecessor.mutable_data_ptr<int>(), metadata_status.mutable_data_ptr<int>(),
       x.size(0), static_cast<float>(eps));
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  FLASHRWKV_CUDA_CHECK(cudaGetLastError());
   return {res_out, mixed};
 }

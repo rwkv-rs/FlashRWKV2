@@ -4,12 +4,13 @@
 // Native-private dense projection dispatch owned by the complete CMix operator.
 // Albatross source revision: ee3308f6922e59f2166c7fac3c5a192340a2b48e.
 
+#include "validation.h"
+
 #include "../../../internal/linear/backend.cuh"
 
-#include <ATen/ATen.h>
 
-at::Tensor cmix_linear_ffn_key_dispatch_f16_cuda(
-    at::Tensor x, at::Tensor weight_orig) {
+torch::stable::Tensor cmix_linear_ffn_key_dispatch_f16_cuda(
+    torch::stable::Tensor x, torch::stable::Tensor weight_orig) {
   const int64_t channels = x.size(-1);
   const int64_t rows = x.numel() / channels;
 
@@ -117,8 +118,8 @@ at::Tensor cmix_linear_ffn_key_dispatch_f16_cuda(
   return linear_f16_orig_cuda(x, weight_orig);
 }
 
-at::Tensor cmix_linear_ffn_down_forward_varlen_cuda(
-    at::Tensor x, at::Tensor weight) {
+torch::stable::Tensor cmix_linear_ffn_down_forward_varlen_cuda(
+    torch::stable::Tensor x, torch::stable::Tensor weight) {
   const int64_t rows = x.size(0);
   const bool canonical_4096_shape =
       x.size(1) == 16384 && weight.size(0) == 16384 &&

@@ -3,9 +3,6 @@
 
 #include "../validation.h"
 
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
-#include <c10/cuda/CUDAException.h>
 
 #include <limits>
 #include <utility>
@@ -172,71 +169,73 @@ __global__ void build_token_predecessor_kernel(
 }
 
 void check_graph_scalar(
-    const torch::Tensor& tensor,
-    const torch::Tensor& reference,
+    const torch::stable::Tensor& tensor,
+    const torch::stable::Tensor& reference,
     const char* name) {
-  TORCH_CHECK(tensor.is_cuda(), name, " must be a CUDA tensor");
-  TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
-  TORCH_CHECK(tensor.device() == reference.device(),
+  STD_TORCH_CHECK(tensor.is_cuda(), name, " must be a CUDA tensor");
+  STD_TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
+  STD_TORCH_CHECK(tensor.device() == reference.device(),
               name, " must share the metadata CUDA device");
-  TORCH_CHECK(tensor.scalar_type() == torch::kInt32,
+  STD_TORCH_CHECK(tensor.scalar_type() == torch::headeronly::ScalarType::Int,
               name, " must have dtype int32");
-  TORCH_CHECK(tensor.numel() == 1, name, " must contain one element");
+  STD_TORCH_CHECK(tensor.numel() == 1, name, " must contain one element");
 }
 
 PreparedRecurrentMetadata launch_recurrent_metadata_validation(
-    torch::Tensor query_start_loc,
-    torch::Tensor state_indices,
-    torch::Tensor num_active_tokens,
-    torch::Tensor num_active_sequences,
+    torch::stable::Tensor query_start_loc,
+    torch::stable::Tensor state_indices,
+    torch::stable::Tensor num_active_tokens,
+    torch::stable::Tensor num_active_sequences,
     int64_t total_tokens,
     int64_t num_sequences,
     int64_t state_pool_size,
     int64_t max_seqlen,
     bool snapshot) {
-  const c10::cuda::CUDAGuard device_guard(query_start_loc.device());
-  auto status = torch::empty({3}, query_start_loc.options());
-  auto seen_slots = torch::empty({state_pool_size}, query_start_loc.options());
+  const torch::stable::accelerator::DeviceGuard device_guard(query_start_loc.device().index());
+  auto status = torch::stable::new_empty(query_start_loc, {3});
+  auto seen_slots =
+      torch::stable::new_empty(query_start_loc, {state_pool_size});
   auto query_start_loc_snapshot = snapshot
-      ? torch::empty_like(query_start_loc)
+      ? torch::stable::empty_like(query_start_loc)
       : query_start_loc;
   auto state_indices_snapshot = snapshot
-      ? torch::empty_like(state_indices)
+      ? torch::stable::empty_like(state_indices)
       : state_indices;
-  auto token_predecessor = torch::empty({total_tokens}, query_start_loc.options());
+  auto token_predecessor =
+      torch::stable::new_empty(query_start_loc, {total_tokens});
   constexpr int threads = 256;
   validate_recurrent_metadata_kernel<<<
       1,
       threads,
       0,
-      at::cuda::getCurrentCUDAStream()>>>(
-      query_start_loc.data_ptr<int>(),
-      state_indices.data_ptr<int>(),
+      flashrwkv2::validation::current_cuda_stream()>>>(
+      query_start_loc.mutable_data_ptr<int>(),
+      state_indices.mutable_data_ptr<int>(),
       static_cast<int>(num_sequences),
       static_cast<int>(total_tokens),
       static_cast<int>(state_pool_size),
       static_cast<int>(max_seqlen),
-      num_active_tokens.defined() ? num_active_tokens.data_ptr<int>() : nullptr,
+      num_active_tokens.defined() ? num_active_tokens.mutable_data_ptr<int>() : nullptr,
       num_active_sequences.defined()
-          ? num_active_sequences.data_ptr<int>()
+          ? num_active_sequences.mutable_data_ptr<int>()
           : nullptr,
-      status.data_ptr<int>(),
-      seen_slots.data_ptr<int>(),
-      snapshot ? query_start_loc_snapshot.data_ptr<int>() : nullptr,
-      snapshot ? state_indices_snapshot.data_ptr<int>() : nullptr);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+      status.mutable_data_ptr<int>(),
+      seen_slots.mutable_data_ptr<int>(),
+      snapshot ? query_start_loc_snapshot.mutable_data_ptr<int>() : nullptr,
+      snapshot ? state_indices_snapshot.mutable_data_ptr<int>() : nullptr);
+  FLASHRWKV_CUDA_CHECK(cudaGetLastError());
   const int predecessor_blocks = static_cast<int>((total_tokens + threads - 1) / threads);
   build_token_predecessor_kernel<<<
       predecessor_blocks,
       threads,
       0,
-      at::cuda::getCurrentCUDAStream()>>>(
-      query_start_loc_snapshot.data_ptr<int>(),
-      state_indices_snapshot.data_ptr<int>(),
-      status.data_ptr<int>(),
+      flashrwkv2::validation::current_cuda_stream()>>>(
+      query_start_loc_snapshot.mutable_data_ptr<int>(),
+      state_indices_snapshot.mutable_data_ptr<int>(),
+      status.mutable_data_ptr<int>(),
       static_cast<int>(total_tokens),
-      token_predecessor.data_ptr<int>());
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+      token_predecessor.mutable_data_ptr<int>());
+  FLASHRWKV_CUDA_CHECK(cudaGetLastError());
   return PreparedRecurrentMetadata{
       std::move(query_start_loc_snapshot),
       std::move(state_indices_snapshot),
@@ -248,22 +247,22 @@ PreparedRecurrentMetadata launch_recurrent_metadata_validation(
 }  // namespace
 
 PreparedRecurrentMetadata prepare_recurrent_metadata_cuda(
-    torch::Tensor query_start_loc,
-    torch::Tensor state_indices,
+    torch::stable::Tensor query_start_loc,
+    torch::stable::Tensor state_indices,
     int64_t total_tokens,
     int64_t state_pool_size) {
   const int64_t num_sequences = state_indices.numel();
   return launch_recurrent_metadata_validation(
-      std::move(query_start_loc), std::move(state_indices), torch::Tensor(),
-      torch::Tensor(), total_tokens, num_sequences, state_pool_size,
+      std::move(query_start_loc), std::move(state_indices), torch::stable::Tensor(),
+      torch::stable::Tensor(), total_tokens, num_sequences, state_pool_size,
       total_tokens, true);
 }
 
 PreparedRecurrentMetadata prepare_recurrent_graph_metadata_cuda(
-    torch::Tensor query_start_loc,
-    torch::Tensor state_indices,
-    torch::Tensor num_active_tokens,
-    torch::Tensor num_active_sequences,
+    torch::stable::Tensor query_start_loc,
+    torch::stable::Tensor state_indices,
+    torch::stable::Tensor num_active_tokens,
+    torch::stable::Tensor num_active_sequences,
     int64_t token_capacity,
     int64_t sequence_capacity,
     int64_t state_pool_size,

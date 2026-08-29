@@ -3,12 +3,11 @@
 // Adapted from Rapid-Sampling revision e0297f7830c3fa581d49ddddddba32f35ea7f733
 // and rwkv-rs/vllm-rwkv revision fd440426689f10e240b5761e1a7c82e4c37deb8d.
 
+#include "validation.h"
+
 #include <iostream>
 #include <math.h>
 #include <assert.h>
-#include <ATen/ATen.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAException.h>
 #include <cuda_fp16.h>
 #include <curand_kernel.h>
 #include <stdexcept>
@@ -146,24 +145,21 @@ __global__ void setup_rand_kernel(RAND* states, unsigned long long seed) {
   curand_init(seed, blockIdx.x, 0, &states[blockIdx.x]);
 }
 
-at::Tensor setup_sampling_states_cuda(int64_t seed, int64_t num_slots) {
-  at::Tensor state =
-      at::zeros({num_slots, static_cast<int64_t>(sizeof(RAND))},
-                at::TensorOptions().dtype(at::kChar).device(at::kCUDA));
-  auto stream = at::cuda::getCurrentCUDAStream();
+torch::stable::Tensor setup_sampling_states_cuda(
+    torch::stable::Tensor anchor, int64_t seed, int64_t num_slots) {
+  auto state = torch::stable::new_zeros(
+      anchor, {num_slots, static_cast<int64_t>(sizeof(RAND))},
+      torch::headeronly::ScalarType::Char);
+  auto stream = flashrwkv2::validation::current_cuda_stream();
   setup_rand_kernel<<<static_cast<int>(num_slots), 1, 0, stream>>>(
-      reinterpret_cast<RAND*>(state.data_ptr()),
+      reinterpret_cast<RAND*>(state.mutable_data_ptr()),
       static_cast<unsigned long long>(seed));
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  FLASHRWKV_CUDA_CHECK(cudaGetLastError());
   return state;
 }
 
-at::Tensor setup_rand(int64_t seed, int64_t B) {
-  return setup_sampling_states_cuda(seed, B);
-}
-
-static void check_cuda_contiguous_1d(const at::Tensor& tensor, const char* name,
-                                     int64_t batch_size, at::ScalarType dtype) {
+static void check_cuda_contiguous_1d(const torch::stable::Tensor& tensor, const char* name,
+                                     int64_t batch_size, torch::headeronly::ScalarType dtype) {
   if (!tensor.is_cuda() || !tensor.is_contiguous() || tensor.dim() != 1 ||
       tensor.size(0) != batch_size || tensor.scalar_type() != dtype) {
     throw std::invalid_argument(std::string(name) +
@@ -565,226 +561,6 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1)
     }
     ((float4*)penalties)[i] = p4;
   }
-}
-
-std::vector<at::Tensor> batch_sampling_repetition_temperature_topk_topp(
-    at::Tensor& logits, at::Tensor& penalties, at::Tensor& states,
-    double presence_penalty, double repetition_penalty, double penalty_decay,
-    double temperature, int64_t top_k, double top_p, bool return_logprobs) {
-  int B, T, V;
-  if (logits.dtype() != at::kFloat) {
-    throw std::invalid_argument(
-        "Logits tensor must be of type float32 (FP32), got " +
-        std::string(logits.dtype().name()) + " !\n");
-  }
-  V = logits.size(-1);
-  B = (penalties.dim() == 2) ? penalties.size(0) : 1;
-  T = (logits.dim() == 3) ? logits.size(1) : 1;
-  if (!(V > 0 && V <= 1048576 && V % 4 == 0)) {
-    throw std::invalid_argument(
-        "Vocabulary size must be multiple of 4, and no larger than 1048576, "
-        "got " +
-        std::to_string(V) + " !\n");
-  }
-  if (!(B > 0 && T > 0)) {
-    throw std::invalid_argument(
-        "B and T must be positive, got B=" + std::to_string(B) +
-        ", T=" + std::to_string(T) + " !\n");
-  }
-  if (!(temperature >= 0.001 && temperature <= 1000)) {
-    throw std::invalid_argument("Temperature outside range, got " +
-                                std::to_string(temperature) +
-                                ", expect [0.001, 1000]!\n");
-  }
-  if (top_k <= 0 || top_k > V) top_k = V;
-  if (top_p < 0 || top_p > 1) top_p = 1;
-  if (top_p == 0) {
-    top_k = 1;
-    top_p = 1;
-  }
-  auto stream = at::cuda::getCurrentCUDAStream();
-  auto probs = at::empty(
-      {B, V}, at::TensorOptions().dtype(at::kFloat).device(at::kCUDA));
-  if (B * V * 4 <= 4194304) {
-    cudaStreamAttrValue stream_attribute;
-    stream_attribute.accessPolicyWindow.base_ptr = probs.data_ptr();
-    stream_attribute.accessPolicyWindow.num_bytes = B * V * 4;
-    stream_attribute.accessPolicyWindow.hitRatio = 1;
-    stream_attribute.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
-    stream_attribute.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
-    cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow,
-                           &stream_attribute);
-  }
-  auto out =
-      at::empty({B}, at::TensorOptions().dtype(at::kInt).device(at::kCUDA));
-  std::vector<at::Tensor> outputs = {out};
-  float* output_logprobs = nullptr;
-  if (return_logprobs) {
-    auto out_logprobs =
-        at::empty({B}, at::TensorOptions().dtype(at::kFloat).device(at::kCUDA));
-    output_logprobs = (float*)out_logprobs.data_ptr();
-    outputs.push_back(out_logprobs);
-  }
-
-  batch_sampling_repetition_temperature_topk_topp_kernel<<<B, 1024, 0,
-                                                           stream>>>(
-      B, T, V, (float*)logits.data_ptr(), (float*)penalties.data_ptr(), nullptr,
-      (int*)out.data_ptr(), output_logprobs, (RAND*)states.data_ptr(),
-      (float*)probs.data_ptr(), nullptr, nullptr, nullptr, nullptr, nullptr,
-      nullptr, (float)presence_penalty, (float)repetition_penalty,
-      (float)penalty_decay, (float)temperature, (int)top_k, (float)top_p,
-      nullptr);
-  return outputs;
-}
-
-std::vector<at::Tensor> batch_sampling_repetition_temperature_topk_topp_indexed(
-    at::Tensor& logits, at::Tensor& penalties, at::Tensor& penalty_indices,
-    at::Tensor& states, double presence_penalty, double repetition_penalty,
-    double penalty_decay, double temperature, int64_t top_k, double top_p,
-    bool return_logprobs) {
-  int B, T, V;
-  if (logits.dtype() != at::kFloat) {
-    throw std::invalid_argument(
-        "Logits tensor must be of type float32 (FP32), got " +
-        std::string(logits.dtype().name()) + " !\n");
-  }
-  if (penalties.dtype() != at::kFloat) {
-    throw std::invalid_argument(
-        "Penalties tensor must be of type float32 (FP32), got " +
-        std::string(penalties.dtype().name()) + " !\n");
-  }
-  if (penalty_indices.dtype() != at::kInt) {
-    throw std::invalid_argument(
-        "Penalty indices tensor must be of type int32, got " +
-        std::string(penalty_indices.dtype().name()) + " !\n");
-  }
-  V = logits.size(-1);
-  B = (logits.dim() == 3) ? logits.size(0)
-                          : (logits.dim() == 2 ? logits.size(0) : 1);
-  T = (logits.dim() == 3) ? logits.size(1) : 1;
-  if (!(V > 0 && V <= 1048576 && V % 4 == 0)) {
-    throw std::invalid_argument(
-        "Vocabulary size must be multiple of 4, and no larger than 1048576, "
-        "got " +
-        std::to_string(V) + " !\n");
-  }
-  if (!(B > 0 && T > 0)) {
-    throw std::invalid_argument(
-        "B and T must be positive, got B=" + std::to_string(B) +
-        ", T=" + std::to_string(T) + " !\n");
-  }
-  if (!(penalties.dim() == 2 && penalties.size(1) == V)) {
-    throw std::invalid_argument(
-        "Penalties tensor must have shape (rows, V), got dim=" +
-        std::to_string(penalties.dim()) +
-        " and V=" + std::to_string(penalties.size(-1)) + " !\n");
-  }
-  if (!(penalty_indices.dim() == 1 && penalty_indices.size(0) == B &&
-        penalty_indices.is_contiguous())) {
-    throw std::invalid_argument(
-        "Penalty indices tensor must be contiguous with shape (B,), got dim=" +
-        std::to_string(penalty_indices.dim()) +
-        " and rows=" + std::to_string(penalty_indices.size(0)) + " !\n");
-  }
-  if (!(temperature >= 0.001 && temperature <= 1000)) {
-    throw std::invalid_argument("Temperature outside range, got " +
-                                std::to_string(temperature) +
-                                ", expect [0.001, 1000]!\n");
-  }
-  if (top_k <= 0 || top_k > V) top_k = V;
-  if (top_p < 0 || top_p > 1) top_p = 1;
-  if (top_p == 0) {
-    top_k = 1;
-    top_p = 1;
-  }
-  auto stream = at::cuda::getCurrentCUDAStream();
-  auto probs = at::empty(
-      {B, V}, at::TensorOptions().dtype(at::kFloat).device(at::kCUDA));
-  if (B * V * 4 <= 4194304) {
-    cudaStreamAttrValue stream_attribute;
-    stream_attribute.accessPolicyWindow.base_ptr = probs.data_ptr();
-    stream_attribute.accessPolicyWindow.num_bytes = B * V * 4;
-    stream_attribute.accessPolicyWindow.hitRatio = 1;
-    stream_attribute.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
-    stream_attribute.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
-    cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow,
-                           &stream_attribute);
-  }
-  auto out =
-      at::empty({B}, at::TensorOptions().dtype(at::kInt).device(at::kCUDA));
-  std::vector<at::Tensor> outputs = {out};
-  float* output_logprobs = nullptr;
-  if (return_logprobs) {
-    auto out_logprobs =
-        at::empty({B}, at::TensorOptions().dtype(at::kFloat).device(at::kCUDA));
-    output_logprobs = (float*)out_logprobs.data_ptr();
-    outputs.push_back(out_logprobs);
-  }
-
-  batch_sampling_repetition_temperature_topk_topp_kernel<<<B, 1024, 0,
-                                                           stream>>>(
-      B, T, V, (float*)logits.data_ptr(), (float*)penalties.data_ptr(),
-      (int*)penalty_indices.data_ptr(), (int*)out.data_ptr(), output_logprobs,
-      (RAND*)states.data_ptr(), (float*)probs.data_ptr(), nullptr, nullptr,
-      nullptr, nullptr, nullptr, nullptr, (float)presence_penalty,
-      (float)repetition_penalty, (float)penalty_decay, (float)temperature,
-      (int)top_k, (float)top_p, nullptr);
-  return outputs;
-}
-
-std::vector<at::Tensor>
-batch_sampling_repetition_temperature_topk_topp_per_request_indexed(
-    at::Tensor& logits, at::Tensor& penalties, at::Tensor& penalty_indices,
-    at::Tensor& states, at::Tensor& presence_penalties,
-    at::Tensor& repetition_penalties, at::Tensor& penalty_decays,
-    at::Tensor& temperatures, at::Tensor& top_ks, at::Tensor& top_ps,
-    bool return_logprobs) {
-  const int V = logits.size(-1);
-  const int B = logits.dim() >= 2 ? logits.size(0) : 1;
-  const int T = logits.dim() == 3 ? logits.size(1) : 1;
-  if (logits.dtype() != at::kFloat || penalties.dtype() != at::kFloat) {
-    throw std::invalid_argument("Logits and penalties must be float32");
-  }
-  if (!(V > 0 && V <= 1048576 && V % 4 == 0) || B <= 0 || T <= 0) {
-    throw std::invalid_argument("Invalid rapid-sampling logits shape");
-  }
-  if (!(penalties.dim() == 2 && penalties.size(1) == V)) {
-    throw std::invalid_argument("Penalties must have shape (rows, V)");
-  }
-  check_cuda_contiguous_1d(penalty_indices, "penalty_indices", B, at::kInt);
-  check_cuda_contiguous_1d(presence_penalties, "presence_penalties", B,
-                           at::kFloat);
-  check_cuda_contiguous_1d(repetition_penalties, "repetition_penalties", B,
-                           at::kFloat);
-  check_cuda_contiguous_1d(penalty_decays, "penalty_decays", B, at::kFloat);
-  check_cuda_contiguous_1d(temperatures, "temperatures", B, at::kFloat);
-  check_cuda_contiguous_1d(top_ks, "top_ks", B, at::kInt);
-  check_cuda_contiguous_1d(top_ps, "top_ps", B, at::kFloat);
-
-  auto stream = at::cuda::getCurrentCUDAStream();
-  auto probs = at::empty(
-      {B, V}, at::TensorOptions().dtype(at::kFloat).device(at::kCUDA));
-  auto out =
-      at::empty({B}, at::TensorOptions().dtype(at::kInt).device(at::kCUDA));
-  std::vector<at::Tensor> outputs = {out};
-  float* output_logprobs = nullptr;
-  if (return_logprobs) {
-    auto out_logprobs =
-        at::empty({B}, at::TensorOptions().dtype(at::kFloat).device(at::kCUDA));
-    output_logprobs = (float*)out_logprobs.data_ptr();
-    outputs.push_back(out_logprobs);
-  }
-  batch_sampling_repetition_temperature_topk_topp_kernel<<<B, 1024, 0,
-                                                           stream>>>(
-      B, T, V, (float*)logits.data_ptr(), (float*)penalties.data_ptr(),
-      (int*)penalty_indices.data_ptr(), (int*)out.data_ptr(), output_logprobs,
-      (RAND*)states.data_ptr(), (float*)probs.data_ptr(),
-      (float*)presence_penalties.data_ptr(),
-      (float*)repetition_penalties.data_ptr(),
-      (float*)penalty_decays.data_ptr(), (float*)temperatures.data_ptr(),
-      (int*)top_ks.data_ptr(), (float*)top_ps.data_ptr(), 0.0f, 0.0f, 1.0f,
-      1.0f, V, 1.0f, nullptr);
-  return outputs;
 }
 
 __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1)
@@ -1314,127 +1090,57 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1)
   }
 }
 
-std::vector<at::Tensor> batch_sampling_temperature_topk_topp(
-    at::Tensor& logits, at::Tensor& states, double temperature, int64_t top_k,
-    double top_p, bool return_logprobs) {
-  int B, T, V;
-  if (logits.dtype() != at::kFloat) {
-    throw std::invalid_argument(
-        "Logits tensor must be of type float32 (FP32), got " +
-        std::string(logits.dtype().name()) + " !\n");
-  }
-  V = logits.size(-1);
-  B = (logits.dim() >= 2) ? logits.size(0) : 1;
-  T = (logits.dim() == 3) ? logits.size(1) : 1;
-
-  if (!(V > 0 && V <= 1048576 && V % 4 == 0)) {
-    throw std::invalid_argument(
-        "Vocabulary size must be multiple of 4, and no larger than 1048576, "
-        "got " +
-        std::to_string(V) + " !\n");
-  }
-  if (!(B > 0 && T > 0)) {
-    throw std::invalid_argument(
-        "B and T must be positive, got B=" + std::to_string(B) +
-        ", T=" + std::to_string(T) + " !\n");
-  }
-  if (!(temperature >= 0.001 && temperature <= 1000)) {
-    throw std::invalid_argument("Temperature outside range, got " +
-                                std::to_string(temperature) +
-                                ", expect [0.001, 1000]!\n");
-  }
-  if (top_k <= 0 || top_k > V) top_k = V;
-  if (top_p < 0 || top_p > 1) top_p = 1;
-  if (top_p == 0) {
-    top_k = 1;
-    top_p = 1;
-  }
-  double log2e_inv_temp = M_LOG2E / temperature;
-
-  auto stream = at::cuda::getCurrentCUDAStream();
-  auto probs = at::empty(
-      {B, V}, at::TensorOptions().dtype(at::kFloat).device(at::kCUDA));
-  if (B * V * 4 <= 4194304) {
-    cudaStreamAttrValue stream_attribute;
-    stream_attribute.accessPolicyWindow.base_ptr = probs.data_ptr();
-    stream_attribute.accessPolicyWindow.num_bytes = B * V * 4;
-    stream_attribute.accessPolicyWindow.hitRatio = 1;
-    stream_attribute.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
-    stream_attribute.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
-    cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow,
-                           &stream_attribute);
-  }
-  auto out =
-      at::empty({B}, at::TensorOptions().dtype(at::kInt).device(at::kCUDA));
-  std::vector<at::Tensor> outputs = {out};
-  float* output_logprobs = nullptr;
-  if (return_logprobs) {
-    auto out_logprobs =
-        at::empty({B}, at::TensorOptions().dtype(at::kFloat).device(at::kCUDA));
-    output_logprobs = (float*)out_logprobs.data_ptr();
-    outputs.push_back(out_logprobs);
-  }
-  if (temperature == 1 && top_k == V)
-    batch_sampling_topp_kernel<<<B, 1024, 0, stream>>>(
-        B, T, V, (float*)logits.data_ptr(), (int*)out.data_ptr(),
-        output_logprobs, (RAND*)states.data_ptr(), (float*)probs.data_ptr(),
-        nullptr, (float)top_p, nullptr);
-  else
-    batch_sampling_temperature_topk_topp_kernel<<<B, 1024, 0, stream>>>(
-        B, T, V, (float*)logits.data_ptr(), (int*)out.data_ptr(),
-        output_logprobs, (RAND*)states.data_ptr(), (float*)probs.data_ptr(),
-        nullptr, (float)log2e_inv_temp, (int)top_k, (float)top_p, nullptr);
-  return outputs;
-}
-
 namespace {
 
-at::Tensor sampling_probs_workspace(const at::Tensor& logits) {
+torch::stable::Tensor sampling_probs_workspace(const torch::stable::Tensor& logits) {
   const int64_t bytes = logits.numel() * static_cast<int64_t>(sizeof(float));
-  auto probs = at::empty(logits.sizes(), logits.options().dtype(at::kFloat));
+  auto probs = torch::stable::new_empty(
+      logits, logits.sizes(), torch::headeronly::ScalarType::Float);
   if (bytes <= 4194304) {
-    auto stream = at::cuda::getCurrentCUDAStream();
+    auto stream = flashrwkv2::validation::current_cuda_stream();
     cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
-    C10_CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
+    FLASHRWKV_CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
     if (capture_status == cudaStreamCaptureStatusNone) {
       cudaStreamAttrValue attribute{};
-      attribute.accessPolicyWindow.base_ptr = probs.data_ptr();
+      attribute.accessPolicyWindow.base_ptr = probs.mutable_data_ptr();
       attribute.accessPolicyWindow.num_bytes = static_cast<size_t>(bytes);
       attribute.accessPolicyWindow.hitRatio = 1.0f;
       attribute.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
       attribute.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
-      C10_CUDA_CHECK(cudaStreamSetAttribute(
+      FLASHRWKV_CUDA_CHECK(cudaStreamSetAttribute(
           stream, cudaStreamAttributeAccessPolicyWindow, &attribute));
     }
   }
   return probs;
 }
 
-at::Tensor sampling_output(const at::Tensor& logits) {
-  return at::empty({logits.size(0)}, logits.options().dtype(at::kInt));
+torch::stable::Tensor sampling_output(const torch::stable::Tensor& logits) {
+  return torch::stable::new_empty(
+      logits, {logits.size(0)}, torch::headeronly::ScalarType::Int);
 }
 
 struct SamplingMetadata {
-  at::Tensor status;
-  at::Tensor workspace;
+  torch::stable::Tensor status;
+  torch::stable::Tensor workspace;
 };
 
 SamplingMetadata prepare_sampling_metadata(
-    const at::Tensor& logits,
-    const at::Tensor& states,
-    const at::Tensor& slot_indices,
-    const at::Tensor& num_active_samples) {
-  auto status = at::empty({2}, slot_indices.options());
-  auto workspace = at::empty({states.size(0)}, slot_indices.options());
+    const torch::stable::Tensor& logits,
+    const torch::stable::Tensor& states,
+    const torch::stable::Tensor& slot_indices,
+    const torch::stable::Tensor& num_active_samples) {
+  auto status = torch::stable::new_empty(
+      slot_indices, {2}, torch::headeronly::ScalarType::Int);
+  auto workspace = torch::stable::new_empty(slot_indices, {states.size(0)});
   validate_sampling_metadata_kernel<<<
-      1, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
-      slot_indices.data_ptr<int>(),
+      1, 256, 0, flashrwkv2::validation::current_cuda_stream()>>>(
+      slot_indices.mutable_data_ptr<int>(),
       num_active_samples.defined()
-          ? num_active_samples.data_ptr<int>()
+          ? num_active_samples.mutable_data_ptr<int>()
           : nullptr,
       static_cast<int>(logits.size(0)), static_cast<int>(states.size(0)),
-      status.data_ptr<int>(), workspace.data_ptr<int>());
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+      status.mutable_data_ptr<int>(), workspace.mutable_data_ptr<int>());
+  FLASHRWKV_CUDA_CHECK(cudaGetLastError());
   return SamplingMetadata{std::move(status), std::move(workspace)};
 }
 
@@ -1451,10 +1157,10 @@ void normalize_sampling_controls(
 
 }  // namespace
 
-at::Tensor sampling_temperature_topk_topp_scalar_cuda(
-    at::Tensor logits, at::Tensor states, at::Tensor slot_indices,
+torch::stable::Tensor sampling_temperature_topk_topp_scalar_cuda(
+    torch::stable::Tensor logits, torch::stable::Tensor states, torch::stable::Tensor slot_indices,
     double temperature, int64_t top_k, double top_p,
-    at::Tensor num_active_samples) {
+    torch::stable::Tensor num_active_samples) {
   const int B = static_cast<int>(logits.size(0));
   const int V = static_cast<int>(logits.size(1));
   normalize_sampling_controls(V, temperature, top_k, top_p);
@@ -1462,55 +1168,55 @@ at::Tensor sampling_temperature_topk_topp_scalar_cuda(
   auto output = sampling_output(logits);
   auto metadata = prepare_sampling_metadata(
       logits, states, slot_indices, num_active_samples);
-  auto stream = at::cuda::getCurrentCUDAStream();
+  auto stream = flashrwkv2::validation::current_cuda_stream();
   if (temperature == 1.0 && top_k == V) {
     batch_sampling_topp_kernel<<<B, BLOCKDIM_X_SAMPLE, 0, stream>>>(
-        B, 1, V, logits.data_ptr<float>(), output.data_ptr<int>(), nullptr,
-        reinterpret_cast<RAND*>(states.data_ptr()), probs.data_ptr<float>(),
-        slot_indices.data_ptr<int>(), static_cast<float>(top_p),
-        metadata.status.data_ptr<int>());
+        B, 1, V, logits.mutable_data_ptr<float>(), output.mutable_data_ptr<int>(), nullptr,
+        reinterpret_cast<RAND*>(states.mutable_data_ptr()), probs.mutable_data_ptr<float>(),
+        slot_indices.mutable_data_ptr<int>(), static_cast<float>(top_p),
+        metadata.status.mutable_data_ptr<int>());
   } else {
     batch_sampling_temperature_topk_topp_kernel
         <<<B, BLOCKDIM_X_SAMPLE, 0, stream>>>(
-            B, 1, V, logits.data_ptr<float>(), output.data_ptr<int>(), nullptr,
-            reinterpret_cast<RAND*>(states.data_ptr()), probs.data_ptr<float>(),
-            slot_indices.data_ptr<int>(),
+            B, 1, V, logits.mutable_data_ptr<float>(), output.mutable_data_ptr<int>(), nullptr,
+            reinterpret_cast<RAND*>(states.mutable_data_ptr()), probs.mutable_data_ptr<float>(),
+            slot_indices.mutable_data_ptr<int>(),
             static_cast<float>(M_LOG2E / temperature),
             static_cast<int>(top_k), static_cast<float>(top_p),
-            metadata.status.data_ptr<int>());
+            metadata.status.mutable_data_ptr<int>());
   }
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  FLASHRWKV_CUDA_CHECK(cudaGetLastError());
   return output;
 }
 
-at::Tensor sampling_temperature_topk_topp_per_request_cuda(
-    at::Tensor logits, at::Tensor states, at::Tensor slot_indices,
-    at::Tensor temperatures, at::Tensor top_ks, at::Tensor top_ps,
-    at::Tensor num_active_samples) {
+torch::stable::Tensor sampling_temperature_topk_topp_per_request_cuda(
+    torch::stable::Tensor logits, torch::stable::Tensor states, torch::stable::Tensor slot_indices,
+    torch::stable::Tensor temperatures, torch::stable::Tensor top_ks, torch::stable::Tensor top_ps,
+    torch::stable::Tensor num_active_samples) {
   const int B = static_cast<int>(logits.size(0));
   const int V = static_cast<int>(logits.size(1));
   auto probs = sampling_probs_workspace(logits);
   auto output = sampling_output(logits);
   auto metadata = prepare_sampling_metadata(
       logits, states, slot_indices, num_active_samples);
-  auto stream = at::cuda::getCurrentCUDAStream();
+  auto stream = flashrwkv2::validation::current_cuda_stream();
   batch_sampling_repetition_temperature_topk_topp_kernel
       <<<B, BLOCKDIM_X_SAMPLE, 0, stream>>>(
-          B, 1, V, logits.data_ptr<float>(), nullptr,
-          slot_indices.data_ptr<int>(), output.data_ptr<int>(), nullptr,
-          reinterpret_cast<RAND*>(states.data_ptr()), probs.data_ptr<float>(),
-          nullptr, nullptr, nullptr, temperatures.data_ptr<float>(),
-          top_ks.data_ptr<int>(), top_ps.data_ptr<float>(), 0.0f, 0.0f, 1.0f,
-          1.0f, V, 1.0f, metadata.status.data_ptr<int>());
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+          B, 1, V, logits.mutable_data_ptr<float>(), nullptr,
+          slot_indices.mutable_data_ptr<int>(), output.mutable_data_ptr<int>(), nullptr,
+          reinterpret_cast<RAND*>(states.mutable_data_ptr()), probs.mutable_data_ptr<float>(),
+          nullptr, nullptr, nullptr, temperatures.mutable_data_ptr<float>(),
+          top_ks.mutable_data_ptr<int>(), top_ps.mutable_data_ptr<float>(), 0.0f, 0.0f, 1.0f,
+          1.0f, V, 1.0f, metadata.status.mutable_data_ptr<int>());
+  FLASHRWKV_CUDA_CHECK(cudaGetLastError());
   return output;
 }
 
-at::Tensor sampling_six_parameter_scalar_cuda(
-    at::Tensor logits, at::Tensor penalties, at::Tensor states,
-    at::Tensor slot_indices, double presence_penalty, double frequency_penalty,
+torch::stable::Tensor sampling_six_parameter_scalar_cuda(
+    torch::stable::Tensor logits, torch::stable::Tensor penalties, torch::stable::Tensor states,
+    torch::stable::Tensor slot_indices, double presence_penalty, double frequency_penalty,
     double penalty_decay, double temperature, int64_t top_k, double top_p,
-    at::Tensor num_active_samples) {
+    torch::stable::Tensor num_active_samples) {
   const int B = static_cast<int>(logits.size(0));
   const int V = static_cast<int>(logits.size(1));
   normalize_sampling_controls(V, temperature, top_k, top_p);
@@ -1518,45 +1224,45 @@ at::Tensor sampling_six_parameter_scalar_cuda(
   auto output = sampling_output(logits);
   auto metadata = prepare_sampling_metadata(
       logits, states, slot_indices, num_active_samples);
-  auto stream = at::cuda::getCurrentCUDAStream();
+  auto stream = flashrwkv2::validation::current_cuda_stream();
   batch_sampling_repetition_temperature_topk_topp_kernel
       <<<B, BLOCKDIM_X_SAMPLE, 0, stream>>>(
-          B, 1, V, logits.data_ptr<float>(), penalties.data_ptr<float>(),
-          slot_indices.data_ptr<int>(), output.data_ptr<int>(), nullptr,
-          reinterpret_cast<RAND*>(states.data_ptr()), probs.data_ptr<float>(),
+          B, 1, V, logits.mutable_data_ptr<float>(), penalties.mutable_data_ptr<float>(),
+          slot_indices.mutable_data_ptr<int>(), output.mutable_data_ptr<int>(), nullptr,
+          reinterpret_cast<RAND*>(states.mutable_data_ptr()), probs.mutable_data_ptr<float>(),
           nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
           static_cast<float>(presence_penalty),
           static_cast<float>(frequency_penalty),
           static_cast<float>(penalty_decay), static_cast<float>(temperature),
           static_cast<int>(top_k), static_cast<float>(top_p),
-          metadata.status.data_ptr<int>());
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+          metadata.status.mutable_data_ptr<int>());
+  FLASHRWKV_CUDA_CHECK(cudaGetLastError());
   return output;
 }
 
-at::Tensor sampling_six_parameter_per_request_cuda(
-    at::Tensor logits, at::Tensor penalties, at::Tensor states,
-    at::Tensor slot_indices, at::Tensor presence_penalties,
-    at::Tensor frequency_penalties, at::Tensor penalty_decays,
-    at::Tensor temperatures, at::Tensor top_ks, at::Tensor top_ps,
-    at::Tensor num_active_samples) {
+torch::stable::Tensor sampling_six_parameter_per_request_cuda(
+    torch::stable::Tensor logits, torch::stable::Tensor penalties, torch::stable::Tensor states,
+    torch::stable::Tensor slot_indices, torch::stable::Tensor presence_penalties,
+    torch::stable::Tensor frequency_penalties, torch::stable::Tensor penalty_decays,
+    torch::stable::Tensor temperatures, torch::stable::Tensor top_ks, torch::stable::Tensor top_ps,
+    torch::stable::Tensor num_active_samples) {
   const int B = static_cast<int>(logits.size(0));
   const int V = static_cast<int>(logits.size(1));
   auto probs = sampling_probs_workspace(logits);
   auto output = sampling_output(logits);
   auto metadata = prepare_sampling_metadata(
       logits, states, slot_indices, num_active_samples);
-  auto stream = at::cuda::getCurrentCUDAStream();
+  auto stream = flashrwkv2::validation::current_cuda_stream();
   batch_sampling_repetition_temperature_topk_topp_kernel
       <<<B, BLOCKDIM_X_SAMPLE, 0, stream>>>(
-          B, 1, V, logits.data_ptr<float>(), penalties.data_ptr<float>(),
-          slot_indices.data_ptr<int>(), output.data_ptr<int>(), nullptr,
-          reinterpret_cast<RAND*>(states.data_ptr()), probs.data_ptr<float>(),
-          presence_penalties.data_ptr<float>(),
-          frequency_penalties.data_ptr<float>(), penalty_decays.data_ptr<float>(),
-          temperatures.data_ptr<float>(), top_ks.data_ptr<int>(),
-          top_ps.data_ptr<float>(), 0.0f, 0.0f, 1.0f, 1.0f, V, 1.0f,
-          metadata.status.data_ptr<int>());
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+          B, 1, V, logits.mutable_data_ptr<float>(), penalties.mutable_data_ptr<float>(),
+          slot_indices.mutable_data_ptr<int>(), output.mutable_data_ptr<int>(), nullptr,
+          reinterpret_cast<RAND*>(states.mutable_data_ptr()), probs.mutable_data_ptr<float>(),
+          presence_penalties.mutable_data_ptr<float>(),
+          frequency_penalties.mutable_data_ptr<float>(), penalty_decays.mutable_data_ptr<float>(),
+          temperatures.mutable_data_ptr<float>(), top_ks.mutable_data_ptr<int>(),
+          top_ps.mutable_data_ptr<float>(), 0.0f, 0.0f, 1.0f, 1.0f, V, 1.0f,
+          metadata.status.mutable_data_ptr<int>());
+  FLASHRWKV_CUDA_CHECK(cudaGetLastError());
   return output;
 }

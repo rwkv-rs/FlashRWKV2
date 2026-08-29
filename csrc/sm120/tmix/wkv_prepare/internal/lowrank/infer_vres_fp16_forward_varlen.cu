@@ -3,14 +3,13 @@
 // Native-private VRes implementation owned by TMix WKV Prepare.
 // Albatross source revision: ee3308f6922e59f2166c7fac3c5a192340a2b48e.
 
-#include <ATen/ATen.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAException.h>
+#include "validation.h"
+
 #include <cuda_fp16.h>
 
 namespace {
 
-using dtype = at::Half;
+using dtype = torch::headeronly::Half;
 
 inline int64_t ceil_div(int64_t n, int64_t d) {
   return (n + d - 1) / d;
@@ -79,19 +78,19 @@ template <int Threads>
 void launch_vec2(
     int channels,
     int64_t rows,
-    const at::Tensor& value,
-    const at::Tensor& v_first,
-    const at::Tensor& v0,
-    const at::Tensor& delta,
-    at::Tensor& output,
+    const torch::stable::Tensor& value,
+    const torch::stable::Tensor& v_first,
+    const torch::stable::Tensor& v0,
+    const torch::stable::Tensor& delta,
+    torch::stable::Tensor& output,
     cudaStream_t stream) {
   const int pairs_per_row = channels >> 1;
   wkv_prepare_vres_vec2_kernel<Threads><<<
       dim3(static_cast<unsigned int>(ceil_div(pairs_per_row, Threads)),
            static_cast<unsigned int>(rows), 1),
       Threads, 0, stream>>>(
-      channels, value.data_ptr<dtype>(), v_first.data_ptr<dtype>(),
-      v0.data_ptr<dtype>(), delta.data_ptr<dtype>(), output.data_ptr<dtype>(),
+      channels, value.mutable_data_ptr<dtype>(), v_first.mutable_data_ptr<dtype>(),
+      v0.mutable_data_ptr<dtype>(), delta.mutable_data_ptr<dtype>(), output.mutable_data_ptr<dtype>(),
       rows);
 }
 
@@ -100,12 +99,12 @@ void launch_vec2(
 void wkv_prepare_vres_forward_varlen_cuda(
     int total_tokens,
     int channels,
-    at::Tensor value,
-    at::Tensor v_first,
-    at::Tensor v0,
-    at::Tensor delta,
-    at::Tensor output) {
-  auto stream = at::cuda::getCurrentCUDAStream();
+    torch::stable::Tensor value,
+    torch::stable::Tensor v_first,
+    torch::stable::Tensor v0,
+    torch::stable::Tensor delta,
+    torch::stable::Tensor output) {
+  auto stream = flashrwkv2::validation::current_cuda_stream();
   const int64_t rows = total_tokens;
   const bool use_vec2 = channels == 4096 && rows >= 64 && rows <= 65535;
   if (use_vec2) {
@@ -122,8 +121,8 @@ void wkv_prepare_vres_forward_varlen_cuda(
     wkv_prepare_vres_kernel<<<
         static_cast<unsigned int>(ceil_div(elements, threads)),
         threads, 0, stream>>>(
-        channels, elements, value.data_ptr<dtype>(), v_first.data_ptr<dtype>(),
-        v0.data_ptr<dtype>(), delta.data_ptr<dtype>(), output.data_ptr<dtype>());
+        channels, elements, value.mutable_data_ptr<dtype>(), v_first.mutable_data_ptr<dtype>(),
+        v0.mutable_data_ptr<dtype>(), delta.mutable_data_ptr<dtype>(), output.mutable_data_ptr<dtype>());
   }
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  FLASHRWKV_CUDA_CHECK(cudaGetLastError());
 }

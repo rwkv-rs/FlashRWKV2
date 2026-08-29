@@ -10,12 +10,7 @@
 
 #include "rl_infctx_chunk_fp32io16_replay.cuh"
 
-#include <ATen/ATen.h>
-#include <ATen/Dispatch.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
-#include <c10/cuda/CUDAException.h>
-#include <torch/extension.h>
+#include "validation.h"
 
 #include "../../../sm120/tmix/wkv7/recurrent_decay.cuh"
 
@@ -138,34 +133,34 @@ template <typename io_t>
 void launch_factor_scan(
     int num_sequences,
     int num_heads,
-    const torch::Tensor& sequence_chunk_offsets,
-    const torch::Tensor& chunk_token_starts,
-    const torch::Tensor& chunk_token_ends,
-    const torch::Tensor& state_indices,
-    torch::Tensor& state,
-    const torch::Tensor& decay,
-    const torch::Tensor& decay_bias,
-    const torch::Tensor& k,
-    const torch::Tensor& v,
-    const torch::Tensor& a,
-    const torch::Tensor& b,
-    torch::Tensor& boundary,
+    const torch::stable::Tensor& sequence_chunk_offsets,
+    const torch::stable::Tensor& chunk_token_starts,
+    const torch::stable::Tensor& chunk_token_ends,
+    const torch::stable::Tensor& state_indices,
+    torch::stable::Tensor& state,
+    const torch::stable::Tensor& decay,
+    const torch::stable::Tensor& decay_bias,
+    const torch::stable::Tensor& k,
+    const torch::stable::Tensor& v,
+    const torch::stable::Tensor& a,
+    const torch::stable::Tensor& b,
+    torch::stable::Tensor& boundary,
     cudaStream_t stream) {
   scan_factor_boundaries_kernel<io_t>
       <<<dim3(num_heads, num_sequences), kHeadSize, 0, stream>>>(
           num_heads,
-          sequence_chunk_offsets.data_ptr<int>(),
-          chunk_token_starts.data_ptr<int>(),
-          chunk_token_ends.data_ptr<int>(),
-          state_indices.data_ptr<int>(),
-          state.data_ptr<float>(),
-          decay.data_ptr<io_t>(),
-          decay_bias.defined() ? decay_bias.data_ptr<io_t>() : nullptr,
-          k.data_ptr<io_t>(),
-          v.data_ptr<io_t>(),
-          a.data_ptr<io_t>(),
-          b.data_ptr<io_t>(),
-          boundary.data_ptr<float>());
+          sequence_chunk_offsets.mutable_data_ptr<int>(),
+          chunk_token_starts.mutable_data_ptr<int>(),
+          chunk_token_ends.mutable_data_ptr<int>(),
+          state_indices.mutable_data_ptr<int>(),
+          state.mutable_data_ptr<float>(),
+          decay.mutable_data_ptr<io_t>(),
+          decay_bias.defined() ? decay_bias.mutable_data_ptr<io_t>() : nullptr,
+          k.mutable_data_ptr<io_t>(),
+          v.mutable_data_ptr<io_t>(),
+          a.mutable_data_ptr<io_t>(),
+          b.mutable_data_ptr<io_t>(),
+          boundary.mutable_data_ptr<float>());
 }
 
 template <typename io_t>
@@ -173,20 +168,20 @@ void launch_recompute_chunk(
     int num_sequences,
     int num_chunks,
     int num_heads,
-    const torch::Tensor& sequence_chunk_offsets,
-    const torch::Tensor& chunk_token_starts,
-    const torch::Tensor& chunk_token_ends,
-    const torch::Tensor& state_indices,
-    torch::Tensor& state,
-    const torch::Tensor& r,
-    const torch::Tensor& decay,
-    const torch::Tensor& decay_bias,
-    const torch::Tensor& k,
-    const torch::Tensor& v,
-    const torch::Tensor& a,
-    const torch::Tensor& b,
-    torch::Tensor& output,
-    torch::Tensor& boundary,
+    const torch::stable::Tensor& sequence_chunk_offsets,
+    const torch::stable::Tensor& chunk_token_starts,
+    const torch::stable::Tensor& chunk_token_ends,
+    const torch::stable::Tensor& state_indices,
+    torch::stable::Tensor& state,
+    const torch::stable::Tensor& r,
+    const torch::stable::Tensor& decay,
+    const torch::stable::Tensor& decay_bias,
+    const torch::stable::Tensor& k,
+    const torch::stable::Tensor& v,
+    const torch::stable::Tensor& a,
+    const torch::stable::Tensor& b,
+    torch::stable::Tensor& output,
+    torch::stable::Tensor& boundary,
     float scale,
     cudaStream_t stream) {
   launch_factor_scan<io_t>(
@@ -205,12 +200,12 @@ void launch_recompute_chunk(
       b,
       boundary,
       stream);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  FLASHRWKV_CUDA_CHECK(cudaGetLastError());
 
   launch_rl_infctx_chunk_replay_fp32_from_decay_logits(
       num_chunks, num_heads, chunk_token_starts, chunk_token_ends, boundary,
       r, decay, decay_bias, k, v, a, b, output, nullptr, scale, stream);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  FLASHRWKV_CUDA_CHECK(cudaGetLastError());
 }
 
 }  // namespace rl_infctx_recompute_detail
@@ -545,30 +540,30 @@ template <
 void launch_build(
     int num_chunks,
     int num_heads,
-    const torch::Tensor& chunk_token_starts,
-    const torch::Tensor& chunk_token_ends,
-    const torch::Tensor& decay,
-    const torch::Tensor& decay_bias,
-    const torch::Tensor& k,
-    const torch::Tensor& v,
-    const torch::Tensor& a,
-    const torch::Tensor& b,
-    torch::Tensor& transform,
-    torch::Tensor& bias,
+    const torch::stable::Tensor& chunk_token_starts,
+    const torch::stable::Tensor& chunk_token_ends,
+    const torch::stable::Tensor& decay,
+    const torch::stable::Tensor& decay_bias,
+    const torch::stable::Tensor& k,
+    const torch::stable::Tensor& v,
+    const torch::stable::Tensor& a,
+    const torch::stable::Tensor& b,
+    torch::stable::Tensor& transform,
+    torch::stable::Tensor& bias,
     cudaStream_t stream) {
   build_transforms_kernel<io_t, BuildWarps, Stages>
       <<<num_chunks * num_heads, BuildWarps * 32, 0, stream>>>(
           num_heads,
-          chunk_token_starts.data_ptr<int>(),
-          chunk_token_ends.data_ptr<int>(),
-          decay.data_ptr<io_t>(),
-          decay_bias.defined() ? decay_bias.data_ptr<io_t>() : nullptr,
-          k.data_ptr<io_t>(),
-          v.data_ptr<io_t>(),
-          a.data_ptr<io_t>(),
-          b.data_ptr<io_t>(),
-          transform.data_ptr<float>(),
-          bias.data_ptr<float>());
+          chunk_token_starts.mutable_data_ptr<int>(),
+          chunk_token_ends.mutable_data_ptr<int>(),
+          decay.mutable_data_ptr<io_t>(),
+          decay_bias.defined() ? decay_bias.mutable_data_ptr<io_t>() : nullptr,
+          k.mutable_data_ptr<io_t>(),
+          v.mutable_data_ptr<io_t>(),
+          a.mutable_data_ptr<io_t>(),
+          b.mutable_data_ptr<io_t>(),
+          transform.mutable_data_ptr<float>(),
+          bias.mutable_data_ptr<float>());
 }
 
 template <typename io_t>
@@ -577,16 +572,16 @@ void dispatch_build(
     int stages,
     int num_chunks,
     int num_heads,
-    const torch::Tensor& chunk_token_starts,
-    const torch::Tensor& chunk_token_ends,
-    const torch::Tensor& decay,
-    const torch::Tensor& decay_bias,
-    const torch::Tensor& k,
-    const torch::Tensor& v,
-    const torch::Tensor& a,
-    const torch::Tensor& b,
-    torch::Tensor& transform,
-    torch::Tensor& bias,
+    const torch::stable::Tensor& chunk_token_starts,
+    const torch::stable::Tensor& chunk_token_ends,
+    const torch::stable::Tensor& decay,
+    const torch::stable::Tensor& decay_bias,
+    const torch::stable::Tensor& k,
+    const torch::stable::Tensor& v,
+    const torch::stable::Tensor& a,
+    const torch::stable::Tensor& b,
+    torch::stable::Tensor& transform,
+    torch::stable::Tensor& bias,
     cudaStream_t stream) {
   if (build_warps == 2 && stages == 1) {
     launch_build<io_t, 2, 1>(
@@ -642,34 +637,34 @@ template <int StateTile>
 void launch_scan(
     int num_sequences,
     int num_heads,
-    const torch::Tensor& sequence_chunk_offsets,
-    const torch::Tensor& state_indices,
-    torch::Tensor& state,
-    const torch::Tensor& transform,
-    const torch::Tensor& bias,
-    torch::Tensor& boundary,
+    const torch::stable::Tensor& sequence_chunk_offsets,
+    const torch::stable::Tensor& state_indices,
+    torch::stable::Tensor& state,
+    const torch::stable::Tensor& transform,
+    const torch::stable::Tensor& bias,
+    torch::stable::Tensor& boundary,
     cudaStream_t stream) {
   scan_boundaries_kernel<StateTile>
       <<<num_sequences * num_heads, kHeadSize, 0, stream>>>(
           num_heads,
-          sequence_chunk_offsets.data_ptr<int>(),
-          state_indices.data_ptr<int>(),
-          state.data_ptr<float>(),
-          transform.data_ptr<float>(),
-          bias.data_ptr<float>(),
-          boundary.data_ptr<float>());
+          sequence_chunk_offsets.mutable_data_ptr<int>(),
+          state_indices.mutable_data_ptr<int>(),
+          state.mutable_data_ptr<float>(),
+          transform.mutable_data_ptr<float>(),
+          bias.mutable_data_ptr<float>(),
+          boundary.mutable_data_ptr<float>());
 }
 
 void dispatch_scan(
     int state_tile,
     int num_sequences,
     int num_heads,
-    const torch::Tensor& sequence_chunk_offsets,
-    const torch::Tensor& state_indices,
-    torch::Tensor& state,
-    const torch::Tensor& transform,
-    const torch::Tensor& bias,
-    torch::Tensor& boundary,
+    const torch::stable::Tensor& sequence_chunk_offsets,
+    const torch::stable::Tensor& state_indices,
+    torch::stable::Tensor& state,
+    const torch::stable::Tensor& transform,
+    const torch::stable::Tensor& bias,
+    torch::stable::Tensor& boundary,
     cudaStream_t stream) {
   if (state_tile == 16) {
     launch_scan<16>(
@@ -717,23 +712,23 @@ void launch_materialized_chunk(
     int build_warps,
     int stages,
     int state_tile,
-    const torch::Tensor& sequence_chunk_offsets,
-    const torch::Tensor& chunk_token_starts,
-    const torch::Tensor& chunk_token_ends,
-    const torch::Tensor& state_indices,
-    torch::Tensor& state,
-    const torch::Tensor& r,
-    const torch::Tensor& decay,
-    const torch::Tensor& decay_bias,
-    const torch::Tensor& k,
-    const torch::Tensor& v,
-    const torch::Tensor& a,
-    const torch::Tensor& b,
-    torch::Tensor& output,
-    torch::Tensor& transform,
-    torch::Tensor& bias,
-    torch::Tensor& boundary,
-    torch::Tensor* state_dot_a,
+    const torch::stable::Tensor& sequence_chunk_offsets,
+    const torch::stable::Tensor& chunk_token_starts,
+    const torch::stable::Tensor& chunk_token_ends,
+    const torch::stable::Tensor& state_indices,
+    torch::stable::Tensor& state,
+    const torch::stable::Tensor& r,
+    const torch::stable::Tensor& decay,
+    const torch::stable::Tensor& decay_bias,
+    const torch::stable::Tensor& k,
+    const torch::stable::Tensor& v,
+    const torch::stable::Tensor& a,
+    const torch::stable::Tensor& b,
+    torch::stable::Tensor& output,
+    torch::stable::Tensor& transform,
+    torch::stable::Tensor& bias,
+    torch::stable::Tensor& boundary,
+    torch::stable::Tensor* state_dot_a,
     float scale,
     cudaStream_t stream) {
   dispatch_build<io_t>(
@@ -752,7 +747,7 @@ void launch_materialized_chunk(
       transform,
       bias,
       stream);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  FLASHRWKV_CUDA_CHECK(cudaGetLastError());
 
   dispatch_scan(
       state_tile,
@@ -765,12 +760,12 @@ void launch_materialized_chunk(
       bias,
       boundary,
       stream);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  FLASHRWKV_CUDA_CHECK(cudaGetLastError());
 
   launch_rl_infctx_chunk_replay_fp32_from_decay_logits(
       num_chunks, num_heads, chunk_token_starts, chunk_token_ends, boundary,
       r, decay, decay_bias, k, v, a, b, output, state_dot_a, scale, stream);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  FLASHRWKV_CUDA_CHECK(cudaGetLastError());
 }
 
 }  // namespace rl_infctx_materialized_detail
@@ -778,78 +773,80 @@ void launch_materialized_chunk(
 
 
 void recompute_chunk_fp32_from_decay_logits_cuda(
-    torch::Tensor sequence_chunk_offsets,
-    torch::Tensor chunk_token_starts,
-    torch::Tensor chunk_token_ends,
-    torch::Tensor state_indices,
-    torch::Tensor state,
-    torch::Tensor r,
-    torch::Tensor decay_logits,
-    torch::Tensor decay_bias,
-    torch::Tensor k,
-    torch::Tensor v,
-    torch::Tensor a,
-    torch::Tensor b,
-    torch::Tensor output,
-    torch::Tensor boundary,
+    torch::stable::Tensor sequence_chunk_offsets,
+    torch::stable::Tensor chunk_token_starts,
+    torch::stable::Tensor chunk_token_ends,
+    torch::stable::Tensor state_indices,
+    torch::stable::Tensor state,
+    torch::stable::Tensor r,
+    torch::stable::Tensor decay_logits,
+    torch::stable::Tensor decay_bias,
+    torch::stable::Tensor k,
+    torch::stable::Tensor v,
+    torch::stable::Tensor a,
+    torch::stable::Tensor b,
+    torch::stable::Tensor output,
+    torch::stable::Tensor boundary,
     double scale) {
-  const c10::cuda::CUDAGuard device_guard(state.device());
-  const auto stream = at::cuda::getCurrentCUDAStream();
+  const torch::stable::accelerator::DeviceGuard device_guard(state.device().index());
+  const auto stream = flashrwkv2::validation::current_cuda_stream();
   const int num_sequences = static_cast<int>(state_indices.numel());
   const int num_chunks = static_cast<int>(chunk_token_starts.numel());
   const int num_heads = static_cast<int>(state.size(1));
 
-  AT_DISPATCH_FLOATING_TYPES_AND2(
-      at::ScalarType::Half,
-      at::ScalarType::BFloat16,
-      r.scalar_type(),
-      "flashrwkv2_rl_infctx_recompute_chunk_fp32",
-      [&] {
+  auto dispatch_launch = [&](auto scalar_value) {
+    using scalar_t = decltype(scalar_value);
         rl_infctx_recompute_detail::launch_recompute_chunk<scalar_t>(
             num_sequences, num_chunks, num_heads,
             sequence_chunk_offsets, chunk_token_starts, chunk_token_ends,
             state_indices, state, r, decay_logits, decay_bias, k, v, a, b,
             output, boundary, static_cast<float>(scale), stream);
-      });
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+      };
+  switch (r.scalar_type()) {
+    case torch::headeronly::ScalarType::Half:
+      dispatch_launch(torch::headeronly::Half{});
+      break;
+    case torch::headeronly::ScalarType::BFloat16:
+      dispatch_launch(torch::headeronly::BFloat16{});
+      break;
+    default:
+      STD_TORCH_CHECK(false, "token dtype must be float16 or bfloat16");
+  }
+  FLASHRWKV_CUDA_CHECK(cudaGetLastError());
 }
 
 
 
 void materialized_chunk_fp32_from_decay_logits_cuda(
-    torch::Tensor sequence_chunk_offsets,
-    torch::Tensor chunk_token_starts,
-    torch::Tensor chunk_token_ends,
-    torch::Tensor state_indices,
-    torch::Tensor state,
-    torch::Tensor r,
-    torch::Tensor decay_logits,
-    torch::Tensor decay_bias,
-    torch::Tensor k,
-    torch::Tensor v,
-    torch::Tensor a,
-    torch::Tensor b,
-    torch::Tensor output,
-    torch::Tensor transform,
-    torch::Tensor bias,
-    torch::Tensor boundary,
-    torch::Tensor state_dot_a,
+    torch::stable::Tensor sequence_chunk_offsets,
+    torch::stable::Tensor chunk_token_starts,
+    torch::stable::Tensor chunk_token_ends,
+    torch::stable::Tensor state_indices,
+    torch::stable::Tensor state,
+    torch::stable::Tensor r,
+    torch::stable::Tensor decay_logits,
+    torch::stable::Tensor decay_bias,
+    torch::stable::Tensor k,
+    torch::stable::Tensor v,
+    torch::stable::Tensor a,
+    torch::stable::Tensor b,
+    torch::stable::Tensor output,
+    torch::stable::Tensor transform,
+    torch::stable::Tensor bias,
+    torch::stable::Tensor boundary,
+    torch::stable::Tensor state_dot_a,
     int64_t build_warps,
     int64_t stages,
     int64_t state_tile,
     double scale) {
-  const c10::cuda::CUDAGuard device_guard(state.device());
-  const auto stream = at::cuda::getCurrentCUDAStream();
+  const torch::stable::accelerator::DeviceGuard device_guard(state.device().index());
+  const auto stream = flashrwkv2::validation::current_cuda_stream();
   const int num_sequences = static_cast<int>(state_indices.numel());
   const int num_chunks = static_cast<int>(chunk_token_starts.numel());
   const int num_heads = static_cast<int>(state.size(1));
 
-  AT_DISPATCH_FLOATING_TYPES_AND2(
-      at::ScalarType::Half,
-      at::ScalarType::BFloat16,
-      r.scalar_type(),
-      "flashrwkv2_rl_infctx_materialized_chunk_fp32",
-      [&] {
+  auto dispatch_launch = [&](auto scalar_value) {
+    using scalar_t = decltype(scalar_value);
         rl_infctx_materialized_detail::launch_materialized_chunk<scalar_t>(
             num_sequences, num_chunks, num_heads,
             static_cast<int>(build_warps),
@@ -860,8 +857,18 @@ void materialized_chunk_fp32_from_decay_logits_cuda(
             output, transform, bias, boundary,
             state_dot_a.defined() ? &state_dot_a : nullptr,
             static_cast<float>(scale), stream);
-      });
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+      };
+  switch (r.scalar_type()) {
+    case torch::headeronly::ScalarType::Half:
+      dispatch_launch(torch::headeronly::Half{});
+      break;
+    case torch::headeronly::ScalarType::BFloat16:
+      dispatch_launch(torch::headeronly::BFloat16{});
+      break;
+    default:
+      STD_TORCH_CHECK(false, "token dtype must be float16 or bfloat16");
+  }
+  FLASHRWKV_CUDA_CHECK(cudaGetLastError());
 }
 
 namespace rl_infctx_tiled_detail {
@@ -906,18 +913,29 @@ __global__ void recurrent_columns(
 }
 
 void tiled_chunk_fp32_from_decay_logits_cuda(
-    torch::Tensor sequence_chunk_offsets,torch::Tensor chunk_token_starts,
-    torch::Tensor chunk_token_ends,torch::Tensor state_indices,torch::Tensor state,
-    torch::Tensor r,torch::Tensor decay_logits,torch::Tensor decay_bias,
-    torch::Tensor k,torch::Tensor v,torch::Tensor a,torch::Tensor b,
-    torch::Tensor output,torch::Tensor boundary,torch::Tensor state_dot_a,double scale) {
-  const c10::cuda::CUDAGuard guard(state.device());
-  const auto stream=at::cuda::getCurrentCUDAStream();
+    torch::stable::Tensor sequence_chunk_offsets,torch::stable::Tensor chunk_token_starts,
+    torch::stable::Tensor chunk_token_ends,torch::stable::Tensor state_indices,torch::stable::Tensor state,
+    torch::stable::Tensor r,torch::stable::Tensor decay_logits,torch::stable::Tensor decay_bias,
+    torch::stable::Tensor k,torch::stable::Tensor v,torch::stable::Tensor a,torch::stable::Tensor b,
+    torch::stable::Tensor output,torch::stable::Tensor boundary,torch::stable::Tensor state_dot_a,double scale) {
+  const torch::stable::accelerator::DeviceGuard guard(state.device().index());
+  const auto stream=flashrwkv2::validation::current_cuda_stream();
   const int D=state.size(2),H=state.size(1),B=state_indices.numel();
-  AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half,at::ScalarType::BFloat16,r.scalar_type(),"flashrwkv2_rl_tiled",[&]{
+  auto dispatch_launch = [&](auto scalar_value) {
+    using scalar_t = decltype(scalar_value);
     const dim3 grid(D,H,B);
-    if(D==128) rl_infctx_tiled_detail::recurrent_columns<scalar_t,128><<<grid,32,0,stream>>>(H,sequence_chunk_offsets.data_ptr<int>(),chunk_token_starts.data_ptr<int>(),chunk_token_ends.data_ptr<int>(),state_indices.data_ptr<int>(),state.data_ptr<float>(),r.data_ptr<scalar_t>(),decay_logits.data_ptr<scalar_t>(),decay_bias.defined()?decay_bias.data_ptr<scalar_t>():nullptr,k.data_ptr<scalar_t>(),v.data_ptr<scalar_t>(),a.data_ptr<scalar_t>(),b.data_ptr<scalar_t>(),output.data_ptr<scalar_t>(),boundary.data_ptr<float>(),state_dot_a.defined()?state_dot_a.data_ptr<float>():nullptr,static_cast<float>(scale));
-    else rl_infctx_tiled_detail::recurrent_columns<scalar_t,256><<<grid,32,0,stream>>>(H,sequence_chunk_offsets.data_ptr<int>(),chunk_token_starts.data_ptr<int>(),chunk_token_ends.data_ptr<int>(),state_indices.data_ptr<int>(),state.data_ptr<float>(),r.data_ptr<scalar_t>(),decay_logits.data_ptr<scalar_t>(),decay_bias.defined()?decay_bias.data_ptr<scalar_t>():nullptr,k.data_ptr<scalar_t>(),v.data_ptr<scalar_t>(),a.data_ptr<scalar_t>(),b.data_ptr<scalar_t>(),output.data_ptr<scalar_t>(),boundary.data_ptr<float>(),state_dot_a.defined()?state_dot_a.data_ptr<float>():nullptr,static_cast<float>(scale));
-  });
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+    if(D==128) rl_infctx_tiled_detail::recurrent_columns<scalar_t,128><<<grid,32,0,stream>>>(H,sequence_chunk_offsets.mutable_data_ptr<int>(),chunk_token_starts.mutable_data_ptr<int>(),chunk_token_ends.mutable_data_ptr<int>(),state_indices.mutable_data_ptr<int>(),state.mutable_data_ptr<float>(),r.mutable_data_ptr<scalar_t>(),decay_logits.mutable_data_ptr<scalar_t>(),decay_bias.defined()?decay_bias.mutable_data_ptr<scalar_t>():nullptr,k.mutable_data_ptr<scalar_t>(),v.mutable_data_ptr<scalar_t>(),a.mutable_data_ptr<scalar_t>(),b.mutable_data_ptr<scalar_t>(),output.mutable_data_ptr<scalar_t>(),boundary.mutable_data_ptr<float>(),state_dot_a.defined()?state_dot_a.mutable_data_ptr<float>():nullptr,static_cast<float>(scale));
+    else rl_infctx_tiled_detail::recurrent_columns<scalar_t,256><<<grid,32,0,stream>>>(H,sequence_chunk_offsets.mutable_data_ptr<int>(),chunk_token_starts.mutable_data_ptr<int>(),chunk_token_ends.mutable_data_ptr<int>(),state_indices.mutable_data_ptr<int>(),state.mutable_data_ptr<float>(),r.mutable_data_ptr<scalar_t>(),decay_logits.mutable_data_ptr<scalar_t>(),decay_bias.defined()?decay_bias.mutable_data_ptr<scalar_t>():nullptr,k.mutable_data_ptr<scalar_t>(),v.mutable_data_ptr<scalar_t>(),a.mutable_data_ptr<scalar_t>(),b.mutable_data_ptr<scalar_t>(),output.mutable_data_ptr<scalar_t>(),boundary.mutable_data_ptr<float>(),state_dot_a.defined()?state_dot_a.mutable_data_ptr<float>():nullptr,static_cast<float>(scale));
+  };
+  switch (r.scalar_type()) {
+    case torch::headeronly::ScalarType::Half:
+      dispatch_launch(torch::headeronly::Half{});
+      break;
+    case torch::headeronly::ScalarType::BFloat16:
+      dispatch_launch(torch::headeronly::BFloat16{});
+      break;
+    default:
+      STD_TORCH_CHECK(false, "token dtype must be float16 or bfloat16");
+  }
+  FLASHRWKV_CUDA_CHECK(cudaGetLastError());
 }

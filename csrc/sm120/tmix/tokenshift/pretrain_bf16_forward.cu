@@ -5,9 +5,8 @@
 // Local adaptation: module-local FlashRWKV2 binding names only; tensor contract
 // remains the canonical train_temp [B,T,C] BF16 contract.
 
-#include <torch/extension.h>
+#include "validation.h"
 
-#include <ATen/cuda/CUDAContext.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -15,11 +14,11 @@
 
 namespace {
 
-__device__ inline __nv_bfloat162 load_bf16x2(const at::BFloat16* ptr) {
+__device__ inline __nv_bfloat162 load_bf16x2(const torch::headeronly::BFloat16* ptr) {
     return *reinterpret_cast<const __nv_bfloat162*>(ptr);
 }
 
-__device__ inline void store_bf16x2(at::BFloat16* ptr, __nv_bfloat162 value) {
+__device__ inline void store_bf16x2(torch::headeronly::BFloat16* ptr, __nv_bfloat162 value) {
     *reinterpret_cast<__nv_bfloat162*>(ptr) = value;
 }
 
@@ -32,19 +31,19 @@ inline int64_t ceil_div(int64_t n, int64_t d) {
 }
 
 __global__ void tmix_tokenshift_forward_kernel(
-    const at::BFloat16* __restrict__ x,
-    const at::BFloat16* __restrict__ x_r,
-    const at::BFloat16* __restrict__ x_w,
-    const at::BFloat16* __restrict__ x_k,
-    const at::BFloat16* __restrict__ x_v,
-    const at::BFloat16* __restrict__ x_a,
-    const at::BFloat16* __restrict__ x_g,
-    at::BFloat16* __restrict__ out_r,
-    at::BFloat16* __restrict__ out_w,
-    at::BFloat16* __restrict__ out_k,
-    at::BFloat16* __restrict__ out_v,
-    at::BFloat16* __restrict__ out_a,
-    at::BFloat16* __restrict__ out_g,
+    const torch::headeronly::BFloat16* __restrict__ x,
+    const torch::headeronly::BFloat16* __restrict__ x_r,
+    const torch::headeronly::BFloat16* __restrict__ x_w,
+    const torch::headeronly::BFloat16* __restrict__ x_k,
+    const torch::headeronly::BFloat16* __restrict__ x_v,
+    const torch::headeronly::BFloat16* __restrict__ x_a,
+    const torch::headeronly::BFloat16* __restrict__ x_g,
+    torch::headeronly::BFloat16* __restrict__ out_r,
+    torch::headeronly::BFloat16* __restrict__ out_w,
+    torch::headeronly::BFloat16* __restrict__ out_k,
+    torch::headeronly::BFloat16* __restrict__ out_v,
+    torch::headeronly::BFloat16* __restrict__ out_a,
+    torch::headeronly::BFloat16* __restrict__ out_g,
     int64_t bt_size,
     int64_t t_size,
     int64_t c_size) {
@@ -79,20 +78,20 @@ constexpr int TMIX_PARAM_THREADS = 256;
 constexpr int TMIX_PARAM_BT_TILE = 8;
 
 __global__ void tmix_tokenshift_backward_fused_kernel_v5(
-    const at::BFloat16* __restrict__ grad_r,
-    const at::BFloat16* __restrict__ grad_w,
-    const at::BFloat16* __restrict__ grad_k,
-    const at::BFloat16* __restrict__ grad_v,
-    const at::BFloat16* __restrict__ grad_a,
-    const at::BFloat16* __restrict__ grad_g,
-    const at::BFloat16* __restrict__ x,
-    const at::BFloat16* __restrict__ x_r,
-    const at::BFloat16* __restrict__ x_w,
-    const at::BFloat16* __restrict__ x_k,
-    const at::BFloat16* __restrict__ x_v,
-    const at::BFloat16* __restrict__ x_a,
-    const at::BFloat16* __restrict__ x_g,
-    at::BFloat16* __restrict__ grad_x,
+    const torch::headeronly::BFloat16* __restrict__ grad_r,
+    const torch::headeronly::BFloat16* __restrict__ grad_w,
+    const torch::headeronly::BFloat16* __restrict__ grad_k,
+    const torch::headeronly::BFloat16* __restrict__ grad_v,
+    const torch::headeronly::BFloat16* __restrict__ grad_a,
+    const torch::headeronly::BFloat16* __restrict__ grad_g,
+    const torch::headeronly::BFloat16* __restrict__ x,
+    const torch::headeronly::BFloat16* __restrict__ x_r,
+    const torch::headeronly::BFloat16* __restrict__ x_w,
+    const torch::headeronly::BFloat16* __restrict__ x_k,
+    const torch::headeronly::BFloat16* __restrict__ x_v,
+    const torch::headeronly::BFloat16* __restrict__ x_a,
+    const torch::headeronly::BFloat16* __restrict__ x_g,
+    torch::headeronly::BFloat16* __restrict__ grad_x,
     float* __restrict__ grad_x_r,
     float* __restrict__ grad_x_w,
     float* __restrict__ grad_x_k,
@@ -223,7 +222,7 @@ __global__ void tmix_tokenshift_backward_fused_kernel_v5(
 
 __global__ void cast_float_to_bf16_vec2_kernel(
     const float* __restrict__ src,
-    at::BFloat16* __restrict__ dst,
+    torch::headeronly::BFloat16* __restrict__ dst,
     int64_t c_size) {
     int64_t c_pair = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     int64_t total_pairs = c_size / 2;
@@ -235,44 +234,44 @@ __global__ void cast_float_to_bf16_vec2_kernel(
 }
 
 }
-std::vector<torch::Tensor> pretrain_tmix_tokenshift_forward_cuda(
-    torch::Tensor x,
-    torch::Tensor x_r,
-    torch::Tensor x_w,
-    torch::Tensor x_k,
-    torch::Tensor x_v,
-    torch::Tensor x_a,
-    torch::Tensor x_g) {
-    auto out_r = torch::empty_like(x);
-    auto out_w = torch::empty_like(x);
-    auto out_k = torch::empty_like(x);
-    auto out_v = torch::empty_like(x);
-    auto out_a = torch::empty_like(x);
-    auto out_g = torch::empty_like(x);
+std::vector<torch::stable::Tensor> pretrain_tmix_tokenshift_forward_cuda(
+    torch::stable::Tensor x,
+    torch::stable::Tensor x_r,
+    torch::stable::Tensor x_w,
+    torch::stable::Tensor x_k,
+    torch::stable::Tensor x_v,
+    torch::stable::Tensor x_a,
+    torch::stable::Tensor x_g) {
+    auto out_r = torch::stable::empty_like(x);
+    auto out_w = torch::stable::empty_like(x);
+    auto out_k = torch::stable::empty_like(x);
+    auto out_v = torch::stable::empty_like(x);
+    auto out_a = torch::stable::empty_like(x);
+    auto out_g = torch::stable::empty_like(x);
     const int threads = 256;
     const int64_t bt_size = x.size(0) * x.size(1);
     const int64_t c_size = x.size(2);
-    auto stream = at::cuda::getCurrentCUDAStream();
+    auto stream = flashrwkv2::validation::current_cuda_stream();
 
     const int64_t total_pairs = bt_size * (c_size / 2);
     const int blocks = static_cast<int>(ceil_div(total_pairs, static_cast<int64_t>(threads)));
     tmix_tokenshift_forward_kernel<<<blocks, threads, 0, stream>>>(
-        x.data_ptr<at::BFloat16>(),
-        x_r.data_ptr<at::BFloat16>(),
-        x_w.data_ptr<at::BFloat16>(),
-        x_k.data_ptr<at::BFloat16>(),
-        x_v.data_ptr<at::BFloat16>(),
-        x_a.data_ptr<at::BFloat16>(),
-        x_g.data_ptr<at::BFloat16>(),
-        out_r.data_ptr<at::BFloat16>(),
-        out_w.data_ptr<at::BFloat16>(),
-        out_k.data_ptr<at::BFloat16>(),
-        out_v.data_ptr<at::BFloat16>(),
-        out_a.data_ptr<at::BFloat16>(),
-        out_g.data_ptr<at::BFloat16>(),
+        x.mutable_data_ptr<torch::headeronly::BFloat16>(),
+        x_r.mutable_data_ptr<torch::headeronly::BFloat16>(),
+        x_w.mutable_data_ptr<torch::headeronly::BFloat16>(),
+        x_k.mutable_data_ptr<torch::headeronly::BFloat16>(),
+        x_v.mutable_data_ptr<torch::headeronly::BFloat16>(),
+        x_a.mutable_data_ptr<torch::headeronly::BFloat16>(),
+        x_g.mutable_data_ptr<torch::headeronly::BFloat16>(),
+        out_r.mutable_data_ptr<torch::headeronly::BFloat16>(),
+        out_w.mutable_data_ptr<torch::headeronly::BFloat16>(),
+        out_k.mutable_data_ptr<torch::headeronly::BFloat16>(),
+        out_v.mutable_data_ptr<torch::headeronly::BFloat16>(),
+        out_a.mutable_data_ptr<torch::headeronly::BFloat16>(),
+        out_g.mutable_data_ptr<torch::headeronly::BFloat16>(),
         bt_size,
         x.size(1),
         c_size);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    FLASHRWKV_CUDA_CHECK(cudaGetLastError());
     return {out_r, out_w, out_k, out_v, out_a, out_g};
 }

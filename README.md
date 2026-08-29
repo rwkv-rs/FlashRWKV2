@@ -13,20 +13,24 @@ downstream projects.
 - `uv`, using the repository-local `./.venv`
 - A CUDA GPU binary-compatible with the native SM90 or SM120 backends
 
-The runtime and reproducible source-build contracts currently pin PyTorch
-2.13.0. Native builds always compile separate SM90 and SM120 private extensions;
-the active extension is selected at runtime. A backend suffix is its minimum
-native cubin target, not an exact-device allowlist: `_C_sm90` serves compatible
-SM9.x devices and `_C_sm120` serves compatible SM12.x devices whose minor
-compute capability is at least the compiled target.
+The runtime contract supports `torch>=2.11,<2.14`. Reproducible source builds
+remain pinned to PyTorch 2.13.0 and compile against the PyTorch 2.11 LibTorch
+Stable ABI baseline. Native builds always compile separate import-only SM90 and
+SM120 private extensions; the active extension is selected at runtime and the
+public operators are exposed through `torch.ops.flashrwkv2`. A backend suffix is
+its minimum native cubin target, not an exact-device allowlist: `_C_sm90` serves
+compatible SM9.x devices and `_C_sm120` serves compatible SM12.x devices whose
+minor compute capability is at least the compiled target.
 
 ## Installation
 
 The current alpha publishes a prebuilt CPython 3.12 Linux x86_64 wheel. Its
 currently validated product is the RTX PRO 6000 at SM120; binary compatibility
 does not by itself constitute a product-level correctness or CUDA Graph claim.
-The wheel requires glibc 2.38 or newer, PyTorch 2.13.0, and a CUDA 13 runtime
-supplied through PyTorch's dependencies:
+The wheel requires glibc 2.38 or newer, PyTorch 2.11 through 2.13, and a CUDA 13
+runtime supplied through PyTorch's dependencies. The same CPython 3.12 wheel is
+built once with PyTorch 2.13 and validated against all three supported PyTorch
+minor versions:
 
 ```bash
 python -m pip install --pre FlashRWKV2

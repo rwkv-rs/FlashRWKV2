@@ -14,11 +14,10 @@
 // canonical large-rank lowrank caller reaches those helpers directly.
 //
 // SPDX and provenance are retained from the upstream source below.
+#include "validation.h"
+
 #include "../../../../internal/linear/backend.cuh"
 
-#include <ATen/ATen.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAException.h>
 #include <cuda_fp16.h>
 
 #include <algorithm>
@@ -26,16 +25,16 @@
 #include <optional>
 #include <vector>
 
-using dtype = at::Half;
+using dtype = torch::headeronly::Half;
 
 void wkv_prepare_vres_forward_varlen_cuda(
     int total_tokens,
     int channels,
-    at::Tensor v,
-    at::Tensor v_first,
-    at::Tensor v0,
-    at::Tensor v12,
-    at::Tensor output);
+    torch::stable::Tensor v,
+    torch::stable::Tensor v_first,
+    torch::stable::Tensor v0,
+    torch::stable::Tensor v12,
+    torch::stable::Tensor output);
 
 namespace {
 
@@ -420,45 +419,45 @@ __global__ __launch_bounds__(Threads, 2) void linear_wagv_rank_out_f16_kernel(
 
 } // namespace
 
-at::Tensor lowrank_tanh_f16_cuda(at::Tensor x) {
-  TORCH_CHECK((x.numel() % 2) == 0,
+torch::stable::Tensor lowrank_tanh_f16_cuda(torch::stable::Tensor x) {
+  STD_TORCH_CHECK((x.numel() % 2) == 0,
               "lowrank tanh requires an even number of elements");
-  auto out = at::empty_like(x);
+  auto out = torch::stable::empty_like(x);
   constexpr int threads = 256;
   const int64_t total_pairs = x.numel() / 2;
-  auto stream = at::cuda::getCurrentCUDAStream();
+  auto stream = flashrwkv2::validation::current_cuda_stream();
   linear_act_tanh_f16_kernel<<<static_cast<int>(ceil_div(total_pairs, threads)), threads, 0, stream>>>(
-      x.data_ptr<dtype>(), out.data_ptr<dtype>(), total_pairs);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+      x.mutable_data_ptr<dtype>(), out.mutable_data_ptr<dtype>(), total_pairs);
+  FLASHRWKV_CUDA_CHECK(cudaGetLastError());
   return out;
 }
 
-at::Tensor lowrank_sigmoid_f16_cuda(at::Tensor x) {
-  TORCH_CHECK((x.numel() % 2) == 0,
+torch::stable::Tensor lowrank_sigmoid_f16_cuda(torch::stable::Tensor x) {
+  STD_TORCH_CHECK((x.numel() % 2) == 0,
               "lowrank sigmoid requires an even number of elements");
-  auto out = at::empty_like(x);
+  auto out = torch::stable::empty_like(x);
   constexpr int threads = 256;
   const int64_t total_pairs = x.numel() / 2;
-  auto stream = at::cuda::getCurrentCUDAStream();
+  auto stream = flashrwkv2::validation::current_cuda_stream();
   linear_act_sigmoid_f16_kernel<<<static_cast<int>(ceil_div(total_pairs, threads)), threads, 0, stream>>>(
-      x.data_ptr<dtype>(), out.data_ptr<dtype>(), total_pairs);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+      x.mutable_data_ptr<dtype>(), out.mutable_data_ptr<dtype>(), total_pairs);
+  FLASHRWKV_CUDA_CHECK(cudaGetLastError());
   return out;
 }
 
-std::vector<at::Tensor> linear_wag_rank_in_f16_cuda(
-    at::Tensor xw,
-    at::Tensor xa,
-    at::Tensor xg,
-    at::Tensor w1_t,
-    at::Tensor a1_t,
-    at::Tensor g1_t) {
+std::vector<torch::stable::Tensor> linear_wag_rank_in_f16_cuda(
+    torch::stable::Tensor xw,
+    torch::stable::Tensor xa,
+    torch::stable::Tensor xg,
+    torch::stable::Tensor w1_t,
+    torch::stable::Tensor a1_t,
+    torch::stable::Tensor g1_t) {
   const int64_t k64 = xw.size(-1);
   const int64_t rw64 = w1_t.size(0);
   const int64_t ra64 = a1_t.size(0);
   const int64_t rg64 = g1_t.size(0);
   const int64_t m64 = xw.numel() / k64;
-  TORCH_CHECK(k64 <= INT_MAX && rw64 <= INT_MAX && ra64 <= INT_MAX && rg64 <= INT_MAX && m64 <= INT_MAX,
+  STD_TORCH_CHECK(k64 <= INT_MAX && rw64 <= INT_MAX && ra64 <= INT_MAX && rg64 <= INT_MAX && m64 <= INT_MAX,
               "linear_wag_rank_in_f16 shape too large");
   const int K = static_cast<int>(k64);
   const int Rw = static_cast<int>(rw64);
@@ -466,45 +465,45 @@ std::vector<at::Tensor> linear_wag_rank_in_f16_cuda(
   const int Rg = static_cast<int>(rg64);
   const int Rmax = std::max(Rw, std::max(Ra, Rg));
   const int M = static_cast<int>(m64);
-  TORCH_CHECK(K >= 1024 && Rmax <= 512 && M <= 8, "linear_wag_rank_in_f16 supports only K>=1024,R<=512,M<=8");
+  STD_TORCH_CHECK(K >= 1024 && Rmax <= 512 && M <= 8, "linear_wag_rank_in_f16 supports only K>=1024,R<=512,M<=8");
   std::vector<int64_t> w_sizes(xw.sizes().begin(), xw.sizes().end());
   std::vector<int64_t> a_sizes = w_sizes;
   std::vector<int64_t> g_sizes = w_sizes;
   w_sizes.back() = rw64;
   a_sizes.back() = ra64;
   g_sizes.back() = rg64;
-  auto w1 = at::empty(w_sizes, xw.options());
-  auto a1 = at::empty(a_sizes, xw.options());
-  auto g1 = at::empty(g_sizes, xw.options());
+  auto w1 = torch::stable::new_empty(xw, w_sizes);
+  auto a1 = torch::stable::new_empty(xw, a_sizes);
+  auto g1 = torch::stable::new_empty(xw, g_sizes);
   if (M == 0 || K == 0 || Rmax == 0) {
     return {w1, a1, g1};
   }
-  auto stream = at::cuda::getCurrentCUDAStream();
+  auto stream = flashrwkv2::validation::current_cuda_stream();
   linear_wag_rank_in_f16_kernel<256><<<dim3(Rmax, M, 3), 256, 0, stream>>>(
       M, K, Rw, Ra, Rg, Rmax,
-      xw.data_ptr<dtype>(), xa.data_ptr<dtype>(), xg.data_ptr<dtype>(),
-      w1_t.data_ptr<dtype>(), a1_t.data_ptr<dtype>(), g1_t.data_ptr<dtype>(),
-      w1.data_ptr<dtype>(), a1.data_ptr<dtype>(), g1.data_ptr<dtype>());
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+      xw.mutable_data_ptr<dtype>(), xa.mutable_data_ptr<dtype>(), xg.mutable_data_ptr<dtype>(),
+      w1_t.mutable_data_ptr<dtype>(), a1_t.mutable_data_ptr<dtype>(), g1_t.mutable_data_ptr<dtype>(),
+      w1.mutable_data_ptr<dtype>(), a1.mutable_data_ptr<dtype>(), g1.mutable_data_ptr<dtype>());
+  FLASHRWKV_CUDA_CHECK(cudaGetLastError());
   return {w1, a1, g1};
 }
 
-std::vector<at::Tensor> linear_wagv_rank_in_f16_cuda(
-    at::Tensor xw,
-    at::Tensor xa,
-    at::Tensor xg,
-    at::Tensor xv,
-    at::Tensor w1_t,
-    at::Tensor a1_t,
-    at::Tensor g1_t,
-    at::Tensor v1_t) {
+std::vector<torch::stable::Tensor> linear_wagv_rank_in_f16_cuda(
+    torch::stable::Tensor xw,
+    torch::stable::Tensor xa,
+    torch::stable::Tensor xg,
+    torch::stable::Tensor xv,
+    torch::stable::Tensor w1_t,
+    torch::stable::Tensor a1_t,
+    torch::stable::Tensor g1_t,
+    torch::stable::Tensor v1_t) {
   const int64_t k64 = xw.size(-1);
   const int64_t rw64 = w1_t.size(0);
   const int64_t ra64 = a1_t.size(0);
   const int64_t rg64 = g1_t.size(0);
   const int64_t rv64 = v1_t.size(0);
   const int64_t m64 = xw.numel() / k64;
-  TORCH_CHECK(k64 <= INT_MAX && rw64 <= INT_MAX && ra64 <= INT_MAX && rg64 <= INT_MAX && rv64 <= INT_MAX && m64 <= INT_MAX,
+  STD_TORCH_CHECK(k64 <= INT_MAX && rw64 <= INT_MAX && ra64 <= INT_MAX && rg64 <= INT_MAX && rv64 <= INT_MAX && m64 <= INT_MAX,
               "linear_wagv_rank_in_f16 shape too large");
   const int K = static_cast<int>(k64);
   const int Rw = static_cast<int>(rw64);
@@ -513,7 +512,7 @@ std::vector<at::Tensor> linear_wagv_rank_in_f16_cuda(
   const int Rv = static_cast<int>(rv64);
   const int Rmax = std::max(std::max(Rw, Ra), std::max(Rg, Rv));
   const int M = static_cast<int>(m64);
-  TORCH_CHECK(K >= 1024 && Rmax <= 512 && M <= 8, "linear_wagv_rank_in_f16 supports only K>=1024,R<=512,M<=8");
+  STD_TORCH_CHECK(K >= 1024 && Rmax <= 512 && M <= 8, "linear_wagv_rank_in_f16 supports only K>=1024,R<=512,M<=8");
   std::vector<int64_t> w_sizes(xw.sizes().begin(), xw.sizes().end());
   std::vector<int64_t> a_sizes = w_sizes;
   std::vector<int64_t> g_sizes = w_sizes;
@@ -522,89 +521,89 @@ std::vector<at::Tensor> linear_wagv_rank_in_f16_cuda(
   a_sizes.back() = ra64;
   g_sizes.back() = rg64;
   v_sizes.back() = rv64;
-  auto w1 = at::empty(w_sizes, xw.options());
-  auto a1 = at::empty(a_sizes, xw.options());
-  auto g1 = at::empty(g_sizes, xw.options());
-  auto v1 = at::empty(v_sizes, xw.options());
+  auto w1 = torch::stable::new_empty(xw, w_sizes);
+  auto a1 = torch::stable::new_empty(xw, a_sizes);
+  auto g1 = torch::stable::new_empty(xw, g_sizes);
+  auto v1 = torch::stable::new_empty(xw, v_sizes);
   if (M == 0 || K == 0 || Rmax == 0) {
     return {w1, a1, g1, v1};
   }
-  auto stream = at::cuda::getCurrentCUDAStream();
+  auto stream = flashrwkv2::validation::current_cuda_stream();
   linear_wagv_rank_in_f16_kernel<256><<<dim3(Rmax, M, 4), 256, 0, stream>>>(
       M, K, Rw, Ra, Rg, Rv, Rmax,
-      xw.data_ptr<dtype>(), xa.data_ptr<dtype>(), xg.data_ptr<dtype>(), xv.data_ptr<dtype>(),
-      w1_t.data_ptr<dtype>(), a1_t.data_ptr<dtype>(), g1_t.data_ptr<dtype>(), v1_t.data_ptr<dtype>(),
-      w1.data_ptr<dtype>(), a1.data_ptr<dtype>(), g1.data_ptr<dtype>(), v1.data_ptr<dtype>());
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+      xw.mutable_data_ptr<dtype>(), xa.mutable_data_ptr<dtype>(), xg.mutable_data_ptr<dtype>(), xv.mutable_data_ptr<dtype>(),
+      w1_t.mutable_data_ptr<dtype>(), a1_t.mutable_data_ptr<dtype>(), g1_t.mutable_data_ptr<dtype>(), v1_t.mutable_data_ptr<dtype>(),
+      w1.mutable_data_ptr<dtype>(), a1.mutable_data_ptr<dtype>(), g1.mutable_data_ptr<dtype>(), v1.mutable_data_ptr<dtype>());
+  FLASHRWKV_CUDA_CHECK(cudaGetLastError());
   return {w1, a1, g1, v1};
 }
 
-std::vector<at::Tensor> linear_wag_rank_out_f16_cuda(
-    at::Tensor w1,
-    at::Tensor a1,
-    at::Tensor g1,
-    at::Tensor w2_t,
-    at::Tensor a2_t,
-    at::Tensor g2_t) {
+std::vector<torch::stable::Tensor> linear_wag_rank_out_f16_cuda(
+    torch::stable::Tensor w1,
+    torch::stable::Tensor a1,
+    torch::stable::Tensor g1,
+    torch::stable::Tensor w2_t,
+    torch::stable::Tensor a2_t,
+    torch::stable::Tensor g2_t) {
   const int64_t kw64 = w1.size(-1);
   const int64_t ka64 = a1.size(-1);
   const int64_t kg64 = g1.size(-1);
   const int64_t c64 = w2_t.size(0);
   const int64_t m64 = w1.numel() / kw64;
-  TORCH_CHECK(kw64 <= INT_MAX && ka64 <= INT_MAX && kg64 <= INT_MAX && c64 <= INT_MAX && m64 <= INT_MAX,
+  STD_TORCH_CHECK(kw64 <= INT_MAX && ka64 <= INT_MAX && kg64 <= INT_MAX && c64 <= INT_MAX && m64 <= INT_MAX,
               "linear_wag_rank_out_f16 shape too large");
   const int Kw = static_cast<int>(kw64);
   const int Ka = static_cast<int>(ka64);
   const int Kg = static_cast<int>(kg64);
   const int C = static_cast<int>(c64);
   const int M = static_cast<int>(m64);
-  TORCH_CHECK(Kw <= 512 && Ka <= 512 && Kg <= 512 && C >= 1024 && M <= 4,
+  STD_TORCH_CHECK(Kw <= 512 && Ka <= 512 && Kg <= 512 && C >= 1024 && M <= 4,
               "linear_wag_rank_out_f16 supports only small-rank M<=4");
   std::vector<int64_t> out_sizes(w1.sizes().begin(), w1.sizes().end());
   out_sizes.back() = c64;
-  auto w = at::empty(out_sizes, w1.options());
-  auto a = at::empty(out_sizes, w1.options());
-  auto g = at::empty(out_sizes, w1.options());
+  auto w = torch::stable::new_empty(w1, out_sizes);
+  auto a = torch::stable::new_empty(w1, out_sizes);
+  auto g = torch::stable::new_empty(w1, out_sizes);
   if (M == 0 || C == 0 || Kw == 0 || Ka == 0 || Kg == 0) {
     return {w, a, g};
   }
-  auto stream = at::cuda::getCurrentCUDAStream();
+  auto stream = flashrwkv2::validation::current_cuda_stream();
   if (M == 1) {
     linear_wag_rank_out_f16_kernel<128, 4><<<dim3(ceil_div(C, 4), M, 3), 128, 0, stream>>>(
         M, C, Kw, Ka, Kg,
-        w1.data_ptr<dtype>(), a1.data_ptr<dtype>(), g1.data_ptr<dtype>(),
-        w2_t.data_ptr<dtype>(), a2_t.data_ptr<dtype>(), g2_t.data_ptr<dtype>(),
-        w.data_ptr<dtype>(), a.data_ptr<dtype>(), g.data_ptr<dtype>());
+        w1.mutable_data_ptr<dtype>(), a1.mutable_data_ptr<dtype>(), g1.mutable_data_ptr<dtype>(),
+        w2_t.mutable_data_ptr<dtype>(), a2_t.mutable_data_ptr<dtype>(), g2_t.mutable_data_ptr<dtype>(),
+        w.mutable_data_ptr<dtype>(), a.mutable_data_ptr<dtype>(), g.mutable_data_ptr<dtype>());
   } else {
     linear_wag_rank_out_f16_kernel<128, 4><<<dim3(ceil_div(C, 4), M, 3), 128, 0, stream>>>(
         M, C, Kw, Ka, Kg,
-        w1.data_ptr<dtype>(), a1.data_ptr<dtype>(), g1.data_ptr<dtype>(),
-        w2_t.data_ptr<dtype>(), a2_t.data_ptr<dtype>(), g2_t.data_ptr<dtype>(),
-        w.data_ptr<dtype>(), a.data_ptr<dtype>(), g.data_ptr<dtype>());
+        w1.mutable_data_ptr<dtype>(), a1.mutable_data_ptr<dtype>(), g1.mutable_data_ptr<dtype>(),
+        w2_t.mutable_data_ptr<dtype>(), a2_t.mutable_data_ptr<dtype>(), g2_t.mutable_data_ptr<dtype>(),
+        w.mutable_data_ptr<dtype>(), a.mutable_data_ptr<dtype>(), g.mutable_data_ptr<dtype>());
   }
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  FLASHRWKV_CUDA_CHECK(cudaGetLastError());
   return {w, a, g};
 }
 
-std::vector<at::Tensor> linear_wagv_rank_out_f16_cuda(
-    at::Tensor w1,
-    at::Tensor a1,
-    at::Tensor g1,
-    at::Tensor v1,
-    at::Tensor w2_t,
-    at::Tensor a2_t,
-    at::Tensor g2_t,
-    at::Tensor v2_t,
-    at::Tensor v,
-    at::Tensor v_first,
-    at::Tensor v0) {
+std::vector<torch::stable::Tensor> linear_wagv_rank_out_f16_cuda(
+    torch::stable::Tensor w1,
+    torch::stable::Tensor a1,
+    torch::stable::Tensor g1,
+    torch::stable::Tensor v1,
+    torch::stable::Tensor w2_t,
+    torch::stable::Tensor a2_t,
+    torch::stable::Tensor g2_t,
+    torch::stable::Tensor v2_t,
+    torch::stable::Tensor v,
+    torch::stable::Tensor v_first,
+    torch::stable::Tensor v0) {
   const int64_t kw64 = w1.size(-1);
   const int64_t ka64 = a1.size(-1);
   const int64_t kg64 = g1.size(-1);
   const int64_t kv64 = v1.size(-1);
   const int64_t c64 = w2_t.size(0);
   const int64_t m64 = w1.numel() / kw64;
-  TORCH_CHECK(kw64 <= INT_MAX && ka64 <= INT_MAX && kg64 <= INT_MAX && kv64 <= INT_MAX && c64 <= INT_MAX && m64 <= INT_MAX,
+  STD_TORCH_CHECK(kw64 <= INT_MAX && ka64 <= INT_MAX && kg64 <= INT_MAX && kv64 <= INT_MAX && c64 <= INT_MAX && m64 <= INT_MAX,
               "linear_wagv_rank_out_f16 shape too large");
   const int Kw = static_cast<int>(kw64);
   const int Ka = static_cast<int>(ka64);
@@ -612,34 +611,34 @@ std::vector<at::Tensor> linear_wagv_rank_out_f16_cuda(
   const int Kv = static_cast<int>(kv64);
   const int C = static_cast<int>(c64);
   const int M = static_cast<int>(m64);
-  TORCH_CHECK(Kw <= 512 && Ka <= 512 && Kg <= 512 && Kv <= 512 && C >= 1024 && M <= 4,
+  STD_TORCH_CHECK(Kw <= 512 && Ka <= 512 && Kg <= 512 && Kv <= 512 && C >= 1024 && M <= 4,
               "linear_wagv_rank_out_f16 supports only small-rank M<=4");
   std::vector<int64_t> out_sizes(w1.sizes().begin(), w1.sizes().end());
   out_sizes.back() = c64;
-  auto w = at::empty(out_sizes, w1.options());
-  auto a = at::empty(out_sizes, w1.options());
-  auto g = at::empty(out_sizes, w1.options());
-  auto v_out = at::empty(out_sizes, w1.options());
+  auto w = torch::stable::new_empty(w1, out_sizes);
+  auto a = torch::stable::new_empty(w1, out_sizes);
+  auto g = torch::stable::new_empty(w1, out_sizes);
+  auto v_out = torch::stable::new_empty(w1, out_sizes);
   if (M == 0 || C == 0 || Kw == 0 || Ka == 0 || Kg == 0 || Kv == 0) {
     return {w, a, g, v_out};
   }
-  auto stream = at::cuda::getCurrentCUDAStream();
+  auto stream = flashrwkv2::validation::current_cuda_stream();
   if (M == 1) {
     linear_wagv_rank_out_f16_kernel<128, 4><<<dim3(ceil_div(C, 4), M, 4), 128, 0, stream>>>(
         M, C, Kw, Ka, Kg, Kv,
-        w1.data_ptr<dtype>(), a1.data_ptr<dtype>(), g1.data_ptr<dtype>(), v1.data_ptr<dtype>(),
-        w2_t.data_ptr<dtype>(), a2_t.data_ptr<dtype>(), g2_t.data_ptr<dtype>(), v2_t.data_ptr<dtype>(),
-        v.data_ptr<dtype>(), v_first.data_ptr<dtype>(), v0.data_ptr<dtype>(),
-        w.data_ptr<dtype>(), a.data_ptr<dtype>(), g.data_ptr<dtype>(), v_out.data_ptr<dtype>());
+        w1.mutable_data_ptr<dtype>(), a1.mutable_data_ptr<dtype>(), g1.mutable_data_ptr<dtype>(), v1.mutable_data_ptr<dtype>(),
+        w2_t.mutable_data_ptr<dtype>(), a2_t.mutable_data_ptr<dtype>(), g2_t.mutable_data_ptr<dtype>(), v2_t.mutable_data_ptr<dtype>(),
+        v.mutable_data_ptr<dtype>(), v_first.mutable_data_ptr<dtype>(), v0.mutable_data_ptr<dtype>(),
+        w.mutable_data_ptr<dtype>(), a.mutable_data_ptr<dtype>(), g.mutable_data_ptr<dtype>(), v_out.mutable_data_ptr<dtype>());
   } else {
     linear_wagv_rank_out_f16_kernel<128, 4><<<dim3(ceil_div(C, 4), M, 4), 128, 0, stream>>>(
         M, C, Kw, Ka, Kg, Kv,
-        w1.data_ptr<dtype>(), a1.data_ptr<dtype>(), g1.data_ptr<dtype>(), v1.data_ptr<dtype>(),
-        w2_t.data_ptr<dtype>(), a2_t.data_ptr<dtype>(), g2_t.data_ptr<dtype>(), v2_t.data_ptr<dtype>(),
-        v.data_ptr<dtype>(), v_first.data_ptr<dtype>(), v0.data_ptr<dtype>(),
-        w.data_ptr<dtype>(), a.data_ptr<dtype>(), g.data_ptr<dtype>(), v_out.data_ptr<dtype>());
+        w1.mutable_data_ptr<dtype>(), a1.mutable_data_ptr<dtype>(), g1.mutable_data_ptr<dtype>(), v1.mutable_data_ptr<dtype>(),
+        w2_t.mutable_data_ptr<dtype>(), a2_t.mutable_data_ptr<dtype>(), g2_t.mutable_data_ptr<dtype>(), v2_t.mutable_data_ptr<dtype>(),
+        v.mutable_data_ptr<dtype>(), v_first.mutable_data_ptr<dtype>(), v0.mutable_data_ptr<dtype>(),
+        w.mutable_data_ptr<dtype>(), a.mutable_data_ptr<dtype>(), g.mutable_data_ptr<dtype>(), v_out.mutable_data_ptr<dtype>());
   }
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  FLASHRWKV_CUDA_CHECK(cudaGetLastError());
   return {w, a, g, v_out};
 }
 
@@ -740,12 +739,12 @@ const WkvPrepareRankConfig* find_wkv_prepare_rank_config(
   return nullptr;
 }
 
-at::Tensor wkv_prepare_rank_dispatch_f16_cuda(
-    at::Tensor x,
-    const std::optional<at::Tensor>& weight,
-    const std::optional<at::Tensor>& weight_orig,
+torch::stable::Tensor wkv_prepare_rank_dispatch_f16_cuda(
+    torch::stable::Tensor x,
+    const std::optional<torch::stable::Tensor>& weight,
+    const std::optional<torch::stable::Tensor>& weight_orig,
     bool input_projection) {
-  TORCH_CHECK(weight.has_value() || weight_orig.has_value(),
+  STD_TORCH_CHECK(weight.has_value() || weight_orig.has_value(),
               "one of weight or weight_t must be provided");
   const int64_t input_features = x.size(-1);
   const int64_t rows64 = x.numel() / input_features;
@@ -755,7 +754,7 @@ at::Tensor wkv_prepare_rank_dispatch_f16_cuda(
   const int64_t rank64 = input_projection
       ? (weight.has_value() ? weight->size(1) : weight_orig->size(0))
       : (weight.has_value() ? weight->size(0) : weight_orig->size(1));
-  TORCH_CHECK(rows64 <= INT_MAX && rank64 <= INT_MAX,
+  STD_TORCH_CHECK(rows64 <= INT_MAX && rank64 <= INT_MAX,
               "lowrank dispatch shape exceeds int32");
 
   const WkvPrepareRankConfig* config = nullptr;
@@ -797,16 +796,16 @@ at::Tensor wkv_prepare_rank_dispatch_f16_cuda(
 
 
 
-std::vector<at::Tensor> lowrank_wag_rank_in_f16_cuda(
-    at::Tensor x_w,
-    at::Tensor x_a,
-    at::Tensor x_g,
-    std::optional<at::Tensor> w1_t,
-    std::optional<at::Tensor> a1_t,
-    std::optional<at::Tensor> g1_t,
-    std::optional<at::Tensor> w1,
-    std::optional<at::Tensor> a1,
-    std::optional<at::Tensor> g1) {
+std::vector<torch::stable::Tensor> lowrank_wag_rank_in_f16_cuda(
+    torch::stable::Tensor x_w,
+    torch::stable::Tensor x_a,
+    torch::stable::Tensor x_g,
+    std::optional<torch::stable::Tensor> w1_t,
+    std::optional<torch::stable::Tensor> a1_t,
+    std::optional<torch::stable::Tensor> g1_t,
+    std::optional<torch::stable::Tensor> w1,
+    std::optional<torch::stable::Tensor> a1,
+    std::optional<torch::stable::Tensor> g1) {
   const int64_t rows = x_w.size(0);
   if (rows <= 7 && w1_t.has_value() && a1_t.has_value() && g1_t.has_value()) {
     return linear_wag_rank_in_f16_cuda(
@@ -819,19 +818,19 @@ std::vector<at::Tensor> lowrank_wag_rank_in_f16_cuda(
   };
 }
 
-std::vector<at::Tensor> lowrank_wagv_rank_in_f16_cuda(
-    at::Tensor x_w,
-    at::Tensor x_a,
-    at::Tensor x_g,
-    at::Tensor x_v,
-    std::optional<at::Tensor> w1_t,
-    std::optional<at::Tensor> a1_t,
-    std::optional<at::Tensor> g1_t,
-    std::optional<at::Tensor> v1_t,
-    std::optional<at::Tensor> w1,
-    std::optional<at::Tensor> a1,
-    std::optional<at::Tensor> g1,
-    std::optional<at::Tensor> v1) {
+std::vector<torch::stable::Tensor> lowrank_wagv_rank_in_f16_cuda(
+    torch::stable::Tensor x_w,
+    torch::stable::Tensor x_a,
+    torch::stable::Tensor x_g,
+    torch::stable::Tensor x_v,
+    std::optional<torch::stable::Tensor> w1_t,
+    std::optional<torch::stable::Tensor> a1_t,
+    std::optional<torch::stable::Tensor> g1_t,
+    std::optional<torch::stable::Tensor> v1_t,
+    std::optional<torch::stable::Tensor> w1,
+    std::optional<torch::stable::Tensor> a1,
+    std::optional<torch::stable::Tensor> g1,
+    std::optional<torch::stable::Tensor> v1) {
   const int64_t rows = x_w.size(0);
   if (rows <= 7 && w1_t.has_value() && a1_t.has_value() &&
       g1_t.has_value() && v1_t.has_value()) {
@@ -846,16 +845,16 @@ std::vector<at::Tensor> lowrank_wagv_rank_in_f16_cuda(
   };
 }
 
-std::vector<at::Tensor> lowrank_wag_rank_out_f16_cuda(
-    at::Tensor w1,
-    at::Tensor a1,
-    at::Tensor g1,
-    std::optional<at::Tensor> w2_t,
-    std::optional<at::Tensor> a2_t,
-    std::optional<at::Tensor> g2_t,
-    std::optional<at::Tensor> w2,
-    std::optional<at::Tensor> a2,
-    std::optional<at::Tensor> g2) {
+std::vector<torch::stable::Tensor> lowrank_wag_rank_out_f16_cuda(
+    torch::stable::Tensor w1,
+    torch::stable::Tensor a1,
+    torch::stable::Tensor g1,
+    std::optional<torch::stable::Tensor> w2_t,
+    std::optional<torch::stable::Tensor> a2_t,
+    std::optional<torch::stable::Tensor> g2_t,
+    std::optional<torch::stable::Tensor> w2,
+    std::optional<torch::stable::Tensor> a2,
+    std::optional<torch::stable::Tensor> g2) {
   const int64_t rows = w1.size(0);
   if (rows <= 4 && w2_t.has_value() && a2_t.has_value() && g2_t.has_value()) {
     return linear_wag_rank_out_f16_cuda(
@@ -872,22 +871,22 @@ std::vector<at::Tensor> lowrank_wag_rank_out_f16_cuda(
   };
 }
 
-std::vector<at::Tensor> lowrank_wagv_vres_f16_cuda(
-    at::Tensor w1,
-    at::Tensor a1,
-    at::Tensor g1,
-    at::Tensor v1,
-    std::optional<at::Tensor> w2_t,
-    std::optional<at::Tensor> a2_t,
-    std::optional<at::Tensor> g2_t,
-    std::optional<at::Tensor> v2_t,
-    std::optional<at::Tensor> w2,
-    std::optional<at::Tensor> a2,
-    std::optional<at::Tensor> g2,
-    std::optional<at::Tensor> v2,
-    at::Tensor v,
-    at::Tensor v_first,
-    at::Tensor v0) {
+std::vector<torch::stable::Tensor> lowrank_wagv_vres_f16_cuda(
+    torch::stable::Tensor w1,
+    torch::stable::Tensor a1,
+    torch::stable::Tensor g1,
+    torch::stable::Tensor v1,
+    std::optional<torch::stable::Tensor> w2_t,
+    std::optional<torch::stable::Tensor> a2_t,
+    std::optional<torch::stable::Tensor> g2_t,
+    std::optional<torch::stable::Tensor> v2_t,
+    std::optional<torch::stable::Tensor> w2,
+    std::optional<torch::stable::Tensor> a2,
+    std::optional<torch::stable::Tensor> g2,
+    std::optional<torch::stable::Tensor> v2,
+    torch::stable::Tensor v,
+    torch::stable::Tensor v_first,
+    torch::stable::Tensor v0) {
   const int64_t rows = w1.size(0);
   if (rows <= 4 && w2_t.has_value() && a2_t.has_value() &&
       g2_t.has_value() && v2_t.has_value()) {
@@ -898,7 +897,7 @@ std::vector<at::Tensor> lowrank_wagv_vres_f16_cuda(
   auto wag = lowrank_wag_rank_out_f16_cuda(
       w1, a1, g1, w2_t, a2_t, g2_t, w2, a2, g2);
   auto v12 = wkv_prepare_rank_dispatch_f16_cuda(v1, v2, v2_t, false);
-  auto value = at::empty_like(v);
+  auto value = torch::stable::empty_like(v);
   wkv_prepare_vres_forward_varlen_cuda(
       static_cast<int>(rows), static_cast<int>(v.size(1)),
       v, v_first, v0, v12, value);

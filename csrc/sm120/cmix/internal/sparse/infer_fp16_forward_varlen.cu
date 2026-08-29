@@ -16,17 +16,14 @@
 // to one CTA and visits feature tiles in a fixed order, avoiding the canonical
 // kernels' cross-CTA FP16 atomicAdd ordering.
 
-#include <ATen/ATen.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAException.h>
 #include <cuda_fp16.h>
-#include <torch/extension.h>
+#include "validation.h"
 
 #include <cstdint>
 
 namespace {
 
-using dtype = at::Half;
+using dtype = torch::headeronly::Half;
 
 constexpr int FFN_SPMV_THREADS = 128;
 constexpr int FFN_TILE = 128;
@@ -577,17 +574,17 @@ void launch_sparse_down_deterministic(
     int rows,
     int channels,
     int features,
-    torch::Tensor input,
-    torch::Tensor value_fc,
-    torch::Tensor output,
+    torch::stable::Tensor input,
+    torch::stable::Tensor value_fc,
+    torch::stable::Tensor output,
     bool apply_relu_square) {
-  TORCH_CHECK(
+  STD_TORCH_CHECK(
       channels % (2 * FFN_SPMV_THREADS) == 0,
       "deterministic CMix sparse output channels must be divisible by 256");
-  TORCH_CHECK(
+  STD_TORCH_CHECK(
       features % FFN_TILE == 0,
       "deterministic CMix sparse features must be divisible by 128");
-  const auto stream = at::cuda::getCurrentCUDAStream();
+  const auto stream = flashrwkv2::validation::current_cuda_stream();
   const dim3 grid(
       static_cast<unsigned int>(channels / (2 * FFN_SPMV_THREADS)),
       static_cast<unsigned int>(rows));
@@ -596,19 +593,19 @@ void launch_sparse_down_deterministic(
         grid, FFN_SPMV_THREADS, 0, stream>>>(
         channels,
         features,
-        reinterpret_cast<const dtype*>(input.data_ptr()),
-        reinterpret_cast<const dtype*>(value_fc.data_ptr()),
-        reinterpret_cast<dtype*>(output.data_ptr()));
+        reinterpret_cast<const dtype*>(input.mutable_data_ptr()),
+        reinterpret_cast<const dtype*>(value_fc.mutable_data_ptr()),
+        reinterpret_cast<dtype*>(output.mutable_data_ptr()));
   } else {
     cmix_sparse_spmv_deterministic_rows_kernel<false><<<
         grid, FFN_SPMV_THREADS, 0, stream>>>(
         channels,
         features,
-        reinterpret_cast<const dtype*>(input.data_ptr()),
-        reinterpret_cast<const dtype*>(value_fc.data_ptr()),
-        reinterpret_cast<dtype*>(output.data_ptr()));
+        reinterpret_cast<const dtype*>(input.mutable_data_ptr()),
+        reinterpret_cast<const dtype*>(value_fc.mutable_data_ptr()),
+        reinterpret_cast<dtype*>(output.mutable_data_ptr()));
   }
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  FLASHRWKV_CUDA_CHECK(cudaGetLastError());
 }
 
 void launch_sparse_down(
@@ -616,64 +613,64 @@ void launch_sparse_down(
     int64_t dispatch_rows,
     int channels,
     int features,
-    torch::Tensor preact,
-    torch::Tensor value_fc,
-    torch::Tensor output,
+    torch::stable::Tensor preact,
+    torch::stable::Tensor value_fc,
+    torch::stable::Tensor output,
     int accumulators,
     bool reuse,
     bool split2) {
-  TORCH_CHECK(channels % 8 == 0, "CMix sparse output channels must be divisible by 8");
-  TORCH_CHECK(features % 128 == 0, "CMix sparse features must be divisible by 128");
-  const auto stream = at::cuda::getCurrentCUDAStream();
+  STD_TORCH_CHECK(channels % 8 == 0, "CMix sparse output channels must be divisible by 8");
+  STD_TORCH_CHECK(features % 128 == 0, "CMix sparse features must be divisible by 128");
+  const auto stream = flashrwkv2::validation::current_cuda_stream();
   const int64_t output_vec4 = static_cast<int64_t>(rows) * (channels / 8);
   zero_vec4_kernel<<<static_cast<int>(ceil_div(output_vec4, 128)), 128, 0, stream>>>(
-      reinterpret_cast<dtype*>(output.data_ptr()), output_vec4);
+      reinterpret_cast<dtype*>(output.mutable_data_ptr()), output_vec4);
 
   if (dispatch_rows >= 8 && features % 512 == 0 && channels % 512 == 0) {
     if (reuse) {
-      TORCH_CHECK(accumulators == 1 || accumulators == 2,
+      STD_TORCH_CHECK(accumulators == 1 || accumulators == 2,
                   "T512 reuse dispatch requires one or two accumulators");
       if (accumulators == 1) {
         cmix_sparse_spmv_relu_rows_t512_reuse_kernel<1><<<
             dim3(features / 512, channels / 512, rows), 256, 0, stream>>>(
             channels,
             features,
-            reinterpret_cast<const dtype*>(preact.data_ptr()),
-            reinterpret_cast<const dtype*>(value_fc.data_ptr()),
-            reinterpret_cast<dtype*>(output.data_ptr()));
+            reinterpret_cast<const dtype*>(preact.mutable_data_ptr()),
+            reinterpret_cast<const dtype*>(value_fc.mutable_data_ptr()),
+            reinterpret_cast<dtype*>(output.mutable_data_ptr()));
       } else {
         cmix_sparse_spmv_relu_rows_t512_reuse_kernel<2><<<
             dim3(features / 512, channels / 512, rows), 256, 0, stream>>>(
             channels,
             features,
-            reinterpret_cast<const dtype*>(preact.data_ptr()),
-            reinterpret_cast<const dtype*>(value_fc.data_ptr()),
-            reinterpret_cast<dtype*>(output.data_ptr()));
+            reinterpret_cast<const dtype*>(preact.mutable_data_ptr()),
+            reinterpret_cast<const dtype*>(value_fc.mutable_data_ptr()),
+            reinterpret_cast<dtype*>(output.mutable_data_ptr()));
       }
     } else if (accumulators == 1) {
       cmix_sparse_spmv_relu_rows_t512_kernel<1><<<
           dim3(features / 512, channels / 512, rows), 256, 0, stream>>>(
           channels,
           features,
-          reinterpret_cast<const dtype*>(preact.data_ptr()),
-          reinterpret_cast<const dtype*>(value_fc.data_ptr()),
-          reinterpret_cast<dtype*>(output.data_ptr()));
+          reinterpret_cast<const dtype*>(preact.mutable_data_ptr()),
+          reinterpret_cast<const dtype*>(value_fc.mutable_data_ptr()),
+          reinterpret_cast<dtype*>(output.mutable_data_ptr()));
     } else if (accumulators == 2) {
       cmix_sparse_spmv_relu_rows_t512_kernel<2><<<
           dim3(features / 512, channels / 512, rows), 256, 0, stream>>>(
           channels,
           features,
-          reinterpret_cast<const dtype*>(preact.data_ptr()),
-          reinterpret_cast<const dtype*>(value_fc.data_ptr()),
-          reinterpret_cast<dtype*>(output.data_ptr()));
+          reinterpret_cast<const dtype*>(preact.mutable_data_ptr()),
+          reinterpret_cast<const dtype*>(value_fc.mutable_data_ptr()),
+          reinterpret_cast<dtype*>(output.mutable_data_ptr()));
     } else {
       cmix_sparse_spmv_relu_rows_t512_kernel<4><<<
           dim3(features / 512, channels / 512, rows), 256, 0, stream>>>(
           channels,
           features,
-          reinterpret_cast<const dtype*>(preact.data_ptr()),
-          reinterpret_cast<const dtype*>(value_fc.data_ptr()),
-          reinterpret_cast<dtype*>(output.data_ptr()));
+          reinterpret_cast<const dtype*>(preact.mutable_data_ptr()),
+          reinterpret_cast<const dtype*>(value_fc.mutable_data_ptr()),
+          reinterpret_cast<dtype*>(output.mutable_data_ptr()));
     }
   } else if (dispatch_rows == 1) {
     if (split2) {
@@ -683,9 +680,9 @@ void launch_sparse_down(
           0,
           stream>>>(
           channels,
-          reinterpret_cast<const dtype*>(preact.data_ptr()),
-          reinterpret_cast<const dtype*>(value_fc.data_ptr()),
-          reinterpret_cast<dtype*>(output.data_ptr()));
+          reinterpret_cast<const dtype*>(preact.mutable_data_ptr()),
+          reinterpret_cast<const dtype*>(value_fc.mutable_data_ptr()),
+          reinterpret_cast<dtype*>(output.mutable_data_ptr()));
     } else {
       cmix_sparse_spmv_relu_one_kernel<false><<<
           dim3(features / FFN_TILE, channels / (2 * FFN_SPMV_THREADS), 1),
@@ -693,9 +690,9 @@ void launch_sparse_down(
           0,
           stream>>>(
           channels,
-          reinterpret_cast<const dtype*>(preact.data_ptr()),
-          reinterpret_cast<const dtype*>(value_fc.data_ptr()),
-          reinterpret_cast<dtype*>(output.data_ptr()));
+          reinterpret_cast<const dtype*>(preact.mutable_data_ptr()),
+          reinterpret_cast<const dtype*>(value_fc.mutable_data_ptr()),
+          reinterpret_cast<dtype*>(output.mutable_data_ptr()));
     }
   } else {
     if (split2) {
@@ -706,9 +703,9 @@ void launch_sparse_down(
           stream>>>(
           channels,
           features,
-          reinterpret_cast<const dtype*>(preact.data_ptr()),
-          reinterpret_cast<const dtype*>(value_fc.data_ptr()),
-          reinterpret_cast<dtype*>(output.data_ptr()));
+          reinterpret_cast<const dtype*>(preact.mutable_data_ptr()),
+          reinterpret_cast<const dtype*>(value_fc.mutable_data_ptr()),
+          reinterpret_cast<dtype*>(output.mutable_data_ptr()));
     } else {
       cmix_sparse_spmv_relu_rows_kernel<false><<<
           dim3(features / FFN_TILE, channels / (2 * FFN_SPMV_THREADS), rows),
@@ -717,26 +714,26 @@ void launch_sparse_down(
           stream>>>(
           channels,
           features,
-          reinterpret_cast<const dtype*>(preact.data_ptr()),
-          reinterpret_cast<const dtype*>(value_fc.data_ptr()),
-          reinterpret_cast<dtype*>(output.data_ptr()));
+          reinterpret_cast<const dtype*>(preact.mutable_data_ptr()),
+          reinterpret_cast<const dtype*>(value_fc.mutable_data_ptr()),
+          reinterpret_cast<dtype*>(output.mutable_data_ptr()));
     }
   }
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  FLASHRWKV_CUDA_CHECK(cudaGetLastError());
 }
 
 }  // namespace
 
-torch::Tensor cmix_sparse_down_relu_forward_varlen_cuda(
-    torch::Tensor preact,
-    torch::Tensor value_fc,
+torch::stable::Tensor cmix_sparse_down_relu_forward_varlen_cuda(
+    torch::stable::Tensor preact,
+    torch::stable::Tensor value_fc,
     int64_t batch_size,
     int64_t max_seqlen,
     bool deterministic) {
   const int rows = static_cast<int>(preact.size(0));
   const int features = static_cast<int>(preact.size(1));
   const int channels = static_cast<int>(value_fc.size(1));
-  auto output = torch::empty({rows, channels}, preact.options());
+  auto output = torch::stable::new_empty(preact, {rows, channels});
 
   if (deterministic) {
     launch_sparse_down_deterministic(

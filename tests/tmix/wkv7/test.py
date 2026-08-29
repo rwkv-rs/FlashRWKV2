@@ -554,7 +554,7 @@ def test_public_signature_is_raw_only_and_old_symbols_are_absent() -> None:
     assert tuple(caller_backed_signature.parameters) == ("state",)
     if flashrwkv2._C is not None:
         assert hasattr(
-            flashrwkv2._C, "tmix_wkv7_recurrent_fp32_from_decay_logits"
+            torch.ops.flashrwkv2, "tmix_wkv7_recurrent_fp32_from_decay_logits"
         )
 
 
@@ -958,15 +958,19 @@ def test_packed_low_level_invalid_metadata_fails_closed_without_state_write() ->
     slots = torch.tensor([0], device=state_pool.device, dtype=torch.int32)
     output = torch.zeros_like(flat[3])
     before = state_pool.clone()
-    flashrwkv2._C.tmix_wkv7_recurrent_fp32_from_decay_logits(
-        bad_cu,
-        slots,
+    prepared = torch.ops.flashrwkv2.prepare_tmix_wkv7_recurrent_metadata(
+        bad_cu, slots, flat[0].shape[0], state_pool.shape[0]
+    )
+    torch.ops.flashrwkv2.tmix_wkv7_recurrent_fp32_from_decay_logits(
+        prepared[0],
+        prepared[1],
         state_pool,
         *flat,
         output,
         1.0,
         None,
-        None,
+        prepared[2],
+        4,
     )
     torch.cuda.synchronize()
     assert torch.isnan(output).all()
@@ -1119,7 +1123,7 @@ def test_public_signatures_use_only_prepared_state_handles() -> None:
     )
     if flashrwkv2._C is not None:
         assert hasattr(
-            flashrwkv2._C, "tmix_wkv7_recurrent_fp16_from_decay_logits"
+            torch.ops.flashrwkv2, "tmix_wkv7_recurrent_fp16_from_decay_logits"
         )
 
 
@@ -2038,19 +2042,19 @@ def test_deltalog_native_launcher_is_private_provider_detail() -> None:
     assert "_run_deltalog_fp32io16" not in wkv7_module.__all__
     if flashrwkv2._C is not None:
         assert hasattr(
-            flashrwkv2._C,
+            torch.ops.flashrwkv2,
             "tmix_wkv7_recurrent_deltalog_fp16_from_decay_logits",
         )
         assert hasattr(
-            flashrwkv2._C,
+            torch.ops.flashrwkv2,
             "tmix_wkv7_recurrent_deltalog_fp32io16_from_decay_logits",
         )
         assert hasattr(
-            flashrwkv2._C,
+            torch.ops.flashrwkv2,
             "tmix_wkv7_recurrent_deltalog_fp16_materialize_slots",
         )
         assert hasattr(
-            flashrwkv2._C,
+            torch.ops.flashrwkv2,
             "tmix_wkv7_recurrent_deltalog_fp32io16_materialize_slots",
         )
 

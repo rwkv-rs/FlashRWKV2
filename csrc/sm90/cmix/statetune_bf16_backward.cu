@@ -4,10 +4,8 @@
 // Source revision: 952102498e9ed367ea0a59ee64106916d474d30f.
 // Local adaptation: propagate full ChannelMix nonzero initial and returned shift gradients.
 
-#include <torch/extension.h>
+#include "validation.h"
 
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAException.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -15,10 +13,10 @@
 
 namespace {
 
-__device__ inline __nv_bfloat162 load_bf16x2(const at::BFloat16* ptr) {
+__device__ inline __nv_bfloat162 load_bf16x2(const torch::headeronly::BFloat16* ptr) {
   return *reinterpret_cast<const __nv_bfloat162*>(ptr);
 }
-__device__ inline void store_bf16x2(at::BFloat16* ptr,
+__device__ inline void store_bf16x2(torch::headeronly::BFloat16* ptr,
                                     __nv_bfloat162 value) {
   *reinterpret_cast<__nv_bfloat162*>(ptr) = value;
 }
@@ -26,8 +24,8 @@ inline int64_t ceil_div(int64_t n, int64_t d) { return (n + d - 1) / d; }
 constexpr int kThreads = 256;
 
 __global__ void relu_square_backward_from_output_kernel(
-    at::BFloat16* __restrict__ grad,
-    const at::BFloat16* __restrict__ activation, int64_t pairs) {
+    torch::headeronly::BFloat16* __restrict__ grad,
+    const torch::headeronly::BFloat16* __restrict__ activation, int64_t pairs) {
   const int64_t pair =
       static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (pair >= pairs) return;
@@ -41,13 +39,13 @@ __global__ void relu_square_backward_from_output_kernel(
 }
 
 __global__ void statetune_cmix_tokenshift_backward_kernel(
-    const at::BFloat16* __restrict__ grad_mixed,
-    const at::BFloat16* __restrict__ grad_next,
-    const at::BFloat16* __restrict__ x,
-    const at::BFloat16* __restrict__ initial_shift,
-    const at::BFloat16* __restrict__ x_k,
-    at::BFloat16* __restrict__ grad_x,
-    at::BFloat16* __restrict__ grad_initial,
+    const torch::headeronly::BFloat16* __restrict__ grad_mixed,
+    const torch::headeronly::BFloat16* __restrict__ grad_next,
+    const torch::headeronly::BFloat16* __restrict__ x,
+    const torch::headeronly::BFloat16* __restrict__ initial_shift,
+    const torch::headeronly::BFloat16* __restrict__ x_k,
+    torch::headeronly::BFloat16* __restrict__ grad_x,
+    torch::headeronly::BFloat16* __restrict__ grad_initial,
     float* __restrict__ grad_x_k, int64_t b_size, int64_t t_size,
     int64_t c_size) {
   const int64_t bc_pair =
@@ -89,7 +87,7 @@ __global__ void statetune_cmix_tokenshift_backward_kernel(
 }
 
 __global__ void cast_float_to_bf16_vec2_kernel(
-    const float* __restrict__ source, at::BFloat16* __restrict__ target,
+    const float* __restrict__ source, torch::headeronly::BFloat16* __restrict__ target,
     int64_t pairs) {
   const int64_t pair =
       static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -101,51 +99,54 @@ __global__ void cast_float_to_bf16_vec2_kernel(
 
 }  // namespace
 
-std::vector<torch::Tensor> statetune_cmix_backward_cuda(
-    torch::Tensor grad_output, torch::Tensor grad_next_shift,
-    torch::Tensor x, torch::Tensor initial_shift, torch::Tensor x_k,
-    torch::Tensor key_weight, torch::Tensor value_weight,
-    torch::Tensor mixed, torch::Tensor activation) {
+std::vector<torch::stable::Tensor> statetune_cmix_backward_cuda(
+    torch::stable::Tensor grad_output, torch::stable::Tensor grad_next_shift,
+    torch::stable::Tensor x, torch::stable::Tensor initial_shift, torch::stable::Tensor x_k,
+    torch::stable::Tensor key_weight, torch::stable::Tensor value_weight,
+    torch::stable::Tensor mixed, torch::stable::Tensor activation) {
   const int64_t bt_size = x.size(0) * x.size(1);
-  auto grad_output_2d =
-      grad_output.view({bt_size, x.size(2)}).contiguous();
-  auto mixed_2d = mixed.view({bt_size, x.size(2)});
-  auto grad_value_weight =
-      at::matmul(grad_output_2d.transpose(0, 1), activation);
-  auto grad_hidden = at::matmul(grad_output_2d, value_weight).contiguous();
-  auto stream = at::cuda::getCurrentCUDAStream();
+  auto grad_output_2d = torch::stable::contiguous(
+      torch::stable::view(grad_output, {bt_size, x.size(2)}));
+  auto mixed_2d = torch::stable::view(mixed, {bt_size, x.size(2)});
+  auto grad_output_t = torch::stable::transpose(grad_output_2d, 0, 1);
+  auto grad_value_weight = torch::stable::matmul(grad_output_t, activation);
+  auto grad_hidden = torch::stable::contiguous(
+      torch::stable::matmul(grad_output_2d, value_weight));
+  auto stream = flashrwkv2::validation::current_cuda_stream();
   const int64_t activation_pairs = activation.numel() / 2;
   relu_square_backward_from_output_kernel<<<
       static_cast<int>(ceil_div(activation_pairs, kThreads)), kThreads, 0,
-      stream>>>(grad_hidden.data_ptr<at::BFloat16>(),
-                activation.data_ptr<at::BFloat16>(), activation_pairs);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-  auto grad_key_weight =
-      at::matmul(grad_hidden.transpose(0, 1), mixed_2d);
-  auto grad_mixed_2d = at::matmul(grad_hidden, key_weight).contiguous();
-  auto grad_mixed = grad_mixed_2d.view_as(x);
+      stream>>>(grad_hidden.mutable_data_ptr<torch::headeronly::BFloat16>(),
+                activation.mutable_data_ptr<torch::headeronly::BFloat16>(), activation_pairs);
+  FLASHRWKV_CUDA_CHECK(cudaGetLastError());
+  auto grad_hidden_t = torch::stable::transpose(grad_hidden, 0, 1);
+  auto grad_key_weight = torch::stable::matmul(grad_hidden_t, mixed_2d);
+  auto grad_mixed_2d = torch::stable::contiguous(
+      torch::stable::matmul(grad_hidden, key_weight));
+  auto grad_mixed = torch::stable::view(grad_mixed_2d, x.sizes());
 
-  auto grad_x = torch::empty_like(x);
-  auto grad_initial = torch::empty_like(initial_shift);
+  auto grad_x = torch::stable::empty_like(x);
+  auto grad_initial = torch::stable::empty_like(initial_shift);
   auto grad_x_k_fp32 =
-      torch::zeros({x.size(2)}, x.options().dtype(torch::kFloat32));
-  auto grad_x_k = torch::empty_like(x_k);
+      torch::stable::new_zeros(x, {x.size(2)}, torch::headeronly::ScalarType::Float);
+  auto grad_x_k = torch::stable::empty_like(x_k);
   const int64_t bc_pairs = x.size(0) * (x.size(2) / 2);
   statetune_cmix_tokenshift_backward_kernel<<<
       static_cast<int>(ceil_div(bc_pairs, kThreads)), kThreads, 0, stream>>>(
-      grad_mixed.data_ptr<at::BFloat16>(),
-      grad_next_shift.data_ptr<at::BFloat16>(), x.data_ptr<at::BFloat16>(),
-      initial_shift.data_ptr<at::BFloat16>(), x_k.data_ptr<at::BFloat16>(),
-      grad_x.data_ptr<at::BFloat16>(),
-      grad_initial.data_ptr<at::BFloat16>(), grad_x_k_fp32.data_ptr<float>(),
+      grad_mixed.mutable_data_ptr<torch::headeronly::BFloat16>(),
+      grad_next_shift.mutable_data_ptr<torch::headeronly::BFloat16>(), x.mutable_data_ptr<torch::headeronly::BFloat16>(),
+      initial_shift.mutable_data_ptr<torch::headeronly::BFloat16>(), x_k.mutable_data_ptr<torch::headeronly::BFloat16>(),
+      grad_x.mutable_data_ptr<torch::headeronly::BFloat16>(),
+      grad_initial.mutable_data_ptr<torch::headeronly::BFloat16>(), grad_x_k_fp32.mutable_data_ptr<float>(),
       x.size(0), x.size(1), x.size(2));
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  FLASHRWKV_CUDA_CHECK(cudaGetLastError());
   const int64_t channel_pairs = x.size(2) / 2;
   cast_float_to_bf16_vec2_kernel<<<
       static_cast<int>(ceil_div(channel_pairs, kThreads)), kThreads, 0,
-      stream>>>(grad_x_k_fp32.data_ptr<float>(),
-                grad_x_k.data_ptr<at::BFloat16>(), channel_pairs);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-  return {grad_x, grad_initial, grad_x_k, grad_key_weight.contiguous(),
-          grad_value_weight.contiguous()};
+      stream>>>(grad_x_k_fp32.mutable_data_ptr<float>(),
+                grad_x_k.mutable_data_ptr<torch::headeronly::BFloat16>(), channel_pairs);
+  FLASHRWKV_CUDA_CHECK(cudaGetLastError());
+  return {grad_x, grad_initial, grad_x_k,
+          torch::stable::contiguous(grad_key_weight),
+          torch::stable::contiguous(grad_value_weight)};
 }

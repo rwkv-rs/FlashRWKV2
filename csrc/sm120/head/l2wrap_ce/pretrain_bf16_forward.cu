@@ -5,9 +5,8 @@
 // Local adaptation: the canonical row-chunk/reduction kernels are retained;
 // FlashRWKV2 owns the module-local memory-bounded wrapper below.
 
-#include <torch/extension.h>
+#include "validation.h"
 
-#include <ATen/cuda/CUDAContext.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -24,7 +23,7 @@ __device__ inline float scalar_to_float(scalar_t x) {
 }
 
 template <>
-__device__ inline float scalar_to_float<at::BFloat16>(at::BFloat16 x) {
+__device__ inline float scalar_to_float<torch::headeronly::BFloat16>(torch::headeronly::BFloat16 x) {
     return __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&x));
 }
 
@@ -34,9 +33,9 @@ __device__ inline scalar_t float_to_scalar(float x) {
 }
 
 template <>
-__device__ inline at::BFloat16 float_to_scalar<at::BFloat16>(float x) {
+__device__ inline torch::headeronly::BFloat16 float_to_scalar<torch::headeronly::BFloat16>(float x) {
     __nv_bfloat16 v = __float2bfloat16_rn(x);
-    return *reinterpret_cast<at::BFloat16*>(&v);
+    return *reinterpret_cast<torch::headeronly::BFloat16*>(&v);
 }
 
 __device__ inline void reduce_max_first(float& value, int& index, float other_value, int other_index) {
@@ -213,78 +212,96 @@ void launch_row_chunk_loss_and_grad(
 } // namespace
 
 void head_l2wrap_ce_row_chunk_loss_and_grad_v4_cuda(
-    torch::Tensor logits,
-    torch::Tensor targets,
-    torch::Tensor loss_rows,
+    torch::stable::Tensor logits,
+    torch::stable::Tensor targets,
+    torch::stable::Tensor loss_rows,
     int64_t row_start,
     int64_t total_rows) {
     const int64_t chunk_rows = logits.size(0);
-    auto stream = at::cuda::getCurrentCUDAStream();
+    auto stream = flashrwkv2::validation::current_cuda_stream();
     constexpr int threads = 512;
-    if (logits.scalar_type() == torch::kBFloat16) {
-        launch_row_chunk_loss_and_grad<at::BFloat16, threads>(
-            logits.data_ptr<at::BFloat16>(),
-            targets.data_ptr<int64_t>(),
-            loss_rows.data_ptr<float>(),
+    if (logits.scalar_type() == torch::headeronly::ScalarType::BFloat16) {
+        launch_row_chunk_loss_and_grad<torch::headeronly::BFloat16, threads>(
+            logits.mutable_data_ptr<torch::headeronly::BFloat16>(),
+            targets.mutable_data_ptr<int64_t>(),
+            loss_rows.mutable_data_ptr<float>(),
             row_start,
             chunk_rows,
             total_rows,
             stream);
     } else {
         launch_row_chunk_loss_and_grad<float, threads>(
-            logits.data_ptr<float>(),
-            targets.data_ptr<int64_t>(),
-            loss_rows.data_ptr<float>(),
+            logits.mutable_data_ptr<float>(),
+            targets.mutable_data_ptr<int64_t>(),
+            loss_rows.mutable_data_ptr<float>(),
             row_start,
             chunk_rows,
             total_rows,
             stream);
     }
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    FLASHRWKV_CUDA_CHECK(cudaGetLastError());
 }
 
-void head_l2wrap_ce_reduce_loss_v4_cuda(torch::Tensor loss_rows, torch::Tensor loss) {
-    auto stream = at::cuda::getCurrentCUDAStream();
+void head_l2wrap_ce_reduce_loss_v4_cuda(torch::stable::Tensor loss_rows, torch::stable::Tensor loss) {
+    auto stream = flashrwkv2::validation::current_cuda_stream();
     reduce_loss_kernel<<<1, 256, 0, stream>>>(
-        loss_rows.data_ptr<float>(),
-        loss.data_ptr<float>(),
+        loss_rows.mutable_data_ptr<float>(),
+        loss.mutable_data_ptr<float>(),
         loss_rows.numel());
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    FLASHRWKV_CUDA_CHECK(cudaGetLastError());
 }
 
-#include <ATen/ATen.h>
 
 #include <algorithm>
 
-std::vector<torch::Tensor> pretrain_head_l2wrap_ce_cuda(
-    torch::Tensor hidden,
-    torch::Tensor weight,
-    torch::Tensor targets,
+__global__ void add_bf16_inplace_kernel(
+    torch::headeronly::BFloat16* destination,
+    const torch::headeronly::BFloat16* source,
+    int64_t elements) {
+  const int64_t index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index < elements) {
+    destination[index] = static_cast<torch::headeronly::BFloat16>(
+        static_cast<float>(destination[index]) + static_cast<float>(source[index]));
+  }
+}
+
+std::vector<torch::stable::Tensor> pretrain_head_l2wrap_ce_cuda(
+    torch::stable::Tensor hidden,
+    torch::stable::Tensor weight,
+    torch::stable::Tensor targets,
     int64_t chunk_rows) {
-  constexpr int64_t kVocab = 65536;
   const int64_t rows = hidden.size(0) * hidden.size(1);
   const int64_t channels = hidden.size(2);
   const int64_t chunk = std::min(chunk_rows, rows);
-  auto h2d = hidden.view({rows, channels});
-  auto flat_targets = targets.view({rows});
-  auto loss_rows = torch::empty(
-      {rows}, hidden.options().dtype(torch::kFloat32));
-  auto loss = torch::empty({}, hidden.options().dtype(torch::kFloat32));
-  auto grad_hidden = torch::empty_like(hidden);
-  auto grad_h2d = grad_hidden.view({rows, channels});
-  auto grad_weight = torch::zeros_like(weight);
-  auto logits = torch::empty({chunk, kVocab}, hidden.options());
+  auto h2d = torch::stable::view(hidden, {rows, channels});
+  auto flat_targets = torch::stable::view(targets, {rows});
+  auto loss_rows = torch::stable::new_empty(
+      hidden, {rows}, torch::headeronly::ScalarType::Float);
+  auto loss = torch::stable::new_empty(
+      hidden, {}, torch::headeronly::ScalarType::Float);
+  auto grad_hidden = torch::stable::empty_like(hidden);
+  auto grad_h2d = torch::stable::view(grad_hidden, {rows, channels});
+  auto grad_weight = torch::stable::new_zeros(weight, weight.sizes());
 
   for (int64_t start = 0; start < rows; start += chunk) {
     const int64_t length = std::min(chunk, rows - start);
-    auto h_chunk = h2d.narrow(0, start, length);
-    auto logits_use = logits.narrow(0, 0, length);
-    at::mm_out(logits_use, h_chunk, weight.transpose(0, 1));
+    auto h_chunk = torch::stable::narrow(h2d, 0, start, length);
+    auto weight_t = torch::stable::transpose(weight, 0, 1);
+    auto logits_use = torch::stable::matmul(h_chunk, weight_t);
     head_l2wrap_ce_row_chunk_loss_and_grad_v4_cuda(
         logits_use, flat_targets, loss_rows, start, rows);
-    auto grad_h_chunk = grad_h2d.narrow(0, start, length);
-    at::mm_out(grad_h_chunk, logits_use, weight);
-    grad_weight.addmm_(logits_use.transpose(0, 1), h_chunk);
+    auto grad_h_chunk = torch::stable::narrow(grad_h2d, 0, start, length);
+    auto grad_h_result = torch::stable::matmul(logits_use, weight);
+    torch::stable::copy_(grad_h_chunk, grad_h_result);
+    auto logits_t = torch::stable::transpose(logits_use, 0, 1);
+    auto grad_weight_update = torch::stable::matmul(logits_t, h_chunk);
+    const auto elements = grad_weight.numel();
+    auto stream = flashrwkv2::validation::current_cuda_stream();
+    add_bf16_inplace_kernel<<<(elements + 255) / 256, 256, 0, stream>>>(
+        grad_weight.mutable_data_ptr<torch::headeronly::BFloat16>(),
+        grad_weight_update.const_data_ptr<torch::headeronly::BFloat16>(),
+        elements);
+    FLASHRWKV_CUDA_CHECK(cudaGetLastError());
   }
 
   head_l2wrap_ce_reduce_loss_v4_cuda(loss_rows, loss);

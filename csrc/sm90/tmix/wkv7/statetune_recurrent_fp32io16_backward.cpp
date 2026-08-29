@@ -3,80 +3,73 @@
 // StateTune contract from RWKV-LM train_temp revision
 // 952102498e9ed367ea0a59ee64106916d474d30f.
 
-#include <torch/extension.h>
+#include "validation.h"
 
 #include <optional>
 
 void statetune_tmix_wkv7_recurrent_fp32io16_backward_cuda(
-    torch::Tensor sequence_chunk_offsets,
-    torch::Tensor chunk_token_starts,
-    torch::Tensor chunk_token_ends,
-    torch::Tensor final_state,
-    torch::Tensor r,
-    torch::Tensor decay_logits,
-    torch::Tensor k,
-    torch::Tensor v,
-    torch::Tensor a,
-    torch::Tensor b,
-    torch::Tensor state_dot_a,
-    torch::Tensor grad_output,
-    torch::Tensor grad_final_state,
-    torch::Tensor boundary,
-    torch::Tensor grad_r,
-    torch::Tensor grad_decay_logits,
-    torch::Tensor grad_k,
-    torch::Tensor grad_v,
-    torch::Tensor grad_a,
-    torch::Tensor grad_b,
-    torch::Tensor grad_initial_state,
+    torch::stable::Tensor sequence_chunk_offsets,
+    torch::stable::Tensor chunk_token_starts,
+    torch::stable::Tensor chunk_token_ends,
+    torch::stable::Tensor final_state,
+    torch::stable::Tensor r,
+    torch::stable::Tensor decay_logits,
+    torch::stable::Tensor k,
+    torch::stable::Tensor v,
+    torch::stable::Tensor a,
+    torch::stable::Tensor b,
+    torch::stable::Tensor state_dot_a,
+    torch::stable::Tensor grad_output,
+    torch::stable::Tensor grad_final_state,
+    torch::stable::Tensor boundary,
+    torch::stable::Tensor grad_r,
+    torch::stable::Tensor grad_decay_logits,
+    torch::stable::Tensor grad_k,
+    torch::stable::Tensor grad_v,
+    torch::stable::Tensor grad_a,
+    torch::stable::Tensor grad_b,
+    torch::stable::Tensor grad_initial_state,
     double scale);
 
 void statetune_tmix_wkv7_recurrent_fp32io16_backward(
-    torch::Tensor sequence_chunk_offsets,
-    torch::Tensor chunk_token_starts,
-    torch::Tensor chunk_token_ends,
-    torch::Tensor final_state,
-    torch::Tensor r,
-    torch::Tensor decay_logits,
-    torch::Tensor k,
-    torch::Tensor v,
-    torch::Tensor a,
-    torch::Tensor b,
-    torch::Tensor state_dot_a,
-    std::optional<torch::Tensor> grad_output,
-    std::optional<torch::Tensor> grad_final_state,
-    torch::Tensor boundary,
-    std::optional<torch::Tensor> grad_r,
-    std::optional<torch::Tensor> grad_decay_logits,
-    std::optional<torch::Tensor> grad_k,
-    std::optional<torch::Tensor> grad_v,
-    std::optional<torch::Tensor> grad_a,
-    std::optional<torch::Tensor> grad_b,
-    std::optional<torch::Tensor> grad_initial_state,
+    torch::stable::Tensor sequence_chunk_offsets,
+    torch::stable::Tensor chunk_token_starts,
+    torch::stable::Tensor chunk_token_ends,
+    torch::stable::Tensor final_state,
+    torch::stable::Tensor r,
+    torch::stable::Tensor decay_logits,
+    torch::stable::Tensor k,
+    torch::stable::Tensor v,
+    torch::stable::Tensor a,
+    torch::stable::Tensor b,
+    torch::stable::Tensor state_dot_a,
+    std::optional<torch::stable::Tensor> grad_output,
+    std::optional<torch::stable::Tensor> grad_final_state,
+    torch::stable::Tensor boundary,
+    std::optional<torch::stable::Tensor> grad_r,
+    std::optional<torch::stable::Tensor> grad_decay_logits,
+    std::optional<torch::stable::Tensor> grad_k,
+    std::optional<torch::stable::Tensor> grad_v,
+    std::optional<torch::stable::Tensor> grad_a,
+    std::optional<torch::stable::Tensor> grad_b,
+    std::optional<torch::stable::Tensor> grad_initial_state,
     double scale) {
   statetune_tmix_wkv7_recurrent_fp32io16_backward_cuda(
       sequence_chunk_offsets, chunk_token_starts, chunk_token_ends, final_state,
       r, decay_logits, k, v, a, b, state_dot_a,
-      grad_output.value_or(torch::Tensor()),
-      grad_final_state.value_or(torch::Tensor()), boundary,
-      grad_r.value_or(torch::Tensor()),
-      grad_decay_logits.value_or(torch::Tensor()),
-      grad_k.value_or(torch::Tensor()), grad_v.value_or(torch::Tensor()),
-      grad_a.value_or(torch::Tensor()), grad_b.value_or(torch::Tensor()),
-      grad_initial_state.value_or(torch::Tensor()), scale);
+      grad_output.value_or(torch::stable::Tensor()),
+      grad_final_state.value_or(torch::stable::Tensor()), boundary,
+      grad_r.value_or(torch::stable::Tensor()),
+      grad_decay_logits.value_or(torch::stable::Tensor()),
+      grad_k.value_or(torch::stable::Tensor()), grad_v.value_or(torch::stable::Tensor()),
+      grad_a.value_or(torch::stable::Tensor()), grad_b.value_or(torch::stable::Tensor()),
+      grad_initial_state.value_or(torch::stable::Tensor()), scale);
 }
 
-void register_statetune_tmix_wkv7_recurrent_backward_bindings(py::module_& module) {
-  module.def(
-      "statetune_tmix_wkv7_recurrent_fp32io16_backward",
-      &statetune_tmix_wkv7_recurrent_fp32io16_backward,
-      "StateTune recurrent backward with initial-state gradient",
-      py::arg("sequence_chunk_offsets"), py::arg("chunk_token_starts"),
-      py::arg("chunk_token_ends"), py::arg("final_state"), py::arg("r"),
-      py::arg("decay_logits"), py::arg("k"), py::arg("v"), py::arg("a"),
-      py::arg("b"), py::arg("state_dot_a"), py::arg("grad_output"),
-      py::arg("grad_final_state"), py::arg("boundary"), py::arg("grad_r"),
-      py::arg("grad_decay_logits"), py::arg("grad_k"), py::arg("grad_v"),
-      py::arg("grad_a"), py::arg("grad_b"), py::arg("grad_initial_state"),
-      py::arg("scale") = 1.0);
+STABLE_TORCH_LIBRARY_FRAGMENT(flashrwkv2, module) {
+  module.def("statetune_tmix_wkv7_recurrent_fp32io16_backward(Tensor sequence_chunk_offsets, Tensor chunk_token_starts, Tensor chunk_token_ends, Tensor final_state, Tensor r, Tensor decay_logits, Tensor k, Tensor v, Tensor a, Tensor b, Tensor state_dot_a, Tensor? grad_output, Tensor? grad_final_state, Tensor boundary, Tensor(a!)? grad_r, Tensor(b!)? grad_decay_logits, Tensor(c!)? grad_k, Tensor(d!)? grad_v, Tensor(e!)? grad_a, Tensor(f!)? grad_b, Tensor(g!)? grad_initial_state, float scale) -> ()");
+}
+
+STABLE_TORCH_LIBRARY_IMPL(flashrwkv2, CUDA, module) {
+  module.impl("statetune_tmix_wkv7_recurrent_fp32io16_backward", TORCH_BOX(&statetune_tmix_wkv7_recurrent_fp32io16_backward));
 }

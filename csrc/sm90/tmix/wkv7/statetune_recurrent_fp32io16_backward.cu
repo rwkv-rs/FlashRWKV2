@@ -6,12 +6,7 @@
 // Raw-decay training backward: initial-state gradients, checkpoint replay
 // and decay_logits gradients remain part of the training-only contract.
 
-#include <ATen/ATen.h>
-#include <ATen/Dispatch.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
-#include <c10/cuda/CUDAException.h>
-#include <torch/extension.h>
+#include "validation.h"
 
 #include "../../../sm120/tmix/wkv7/recurrent_decay.cuh"
 
@@ -505,91 +500,91 @@ template <int HeadSize, typename io_t>
 void launch_statetune_tmix_wkv7_recurrent_fp32io16_backward(
     int num_sequences,
     int num_heads,
-    const torch::Tensor& sequence_chunk_offsets,
-    const torch::Tensor& chunk_token_starts,
-    const torch::Tensor& chunk_token_ends,
-    const torch::Tensor& final_state,
-    const torch::Tensor& r,
-    const torch::Tensor& decay,
-    const torch::Tensor& k,
-    const torch::Tensor& v,
-    const torch::Tensor& a,
-    const torch::Tensor& b,
-    const torch::Tensor& state_dot_a,
-    const torch::Tensor& grad_output,
-    const torch::Tensor& grad_final_state,
-    const torch::Tensor& boundary,
-    torch::Tensor& grad_r,
-    torch::Tensor& grad_decay,
-    torch::Tensor& grad_k,
-    torch::Tensor& grad_v,
-    torch::Tensor& grad_a,
-    torch::Tensor& grad_b,
-    torch::Tensor& grad_initial_state,
+    const torch::stable::Tensor& sequence_chunk_offsets,
+    const torch::stable::Tensor& chunk_token_starts,
+    const torch::stable::Tensor& chunk_token_ends,
+    const torch::stable::Tensor& final_state,
+    const torch::stable::Tensor& r,
+    const torch::stable::Tensor& decay,
+    const torch::stable::Tensor& k,
+    const torch::stable::Tensor& v,
+    const torch::stable::Tensor& a,
+    const torch::stable::Tensor& b,
+    const torch::stable::Tensor& state_dot_a,
+    const torch::stable::Tensor& grad_output,
+    const torch::stable::Tensor& grad_final_state,
+    const torch::stable::Tensor& boundary,
+    torch::stable::Tensor& grad_r,
+    torch::stable::Tensor& grad_decay,
+    torch::stable::Tensor& grad_k,
+    torch::stable::Tensor& grad_v,
+    torch::stable::Tensor& grad_a,
+    torch::stable::Tensor& grad_b,
+    torch::stable::Tensor& grad_initial_state,
     float scale,
     cudaStream_t stream) {
   if constexpr (HeadSize == kHeadSize) {
     statetune_tmix_wkv7_recurrent_fp32io16_backward_kernel<io_t>
         <<<dim3(num_heads, num_sequences), HeadSize, 0, stream>>>(
             num_heads,
-            sequence_chunk_offsets.data_ptr<int>(),
-            chunk_token_starts.data_ptr<int>(),
-            chunk_token_ends.data_ptr<int>(),
-            final_state.data_ptr<float>(),
-            r.data_ptr<io_t>(),
-            decay.data_ptr<io_t>(),
-            k.data_ptr<io_t>(),
-            v.data_ptr<io_t>(),
-            a.data_ptr<io_t>(),
-            b.data_ptr<io_t>(),
-            state_dot_a.data_ptr<float>(),
-            grad_output.defined() ? grad_output.data_ptr<io_t>() : nullptr,
+            sequence_chunk_offsets.mutable_data_ptr<int>(),
+            chunk_token_starts.mutable_data_ptr<int>(),
+            chunk_token_ends.mutable_data_ptr<int>(),
+            final_state.mutable_data_ptr<float>(),
+            r.mutable_data_ptr<io_t>(),
+            decay.mutable_data_ptr<io_t>(),
+            k.mutable_data_ptr<io_t>(),
+            v.mutable_data_ptr<io_t>(),
+            a.mutable_data_ptr<io_t>(),
+            b.mutable_data_ptr<io_t>(),
+            state_dot_a.mutable_data_ptr<float>(),
+            grad_output.defined() ? grad_output.mutable_data_ptr<io_t>() : nullptr,
             grad_final_state.defined()
-                ? grad_final_state.data_ptr<float>()
+                ? grad_final_state.mutable_data_ptr<float>()
                 : nullptr,
-            boundary.data_ptr<float>(),
-            grad_r.defined() ? grad_r.data_ptr<io_t>() : nullptr,
+            boundary.mutable_data_ptr<float>(),
+            grad_r.defined() ? grad_r.mutable_data_ptr<io_t>() : nullptr,
             grad_decay.defined()
-                ? grad_decay.data_ptr<io_t>()
+                ? grad_decay.mutable_data_ptr<io_t>()
                 : nullptr,
-            grad_k.defined() ? grad_k.data_ptr<io_t>() : nullptr,
-            grad_v.defined() ? grad_v.data_ptr<io_t>() : nullptr,
-            grad_a.defined() ? grad_a.data_ptr<io_t>() : nullptr,
-            grad_b.defined() ? grad_b.data_ptr<io_t>() : nullptr,
+            grad_k.defined() ? grad_k.mutable_data_ptr<io_t>() : nullptr,
+            grad_v.defined() ? grad_v.mutable_data_ptr<io_t>() : nullptr,
+            grad_a.defined() ? grad_a.mutable_data_ptr<io_t>() : nullptr,
+            grad_b.defined() ? grad_b.mutable_data_ptr<io_t>() : nullptr,
             grad_initial_state.defined()
-                ? grad_initial_state.data_ptr<float>()
+                ? grad_initial_state.mutable_data_ptr<float>()
                 : nullptr,
             scale);
   } else {
     statetune_tmix_wkv7_recurrent_fp32io16_backward_large_kernel<HeadSize, io_t>
         <<<dim3(num_heads, num_sequences), HeadSize, 0, stream>>>(
             num_heads,
-            sequence_chunk_offsets.data_ptr<int>(),
-            chunk_token_starts.data_ptr<int>(),
-            chunk_token_ends.data_ptr<int>(),
-            final_state.data_ptr<float>(),
-            r.data_ptr<io_t>(),
-            decay.data_ptr<io_t>(),
-            k.data_ptr<io_t>(),
-            v.data_ptr<io_t>(),
-            a.data_ptr<io_t>(),
-            b.data_ptr<io_t>(),
-            state_dot_a.data_ptr<float>(),
-            grad_output.defined() ? grad_output.data_ptr<io_t>() : nullptr,
+            sequence_chunk_offsets.mutable_data_ptr<int>(),
+            chunk_token_starts.mutable_data_ptr<int>(),
+            chunk_token_ends.mutable_data_ptr<int>(),
+            final_state.mutable_data_ptr<float>(),
+            r.mutable_data_ptr<io_t>(),
+            decay.mutable_data_ptr<io_t>(),
+            k.mutable_data_ptr<io_t>(),
+            v.mutable_data_ptr<io_t>(),
+            a.mutable_data_ptr<io_t>(),
+            b.mutable_data_ptr<io_t>(),
+            state_dot_a.mutable_data_ptr<float>(),
+            grad_output.defined() ? grad_output.mutable_data_ptr<io_t>() : nullptr,
             grad_final_state.defined()
-                ? grad_final_state.data_ptr<float>()
+                ? grad_final_state.mutable_data_ptr<float>()
                 : nullptr,
-            boundary.data_ptr<float>(),
-            grad_r.defined() ? grad_r.data_ptr<io_t>() : nullptr,
+            boundary.mutable_data_ptr<float>(),
+            grad_r.defined() ? grad_r.mutable_data_ptr<io_t>() : nullptr,
             grad_decay.defined()
-                ? grad_decay.data_ptr<io_t>()
+                ? grad_decay.mutable_data_ptr<io_t>()
                 : nullptr,
-            grad_k.defined() ? grad_k.data_ptr<io_t>() : nullptr,
-            grad_v.defined() ? grad_v.data_ptr<io_t>() : nullptr,
-            grad_a.defined() ? grad_a.data_ptr<io_t>() : nullptr,
-            grad_b.defined() ? grad_b.data_ptr<io_t>() : nullptr,
+            grad_k.defined() ? grad_k.mutable_data_ptr<io_t>() : nullptr,
+            grad_v.defined() ? grad_v.mutable_data_ptr<io_t>() : nullptr,
+            grad_a.defined() ? grad_a.mutable_data_ptr<io_t>() : nullptr,
+            grad_b.defined() ? grad_b.mutable_data_ptr<io_t>() : nullptr,
             grad_initial_state.defined()
-                ? grad_initial_state.data_ptr<float>()
+                ? grad_initial_state.mutable_data_ptr<float>()
                 : nullptr,
             scale);
   }
@@ -598,41 +593,38 @@ void launch_statetune_tmix_wkv7_recurrent_fp32io16_backward(
 }  // namespace
 
 void statetune_tmix_wkv7_recurrent_fp32io16_backward_cuda_impl(
-    torch::Tensor sequence_chunk_offsets,
-    torch::Tensor chunk_token_starts,
-    torch::Tensor chunk_token_ends,
-    torch::Tensor final_state,
-    torch::Tensor r,
-    torch::Tensor decay,
-    torch::Tensor k,
-    torch::Tensor v,
-    torch::Tensor a,
-    torch::Tensor b,
-    torch::Tensor state_dot_a,
-    torch::Tensor grad_output,
-    torch::Tensor grad_final_state,
-    torch::Tensor boundary,
-    torch::Tensor grad_r,
-    torch::Tensor grad_decay,
-    torch::Tensor grad_k,
-    torch::Tensor grad_v,
-    torch::Tensor grad_a,
-    torch::Tensor grad_b,
-    torch::Tensor grad_initial_state,
+    torch::stable::Tensor sequence_chunk_offsets,
+    torch::stable::Tensor chunk_token_starts,
+    torch::stable::Tensor chunk_token_ends,
+    torch::stable::Tensor final_state,
+    torch::stable::Tensor r,
+    torch::stable::Tensor decay,
+    torch::stable::Tensor k,
+    torch::stable::Tensor v,
+    torch::stable::Tensor a,
+    torch::stable::Tensor b,
+    torch::stable::Tensor state_dot_a,
+    torch::stable::Tensor grad_output,
+    torch::stable::Tensor grad_final_state,
+    torch::stable::Tensor boundary,
+    torch::stable::Tensor grad_r,
+    torch::stable::Tensor grad_decay,
+    torch::stable::Tensor grad_k,
+    torch::stable::Tensor grad_v,
+    torch::stable::Tensor grad_a,
+    torch::stable::Tensor grad_b,
+    torch::stable::Tensor grad_initial_state,
     double scale) {
-  const c10::cuda::CUDAGuard device_guard(final_state.device());
-  const auto stream = at::cuda::getCurrentCUDAStream();
+  const torch::stable::accelerator::DeviceGuard device_guard(final_state.device().index());
+  const auto stream = flashrwkv2::validation::current_cuda_stream();
   const int num_sequences =
       static_cast<int>(sequence_chunk_offsets.numel() - 1);
   const int num_heads = static_cast<int>(final_state.size(1));
 
-  AT_DISPATCH_FLOATING_TYPES_AND2(
-      at::ScalarType::Half,
-      at::ScalarType::BFloat16,
-      r.scalar_type(),
-      "flashrwkv2_statetune_tmix_wkv7_recurrent_fp32io16_backward",
-      [&] {
-        const auto launch = [&]<int HeadSize>() {
+  auto dispatch_launch = [&](auto scalar_value) {
+    using scalar_t = decltype(scalar_value);
+        const auto launch = [&](auto head_size_tag) {
+          constexpr int HeadSize = decltype(head_size_tag)::value;
           launch_statetune_tmix_wkv7_recurrent_fp32io16_backward<HeadSize, scalar_t>(
               num_sequences,
               num_heads,
@@ -662,41 +654,51 @@ void statetune_tmix_wkv7_recurrent_fp32io16_backward_cuda_impl(
         };
         switch (final_state.size(2)) {
           case 64:
-            launch.template operator()<64>();
+            launch(std::integral_constant<int, 64>{});
             break;
           case 128:
-            launch.template operator()<128>();
+            launch(std::integral_constant<int, 128>{});
             break;
           case 256:
-            launch.template operator()<256>();
+            launch(std::integral_constant<int, 256>{});
             break;
         }
-      });
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+      };
+  switch (r.scalar_type()) {
+    case torch::headeronly::ScalarType::Half:
+      dispatch_launch(torch::headeronly::Half{});
+      break;
+    case torch::headeronly::ScalarType::BFloat16:
+      dispatch_launch(torch::headeronly::BFloat16{});
+      break;
+    default:
+      STD_TORCH_CHECK(false, "token dtype must be float16 or bfloat16");
+  }
+  FLASHRWKV_CUDA_CHECK(cudaGetLastError());
 }
 
 void statetune_tmix_wkv7_recurrent_fp32io16_backward_cuda(
-    torch::Tensor sequence_chunk_offsets,
-    torch::Tensor chunk_token_starts,
-    torch::Tensor chunk_token_ends,
-    torch::Tensor final_state,
-    torch::Tensor r,
-    torch::Tensor decay_logits,
-    torch::Tensor k,
-    torch::Tensor v,
-    torch::Tensor a,
-    torch::Tensor b,
-    torch::Tensor state_dot_a,
-    torch::Tensor grad_output,
-    torch::Tensor grad_final_state,
-    torch::Tensor boundary,
-    torch::Tensor grad_r,
-    torch::Tensor grad_decay_logits,
-    torch::Tensor grad_k,
-    torch::Tensor grad_v,
-    torch::Tensor grad_a,
-    torch::Tensor grad_b,
-    torch::Tensor grad_initial_state,
+    torch::stable::Tensor sequence_chunk_offsets,
+    torch::stable::Tensor chunk_token_starts,
+    torch::stable::Tensor chunk_token_ends,
+    torch::stable::Tensor final_state,
+    torch::stable::Tensor r,
+    torch::stable::Tensor decay_logits,
+    torch::stable::Tensor k,
+    torch::stable::Tensor v,
+    torch::stable::Tensor a,
+    torch::stable::Tensor b,
+    torch::stable::Tensor state_dot_a,
+    torch::stable::Tensor grad_output,
+    torch::stable::Tensor grad_final_state,
+    torch::stable::Tensor boundary,
+    torch::stable::Tensor grad_r,
+    torch::stable::Tensor grad_decay_logits,
+    torch::stable::Tensor grad_k,
+    torch::stable::Tensor grad_v,
+    torch::stable::Tensor grad_a,
+    torch::stable::Tensor grad_b,
+    torch::stable::Tensor grad_initial_state,
     double scale) {
   statetune_tmix_wkv7_recurrent_fp32io16_backward_cuda_impl(
       sequence_chunk_offsets, chunk_token_starts, chunk_token_ends,

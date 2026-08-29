@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 
 import importlib as _importlib
+import os as _os
 import sys as _sys
 
 import torch as _torch
@@ -39,7 +40,16 @@ def _load_native_backend():
     if not _torch.cuda.is_available():
         return None
     capability = tuple(_torch.cuda.get_device_capability())
-    module_name = _backend_module_name(capability)
+    forced_backend = _os.environ.get("FLASHRWKV_TEST_BACKEND")
+    if forced_backend is not None:
+        available = {module_name for _, module_name in _NATIVE_BACKENDS}
+        if forced_backend not in available:
+            raise RuntimeError(
+                f"invalid FLASHRWKV_TEST_BACKEND={forced_backend!r}"
+            )
+        module_name = forced_backend
+    else:
+        module_name = _backend_module_name(capability)
     try:
         module = _importlib.import_module(f"{__name__}.{module_name}")
     except ImportError as error:

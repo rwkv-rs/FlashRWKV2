@@ -670,7 +670,7 @@ def fetch_main_baselines(
             (
                 row
                 for row in artifacts
-                if row.get("name", "").startswith("flashrwkv2-quality-v4-")
+                if row.get("name", "").startswith("flashrwkv2-quality-v5-")
                 and not row.get("expired")
             ),
             None,

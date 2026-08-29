@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from itertools import pairwise
+
 import torch
 
 _DELTALOG_POLICY_SOURCE_REVISION = (
@@ -87,7 +89,7 @@ def _extension():
             "FlashRWKV2 CUDA extension is not built; build flashrwkv2._C before "
             "using the accelerated recurrent operator"
         )
-    return extension
+    return torch.ops.flashrwkv2
 
 
 def _validate_packed_inputs(*tensors: torch.Tensor) -> tuple[torch.Tensor, ...]:
@@ -689,6 +691,13 @@ def _check_metadata_inputs(
         raise ValueError("cu_seqlens must be one-dimensional")
     if not isinstance(state_indices, torch.Tensor):
         raise TypeError("state_indices must be a torch.Tensor")
+    if state_indices.ndim != 1:
+        raise ValueError("state_indices must be one-dimensional")
+    for name, tensor in (("cu_seqlens", cu_seqlens), ("state_indices", state_indices)):
+        if tensor.dtype != torch.int32 or not tensor.is_cuda or not tensor.is_contiguous():
+            raise ValueError(f"{name} must be a contiguous CUDA int32 tensor")
+    if cu_seqlens.device != state_indices.device:
+        raise ValueError("cu_seqlens and state_indices must share a CUDA device")
 
 
 def _resolve_max_seqlen(
@@ -703,6 +712,148 @@ def _resolve_max_seqlen(
     if cu_seqlens.numel() < 2:
         raise ValueError("cu_seqlens must contain at least one sequence")
     return int((cu_seqlens[1:] - cu_seqlens[:-1]).max().item())
+
+
+def _tensor_version(tensor: torch.Tensor) -> int | None:
+    try:
+        return tensor._version
+    except RuntimeError:
+        return None
+
+
+class _RecurrentMetadataTicket:
+    def __init__(
+        self,
+        query_start_loc: torch.Tensor,
+        state_indices: torch.Tensor,
+        query_start_loc_snapshot: torch.Tensor,
+        state_indices_snapshot: torch.Tensor,
+        status: torch.Tensor,
+        token_predecessor: torch.Tensor,
+        workspace: torch.Tensor,
+        num_active_tokens: torch.Tensor | None,
+        num_active_sequences: torch.Tensor | None,
+        total_tokens: int,
+        state_pool_size: int,
+        max_seqlen: int,
+        graph_mode: bool,
+    ) -> None:
+        self._query_start_loc = query_start_loc
+        self._state_indices = state_indices
+        self.__query_start_loc_snapshot = query_start_loc_snapshot
+        self.__state_indices_snapshot = state_indices_snapshot
+        self.__status = status
+        self.__token_predecessor = token_predecessor
+        self._workspace = workspace
+        self.__num_active_tokens = num_active_tokens
+        self.__num_active_sequences = num_active_sequences
+        self._query_start_loc_version = _tensor_version(query_start_loc)
+        self._state_indices_version = _tensor_version(state_indices)
+        self._query_start_loc_data = query_start_loc.data_ptr()
+        self._state_indices_data = state_indices.data_ptr()
+        self._query_start_loc_shape = tuple(query_start_loc.shape)
+        self._state_indices_shape = tuple(state_indices.shape)
+        self._query_start_loc_stride = query_start_loc.stride()
+        self._state_indices_stride = state_indices.stride()
+        self._total_tokens = total_tokens
+        self._state_pool_size = state_pool_size
+        self.__max_seqlen = max_seqlen
+        self.__graph_mode = graph_mode
+        self._device = query_start_loc.device
+        self._stream = torch.cuda.current_stream(self._device).cuda_stream
+
+    def _check_compatible(
+        self,
+        query_start_loc: torch.Tensor,
+        state_indices: torch.Tensor,
+        total_tokens: int,
+        state_pool_size: int,
+        max_seqlen: int,
+    ) -> None:
+        if query_start_loc is not self._query_start_loc:
+            raise RuntimeError("validated_metadata query_start_loc identity mismatch")
+        if state_indices is not self._state_indices:
+            raise RuntimeError("validated_metadata state_indices identity mismatch")
+        if (
+            query_start_loc.data_ptr() != self._query_start_loc_data
+            or state_indices.data_ptr() != self._state_indices_data
+        ):
+            raise RuntimeError("validated_metadata metadata data_ptr mismatch")
+        if (
+            tuple(query_start_loc.shape) != self._query_start_loc_shape
+            or tuple(state_indices.shape) != self._state_indices_shape
+            or query_start_loc.stride() != self._query_start_loc_stride
+            or state_indices.stride() != self._state_indices_stride
+        ):
+            raise RuntimeError("validated_metadata metadata shape or stride mismatch")
+        if not self.__graph_mode:
+            for tensor, expected, name in (
+                (query_start_loc, self._query_start_loc_version, "query_start_loc"),
+                (state_indices, self._state_indices_version, "state_indices"),
+            ):
+                if expected is not None and _tensor_version(tensor) != expected:
+                    raise RuntimeError(f"validated_metadata {name} version mismatch")
+        if query_start_loc.device != self._device or state_indices.device != self._device:
+            raise RuntimeError("validated_metadata device mismatch")
+        if total_tokens != self._total_tokens:
+            raise RuntimeError("validated_metadata total_tokens mismatch")
+        if state_pool_size != self._state_pool_size:
+            raise RuntimeError("validated_metadata state_pool_size mismatch")
+        if max_seqlen > 0 and max_seqlen != self.__max_seqlen:
+            raise RuntimeError("validated_metadata max_seqlen mismatch")
+        if torch.cuda.current_stream(self._device).cuda_stream != self._stream:
+            raise RuntimeError(
+                "validated_metadata stream mismatch; prepare and consume the ticket "
+                "on the same CUDA stream"
+            )
+
+    def _query_start_loc_snapshot(self) -> torch.Tensor:
+        return self.__query_start_loc_snapshot
+
+    def _state_indices_snapshot(self) -> torch.Tensor:
+        return self.__state_indices_snapshot
+
+    def _status(self) -> torch.Tensor:
+        return self.__status
+
+    def _active_status(self) -> torch.Tensor:
+        return self.__status
+
+    def _token_predecessor(self) -> torch.Tensor:
+        return self.__token_predecessor
+
+    def _max_seqlen(self) -> int:
+        return self.__max_seqlen
+
+    def _is_graph(self) -> bool:
+        return self.__graph_mode
+
+    def _num_active_tokens(self) -> torch.Tensor | None:
+        return self.__num_active_tokens
+
+    def _num_active_sequences(self) -> torch.Tensor | None:
+        return self.__num_active_sequences
+
+
+def _metadata_launch_args(
+    ticket: object,
+    query_start_loc: torch.Tensor,
+    state_indices: torch.Tensor,
+    total_tokens: int,
+    state_pool_size: int,
+    max_seqlen: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    if not isinstance(ticket, _RecurrentMetadataTicket):
+        raise TypeError("validated_metadata must come from prepare_tmix_wkv7_recurrent_metadata")
+    ticket._check_compatible(
+        query_start_loc, state_indices, total_tokens, state_pool_size, max_seqlen
+    )
+    return (
+        ticket._query_start_loc_snapshot(),
+        ticket._state_indices_snapshot(),
+        ticket._status(),
+        ticket._max_seqlen(),
+    )
 
 
 def prepare_tmix_wkv7_recurrent_metadata(
@@ -771,7 +922,7 @@ def prepare_tmix_wkv7_recurrent_metadata(
                 raise ValueError(
                     f"{name} must be a one-element contiguous CUDA int32 tensor"
                 )
-        return _extension().prepare_tmix_wkv7_recurrent_graph_metadata(
+        prepared = _extension().prepare_tmix_wkv7_recurrent_graph_metadata(
             cu_seqlens,
             state_indices,
             num_active_tokens,
@@ -781,15 +932,56 @@ def prepare_tmix_wkv7_recurrent_metadata(
             state_pool_size,
             max_seqlen_capacity,
         )
+        return _RecurrentMetadataTicket(
+            cu_seqlens,
+            state_indices,
+            *prepared,
+            num_active_tokens,
+            num_active_sequences,
+            token_capacity,
+            state_pool_size,
+            max_seqlen_capacity,
+            True,
+        )
 
     if total_tokens is None:
         raise ValueError("total_tokens is required for static recurrent metadata")
-    return _extension().prepare_tmix_wkv7_recurrent_metadata(
+    offsets = cu_seqlens.to(device="cpu", copy=True).tolist()
+    slots = state_indices.to(device="cpu", copy=True).tolist()
+    if len(offsets) != len(slots) + 1 or not slots:
+        raise ValueError("cu_seqlens must have shape [B+1] and state_indices shape [B]")
+    if offsets[0] != 0 or offsets[-1] != total_tokens:
+        raise ValueError("cu_seqlens endpoints must be 0 and total_tokens")
+    if any(start < 0 or end <= start for start, end in pairwise(offsets)):
+        raise ValueError(
+            "cu_seqlens must be strictly increasing with non-empty sequences"
+        )
+    if len(set(slots)) != len(slots) or any(
+        slot < 0 or slot >= state_pool_size for slot in slots
+    ):
+        raise ValueError("state_indices must be unique and within the state pool")
+    inferred_max_seqlen = max(end - start for start, end in pairwise(offsets))
+    resolved_max_seqlen = (
+        inferred_max_seqlen if max_seqlen is None else int(max_seqlen)
+    )
+    if resolved_max_seqlen != inferred_max_seqlen:
+        raise ValueError("max_seqlen must equal the largest packed sequence length")
+    prepared = _extension().prepare_tmix_wkv7_recurrent_metadata(
         cu_seqlens,
         state_indices,
         total_tokens,
         state_pool_size,
-        -1 if max_seqlen is None else int(max_seqlen),
+    )
+    return _RecurrentMetadataTicket(
+        cu_seqlens,
+        state_indices,
+        *prepared,
+        None,
+        None,
+        total_tokens,
+        state_pool_size,
+        resolved_max_seqlen,
+        False,
     )
 
 
@@ -824,16 +1016,24 @@ def _run_fp32io16(
         )
     )
     output = torch.empty_like(packed[3])
-    _extension().tmix_wkv7_recurrent_fp32_from_decay_logits(
+    launch_metadata = _metadata_launch_args(
+        ticket,
         cu_seqlens,
         state_indices,
+        r.shape[0],
+        state.shape[0],
+        -1 if max_seqlen is None else int(max_seqlen),
+    )
+    _extension().tmix_wkv7_recurrent_fp32_from_decay_logits(
+        launch_metadata[0],
+        launch_metadata[1],
         state,
         *packed,
         output,
         float(scale),
         decay_bias,
-        ticket,
-        -1 if max_seqlen is None else int(max_seqlen),
+        launch_metadata[2],
+        launch_metadata[3],
     )
     return output
 
@@ -1087,17 +1287,25 @@ def _run_fp16(
         )
     )
     output = torch.empty_like(packed[3])
-    _extension().tmix_wkv7_recurrent_fp16_from_decay_logits(
+    launch_metadata = _metadata_launch_args(
+        ticket,
         cu_seqlens,
         state_indices,
+        r.shape[0],
+        state_pool.shape[0],
+        launch_max_seqlen,
+    )
+    _extension().tmix_wkv7_recurrent_fp16_from_decay_logits(
+        launch_metadata[0],
+        launch_metadata[1],
         elapsed_state_pool,
         state_pool,
         *packed,
         output,
         float(scale),
         decay_bias,
-        ticket,
-        launch_max_seqlen,
+        launch_metadata[2],
+        launch_metadata[3],
     )
     return output
 
@@ -1142,9 +1350,12 @@ def _run_deltalog_fp16(
         )
     )
     output = torch.empty_like(packed[3])
+    launch_metadata = _metadata_launch_args(
+        ticket, cu_seqlens, state_indices, r.shape[0], state_pool.shape[0], -1
+    )
     _extension().tmix_wkv7_recurrent_deltalog_fp16_from_decay_logits(
-        cu_seqlens,
-        state_indices,
+        launch_metadata[0],
+        launch_metadata[1],
         elapsed_state_pool,
         deltalog_phase_pool,
         state_pool,
@@ -1153,7 +1364,7 @@ def _run_deltalog_fp16(
         output,
         float(scale),
         decay_bias,
-        ticket,
+        launch_metadata[2],
         deltalog_status,
     )
     return output
@@ -1197,9 +1408,12 @@ def _run_deltalog_fp32io16(
         )
     )
     output = torch.empty_like(packed[3])
+    launch_metadata = _metadata_launch_args(
+        ticket, cu_seqlens, state_indices, r.shape[0], state_pool.shape[0], -1
+    )
     _extension().tmix_wkv7_recurrent_deltalog_fp32io16_from_decay_logits(
-        cu_seqlens,
-        state_indices,
+        launch_metadata[0],
+        launch_metadata[1],
         deltalog_phase_pool,
         state_pool,
         deltalog_pool,
@@ -1207,7 +1421,7 @@ def _run_deltalog_fp32io16(
         output,
         float(scale),
         decay_bias,
-        ticket,
+        launch_metadata[2],
         deltalog_status,
     )
     return output

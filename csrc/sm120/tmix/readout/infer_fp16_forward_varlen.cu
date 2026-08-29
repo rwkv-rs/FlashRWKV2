@@ -10,14 +10,12 @@
 
 #include <assert.h>
 
-#include <ATen/ATen.h>
-#include <ATen/cuda/CUDAContext.h>
 #include <cuda_fp16.h>
-#include <torch/extension.h>
+#include "validation.h"
 
 #include <cstdint>
 
-using dtype = at::Half;
+using dtype = torch::headeronly::Half;
 
 namespace {
 
@@ -310,32 +308,32 @@ void tmix_lnx_rkvres_xg_forward_varlen_cuda(
     int channels,
     int heads,
     int head_size,
-    torch::Tensor x,
-    torch::Tensor r,
-    torch::Tensor k,
-    torch::Tensor v,
-    torch::Tensor r_k,
-    torch::Tensor weight,
-    torch::Tensor bias,
-    torch::Tensor g,
-    torch::Tensor output) {
+    torch::stable::Tensor x,
+    torch::stable::Tensor r,
+    torch::stable::Tensor k,
+    torch::stable::Tensor v,
+    torch::stable::Tensor r_k,
+    torch::stable::Tensor weight,
+    torch::stable::Tensor bias,
+    torch::stable::Tensor g,
+    torch::stable::Tensor output) {
   assert(channels == heads * head_size);
-  const auto stream = at::cuda::getCurrentCUDAStream();
+  const auto stream = flashrwkv2::validation::current_cuda_stream();
   const int64_t rows = static_cast<int64_t>(total_tokens) * heads;
   if (head_size == 128) {
     tmix_lnx_rkvres_xg_generic_kernel<128><<<rows, 64, 0, stream>>>(
-        heads, x.data_ptr<dtype>(), r.data_ptr<dtype>(), k.data_ptr<dtype>(),
-        v.data_ptr<dtype>(), r_k.data_ptr<dtype>(), weight.data_ptr<dtype>(),
-        bias.data_ptr<dtype>(), g.data_ptr<dtype>(), output.data_ptr<dtype>(), rows);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+        heads, x.mutable_data_ptr<dtype>(), r.mutable_data_ptr<dtype>(), k.mutable_data_ptr<dtype>(),
+        v.mutable_data_ptr<dtype>(), r_k.mutable_data_ptr<dtype>(), weight.mutable_data_ptr<dtype>(),
+        bias.mutable_data_ptr<dtype>(), g.mutable_data_ptr<dtype>(), output.mutable_data_ptr<dtype>(), rows);
+    FLASHRWKV_CUDA_CHECK(cudaGetLastError());
     return;
   }
   if (head_size == 256) {
     tmix_lnx_rkvres_xg_generic_kernel<256><<<rows, 128, 0, stream>>>(
-        heads, x.data_ptr<dtype>(), r.data_ptr<dtype>(), k.data_ptr<dtype>(),
-        v.data_ptr<dtype>(), r_k.data_ptr<dtype>(), weight.data_ptr<dtype>(),
-        bias.data_ptr<dtype>(), g.data_ptr<dtype>(), output.data_ptr<dtype>(), rows);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+        heads, x.mutable_data_ptr<dtype>(), r.mutable_data_ptr<dtype>(), k.mutable_data_ptr<dtype>(),
+        v.mutable_data_ptr<dtype>(), r_k.mutable_data_ptr<dtype>(), weight.mutable_data_ptr<dtype>(),
+        bias.mutable_data_ptr<dtype>(), g.mutable_data_ptr<dtype>(), output.mutable_data_ptr<dtype>(), rows);
+    FLASHRWKV_CUDA_CHECK(cudaGetLastError());
     return;
   }
   assert(head_size == HEAD_SIZE);
@@ -363,23 +361,23 @@ void tmix_lnx_rkvres_xg_forward_varlen_cuda(
     tmix_lnx_rkvres_xg_warp_2d_kernel<<<
         dim3(static_cast<unsigned int>(heads), static_cast<unsigned int>(total_tokens)),
         dim3(32), 0, stream>>>(
-        heads, x.data_ptr<dtype>(), r.data_ptr<dtype>(), k.data_ptr<dtype>(),
-        v.data_ptr<dtype>(), r_k.data_ptr<dtype>(), weight.data_ptr<dtype>(),
-        bias.data_ptr<dtype>(), g.data_ptr<dtype>(), output.data_ptr<dtype>());
+        heads, x.mutable_data_ptr<dtype>(), r.mutable_data_ptr<dtype>(), k.mutable_data_ptr<dtype>(),
+        v.mutable_data_ptr<dtype>(), r_k.mutable_data_ptr<dtype>(), weight.mutable_data_ptr<dtype>(),
+        bias.mutable_data_ptr<dtype>(), g.mutable_data_ptr<dtype>(), output.mutable_data_ptr<dtype>());
   }
 #endif
   if (use_warp) {
     tmix_lnx_rkvres_xg_warp_kernel<<<
         static_cast<unsigned int>(rows), dim3(32), 0, stream>>>(
-        heads, x.data_ptr<dtype>(), r.data_ptr<dtype>(), k.data_ptr<dtype>(),
-        v.data_ptr<dtype>(), r_k.data_ptr<dtype>(), weight.data_ptr<dtype>(),
-        bias.data_ptr<dtype>(), g.data_ptr<dtype>(), output.data_ptr<dtype>(), rows);
+        heads, x.mutable_data_ptr<dtype>(), r.mutable_data_ptr<dtype>(), k.mutable_data_ptr<dtype>(),
+        v.mutable_data_ptr<dtype>(), r_k.mutable_data_ptr<dtype>(), weight.mutable_data_ptr<dtype>(),
+        bias.mutable_data_ptr<dtype>(), g.mutable_data_ptr<dtype>(), output.mutable_data_ptr<dtype>(), rows);
   } else {
     tmix_lnx_rkvres_xg_kernel<<<
         static_cast<unsigned int>(rows), dim3(64), 0, stream>>>(
-        heads, x.data_ptr<dtype>(), r.data_ptr<dtype>(), k.data_ptr<dtype>(),
-        v.data_ptr<dtype>(), r_k.data_ptr<dtype>(), weight.data_ptr<dtype>(),
-        bias.data_ptr<dtype>(), g.data_ptr<dtype>(), output.data_ptr<dtype>(), rows);
+        heads, x.mutable_data_ptr<dtype>(), r.mutable_data_ptr<dtype>(), k.mutable_data_ptr<dtype>(),
+        v.mutable_data_ptr<dtype>(), r_k.mutable_data_ptr<dtype>(), weight.mutable_data_ptr<dtype>(),
+        bias.mutable_data_ptr<dtype>(), g.mutable_data_ptr<dtype>(), output.mutable_data_ptr<dtype>(), rows);
   }
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  FLASHRWKV_CUDA_CHECK(cudaGetLastError());
 }

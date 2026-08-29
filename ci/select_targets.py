@@ -67,7 +67,6 @@ TEST_SHARED_FILES = {"tests/fixtures/tolerances-v1.json"}
 SHARED_PREFIXES = (
     ".github/workflows/",
     "ci/",
-    "csrc/bindings.cpp",
     "csrc/registration.cpp",
     "csrc/validation.cpp",
     "csrc/validation/",

@@ -6,14 +6,13 @@
 // Migration boundary: retain the upstream BF16 embedding initial-layer-norm
 // math and thread layout. Local adaptations remove monolithic-file helpers and
 // redundant forwarding; the packed-row operator takes no sequence metadata.
-#include <ATen/ATen.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAException.h>
+#include "validation.h"
+
 #include <cuda_fp16.h>
 
 #include <climits>
 
-using dtype = at::Half;
+using dtype = torch::headeronly::Half;
 
 namespace {
 
@@ -101,26 +100,26 @@ __global__ void emb_ln0_bf16_to_f16_kernel(
 
 } // namespace
 
-at::Tensor embedding_ln0_forward_varlen_cuda(
-    at::Tensor embedding,
-    at::Tensor weight,
-    at::Tensor bias,
+torch::stable::Tensor embedding_ln0_forward_varlen_cuda(
+    torch::stable::Tensor embedding,
+    torch::stable::Tensor weight,
+    torch::stable::Tensor bias,
     double eps) {
-  auto out = at::empty(embedding.sizes(), embedding.options().dtype(at::kHalf));
+  auto out = torch::stable::new_empty(embedding, embedding.sizes(), torch::headeronly::ScalarType::Half);
   const int64_t v64 = embedding.size(0);
   const int64_t c64 = embedding.size(1);
-  TORCH_CHECK(v64 <= INT_MAX && c64 <= INT_MAX, "emb shape too large");
+  STD_TORCH_CHECK(v64 <= INT_MAX && c64 <= INT_MAX, "emb shape too large");
   const int V = static_cast<int>(v64);
   const int C = static_cast<int>(c64);
-  auto stream = at::cuda::getCurrentCUDAStream();
+  auto stream = flashrwkv2::validation::current_cuda_stream();
   // Grid x equals V: launch one 256-thread block per packed token row.
   emb_ln0_bf16_to_f16_kernel<<<V, 256, 0, stream>>>(
       C,
-      reinterpret_cast<const uint16_t*>(embedding.data_ptr<at::BFloat16>()),
-      reinterpret_cast<const uint16_t*>(weight.data_ptr<at::BFloat16>()),
-      reinterpret_cast<const uint16_t*>(bias.data_ptr<at::BFloat16>()),
-      out.data_ptr<dtype>(),
+      reinterpret_cast<const uint16_t*>(embedding.mutable_data_ptr<torch::headeronly::BFloat16>()),
+      reinterpret_cast<const uint16_t*>(weight.mutable_data_ptr<torch::headeronly::BFloat16>()),
+      reinterpret_cast<const uint16_t*>(bias.mutable_data_ptr<torch::headeronly::BFloat16>()),
+      out.mutable_data_ptr<dtype>(),
       static_cast<float>(eps));
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  FLASHRWKV_CUDA_CHECK(cudaGetLastError());
   return out;
 }

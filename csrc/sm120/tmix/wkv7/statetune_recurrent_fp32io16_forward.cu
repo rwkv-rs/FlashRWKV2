@@ -6,12 +6,7 @@
 // Raw-decay training recurrence: the public boundary is decay_logits;
 // checkpoint boundaries, final state and state_dot_a stay training-local.
 
-#include <ATen/ATen.h>
-#include <ATen/Dispatch.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
-#include <c10/cuda/CUDAException.h>
-#include <torch/extension.h>
+#include "validation.h"
 
 #include "../../../sm120/tmix/wkv7/recurrent_decay.cuh"
 
@@ -133,69 +128,65 @@ template <int HeadSize, typename io_t>
 void launch_statetune_tmix_wkv7_recurrent_fp32io16_forward(
     int num_sequences,
     int num_heads,
-    const torch::Tensor& sequence_chunk_offsets,
-    const torch::Tensor& chunk_token_starts,
-    const torch::Tensor& chunk_token_ends,
-    torch::Tensor& state,
-    const torch::Tensor& r,
-    const torch::Tensor& decay,
-    const torch::Tensor& k,
-    const torch::Tensor& v,
-    const torch::Tensor& a,
-    const torch::Tensor& b,
-    torch::Tensor& output,
-    torch::Tensor& boundary,
-    torch::Tensor& state_dot_a,
+    const torch::stable::Tensor& sequence_chunk_offsets,
+    const torch::stable::Tensor& chunk_token_starts,
+    const torch::stable::Tensor& chunk_token_ends,
+    torch::stable::Tensor& state,
+    const torch::stable::Tensor& r,
+    const torch::stable::Tensor& decay,
+    const torch::stable::Tensor& k,
+    const torch::stable::Tensor& v,
+    const torch::stable::Tensor& a,
+    const torch::stable::Tensor& b,
+    torch::stable::Tensor& output,
+    torch::stable::Tensor& boundary,
+    torch::stable::Tensor& state_dot_a,
     float scale,
     cudaStream_t stream) {
   statetune_tmix_wkv7_recurrent_fp32io16_forward_kernel<HeadSize, io_t>
       <<<dim3(num_heads, num_sequences), HeadSize, 0, stream>>>(
           num_heads,
-          sequence_chunk_offsets.data_ptr<int>(),
-          chunk_token_starts.data_ptr<int>(),
-          chunk_token_ends.data_ptr<int>(),
-          state.data_ptr<float>(),
-          r.data_ptr<io_t>(),
-          decay.data_ptr<io_t>(),
-          k.data_ptr<io_t>(),
-          v.data_ptr<io_t>(),
-          a.data_ptr<io_t>(),
-          b.data_ptr<io_t>(),
-          output.data_ptr<io_t>(),
-          boundary.data_ptr<float>(),
-          state_dot_a.data_ptr<float>(),
+          sequence_chunk_offsets.mutable_data_ptr<int>(),
+          chunk_token_starts.mutable_data_ptr<int>(),
+          chunk_token_ends.mutable_data_ptr<int>(),
+          state.mutable_data_ptr<float>(),
+          r.mutable_data_ptr<io_t>(),
+          decay.mutable_data_ptr<io_t>(),
+          k.mutable_data_ptr<io_t>(),
+          v.mutable_data_ptr<io_t>(),
+          a.mutable_data_ptr<io_t>(),
+          b.mutable_data_ptr<io_t>(),
+          output.mutable_data_ptr<io_t>(),
+          boundary.mutable_data_ptr<float>(),
+          state_dot_a.mutable_data_ptr<float>(),
           scale);
 }
 
 }  // namespace
 
 void statetune_tmix_wkv7_recurrent_fp32io16_forward_cuda_impl(
-    torch::Tensor sequence_chunk_offsets,
-    torch::Tensor chunk_token_starts,
-    torch::Tensor chunk_token_ends,
-    torch::Tensor state,
-    torch::Tensor r,
-    torch::Tensor decay,
-    torch::Tensor k,
-    torch::Tensor v,
-    torch::Tensor a,
-    torch::Tensor b,
-    torch::Tensor output,
-    torch::Tensor boundary,
-    torch::Tensor state_dot_a,
+    torch::stable::Tensor sequence_chunk_offsets,
+    torch::stable::Tensor chunk_token_starts,
+    torch::stable::Tensor chunk_token_ends,
+    torch::stable::Tensor state,
+    torch::stable::Tensor r,
+    torch::stable::Tensor decay,
+    torch::stable::Tensor k,
+    torch::stable::Tensor v,
+    torch::stable::Tensor a,
+    torch::stable::Tensor b,
+    torch::stable::Tensor output,
+    torch::stable::Tensor boundary,
+    torch::stable::Tensor state_dot_a,
     double scale) {
-  const c10::cuda::CUDAGuard device_guard(state.device());
-  const auto stream = at::cuda::getCurrentCUDAStream();
+  const torch::stable::accelerator::DeviceGuard device_guard(state.device().index());
+  const auto stream = flashrwkv2::validation::current_cuda_stream();
   const int num_sequences =
       static_cast<int>(sequence_chunk_offsets.numel() - 1);
   const int num_heads = static_cast<int>(state.size(1));
 
-  AT_DISPATCH_FLOATING_TYPES_AND2(
-      at::ScalarType::Half,
-      at::ScalarType::BFloat16,
-      r.scalar_type(),
-      "flashrwkv2_statetune_tmix_wkv7_recurrent_fp32io16_forward",
-      [&] {
+  auto dispatch_launch = [&](auto scalar_value) {
+    using scalar_t = decltype(scalar_value);
         switch (state.size(2)) {
           case 64:
             launch_statetune_tmix_wkv7_recurrent_fp32io16_forward<64, scalar_t>(
@@ -219,24 +210,34 @@ void statetune_tmix_wkv7_recurrent_fp32io16_forward_cuda_impl(
                 static_cast<float>(scale), stream);
             break;
         }
-      });
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+      };
+  switch (r.scalar_type()) {
+    case torch::headeronly::ScalarType::Half:
+      dispatch_launch(torch::headeronly::Half{});
+      break;
+    case torch::headeronly::ScalarType::BFloat16:
+      dispatch_launch(torch::headeronly::BFloat16{});
+      break;
+    default:
+      STD_TORCH_CHECK(false, "token dtype must be float16 or bfloat16");
+  }
+  FLASHRWKV_CUDA_CHECK(cudaGetLastError());
 }
 
 void statetune_tmix_wkv7_recurrent_fp32io16_forward_cuda(
-    torch::Tensor sequence_chunk_offsets,
-    torch::Tensor chunk_token_starts,
-    torch::Tensor chunk_token_ends,
-    torch::Tensor state,
-    torch::Tensor r,
-    torch::Tensor decay_logits,
-    torch::Tensor k,
-    torch::Tensor v,
-    torch::Tensor a,
-    torch::Tensor b,
-    torch::Tensor output,
-    torch::Tensor boundary,
-    torch::Tensor state_dot_a,
+    torch::stable::Tensor sequence_chunk_offsets,
+    torch::stable::Tensor chunk_token_starts,
+    torch::stable::Tensor chunk_token_ends,
+    torch::stable::Tensor state,
+    torch::stable::Tensor r,
+    torch::stable::Tensor decay_logits,
+    torch::stable::Tensor k,
+    torch::stable::Tensor v,
+    torch::stable::Tensor a,
+    torch::stable::Tensor b,
+    torch::stable::Tensor output,
+    torch::stable::Tensor boundary,
+    torch::stable::Tensor state_dot_a,
     double scale) {
   statetune_tmix_wkv7_recurrent_fp32io16_forward_cuda_impl(
       sequence_chunk_offsets, chunk_token_starts, chunk_token_ends, state, r,

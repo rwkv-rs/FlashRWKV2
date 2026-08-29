@@ -19,13 +19,8 @@
 // vllm-rwkv at 6d683f9e49a2997e405c47edc147872c8609513b is a packed-varlen
 // contract reference only; it is not the kernel-body source of this file.
 
-#include <ATen/ATen.h>
-#include <ATen/Dispatch.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
-#include <c10/cuda/CUDAException.h>
 #include <cuda_fp16.h>
-#include <torch/extension.h>
+#include "validation.h"
 
 #include <limits>
 
@@ -127,9 +122,9 @@ __global__ void add_decay_bias_half2_2d_kernel(
 
 template <typename io_t>
 void launch_decay_bias_add(
-    const torch::Tensor& decay_logits,
-    const torch::Tensor& decay_bias,
-    torch::Tensor& decay_raw,
+    const torch::stable::Tensor& decay_logits,
+    const torch::stable::Tensor& decay_bias,
+    torch::stable::Tensor& decay_raw,
     cudaStream_t stream) {
   const int rows = static_cast<int>(decay_logits.size(0));
   const int channels = static_cast<int>(decay_logits.numel() / rows);
@@ -139,33 +134,33 @@ void launch_decay_bias_add(
                                   kDecayAddThreads),
         static_cast<unsigned int>(rows));
     add_decay_bias_2d_kernel<io_t><<<grid, kDecayAddThreads, 0, stream>>>(
-        decay_logits.data_ptr<io_t>(), decay_bias.data_ptr<io_t>(),
-        decay_raw.data_ptr<io_t>(), rows, channels);
+        decay_logits.mutable_data_ptr<io_t>(), decay_bias.mutable_data_ptr<io_t>(),
+        decay_raw.mutable_data_ptr<io_t>(), rows, channels);
   } else {
     const int64_t elements = decay_logits.numel();
     const int blocks = static_cast<int>(
         (elements + kDecayAddThreads - 1) / kDecayAddThreads);
     add_decay_bias_flat_kernel<io_t><<<
         blocks, kDecayAddThreads, 0, stream>>>(
-        decay_logits.data_ptr<io_t>(), decay_bias.data_ptr<io_t>(),
-        decay_raw.data_ptr<io_t>(), elements, channels);
+        decay_logits.mutable_data_ptr<io_t>(), decay_bias.mutable_data_ptr<io_t>(),
+        decay_raw.mutable_data_ptr<io_t>(), elements, channels);
   }
 }
 
 template <>
-void launch_decay_bias_add<c10::Half>(
-    const torch::Tensor& decay_logits,
-    const torch::Tensor& decay_bias,
-    torch::Tensor& decay_raw,
+void launch_decay_bias_add<torch::headeronly::Half>(
+    const torch::stable::Tensor& decay_logits,
+    const torch::stable::Tensor& decay_bias,
+    torch::stable::Tensor& decay_raw,
     cudaStream_t stream) {
   const int rows = static_cast<int>(decay_logits.size(0));
   const int channels = static_cast<int>(decay_logits.numel() / rows);
   const int channel_pairs = channels / 2;
   const auto* logits = reinterpret_cast<const __half*>(
-      decay_logits.data_ptr<c10::Half>());
+      decay_logits.mutable_data_ptr<torch::headeronly::Half>());
   const auto* bias = reinterpret_cast<const __half*>(
-      decay_bias.data_ptr<c10::Half>());
-  auto* raw = reinterpret_cast<__half*>(decay_raw.data_ptr<c10::Half>());
+      decay_bias.mutable_data_ptr<torch::headeronly::Half>());
+  auto* raw = reinterpret_cast<__half*>(decay_raw.mutable_data_ptr<torch::headeronly::Half>());
   if (channels == 4096 && rows >= 17 && rows <= 65535) {
     const dim3 grid(
         static_cast<unsigned int>(
@@ -477,13 +472,13 @@ void wkv_fp32_v2_kv_tloop_group4_kernel(
     const int* __restrict__ state_indices,
     const int* __restrict__ metadata_status,
     float* __restrict__ state_ptr,
-    const c10::Half* __restrict__ r_ptr,
-    const c10::Half* __restrict__ decay_logits_ptr,
-    const c10::Half* __restrict__ k_ptr,
-    const c10::Half* __restrict__ v_ptr,
-    const c10::Half* __restrict__ a_ptr,
-    const c10::Half* __restrict__ b_ptr,
-    c10::Half* __restrict__ output_ptr,
+    const torch::headeronly::Half* __restrict__ r_ptr,
+    const torch::headeronly::Half* __restrict__ decay_logits_ptr,
+    const torch::headeronly::Half* __restrict__ k_ptr,
+    const torch::headeronly::Half* __restrict__ v_ptr,
+    const torch::headeronly::Half* __restrict__ a_ptr,
+    const torch::headeronly::Half* __restrict__ b_ptr,
+    torch::headeronly::Half* __restrict__ output_ptr,
     float scale) {
   static_assert(ValueTile == 4 || ValueTile == 8);
   constexpr int kHeadSize = 64;
@@ -593,7 +588,7 @@ void wkv_fp32_v2_kv_tloop_group4_kernel(
     }
     if (lane < ValueTile) {
       output_ptr[token_base + value_index] =
-          from_float<c10::Half>(scale * result);
+          from_float<torch::headeronly::Half>(scale * result);
     }
   }
 
@@ -893,32 +888,32 @@ void launch_recurrent_fp32(
     int num_heads,
     int total_tokens,
     int max_seqlen,
-    const torch::Tensor& query_start_loc,
-    const torch::Tensor& state_indices,
-    torch::Tensor& state,
-    const torch::Tensor& r,
-    const torch::Tensor& decay_logits,
-    const torch::Tensor& decay_bias,
-    const torch::Tensor& k,
-    const torch::Tensor& v,
-    const torch::Tensor& a,
-    const torch::Tensor& b,
-    torch::Tensor& output,
-    const torch::Tensor& metadata_status,
+    const torch::stable::Tensor& query_start_loc,
+    const torch::stable::Tensor& state_indices,
+    torch::stable::Tensor& state,
+    const torch::stable::Tensor& r,
+    const torch::stable::Tensor& decay_logits,
+    const torch::stable::Tensor& decay_bias,
+    const torch::stable::Tensor& k,
+    const torch::stable::Tensor& v,
+    const torch::stable::Tensor& a,
+    const torch::stable::Tensor& b,
+    torch::stable::Tensor& output,
+    const torch::stable::Tensor& metadata_status,
     float scale,
     cudaStream_t stream) {
   const int64_t output_elements = output.numel();
-  const bool io_fp16 = r.scalar_type() == at::ScalarType::Half;
+  const bool io_fp16 = r.scalar_type() == torch::headeronly::ScalarType::Half;
   const bool use_small = HeadSize == 64 && use_small_auto(
       num_sequences, total_tokens, max_seqlen, io_fp16);
   const int group4_value_tile = group4_value_tile_auto(
       num_sequences, num_heads, max_seqlen, io_fp16);
-  const auto* query_ptr = query_start_loc.data_ptr<int>();
-  const auto* state_indices_ptr = state_indices.data_ptr<int>();
-  const auto* status_ptr = metadata_status.data_ptr<int>();
-  auto* state_ptr = state.data_ptr<float>();
+  const auto* query_ptr = query_start_loc.mutable_data_ptr<int>();
+  const auto* state_indices_ptr = state_indices.mutable_data_ptr<int>();
+  const auto* status_ptr = metadata_status.mutable_data_ptr<int>();
+  auto* state_ptr = state.mutable_data_ptr<float>();
   const auto* decay_bias_ptr =
-      decay_bias.defined() ? decay_bias.data_ptr<io_t>() : nullptr;
+      decay_bias.defined() ? decay_bias.mutable_data_ptr<io_t>() : nullptr;
   // Disabled upstream forced-mode launch retained beside the automatic
   // selector.  See the #if 0 kernel body above for provenance.
 #if 0
@@ -927,10 +922,10 @@ void launch_recurrent_fp32(
         <<<dim3(HeadSize, num_heads, num_sequences), dim3(kBlockThreads), 0,
                stream>>>(
             num_heads, output_elements, query_ptr, state_indices_ptr,
-            status_ptr, state_ptr, r.data_ptr<io_t>(),
-            decay_logits.data_ptr<io_t>(), decay_bias_ptr, k.data_ptr<io_t>(),
-            v.data_ptr<io_t>(), a.data_ptr<io_t>(), b.data_ptr<io_t>(),
-            output.data_ptr<io_t>(), scale);
+            status_ptr, state_ptr, r.mutable_data_ptr<io_t>(),
+            decay_logits.mutable_data_ptr<io_t>(), decay_bias_ptr, k.mutable_data_ptr<io_t>(),
+            v.mutable_data_ptr<io_t>(), a.mutable_data_ptr<io_t>(), b.mutable_data_ptr<io_t>(),
+            output.mutable_data_ptr<io_t>(), scale);
   }
 #endif
   if (use_small) {
@@ -938,10 +933,10 @@ void launch_recurrent_fp32(
         <<<dim3(HeadSize / kSmallValuesPerBlock, num_heads, num_sequences),
                dim3(kSmallThreads), 0, stream>>>(
             num_heads, output_elements, query_ptr, state_indices_ptr,
-            status_ptr, state_ptr, r.data_ptr<io_t>(),
-            decay_logits.data_ptr<io_t>(), decay_bias_ptr, k.data_ptr<io_t>(),
-            v.data_ptr<io_t>(), a.data_ptr<io_t>(), b.data_ptr<io_t>(),
-            output.data_ptr<io_t>(), scale);
+            status_ptr, state_ptr, r.mutable_data_ptr<io_t>(),
+            decay_logits.mutable_data_ptr<io_t>(), decay_bias_ptr, k.mutable_data_ptr<io_t>(),
+            v.mutable_data_ptr<io_t>(), a.mutable_data_ptr<io_t>(), b.mutable_data_ptr<io_t>(),
+            output.mutable_data_ptr<io_t>(), scale);
     return;
   }
   if constexpr (HeadSize == 64) {
@@ -950,10 +945,10 @@ void launch_recurrent_fp32(
           <<<dim3(num_heads, num_sequences, HeadSize / kKvValueTile),
              dim3(kKvTileThreads), 0, stream>>>(
               num_heads, output_elements, query_ptr, state_indices_ptr,
-              status_ptr, state_ptr, r.data_ptr<io_t>(),
-              decay_logits.data_ptr<io_t>(), decay_bias_ptr,
-              k.data_ptr<io_t>(), v.data_ptr<io_t>(), a.data_ptr<io_t>(),
-              b.data_ptr<io_t>(), output.data_ptr<io_t>(), scale);
+              status_ptr, state_ptr, r.mutable_data_ptr<io_t>(),
+              decay_logits.mutable_data_ptr<io_t>(), decay_bias_ptr,
+              k.mutable_data_ptr<io_t>(), v.mutable_data_ptr<io_t>(), a.mutable_data_ptr<io_t>(),
+              b.mutable_data_ptr<io_t>(), output.mutable_data_ptr<io_t>(), scale);
       return;
     }
     if (group4_value_tile == 4) {
@@ -962,14 +957,14 @@ void launch_recurrent_fp32(
              dim3(kWarpThreads * 4), 0, stream>>>(
               num_heads, output_elements, query_ptr, state_indices_ptr,
               status_ptr, state_ptr,
-              reinterpret_cast<const c10::Half*>(r.data_ptr<io_t>()),
-              reinterpret_cast<const c10::Half*>(
-                  decay_logits.data_ptr<io_t>()),
-              reinterpret_cast<const c10::Half*>(k.data_ptr<io_t>()),
-              reinterpret_cast<const c10::Half*>(v.data_ptr<io_t>()),
-              reinterpret_cast<const c10::Half*>(a.data_ptr<io_t>()),
-              reinterpret_cast<const c10::Half*>(b.data_ptr<io_t>()),
-              reinterpret_cast<c10::Half*>(output.data_ptr<io_t>()), scale);
+              reinterpret_cast<const torch::headeronly::Half*>(r.mutable_data_ptr<io_t>()),
+              reinterpret_cast<const torch::headeronly::Half*>(
+                  decay_logits.mutable_data_ptr<io_t>()),
+              reinterpret_cast<const torch::headeronly::Half*>(k.mutable_data_ptr<io_t>()),
+              reinterpret_cast<const torch::headeronly::Half*>(v.mutable_data_ptr<io_t>()),
+              reinterpret_cast<const torch::headeronly::Half*>(a.mutable_data_ptr<io_t>()),
+              reinterpret_cast<const torch::headeronly::Half*>(b.mutable_data_ptr<io_t>()),
+              reinterpret_cast<torch::headeronly::Half*>(output.mutable_data_ptr<io_t>()), scale);
       return;
     }
     if (group4_value_tile == 8) {
@@ -978,45 +973,45 @@ void launch_recurrent_fp32(
              dim3(kWarpThreads * 4), 0, stream>>>(
               num_heads, output_elements, query_ptr, state_indices_ptr,
               status_ptr, state_ptr,
-              reinterpret_cast<const c10::Half*>(r.data_ptr<io_t>()),
-              reinterpret_cast<const c10::Half*>(
-                  decay_logits.data_ptr<io_t>()),
-              reinterpret_cast<const c10::Half*>(k.data_ptr<io_t>()),
-              reinterpret_cast<const c10::Half*>(v.data_ptr<io_t>()),
-              reinterpret_cast<const c10::Half*>(a.data_ptr<io_t>()),
-              reinterpret_cast<const c10::Half*>(b.data_ptr<io_t>()),
-              reinterpret_cast<c10::Half*>(output.data_ptr<io_t>()), scale);
+              reinterpret_cast<const torch::headeronly::Half*>(r.mutable_data_ptr<io_t>()),
+              reinterpret_cast<const torch::headeronly::Half*>(
+                  decay_logits.mutable_data_ptr<io_t>()),
+              reinterpret_cast<const torch::headeronly::Half*>(k.mutable_data_ptr<io_t>()),
+              reinterpret_cast<const torch::headeronly::Half*>(v.mutable_data_ptr<io_t>()),
+              reinterpret_cast<const torch::headeronly::Half*>(a.mutable_data_ptr<io_t>()),
+              reinterpret_cast<const torch::headeronly::Half*>(b.mutable_data_ptr<io_t>()),
+              reinterpret_cast<torch::headeronly::Half*>(output.mutable_data_ptr<io_t>()), scale);
       return;
     }
   }
   wkv_fp32_v2_kernel<HeadSize, io_t>
       <<<dim3(num_heads, num_sequences), dim3(HeadSize), 0, stream>>>(
           num_heads, output_elements, query_ptr, state_indices_ptr,
-          status_ptr, state_ptr, r.data_ptr<io_t>(),
-          decay_logits.data_ptr<io_t>(), decay_bias_ptr, k.data_ptr<io_t>(),
-          v.data_ptr<io_t>(), a.data_ptr<io_t>(), b.data_ptr<io_t>(),
-          output.data_ptr<io_t>(), scale);
+          status_ptr, state_ptr, r.mutable_data_ptr<io_t>(),
+          decay_logits.mutable_data_ptr<io_t>(), decay_bias_ptr, k.mutable_data_ptr<io_t>(),
+          v.mutable_data_ptr<io_t>(), a.mutable_data_ptr<io_t>(), b.mutable_data_ptr<io_t>(),
+          output.mutable_data_ptr<io_t>(), scale);
 }
 
 }  // namespace
 
 void tmix_wkv7_recurrent_fp32_from_decay_logits_cuda(
-    torch::Tensor query_start_loc,
-    torch::Tensor state_indices,
-    torch::Tensor state,
-    torch::Tensor r,
-    torch::Tensor decay_logits,
-    torch::Tensor decay_bias,
-    torch::Tensor k,
-    torch::Tensor v,
-    torch::Tensor a,
-    torch::Tensor b,
-    torch::Tensor output,
-    torch::Tensor metadata_status,
+    torch::stable::Tensor query_start_loc,
+    torch::stable::Tensor state_indices,
+    torch::stable::Tensor state,
+    torch::stable::Tensor r,
+    torch::stable::Tensor decay_logits,
+    torch::stable::Tensor decay_bias,
+    torch::stable::Tensor k,
+    torch::stable::Tensor v,
+    torch::stable::Tensor a,
+    torch::stable::Tensor b,
+    torch::stable::Tensor output,
+    torch::stable::Tensor metadata_status,
     double scale,
     int64_t max_seqlen) {
-  const c10::cuda::CUDAGuard device_guard(state.device());
-  const auto stream = at::cuda::getCurrentCUDAStream();
+  const torch::stable::accelerator::DeviceGuard device_guard(state.device().index());
+  const auto stream = flashrwkv2::validation::current_cuda_stream();
   const int num_sequences = static_cast<int>(state_indices.numel());
   const int num_heads = static_cast<int>(state.size(1));
   const int total_tokens = static_cast<int>(r.size(0));
@@ -1028,20 +1023,16 @@ void tmix_wkv7_recurrent_fp32_from_decay_logits_cuda(
     max_seqlen = std::numeric_limits<int>::max();
   }
 
-  AT_DISPATCH_FLOATING_TYPES_AND2(
-      at::ScalarType::Half,
-      at::ScalarType::BFloat16,
-      r.scalar_type(),
-      "flashrwkv2_tmix_wkv7_recurrent_fp32_from_decay_logits",
-      [&] {
-        torch::Tensor decay_raw = decay_logits;
-        torch::Tensor recurrent_decay_bias = decay_bias;
+  auto dispatch_launch = [&](auto scalar_value) {
+    using scalar_t = decltype(scalar_value);
+        torch::stable::Tensor decay_raw = decay_logits;
+        torch::stable::Tensor recurrent_decay_bias = decay_bias;
         if (decay_bias.defined()) {
-          decay_raw = torch::empty_like(decay_logits);
+          decay_raw = torch::stable::empty_like(decay_logits);
           launch_decay_bias_add<scalar_t>(
               decay_logits, decay_bias, decay_raw, stream);
-          C10_CUDA_KERNEL_LAUNCH_CHECK();
-          recurrent_decay_bias = torch::Tensor();
+          FLASHRWKV_CUDA_CHECK(cudaGetLastError());
+          recurrent_decay_bias = torch::stable::Tensor();
         }
         switch (state.size(2)) {
           case 64:
@@ -1069,8 +1060,18 @@ void tmix_wkv7_recurrent_fp32_from_decay_logits_cuda(
                 static_cast<float>(scale), stream);
             break;
           default:
-            TORCH_CHECK(false, "unsupported recurrent head size");
+            STD_TORCH_CHECK(false, "unsupported recurrent head size");
         }
-      });
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+      };
+  switch (r.scalar_type()) {
+    case torch::headeronly::ScalarType::Half:
+      dispatch_launch(torch::headeronly::Half{});
+      break;
+    case torch::headeronly::ScalarType::BFloat16:
+      dispatch_launch(torch::headeronly::BFloat16{});
+      break;
+    default:
+      STD_TORCH_CHECK(false, "token dtype must be float16 or bfloat16");
+  }
+  FLASHRWKV_CUDA_CHECK(cudaGetLastError());
 }

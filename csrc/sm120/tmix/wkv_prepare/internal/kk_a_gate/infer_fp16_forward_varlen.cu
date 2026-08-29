@@ -10,14 +10,12 @@
 
 #include <assert.h>
 
-#include <ATen/ATen.h>
-#include <ATen/cuda/CUDAContext.h>
 #include <cuda_fp16.h>
-#include <torch/extension.h>
+#include "validation.h"
 
 #include <cstdint>
 
-using dtype = at::Half;
+using dtype = torch::headeronly::Half;
 
 namespace {
 
@@ -218,31 +216,31 @@ void tmix_kk_a_gate_forward_varlen_cuda(
     int channels,
     int heads,
     int head_size,
-    torch::Tensor k,
-    torch::Tensor k_k,
-    torch::Tensor a0,
-    torch::Tensor a12,
-    torch::Tensor k_a,
-    torch::Tensor new_k,
-    torch::Tensor neg_kk,
-    torch::Tensor kka) {
+    torch::stable::Tensor k,
+    torch::stable::Tensor k_k,
+    torch::stable::Tensor a0,
+    torch::stable::Tensor a12,
+    torch::stable::Tensor k_a,
+    torch::stable::Tensor new_k,
+    torch::stable::Tensor neg_kk,
+    torch::stable::Tensor kka) {
   assert(channels == heads * head_size);
-  const auto stream = at::cuda::getCurrentCUDAStream();
+  const auto stream = flashrwkv2::validation::current_cuda_stream();
   const int64_t bth_size = static_cast<int64_t>(total_tokens) * heads;
   if (head_size == 128) {
     tmix_kk_a_gate_generic_kernel<128><<<bth_size, 64, 0, stream>>>(
-        heads, k.data_ptr<dtype>(), k_k.data_ptr<dtype>(), a0.data_ptr<dtype>(),
-        a12.data_ptr<dtype>(), k_a.data_ptr<dtype>(), new_k.data_ptr<dtype>(),
-        neg_kk.data_ptr<dtype>(), kka.data_ptr<dtype>(), bth_size);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+        heads, k.mutable_data_ptr<dtype>(), k_k.mutable_data_ptr<dtype>(), a0.mutable_data_ptr<dtype>(),
+        a12.mutable_data_ptr<dtype>(), k_a.mutable_data_ptr<dtype>(), new_k.mutable_data_ptr<dtype>(),
+        neg_kk.mutable_data_ptr<dtype>(), kka.mutable_data_ptr<dtype>(), bth_size);
+    FLASHRWKV_CUDA_CHECK(cudaGetLastError());
     return;
   }
   if (head_size == 256) {
     tmix_kk_a_gate_generic_kernel<256><<<bth_size, 128, 0, stream>>>(
-        heads, k.data_ptr<dtype>(), k_k.data_ptr<dtype>(), a0.data_ptr<dtype>(),
-        a12.data_ptr<dtype>(), k_a.data_ptr<dtype>(), new_k.data_ptr<dtype>(),
-        neg_kk.data_ptr<dtype>(), kka.data_ptr<dtype>(), bth_size);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+        heads, k.mutable_data_ptr<dtype>(), k_k.mutable_data_ptr<dtype>(), a0.mutable_data_ptr<dtype>(),
+        a12.mutable_data_ptr<dtype>(), k_a.mutable_data_ptr<dtype>(), new_k.mutable_data_ptr<dtype>(),
+        neg_kk.mutable_data_ptr<dtype>(), kka.mutable_data_ptr<dtype>(), bth_size);
+    FLASHRWKV_CUDA_CHECK(cudaGetLastError());
     return;
   }
   assert(head_size == HEAD_SIZE);
@@ -256,17 +254,17 @@ void tmix_kk_a_gate_forward_varlen_cuda(
         static_cast<unsigned int>(ceil_div(heads, WARPS_PER_BLOCK)),
         static_cast<unsigned int>(total_tokens));
     tmix_kk_a_gate_2d_kernel<<<grid, WARPS_PER_BLOCK * 32, 0, stream>>>(
-        heads, k.data_ptr<dtype>(), k_k.data_ptr<dtype>(), a0.data_ptr<dtype>(),
-        a12.data_ptr<dtype>(), k_a.data_ptr<dtype>(),
-        new_k.data_ptr<dtype>(), neg_kk.data_ptr<dtype>(), kka.data_ptr<dtype>());
+        heads, k.mutable_data_ptr<dtype>(), k_k.mutable_data_ptr<dtype>(), a0.mutable_data_ptr<dtype>(),
+        a12.mutable_data_ptr<dtype>(), k_a.mutable_data_ptr<dtype>(),
+        new_k.mutable_data_ptr<dtype>(), neg_kk.mutable_data_ptr<dtype>(), kka.mutable_data_ptr<dtype>());
   } else {
     const int blocks = static_cast<int>(ceil_div(
         bth_size, static_cast<int64_t>(WARPS_PER_BLOCK)));
     tmix_kk_a_gate_kernel<<<blocks, WARPS_PER_BLOCK * 32, 0, stream>>>(
-        heads, k.data_ptr<dtype>(), k_k.data_ptr<dtype>(), a0.data_ptr<dtype>(),
-        a12.data_ptr<dtype>(), k_a.data_ptr<dtype>(),
-        new_k.data_ptr<dtype>(), neg_kk.data_ptr<dtype>(), kka.data_ptr<dtype>(),
+        heads, k.mutable_data_ptr<dtype>(), k_k.mutable_data_ptr<dtype>(), a0.mutable_data_ptr<dtype>(),
+        a12.mutable_data_ptr<dtype>(), k_a.mutable_data_ptr<dtype>(),
+        new_k.mutable_data_ptr<dtype>(), neg_kk.mutable_data_ptr<dtype>(), kka.mutable_data_ptr<dtype>(),
         bth_size);
   }
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  FLASHRWKV_CUDA_CHECK(cudaGetLastError());
 }

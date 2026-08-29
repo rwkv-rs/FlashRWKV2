@@ -5,9 +5,8 @@
 // Local adaptation: module-local FlashRWKV2 binding names only; vocab is passed
 // from the binding while the canonical train_temp row/reduction kernels remain.
 
-#include <torch/extension.h>
+#include "validation.h"
 
-#include <ATen/cuda/CUDAContext.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -24,7 +23,7 @@ __device__ inline float scalar_to_float(scalar_t x) {
 }
 
 template <>
-__device__ inline float scalar_to_float<at::BFloat16>(at::BFloat16 x) {
+__device__ inline float scalar_to_float<torch::headeronly::BFloat16>(torch::headeronly::BFloat16 x) {
     return __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&x));
 }
 
@@ -34,9 +33,9 @@ __device__ inline scalar_t float_to_scalar(float x) {
 }
 
 template <>
-__device__ inline at::BFloat16 float_to_scalar<at::BFloat16>(float x) {
+__device__ inline torch::headeronly::BFloat16 float_to_scalar<torch::headeronly::BFloat16>(float x) {
     __nv_bfloat16 v = __float2bfloat16_rn(x);
-    return *reinterpret_cast<at::BFloat16*>(&v);
+    return *reinterpret_cast<torch::headeronly::BFloat16*>(&v);
 }
 
 __device__ inline void reduce_max_first(float& value, int& index, float other_value, int other_index) {
@@ -263,45 +262,48 @@ void launch_l2wrap_ce_backward_v2_kernel(
 }
 
 }
-std::vector<torch::Tensor> l2wrap_ce_forward_cuda(
-    torch::Tensor logits,
-    torch::Tensor targets,
+std::vector<torch::stable::Tensor> l2wrap_ce_forward_cuda(
+    torch::stable::Tensor logits,
+    torch::stable::Tensor targets,
     int64_t vocab) {
     const int64_t rows = logits.numel() / vocab;
-    auto meta_opts = torch::TensorOptions().device(logits.device()).dtype(torch::kFloat32);
-    auto int_opts = torch::TensorOptions().device(logits.device()).dtype(torch::kInt32);
-    auto lse = torch::empty({rows}, meta_opts);
-    auto max_vals = torch::empty({rows}, meta_opts);
-    auto argmax = torch::empty({rows}, int_opts);
-    auto loss_rows = torch::empty({rows}, meta_opts);
-    auto loss = torch::empty({}, meta_opts);
+    auto lse = torch::stable::new_empty(
+        logits, {rows}, torch::headeronly::ScalarType::Float);
+    auto max_vals = torch::stable::new_empty(
+        logits, {rows}, torch::headeronly::ScalarType::Float);
+    auto argmax = torch::stable::new_empty(
+        logits, {rows}, torch::headeronly::ScalarType::Int);
+    auto loss_rows = torch::stable::new_empty(
+        logits, {rows}, torch::headeronly::ScalarType::Float);
+    auto loss = torch::stable::new_empty(
+        logits, {}, torch::headeronly::ScalarType::Float);
 
-    auto stream = at::cuda::getCurrentCUDAStream();
+    auto stream = flashrwkv2::validation::current_cuda_stream();
     constexpr int threads = 512;
-    if (logits.scalar_type() == torch::kBFloat16) {
-        launch_l2wrap_ce_forward_v2_kernel<at::BFloat16, threads>(
-            logits.data_ptr<at::BFloat16>(),
-            targets.data_ptr<int64_t>(),
-            lse.data_ptr<float>(),
-            max_vals.data_ptr<float>(),
-            argmax.data_ptr<int>(),
-            loss_rows.data_ptr<float>(),
+    if (logits.scalar_type() == torch::headeronly::ScalarType::BFloat16) {
+        launch_l2wrap_ce_forward_v2_kernel<torch::headeronly::BFloat16, threads>(
+            logits.mutable_data_ptr<torch::headeronly::BFloat16>(),
+            targets.mutable_data_ptr<int64_t>(),
+            lse.mutable_data_ptr<float>(),
+            max_vals.mutable_data_ptr<float>(),
+            argmax.mutable_data_ptr<int>(),
+            loss_rows.mutable_data_ptr<float>(),
             rows,
             vocab,
             stream);
     } else {
         launch_l2wrap_ce_forward_v2_kernel<float, threads>(
-            logits.data_ptr<float>(),
-            targets.data_ptr<int64_t>(),
-            lse.data_ptr<float>(),
-            max_vals.data_ptr<float>(),
-            argmax.data_ptr<int>(),
-            loss_rows.data_ptr<float>(),
+            logits.mutable_data_ptr<float>(),
+            targets.mutable_data_ptr<int64_t>(),
+            lse.mutable_data_ptr<float>(),
+            max_vals.mutable_data_ptr<float>(),
+            argmax.mutable_data_ptr<int>(),
+            loss_rows.mutable_data_ptr<float>(),
             rows,
             vocab,
             stream);
     }
-    reduce_loss_kernel<<<1, 256, 0, stream>>>(loss_rows.data_ptr<float>(), loss.data_ptr<float>(), rows);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    reduce_loss_kernel<<<1, 256, 0, stream>>>(loss_rows.mutable_data_ptr<float>(), loss.mutable_data_ptr<float>(), rows);
+    FLASHRWKV_CUDA_CHECK(cudaGetLastError());
     return {loss, lse, max_vals, argmax};
 }

@@ -136,13 +136,24 @@ jobs:
           for key, expected in required.items():
               if checks.get(key) != expected:
                   raise SystemExit(f'quality evidence lacks {key}={expected}')
+          stable_abi = manifest.get('stable_abi', {})
+          if stable_abi.get('target') != '0x020b000000000000':
+              raise SystemExit('quality evidence has the wrong Stable ABI target')
+          if stable_abi.get('build_torch') != '2.13':
+              raise SystemExit('quality evidence was not built with Torch 2.13')
+          if stable_abi.get('runtimes') != {
+              '2.11': 'passed', '2.12': 'passed', '2.13': 'passed'
+          }:
+              raise SystemExit('quality evidence lacks the complete runtime matrix')
           artifacts = manifest.get('artifacts', {})
           for kind, path in [('wheel', wheel), ('sdist', sdist)]:
               expected = artifacts.get(kind, {})
               digest = hashlib.sha256(path.read_bytes()).hexdigest()
               if expected.get('name') != path.name or expected.get('sha256') != digest:
                   raise SystemExit(f'{kind} is not the quality-tested original')
-          if artifacts['wheel'].get('artifact') != f"flashrwkv2-wheel-v4-{os.environ['BUILD_INPUT_HASH']}":
+          if stable_abi.get('wheel_sha256') != artifacts['wheel']['sha256']:
+              raise SystemExit('runtime matrix wheel digest mismatch')
+          if artifacts['wheel'].get('artifact') != f"flashrwkv2-wheel-v5-{os.environ['BUILD_INPUT_HASH']}":
               raise SystemExit('wheel artifact identity mismatch')
           destination = Path('release/payload/dist')
           destination.mkdir(parents=True)
