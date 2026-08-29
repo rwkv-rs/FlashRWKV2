@@ -286,7 +286,7 @@ jobs:
     needs: plan
     if: needs.plan.outputs.reuse_evidence != 'true' && needs.plan.outputs.run_gpu == 'true' && needs.plan.outputs.trusted == 'true'
     runs-on: [self-hosted, linux, x64, rwkv-sha-pro6000x8]
-    timeout-minutes: 15
+    timeout-minutes: 5
     concurrency:
       group: flashrwkv2-pro6000-exclusive
       cancel-in-progress: false
