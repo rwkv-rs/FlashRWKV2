@@ -367,7 +367,7 @@ jobs:
           uv build --no-build-isolation --wheel --out-dir artifacts/raw-wheel \
             2>&1 | tee artifacts/package/wheel-build.log
           ccache --show-stats | tee artifacts/package/ccache-stats.txt
-          hits="$(ccache --show-stats | awk '/^[[:space:]]+Hits:/ {print $2}')"
+          hits="$(ccache --show-stats | awk '/^[[:space:]]+Hits:/ {print $2; exit}')"
           test "${hits:-0}" -gt 0
           test "$(find artifacts/raw-wheel -maxdepth 1 -name '*.whl' | wc -l)" -eq 1
           uv tool run --with patchelf auditwheel repair \
