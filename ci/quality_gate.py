@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import subprocess
 import tempfile
 import urllib.parse
@@ -20,14 +21,13 @@ from select_targets import (
     CUDA_GRAPH_TARGETS,
     RACECHECK_TARGETS,
     TARGETS,
-    Impact,
     _git_changed_files,
     _release_metadata_only,
     classify,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 WORKFLOW_NAME = "Quality Gate"
 BUILD_INPUT_PATHS = (
     "setup.py",
@@ -87,37 +87,111 @@ def build_input_hash(revision: str) -> str:
     return digest.hexdigest()
 
 
-def _force_full_coverage(impact: Impact) -> Impact:
-    return replace(
-        impact,
-        change_class="shared_or_unknown",
-        affected_modules=tuple(sorted(TARGETS)),
-        affected_sm90_modules=tuple(
-            sorted(
-                module
-                for module in TARGETS
-                if "sm90" in BACKENDS_BY_TARGET[module]
-            )
+FUNCTION_TARGETS = {
+    (
+        "csrc/sm120/tmix/wkv7/infer_recurrent_deltalog_fp16_forward_varlen.cu",
+        "materialize_slots_kernel",
+    ): {
+        "module": "tmix/wkv7",
+        "backend": "sm120",
+        "nodeid": (
+            "tests/tmix/wkv7/test.py::"
+            "test_unified_state_materialize_and_pending_log_fallback[fp16]"
         ),
-        affected_sm120_modules=tuple(
-            sorted(
-                module
-                for module in TARGETS
-                if "sm120" in BACKENDS_BY_TARGET[module]
-            )
+        "memcheck": True,
+        "racecheck": True,
+    },
+    (
+        (
+            "csrc/sm120/tmix/wkv7/"
+            "infer_recurrent_deltalog_fp32io16_forward_varlen.cu"
         ),
-        run_gpu=True,
-        run_benchmark=True,
-        run_sanitizer=True,
-        run_all=True,
-        package_smoke_only=False,
-        reasons=tuple(sorted({*impact.reasons, "missing-base-evidence"})),
-    )
+        "materialize_slots_kernel",
+    ): {
+        "module": "tmix/wkv7",
+        "backend": "sm120",
+        "nodeid": (
+            "tests/tmix/wkv7/test.py::"
+            "test_unified_state_materialize_and_pending_log_fallback[fp32io16]"
+        ),
+        "memcheck": True,
+        "racecheck": True,
+    },
+}
 
 
-def build_plan(
-    base_sha: str, head_sha: str, *, force_full: bool = False
-) -> dict[str, Any]:
+def _changed_function_contexts(
+    base_sha: str, head_sha: str, paths: list[str]
+) -> list[tuple[str, str]]:
+    runtime_paths = [
+        path
+        for path in paths
+        if path.startswith(("csrc/", "flashrwkv2/", "tests/", "benchmarks/"))
+    ]
+    if not runtime_paths:
+        return []
+    diff = subprocess.run(
+        (
+            "git",
+            "diff",
+            "--unified=0",
+            "--find-renames",
+            base_sha,
+            head_sha,
+            "--",
+            *runtime_paths,
+        ),
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    current = ""
+    contexts: set[tuple[str, str]] = set()
+    for line in diff.splitlines():
+        if line.startswith("+++ b/"):
+            current = line.removeprefix("+++ b/")
+            continue
+        if not line.startswith("@@"):
+            continue
+        context = line.split("@@", 2)[-1].strip()
+        matches = re.findall(r"(?:^|\s)(?:def\s+)?([A-Za-z_]\w*)\s*\(", context)
+        if not matches:
+            raise SystemExit(f"function ledger cannot resolve changed hunk: {current}: {context}")
+        contexts.add((current, matches[-1]))
+    return sorted(contexts)
+
+
+def _build_function_targets(
+    base_sha: str, head_sha: str, changed: list[str]
+) -> list[dict[str, Any]] | None:
+    contexts = _changed_function_contexts(base_sha, head_sha, changed)
+    native = [context for context in contexts if context[0].startswith("csrc/")]
+    if not native:
+        return None
+    targets: dict[tuple[str, str], dict[str, Any]] = {}
+    for context in native:
+        target = FUNCTION_TARGETS.get(context)
+        if target is None:
+            raise SystemExit(
+                "native function is absent from the CI function ledger: "
+                f"{context[0]}::{context[1]}"
+            )
+        key = (target["backend"], target["nodeid"])
+        targets[key] = {"source": context[0], "function": context[1], **target}
+    test_contexts = {context for context in contexts if context[0].startswith("tests/")}
+    expected_tests = {
+        (target["nodeid"].split("::", 1)[0], target["nodeid"].split("::", 1)[1].split("[", 1)[0])
+        for target in targets.values()
+    }
+    unknown_tests = test_contexts - expected_tests
+    if unknown_tests:
+        rendered = ", ".join(f"{path}::{function}" for path, function in sorted(unknown_tests))
+        raise SystemExit(f"changed tests are absent from the native function ledger: {rendered}")
+    return [targets[key] for key in sorted(targets)]
+
+
+def build_plan(base_sha: str, head_sha: str) -> dict[str, Any]:
     changed = _git_changed_files(base_sha, head_sha)
     release_only = _release_metadata_only(changed, base_sha, head_sha)
     impact = classify(
@@ -126,8 +200,50 @@ def build_plan(
         head_sha=head_sha,
         release_metadata_only=release_only,
     )
-    if force_full:
-        impact = _force_full_coverage(impact)
+    function_targets = _build_function_targets(base_sha, head_sha, changed)
+    if function_targets:
+        modules = tuple(sorted({target["module"] for target in function_targets}))
+        sm90_modules = tuple(
+            sorted({target["module"] for target in function_targets if target["backend"] == "sm90"})
+        )
+        sm120_modules = tuple(
+            sorted({target["module"] for target in function_targets if target["backend"] == "sm120"})
+        )
+        impact = replace(
+            impact,
+            change_class="native_function",
+            affected_modules=modules,
+            affected_sm90_modules=sm90_modules,
+            affected_sm120_modules=sm120_modules,
+            run_gpu=True,
+            run_benchmark=False,
+            run_sanitizer=True,
+            run_all=False,
+            package_smoke_only=False,
+            reasons=tuple(sorted({*impact.reasons, "function-ledger"})),
+        )
+    elif changed and all(
+        path in {"AGENTS.md", "README.md", "RTK.md"}
+        or path.startswith(("ci/", ".github/workflows/", "docs/"))
+        for path in changed
+    ):
+        impact = replace(
+            impact,
+            change_class="control_plane",
+            affected_modules=(),
+            affected_sm90_modules=(),
+            affected_sm120_modules=(),
+            run_gpu=False,
+            run_benchmark=False,
+            run_sanitizer=False,
+            run_all=False,
+            reasons=tuple(sorted({*impact.reasons, "contract-only-control-plane"})),
+        )
+    elif impact.run_gpu and not impact.package_smoke_only:
+        raise SystemExit(
+            "GPU change has no exact function target; add its source function, "
+            "pytest node IDs, sanitizers, and benchmark cases to FUNCTION_TARGETS"
+        )
     payload: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "base_sha": base_sha,
@@ -138,11 +254,37 @@ def build_plan(
         "impact": asdict(impact),
         "contract_required": impact.change_class != "documentation",
         "package_required": impact.run_gpu,
+        "scope": "function" if function_targets else "tree",
+        "function_targets": function_targets or [],
+        "sm90_correctness_nodeids": [
+            target["nodeid"] for target in function_targets or [] if target["backend"] == "sm90"
+        ],
+        "sm120_correctness_nodeids": [
+            target["nodeid"] for target in function_targets or [] if target["backend"] == "sm120"
+        ],
+        "sm90_memcheck_nodeids": [
+            target["nodeid"] for target in function_targets or []
+            if target["backend"] == "sm90" and target["memcheck"]
+        ],
+        "sm120_memcheck_nodeids": [
+            target["nodeid"] for target in function_targets or []
+            if target["backend"] == "sm120" and target["memcheck"]
+        ],
+        "sm90_racecheck_nodeids": [
+            target["nodeid"] for target in function_targets or []
+            if target["backend"] == "sm90" and target["racecheck"]
+        ],
+        "sm120_racecheck_nodeids": [
+            target["nodeid"] for target in function_targets or []
+            if target["backend"] == "sm120" and target["racecheck"]
+        ],
         "benchmark_modules": (
             list(impact.affected_sm120_modules) if impact.run_benchmark else []
         ),
         "cpu_test_paths": (
-            ["tests"]
+            []
+            if function_targets
+            else ["tests"]
             if impact.run_all
             else [
                 (
@@ -157,22 +299,22 @@ def build_plan(
         "cuda_graph_modules": [
             module
             for module in impact.affected_sm120_modules
-            if module in CUDA_GRAPH_TARGETS
+            if not function_targets and module in CUDA_GRAPH_TARGETS
         ],
         "sm90_racecheck_modules": [
             module
             for module in impact.affected_sm90_modules
-            if module in RACECHECK_TARGETS
+            if not function_targets and module in RACECHECK_TARGETS
         ],
         "sm120_racecheck_modules": [
             module
             for module in impact.affected_sm120_modules
-            if module in RACECHECK_TARGETS
+            if not function_targets and module in RACECHECK_TARGETS
         ],
         "sm90_execution_mode": "PTX-on-SM120",
         "sm120_execution_mode": "native-sm120",
     }
-    payload["coverage_requires_parent"] = not (
+    payload["coverage_requires_parent"] = payload["scope"] == "tree" and not (
         impact.run_all and impact.run_sanitizer
     )
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
@@ -255,11 +397,24 @@ def _artifact_covers_plan(
         return False
     if source.get("build_input_hash") != plan["build_input_hash"]:
         return False
-    coverage = manifest.get("coverage", {})
-    for backend in ("sm90", "sm120"):
-        for module in plan["impact"][f"affected_{backend}_modules"]:
-            if coverage.get(backend, {}).get(module, {}).get("correctness") != "passed":
-                return False
+    if plan.get("scope") == "function":
+        observed = {
+            (entry.get("backend"), entry.get("nodeid"))
+            for entry in manifest.get("function_coverage", [])
+            if entry.get("correctness") == "passed"
+        }
+        required_functions = {
+            (target["backend"], target["nodeid"])
+            for target in plan["function_targets"]
+        }
+        if not required_functions <= observed:
+            return False
+    else:
+        coverage = manifest.get("coverage", {})
+        for backend in ("sm90", "sm120"):
+            for module in plan["impact"][f"affected_{backend}_modules"]:
+                if coverage.get(backend, {}).get(module, {}).get("correctness") != "passed":
+                    return False
     if plan["package_required"] and not {
         "wheel",
         "sdist",
@@ -279,8 +434,8 @@ def _artifact_covers_plan(
 def resolve_reuse(
     plan: dict[str, Any], repository: str, token: str, current_run: int
 ) -> dict[str, Any]:
-    evidence_name = f"flashrwkv2-quality-v3-{plan['source_tree_sha']}"
-    wheel_name = f"flashrwkv2-wheel-v3-{plan['build_input_hash']}"
+    evidence_name = f"flashrwkv2-quality-v4-{plan['source_tree_sha']}"
+    wheel_name = f"flashrwkv2-wheel-v4-{plan['build_input_hash']}"
     evidence_run_id = _artifact_run(
         repository,
         token,
@@ -310,7 +465,7 @@ def resolve_reuse(
 def resolve_tree_evidence(
     tree: str, repository: str, token: str, current_run: int
 ) -> dict[str, Any]:
-    artifact_name = f"flashrwkv2-quality-v3-{tree}"
+    artifact_name = f"flashrwkv2-quality-v4-{tree}"
     run_id = _artifact_run(
         repository,
         token,
@@ -342,7 +497,7 @@ def finalize(
         artifacts["wheel"] = {
             "name": wheel.name,
             "sha256": _sha256(wheel),
-            "artifact": f"flashrwkv2-wheel-v3-{plan['build_input_hash']}",
+            "artifact": f"flashrwkv2-wheel-v4-{plan['build_input_hash']}",
         }
     if sdist is not None:
         artifacts["sdist"] = {"name": sdist.name, "sha256": _sha256(sdist)}
@@ -387,7 +542,7 @@ def finalize(
     recorded_results = validation_payload.get("results", [])
 
     def require_result(
-        kind: str, backend: str, modules: list[str]
+        kind: str, backend: str, expected: list[str]
     ) -> None:
         matches = [
             result
@@ -396,8 +551,11 @@ def finalize(
         ]
         if len(matches) != 1 or matches[0].get("status") != "passed":
             raise SystemExit(f"validation lacks passed {backend} {kind} result")
-        if sorted(matches[0].get("modules", [])) != sorted(modules):
-            raise SystemExit(f"validation {backend} {kind} module coverage mismatch")
+        coverage_key = "nodeids" if plan.get("scope") == "function" else "modules"
+        if sorted(matches[0].get(coverage_key, [])) != sorted(expected):
+            raise SystemExit(
+                f"validation {backend} {kind} {coverage_key} coverage mismatch"
+            )
     if plan["package_required"]:
         for check in ("package_identity", "binary_contents"):
             if recorded_checks.get(check) != "passed":
@@ -416,24 +574,39 @@ def finalize(
         raise SystemExit("SM90 validation was not recorded as PTX-on-SM120")
     if not impact["package_smoke_only"]:
         for backend in ("sm90", "sm120"):
-            modules = impact[f"affected_{backend}_modules"]
-            if modules:
-                require_result("correctness", backend, modules)
+            expected = (
+                plan[f"{backend}_correctness_nodeids"]
+                if plan.get("scope") == "function"
+                else impact[f"affected_{backend}_modules"]
+            )
+            if expected:
+                require_result("correctness", backend, expected)
     if impact["run_sanitizer"]:
         if recorded_checks.get("memcheck") != "passed":
             raise SystemExit("sanitizer evidence lacks passed memcheck")
         racecheck_required = bool(
-            plan["sm90_racecheck_modules"] or plan["sm120_racecheck_modules"]
+            plan.get("sm90_racecheck_nodeids")
+            or plan.get("sm120_racecheck_nodeids")
+            or plan["sm90_racecheck_modules"]
+            or plan["sm120_racecheck_modules"]
         )
         if racecheck_required and recorded_checks.get("racecheck") != "passed":
             raise SystemExit("sanitizer evidence lacks required racecheck")
         for backend in ("sm90", "sm120"):
-            modules = impact[f"affected_{backend}_modules"]
-            if modules:
-                require_result("memcheck", backend, modules)
-            race_modules = plan[f"{backend}_racecheck_modules"]
-            if race_modules:
-                require_result("racecheck", backend, race_modules)
+            memcheck = (
+                plan[f"{backend}_memcheck_nodeids"]
+                if plan.get("scope") == "function"
+                else impact[f"affected_{backend}_modules"]
+            )
+            if memcheck:
+                require_result("memcheck", backend, memcheck)
+            racecheck = (
+                plan[f"{backend}_racecheck_nodeids"]
+                if plan.get("scope") == "function"
+                else plan[f"{backend}_racecheck_modules"]
+            )
+            if racecheck:
+                require_result("racecheck", backend, racecheck)
     if plan["cuda_graph_modules"] and recorded_checks.get("cuda_graph") != "passed":
         raise SystemExit("CUDA Graph evidence was not recorded as passed")
 
@@ -471,15 +644,16 @@ def finalize(
                 )
             coverage[backend][module] = entry
 
-    for module in TARGETS:
-        for backend in BACKENDS_BY_TARGET[module]:
-            entry = coverage[backend].get(module)
-            if not entry or entry.get("correctness") != "passed":
-                raise SystemExit(f"quality coverage lacks {backend} correctness for {module}")
-            if entry.get("memcheck") != "passed":
-                raise SystemExit(f"quality coverage lacks {backend} memcheck for {module}")
-            if module in RACECHECK_TARGETS and entry.get("racecheck") != "passed":
-                raise SystemExit(f"quality coverage lacks {backend} racecheck for {module}")
+    if plan.get("scope") != "function":
+        for module in TARGETS:
+            for backend in BACKENDS_BY_TARGET[module]:
+                entry = coverage[backend].get(module)
+                if not entry or entry.get("correctness") != "passed":
+                    raise SystemExit(f"quality coverage lacks {backend} correctness for {module}")
+                if entry.get("memcheck") != "passed":
+                    raise SystemExit(f"quality coverage lacks {backend} memcheck for {module}")
+                if module in RACECHECK_TARGETS and entry.get("racecheck") != "passed":
+                    raise SystemExit(f"quality coverage lacks {backend} racecheck for {module}")
 
     return {
         "schema_version": SCHEMA_VERSION,
@@ -505,6 +679,16 @@ def finalize(
             "sanitizer": "passed",
         },
         "coverage": coverage,
+        "function_coverage": [
+            {
+                **target,
+                "source_tree_sha": current_tree,
+                "correctness": "passed",
+                "memcheck": "passed" if target["memcheck"] else "not-required",
+                "racecheck": "passed" if target["racecheck"] else "not-required",
+            }
+            for target in plan.get("function_targets", [])
+        ],
         "environment": validation_payload.get("environment", {}),
         "results": validation_payload.get("results", []),
         "artifacts": artifacts,
@@ -602,10 +786,6 @@ def _self_test() -> None:
     )
     assert redirected is not None
     assert redirected.get_header("Authorization") is None
-    forced = _force_full_coverage(classify(["README.md"]))
-    assert forced.run_all and forced.run_gpu and forced.run_sanitizer
-    assert forced.affected_modules == tuple(sorted(TARGETS))
-    assert "missing-base-evidence" in forced.reasons
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         wheel = root / "candidate.whl"
@@ -840,7 +1020,6 @@ def main() -> int:
     plan_parser = commands.add_parser("plan")
     plan_parser.add_argument("--base", required=True)
     plan_parser.add_argument("--head", required=True)
-    plan_parser.add_argument("--force-full", action="store_true")
     plan_parser.add_argument("--output", type=Path, required=True)
     plan_parser.add_argument("--github-output", type=Path)
 
@@ -889,7 +1068,7 @@ def main() -> int:
         print("quality_gate self-test passed")
         return 0
     if args.command == "plan":
-        payload = build_plan(args.base, args.head, force_full=args.force_full)
+        payload = build_plan(args.base, args.head)
         _write_json(args.output, payload)
         if args.github_output:
             impact = payload["impact"]
@@ -905,6 +1084,14 @@ def main() -> int:
                     "affected_sm90_modules": impact["affected_sm90_modules"],
                     "affected_sm120_modules": impact["affected_sm120_modules"],
                     "benchmark_modules": payload["benchmark_modules"],
+                    "scope": payload["scope"],
+                    "function_targets": payload["function_targets"],
+                    "sm90_correctness_nodeids": payload["sm90_correctness_nodeids"],
+                    "sm120_correctness_nodeids": payload["sm120_correctness_nodeids"],
+                    "sm90_memcheck_nodeids": payload["sm90_memcheck_nodeids"],
+                    "sm120_memcheck_nodeids": payload["sm120_memcheck_nodeids"],
+                    "sm90_racecheck_nodeids": payload["sm90_racecheck_nodeids"],
+                    "sm120_racecheck_nodeids": payload["sm120_racecheck_nodeids"],
                     "cpu_test_paths": payload["cpu_test_paths"],
                     "cuda_graph_modules": payload["cuda_graph_modules"],
                     "sm90_racecheck_modules": payload["sm90_racecheck_modules"],

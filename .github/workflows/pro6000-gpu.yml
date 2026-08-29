@@ -41,6 +41,14 @@ jobs:
       affected_sm90_modules: ${{ steps.quality.outputs.affected_sm90_modules }}
       affected_sm120_modules: ${{ steps.quality.outputs.affected_sm120_modules }}
       benchmark_modules: ${{ steps.quality.outputs.benchmark_modules }}
+      scope: ${{ steps.quality.outputs.scope }}
+      function_targets: ${{ steps.quality.outputs.function_targets }}
+      sm90_correctness_nodeids: ${{ steps.quality.outputs.sm90_correctness_nodeids }}
+      sm120_correctness_nodeids: ${{ steps.quality.outputs.sm120_correctness_nodeids }}
+      sm90_memcheck_nodeids: ${{ steps.quality.outputs.sm90_memcheck_nodeids }}
+      sm120_memcheck_nodeids: ${{ steps.quality.outputs.sm120_memcheck_nodeids }}
+      sm90_racecheck_nodeids: ${{ steps.quality.outputs.sm90_racecheck_nodeids }}
+      sm120_racecheck_nodeids: ${{ steps.quality.outputs.sm120_racecheck_nodeids }}
       cpu_test_paths: ${{ steps.quality.outputs.cpu_test_paths }}
       cuda_graph_modules: ${{ steps.quality.outputs.cuda_graph_modules }}
       sm90_racecheck_modules: ${{ steps.quality.outputs.sm90_racecheck_modules }}
@@ -204,22 +212,6 @@ jobs:
           python3 ci/quality_gate.py plan \
             --base '${{ steps.revision.outputs.base_sha }}' \
             --head '${{ steps.revision.outputs.head_sha }}' \
-            --output artifacts/plan.json
-          force_full=()
-          if [[ "$(python3 -c 'import json; print(str(json.load(open("artifacts/plan.json"))["coverage_requires_parent"]).lower())')" == true ]]; then
-            python3 ci/quality_gate.py resolve-tree \
-              --tree "$(python3 -c 'import json; print(json.load(open("artifacts/plan.json"))["base_tree_sha"])')" \
-              --repository "$GITHUB_REPOSITORY" \
-              --current-run "$GITHUB_RUN_ID" \
-              --output artifacts/base-tree-evidence.json
-            if [[ "$(python3 -c 'import json; print(str(json.load(open("artifacts/base-tree-evidence.json"))["found"]).lower())')" != true ]]; then
-              force_full+=(--force-full)
-            fi
-          fi
-          python3 ci/quality_gate.py plan \
-            --base '${{ steps.revision.outputs.base_sha }}' \
-            --head '${{ steps.revision.outputs.head_sha }}' \
-            "${force_full[@]}" \
             --output artifacts/plan.json \
             --github-output "$GITHUB_OUTPUT"
       - name: Resolve reusable tree evidence and build artifact
@@ -294,7 +286,7 @@ jobs:
     needs: plan
     if: needs.plan.outputs.reuse_evidence != 'true' && needs.plan.outputs.run_gpu == 'true' && needs.plan.outputs.trusted == 'true'
     runs-on: [self-hosted, linux, x64, rwkv-sha-pro6000x8]
-    timeout-minutes: 240
+    timeout-minutes: 5
     concurrency:
       group: flashrwkv2-pro6000-exclusive
       cancel-in-progress: false
@@ -360,10 +352,18 @@ jobs:
         run: |
           set -o pipefail
           mkdir -p artifacts/package/dist artifacts/raw-wheel
+          command -v ccache
+          export CCACHE_COMPILERCHECK=content
+          export CCACHE_NOHASHDIR=true
+          ccache --zero-stats
           uv sync --frozen --no-install-project --group dev
           uv export --frozen --group dev --no-emit-project \
             --output-file artifacts/package/locked-requirements.txt
-          uv build --wheel --out-dir artifacts/raw-wheel 2>&1 | tee artifacts/package/wheel-build.log
+          uv build --no-build-isolation --wheel --out-dir artifacts/raw-wheel \
+            2>&1 | tee artifacts/package/wheel-build.log
+          ccache --show-stats | tee artifacts/package/ccache-stats.txt
+          hits="$(ccache --show-stats | awk '/^[[:space:]]+Hits:/ {print $2}')"
+          test "${hits:-0}" -gt 0
           test "$(find artifacts/raw-wheel -maxdepth 1 -name '*.whl' | wc -l)" -eq 1
           uv tool run --with patchelf auditwheel repair \
             --plat manylinux_2_38_x86_64 \
@@ -416,12 +416,13 @@ jobs:
         if: steps.locked_reuse.outputs.reuse_evidence != 'true' && steps.locked_reuse.outputs.reuse_wheel != 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: flashrwkv2-wheel-v3-${{ needs.plan.outputs.build_input_hash }}
+          name: flashrwkv2-wheel-v4-${{ needs.plan.outputs.build_input_hash }}
           path: |
             artifacts/package/dist/*.whl
             artifacts/package/locked-requirements.txt
             artifacts/package/wheel-audit.txt
             artifacts/package/wheel-build.log
+            artifacts/package/ccache-stats.txt
             artifacts/package/build-identity.json
           if-no-files-found: error
           retention-days: 90
@@ -490,47 +491,41 @@ jobs:
       - name: Run affected correctness and CUDA Graph tests once
         if: steps.locked_reuse.outputs.reuse_evidence != 'true' && needs.plan.outputs.package_smoke_only != 'true'
         env:
-          SM90_JSON: ${{ needs.plan.outputs.affected_sm90_modules }}
-          SM120_JSON: ${{ needs.plan.outputs.affected_sm120_modules }}
+          SM90_JSON: ${{ needs.plan.outputs.sm90_correctness_nodeids }}
+          SM120_JSON: ${{ needs.plan.outputs.sm120_correctness_nodeids }}
           PYTHONPATH: ${{ github.workspace }}/tests:${{ github.workspace }}/benchmarks
         run: |
           set -o pipefail
           test_root="$RUNNER_TEMP/flashrwkv2-correctness-$GITHUB_RUN_ID"
           mkdir -p "$test_root" artifacts/validation
-          run_modules() {
-            local backend="$1" marker="$2" modules_json="$3"
-            mapfile -t modules < <(MODULES_JSON="$modules_json" python3 -c 'import json,os; print("\n".join(json.loads(os.environ["MODULES_JSON"])))')
-            for module in "${modules[@]}"; do
-              safe="${module//\//-}"
-              target="$GITHUB_WORKSPACE/tests/$module"
-              extra=()
-              if [[ "$module" == 'tmix/wkv7' ]]; then
-                extra+=(--ignore="$GITHUB_WORKSPACE/tests/tmix/wkv7/rl_infctx")
-              fi
-              (
-                cd "$test_root"
-                FLASHRWKV_TEST_BACKEND="$backend" \
-                  "$GITHUB_WORKSPACE/.runtime-venv/bin/python" -m pytest -p utils -q \
-                  "$target" -m "$marker" -c /dev/null \
-                  -o 'python_files=test.py test_*.py' --rootdir="$test_root" \
-                  "${extra[@]}"
-              ) 2>&1 | tee "$GITHUB_WORKSPACE/artifacts/validation/$safe-$marker.log"
+          run_nodeids() {
+            local backend="$1" marker="$2" nodeids_json="$3"
+            mapfile -t nodeids < <(NODEIDS_JSON="$nodeids_json" python3 -c 'import json,os; print("\n".join(json.loads(os.environ["NODEIDS_JSON"])))')
+            (( ${#nodeids[@]} )) || return 0
+            for index in "${!nodeids[@]}"; do
+              nodeids[$index]="$GITHUB_WORKSPACE/${nodeids[$index]}"
             done
+            (
+              cd "$test_root"
+              FLASHRWKV_TEST_BACKEND="$backend" \
+                "$GITHUB_WORKSPACE/.runtime-venv/bin/python" -m pytest -p utils -q \
+                "${nodeids[@]}" -m "$marker" -c /dev/null --rootdir="$test_root"
+            ) 2>&1 | tee "$GITHUB_WORKSPACE/artifacts/validation/function-$marker.log"
           }
-          run_modules _C_sm120 sm120 "$SM120_JSON"
-          run_modules _C_sm90 sm90 "$SM90_JSON"
+          run_nodeids _C_sm120 sm120 "$SM120_JSON"
+          run_nodeids _C_sm90 sm90 "$SM90_JSON"
           python3 - <<'PY'
           import json, os
           from pathlib import Path
           results = []
           for backend, name in (("sm120", "SM120_JSON"), ("sm90", "SM90_JSON")):
-              modules = json.loads(os.environ[name])
-              if modules:
+              nodeids = json.loads(os.environ[name])
+              if nodeids:
                   results.append({
                       "kind": "correctness",
                       "backend": backend,
                       "status": "passed",
-                      "modules": modules,
+                      "nodeids": nodeids,
                   })
           Path("artifacts/validation/correctness-results.json").write_text(
               json.dumps(results, indent=2) + "\n"
@@ -539,41 +534,36 @@ jobs:
       - name: Run only marked sanitizer cases
         if: steps.locked_reuse.outputs.reuse_evidence != 'true' && needs.plan.outputs.run_sanitizer == 'true'
         env:
-          SM90_JSON: ${{ needs.plan.outputs.affected_sm90_modules }}
-          SM120_JSON: ${{ needs.plan.outputs.affected_sm120_modules }}
-          SM90_RACE_JSON: ${{ needs.plan.outputs.sm90_racecheck_modules }}
-          SM120_RACE_JSON: ${{ needs.plan.outputs.sm120_racecheck_modules }}
+          SM90_JSON: ${{ needs.plan.outputs.sm90_memcheck_nodeids }}
+          SM120_JSON: ${{ needs.plan.outputs.sm120_memcheck_nodeids }}
+          SM90_RACE_JSON: ${{ needs.plan.outputs.sm90_racecheck_nodeids }}
+          SM120_RACE_JSON: ${{ needs.plan.outputs.sm120_racecheck_nodeids }}
           PYTHONPATH: ${{ github.workspace }}/tests:${{ github.workspace }}/benchmarks
         run: |
           set -o pipefail
           command -v compute-sanitizer
           test_root="$RUNNER_TEMP/flashrwkv2-sanitizer-$GITHUB_RUN_ID"
           mkdir -p "$test_root" artifacts/validation
-          sanitize_modules() {
-            local backend="$1" arch="$2" tool="$3" modules_json="$4"
-            mapfile -t modules < <(MODULES_JSON="$modules_json" python3 -c 'import json,os; print("\n".join(json.loads(os.environ["MODULES_JSON"])))')
-            for module in "${modules[@]}"; do
-              safe="${module//\//-}"
-              target="$GITHUB_WORKSPACE/tests/$module"
-              extra=()
-              if [[ "$module" == 'tmix/wkv7' ]]; then
-                extra+=(--ignore="$GITHUB_WORKSPACE/tests/tmix/wkv7/rl_infctx")
-              fi
-              (
-                cd "$test_root"
-                FLASHRWKV_TEST_BACKEND="$backend" compute-sanitizer \
-                  --tool "$tool" --target-processes all --error-exitcode 97 \
-                  "$GITHUB_WORKSPACE/.runtime-venv/bin/python" -m pytest -p utils -q \
-                  "$target" -m "$arch and $tool" -x -c /dev/null \
-                  -o 'python_files=test.py test_*.py' --rootdir="$test_root" \
-                  "${extra[@]}"
-              ) 2>&1 | tee "$GITHUB_WORKSPACE/artifacts/validation/$safe-$arch-$tool.log"
+          sanitize_nodeids() {
+            local backend="$1" arch="$2" tool="$3" nodeids_json="$4"
+            mapfile -t nodeids < <(NODEIDS_JSON="$nodeids_json" python3 -c 'import json,os; print("\n".join(json.loads(os.environ["NODEIDS_JSON"])))')
+            (( ${#nodeids[@]} )) || return 0
+            for index in "${!nodeids[@]}"; do
+              nodeids[$index]="$GITHUB_WORKSPACE/${nodeids[$index]}"
             done
+            (
+              cd "$test_root"
+              FLASHRWKV_TEST_BACKEND="$backend" compute-sanitizer \
+                --tool "$tool" --target-processes all --error-exitcode 97 \
+                "$GITHUB_WORKSPACE/.runtime-venv/bin/python" -m pytest -p utils -q \
+                "${nodeids[@]}" -m "$arch and $tool" -x -c /dev/null \
+                --rootdir="$test_root"
+            ) 2>&1 | tee "$GITHUB_WORKSPACE/artifacts/validation/function-$arch-$tool.log"
           }
-          sanitize_modules _C_sm120 sm120 memcheck "$SM120_JSON"
-          sanitize_modules _C_sm90 sm90 memcheck "$SM90_JSON"
-          sanitize_modules _C_sm120 sm120 racecheck "$SM120_RACE_JSON"
-          sanitize_modules _C_sm90 sm90 racecheck "$SM90_RACE_JSON"
+          sanitize_nodeids _C_sm120 sm120 memcheck "$SM120_JSON"
+          sanitize_nodeids _C_sm90 sm90 memcheck "$SM90_JSON"
+          sanitize_nodeids _C_sm120 sm120 racecheck "$SM120_RACE_JSON"
+          sanitize_nodeids _C_sm90 sm90 racecheck "$SM90_RACE_JSON"
           python3 - <<'PY'
           import json, os
           from pathlib import Path
@@ -582,21 +572,21 @@ jobs:
               ("sm120", "SM120_JSON", "SM120_RACE_JSON"),
               ("sm90", "SM90_JSON", "SM90_RACE_JSON"),
           ):
-              modules = json.loads(os.environ[modules_name])
-              if modules:
+              nodeids = json.loads(os.environ[modules_name])
+              if nodeids:
                   results.append({
                       "kind": "memcheck",
                       "backend": backend,
                       "status": "passed",
-                      "modules": modules,
+                      "nodeids": nodeids,
                   })
-              race_modules = json.loads(os.environ[race_name])
-              if race_modules:
+              race_nodeids = json.loads(os.environ[race_name])
+              if race_nodeids:
                   results.append({
                       "kind": "racecheck",
                       "backend": backend,
                       "status": "passed",
-                      "modules": race_modules,
+                      "nodeids": race_nodeids,
                   })
           Path("artifacts/validation/sanitizer-results.json").write_text(
               json.dumps(results, indent=2) + "\n"
@@ -716,7 +706,10 @@ jobs:
               'sm120': 'native-sm120' if impact['affected_sm120_modules'] and not impact['package_smoke_only'] else 'not-required',
               'cuda_graph': 'passed' if plan['cuda_graph_modules'] else 'not-required',
               'memcheck': 'passed' if impact['run_sanitizer'] else 'not-required',
-              'racecheck': 'passed' if plan['sm90_racecheck_modules'] or plan['sm120_racecheck_modules'] else 'not-required',
+              'racecheck': 'passed' if (
+                  plan['sm90_racecheck_modules'] or plan['sm120_racecheck_modules']
+                  or plan['sm90_racecheck_nodeids'] or plan['sm120_racecheck_nodeids']
+              ) else 'not-required',
           }
           payload = {
               'checks': checks,
@@ -830,7 +823,7 @@ jobs:
         run: |
           python3 ci/quality_gate.py extract \
             --repository "$GITHUB_REPOSITORY" \
-            --artifact 'flashrwkv2-quality-v3-${{ needs.plan.outputs.source_tree_sha }}' \
+            --artifact 'flashrwkv2-quality-v4-${{ needs.plan.outputs.source_tree_sha }}' \
             --run-id '${{ steps.source.outputs.run_id }}' \
             --output evidence/final
       - uses: actions/download-artifact@v4
@@ -892,7 +885,7 @@ jobs:
           PY
       - uses: actions/upload-artifact@v4
         with:
-          name: flashrwkv2-quality-v3-${{ needs.plan.outputs.source_tree_sha }}
+          name: flashrwkv2-quality-v4-${{ needs.plan.outputs.source_tree_sha }}
           path: evidence/final/
           if-no-files-found: error
           retention-days: 90
@@ -927,7 +920,7 @@ jobs:
         with:
           script: |
             const fs = require('fs');
-            const marker = '<!-- flashrwkv2-quality-v3 -->';
+            const marker = '<!-- flashrwkv2-quality-v4 -->';
             const body = `${marker}\n${fs.readFileSync('evidence/comment.md', 'utf8')}`;
             const issue_number = Number(process.env.PR_NUMBER);
             const comments = await github.paginate(github.rest.issues.listComments, {

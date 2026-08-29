@@ -142,7 +142,7 @@ jobs:
               digest = hashlib.sha256(path.read_bytes()).hexdigest()
               if expected.get('name') != path.name or expected.get('sha256') != digest:
                   raise SystemExit(f'{kind} is not the quality-tested original')
-          if artifacts['wheel'].get('artifact') != f"flashrwkv2-wheel-v3-{os.environ['BUILD_INPUT_HASH']}":
+          if artifacts['wheel'].get('artifact') != f"flashrwkv2-wheel-v4-{os.environ['BUILD_INPUT_HASH']}":
               raise SystemExit('wheel artifact identity mismatch')
           destination = Path('release/payload/dist')
           destination.mkdir(parents=True)
