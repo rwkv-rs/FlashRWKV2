@@ -569,6 +569,7 @@ jobs:
             (
               cd "$test_root"
               "$python" -m pytest -p utils -q --import-mode=importlib --strict-markers \
+                -o 'python_files=test.py test_*.py' \
                 -m 'not sm90 and not sm120 and not resource and not memcheck and not racecheck' \
                 "$GITHUB_WORKSPACE/tests" -c /dev/null --rootdir="$test_root"
             )
@@ -578,6 +579,7 @@ jobs:
                 cd "$test_root"
                 FLASHRWKV_TEST_BACKEND="$backend" "$python" -m pytest -p utils -q \
                   --import-mode=importlib --strict-markers \
+                  -o 'python_files=test.py test_*.py' \
                   -m "$architecture and not resource and not memcheck and not racecheck" \
                   "$GITHUB_WORKSPACE/tests" -c /dev/null --rootdir="$test_root"
               )
@@ -644,6 +646,7 @@ jobs:
                 --tool "$tool" --target-processes all --error-exitcode 97 \
                 "$GITHUB_WORKSPACE/.runtime-venv/bin/python" -m pytest -p utils -q \
                 --import-mode=importlib --strict-markers \
+                -o 'python_files=test.py test_*.py' \
                 "${nodeids[@]}" -m "$arch and $tool" -x -c /dev/null \
                 --rootdir="$test_root"
             ) 2>&1 | tee "$GITHUB_WORKSPACE/artifacts/validation/function-$arch-$tool.log"
@@ -656,6 +659,7 @@ jobs:
                 --tool "$tool" --target-processes all --error-exitcode 97 \
                 "$GITHUB_WORKSPACE/.runtime-venv/bin/python" -m pytest -p utils -q \
                 --import-mode=importlib --strict-markers \
+                -o 'python_files=test.py test_*.py' \
                 "$GITHUB_WORKSPACE/tests" -m "$arch and $tool" -x -c /dev/null \
                 --rootdir="$test_root"
             ) 2>&1 | tee "$GITHUB_WORKSPACE/artifacts/validation/tree-$arch-$tool.log"
