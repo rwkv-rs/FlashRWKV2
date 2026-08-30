@@ -9,8 +9,7 @@ from flashrwkv2.tmix.a_gate import pretrain_tmix_a_gate_bf16
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.sm90
-@pytest.mark.sm120
+@pytest.mark.cuda
 @pytest.mark.memcheck
 def test_a_gate_forward_backward() -> None:
     torch.manual_seed(3)

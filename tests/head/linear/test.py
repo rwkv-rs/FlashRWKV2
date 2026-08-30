@@ -12,7 +12,7 @@ from flashrwkv2.head.linear import (
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.sm120
+@pytest.mark.cuda
 @pytest.mark.memcheck
 @pytest.mark.parametrize(
     ("rows", "channels", "vocab"), ((4, 8, 11), (1, 4096, 65536))

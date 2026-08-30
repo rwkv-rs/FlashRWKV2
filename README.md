@@ -9,35 +9,38 @@ downstream projects.
 ## Requirements
 
 - Python 3.10 or newer
-- An NVIDIA CUDA build environment and a supported CUDA device
+- Linux, a writable PyTorch extension cache, and a CUDA GPU with Compute
+  Capability 8.0 or newer
+- A system CUDA Toolkit compatible with PyTorch, a compatible host compiler,
+  and Ninja
 - `uv`, using the repository-local `./.venv`
-- A CUDA GPU binary-compatible with the native SM90 or SM120 backends
 
-The runtime and reproducible source-build contracts currently pin PyTorch
-2.13.0. Native builds always compile separate SM90 and SM120 private extensions;
-the active extension is selected at runtime. A backend suffix is its minimum
-native cubin target, not an exact-device allowlist: `_C_sm90` serves compatible
-SM9.x devices and `_C_sm120` serves compatible SM12.x devices whose minor
-compute capability is at least the compiled target.
+The runtime supports PyTorch 2.11 through 2.13. Importing the package does not
+compile CUDA code. The first CUDA operator call builds one private ordinary
+ATen/pybind extension from the packaged `csrc/sm80` sources for the exact
+Compute Capability of all visible GPUs, then reuses PyTorch's extension cache.
+All visible GPUs must have the same Compute Capability.
 
 ## Installation
 
-The current alpha publishes a prebuilt CPython 3.12 Linux x86_64 wheel. Its
-currently validated product is the RTX PRO 6000 at SM120; binary compatibility
-does not by itself constitute a product-level correctness or CUDA Graph claim.
-The wheel requires glibc 2.38 or newer, PyTorch 2.13.0, and a CUDA 13 runtime
-supplied through PyTorch's dependencies:
+The project publishes a universal `py3-none-any` source wheel containing only
+Python and CUDA/C++ sources. It contains no precompiled extension or architecture
+fallback. Building the wheel does not import Torch or run NVCC:
 
 ```bash
 python -m pip install --pre FlashRWKV2
 ```
 
-Other Python or platform combinations install from the source distribution and
-build both CUDA extensions on the target machine:
+To prewarm the runtime cache explicitly, use the same build path as the first
+operator call:
 
 ```bash
-python -m pip install --pre FlashRWKV2
+python -m flashrwkv2.compile
 ```
+
+The command emits JSON containing `status` (`compiled` or `cached`), `target`,
+`cache_key`, and `library`. Build failures preserve the original compiler
+diagnostics; FlashRWKV2 does not download a compiler or select another backend.
 
 For development from a checkout:
 
@@ -59,8 +62,7 @@ for the complete public operator surface and tensor contracts.
 ./.venv/bin/python -m pytest -q
 ```
 
-CUDA tests require a successfully built `flashrwkv2._C` extension and a
-supported GPU.
+CUDA tests build and load `flashrwkv2._C` lazily and require the toolchain above.
 
 ## Benchmarks
 

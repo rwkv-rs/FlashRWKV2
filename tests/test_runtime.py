@@ -6,7 +6,12 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import json
+import os
+import subprocess
 import sys
+import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -37,88 +42,205 @@ PUBLIC_PREFIXES = (
 )
 
 
-@pytest.mark.parametrize(
-    ("capability", "expected"),
-    (
-        ((9, 0), "_C_sm90"),
-        ((9, 1), "_C_sm90"),
-        ((12, 0), "_C_sm120"),
-        ((12, 1), "_C_sm120"),
-        ((12, 9), "_C_sm120"),
-    ),
-)
-def test_backend_selection_uses_binary_compatibility(
-    capability: tuple[int, int], expected: str
-) -> None:
-    import flashrwkv2
-
-    assert flashrwkv2._backend_module_name(capability) == expected
-
-
-def test_backend_selection_prefers_newest_compatible_minor(monkeypatch) -> None:
-    import flashrwkv2
-
-    monkeypatch.setattr(
-        flashrwkv2,
-        "_NATIVE_BACKENDS",
-        (*flashrwkv2._NATIVE_BACKENDS, ((12, 1), "_C_sm121")),
+def test_cpu_import_does_not_compile_or_create_cache(tmp_path) -> None:
+    cache = tmp_path / "extensions"
+    environment = os.environ.copy()
+    environment["TORCH_EXTENSIONS_DIR"] = str(cache)
+    environment["CUDA_HOME"] = str(tmp_path / "missing-toolkit")
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import flashrwkv2,sys; "
+                "assert flashrwkv2._C is None; "
+                "assert 'flashrwkv2.compile' not in sys.modules"
+            ),
+        ],
+        check=True,
+        env=environment,
+        capture_output=True,
+        text=True,
     )
-    assert flashrwkv2._backend_module_name((12, 0)) == "_C_sm120"
-    assert flashrwkv2._backend_module_name((12, 1)) == "_C_sm121"
-    assert flashrwkv2._backend_module_name((12, 2)) == "_C_sm121"
+    assert not cache.exists()
 
 
-@pytest.mark.parametrize("capability", ((8, 9), (10, 0), (11, 0), (13, 0)))
-def test_backend_selection_rejects_incompatible_major(
-    capability: tuple[int, int],
-) -> None:
+def test_root_extension_loads_once_and_publishes_private_alias(monkeypatch) -> None:
     import flashrwkv2
-
-    rendered = f"sm{capability[0]}{capability[1]}"
-    with pytest.raises(
-        RuntimeError,
-        match=rf"no binary-compatible native backend for {rendered}",
-    ):
-        flashrwkv2._backend_module_name(capability)
-
-
-def test_backend_loader_handles_cpu_and_publishes_alias(monkeypatch) -> None:
-    import flashrwkv2
-
-    monkeypatch.setattr(flashrwkv2._torch.cuda, "is_available", lambda: False)
-    assert flashrwkv2._load_native_backend() is None
+    from flashrwkv2 import compile as compiler
 
     sentinel = object()
-    monkeypatch.setattr(flashrwkv2._torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(flashrwkv2, "_C", None)
     monkeypatch.setattr(
-        flashrwkv2._torch.cuda, "get_device_capability", lambda: (12, 1)
-    )
-    monkeypatch.setattr(
-        flashrwkv2._importlib,
-        "import_module",
-        lambda name: sentinel if name == "flashrwkv2._C_sm120" else None,
+        compiler, "load_extension", lambda: SimpleNamespace(module=sentinel)
     )
     try:
-        assert flashrwkv2._load_native_backend() is sentinel
+        assert flashrwkv2._extension() is sentinel
+        assert flashrwkv2._extension() is sentinel
         assert sys.modules["flashrwkv2._C"] is sentinel
     finally:
         sys.modules.pop("flashrwkv2._C", None)
 
 
-def test_missing_backend_reports_capability_and_selection(monkeypatch) -> None:
-    import flashrwkv2
+@pytest.mark.parametrize(
+    ("capabilities", "message"),
+    (
+        ((), "visible CUDA GPU"),
+        (((7, 5),), "8.0 or newer"),
+        (((8, 9), (12, 0)), "same Compute Capability"),
+    ),
+)
+def test_compile_boundary_rejects_invalid_visible_devices(
+    capabilities: tuple[tuple[int, int], ...], message: str
+) -> None:
+    from flashrwkv2.compile import _capability
 
-    monkeypatch.setattr(flashrwkv2._torch.cuda, "is_available", lambda: True)
+    cuda = SimpleNamespace(
+        device_count=lambda: len(capabilities),
+        get_device_capability=lambda index: capabilities[index],
+    )
+    with pytest.raises(RuntimeError, match=message):
+        _capability(SimpleNamespace(cuda=cuda))
+
+
+def test_compile_boundary_accepts_homogeneous_sm89() -> None:
+    from flashrwkv2.compile import _capability
+
+    cuda = SimpleNamespace(
+        device_count=lambda: 2,
+        get_device_capability=lambda index: (8, 9),
+    )
+    assert _capability(SimpleNamespace(cuda=cuda)) == (8, 9)
+
+
+def _mock_runtime_build(monkeypatch, tmp_path, *, fail_once: bool = False):
+    import torch
+    import torch.utils.cpp_extension
+
+    from flashrwkv2 import compile as compiler
+
+    calls = {"build": 0}
+    monkeypatch.setattr(compiler, "_RESULT", None)
+    monkeypatch.setattr(compiler, "source_root", lambda: tmp_path / "sources")
+    monkeypatch.setattr(compiler, "_capability", lambda torch: (8, 9))
+    monkeypatch.setattr(compiler, "_toolchain", lambda torch: {})
     monkeypatch.setattr(
-        flashrwkv2._torch.cuda, "get_device_capability", lambda: (12, 1)
+        compiler,
+        "_cache_payload",
+        lambda torch, root, capability, toolchain: {
+            "target": "sm89",
+            "cxx_flags": ["-O3"],
+            "nvcc_flags": ["-gencode=arch=compute_89,code=sm_89"],
+        },
+    )
+    monkeypatch.setattr(
+        torch.utils.cpp_extension,
+        "get_default_build_root",
+        lambda: str(tmp_path / "cache"),
     )
 
-    def missing_backend(name: str):
-        raise ImportError(name)
+    def build(name, root, build_dir, payload, toolchain):
+        calls["build"] += 1
+        if fail_once and calls["build"] == 1:
+            raise RuntimeError("compiler failed")
+        library = build_dir / f"{name}.so"
+        library.write_bytes(b"extension")
+        return library
 
-    monkeypatch.setattr(flashrwkv2._importlib, "import_module", missing_backend)
-    with pytest.raises(RuntimeError, match=r"selected backend _C_sm120 for sm121"):
-        flashrwkv2._load_native_backend()
+    monkeypatch.setattr(compiler, "_build_extension", build)
+    monkeypatch.setattr(
+        compiler, "_load_module", lambda name, library: SimpleNamespace(__name__=name)
+    )
+    return compiler, calls
+
+
+def test_runtime_cache_compiles_then_hits_manifest(monkeypatch, tmp_path) -> None:
+    compiler, calls = _mock_runtime_build(monkeypatch, tmp_path)
+    first = compiler.load_extension()
+    assert first.status == "compiled"
+    assert first.target == "sm89"
+    monkeypatch.setattr(compiler, "_RESULT", None)
+    second = compiler.load_extension()
+    assert second.status == "cached"
+    assert second.cache_key == first.cache_key
+    assert second.library == first.library
+    assert calls["build"] == 1
+
+
+def test_runtime_cache_serializes_concurrent_builders(monkeypatch, tmp_path) -> None:
+    compiler, calls = _mock_runtime_build(monkeypatch, tmp_path)
+    results = []
+    threads = [threading.Thread(target=lambda: results.append(compiler.load_extension())) for _ in range(6)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert len(results) == 6
+    assert calls["build"] == 1
+
+
+def test_runtime_cache_retries_after_failed_build(monkeypatch, tmp_path) -> None:
+    compiler, calls = _mock_runtime_build(monkeypatch, tmp_path, fail_once=True)
+    with pytest.raises(RuntimeError, match="compiler failed"):
+        compiler.load_extension()
+    result = compiler.load_extension()
+    assert result.status == "compiled"
+    assert calls["build"] == 2
+
+
+def test_compile_cli_keeps_build_diagnostics_out_of_json(monkeypatch, capfd) -> None:
+    from flashrwkv2 import compile as compiler
+
+    result = SimpleNamespace(
+        json=lambda: {
+            "status": "compiled",
+            "target": "sm89",
+            "cache_key": "key",
+            "library": "/cache/extension.so",
+        }
+    )
+
+    def load_extension():
+        os.write(1, b"native build diagnostics\n")
+        return result
+
+    monkeypatch.setattr(compiler, "load_extension", load_extension)
+    compiler.main()
+    stdout, stderr = capfd.readouterr()
+    assert json.loads(stdout) == result.json()
+    assert "native build diagnostics" in stderr
+
+
+def test_cache_key_changes_with_every_compatibility_input() -> None:
+    baseline = {
+        "source_sha256": "source-a",
+        "flashrwkv2": "0.1.0a12",
+        "python_executable": "/venv/a/bin/python",
+        "sys_prefix": "/venv/a",
+        "python": "3.12",
+        "torch": "2.13.0",
+        "torch_cuda": "13.0",
+        "cxx11_abi": True,
+        "target": "sm89",
+        "nvcc": "nvcc-a",
+        "host_compiler": "gcc-a",
+        "cxx_flags": ["-O3"],
+        "nvcc_flags": ["sm_89"],
+        "link_flags": ["--strip-debug"],
+    }
+
+    def key(payload):
+        import hashlib
+
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+
+    expected = key(baseline)
+    for field in baseline:
+        changed = dict(baseline)
+        changed[field] = f"changed-{field}"
+        assert key(changed) != expected
 
 
 def test_root_exports_module_operators_by_identity() -> None:

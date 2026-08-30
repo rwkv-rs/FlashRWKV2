@@ -58,8 +58,7 @@ def _reference(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.sm90
-@pytest.mark.sm120
+@pytest.mark.cuda
 @pytest.mark.memcheck
 @pytest.mark.racecheck
 @pytest.mark.parametrize("d", (64, 128, 256))
@@ -117,8 +116,7 @@ def test_rl_infctx_ragged_materialized_and_recompute(d: int) -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.sm90
-@pytest.mark.sm120
+@pytest.mark.cuda
 @pytest.mark.memcheck
 @pytest.mark.racecheck
 @pytest.mark.parametrize("d", (64, 128, 256))
@@ -185,8 +183,7 @@ def test_rl_infctx_backward_replay_matches_recurrence(d: int) -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.sm90
-@pytest.mark.sm120
+@pytest.mark.cuda
 @pytest.mark.parametrize("d", (64, 128, 256))
 def test_rl_infctx_bf16_chunk_sizes_and_tail_match_reference(d: int) -> None:
     torch.manual_seed(43)
@@ -242,8 +239,7 @@ def test_rl_infctx_bf16_chunk_sizes_and_tail_match_reference(d: int) -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.sm90
-@pytest.mark.sm120
+@pytest.mark.cuda
 def test_rl_infctx_rejects_duplicate_slots() -> None:
     device = torch.device("cuda")
     shape = (2, 1, 64)
@@ -258,8 +254,7 @@ def test_rl_infctx_rejects_duplicate_slots() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.sm90
-@pytest.mark.sm120
+@pytest.mark.cuda
 def test_rl_infctx_rejects_invalid_packed_boundaries() -> None:
     device = torch.device("cuda")
     values = [

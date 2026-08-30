@@ -10,8 +10,7 @@ from flashrwkv2.head.l2wrap_ce import pretrain_head_l2wrap_ce_bf16
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.sm90
-@pytest.mark.sm120
+@pytest.mark.cuda
 @pytest.mark.memcheck
 @pytest.mark.parametrize("chunk_rows", (1, 2))
 def test_head_l2wrap_forward_backward(chunk_rows: int) -> None:
@@ -40,8 +39,7 @@ def test_head_l2wrap_forward_backward(chunk_rows: int) -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.sm90
-@pytest.mark.sm120
+@pytest.mark.cuda
 def test_head_l2wrap_rejects_invalid_target() -> None:
     device = torch.device("cuda")
     hidden = torch.zeros(1, 1, 8, device=device, dtype=torch.bfloat16)

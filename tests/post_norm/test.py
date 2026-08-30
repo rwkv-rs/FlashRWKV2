@@ -10,7 +10,7 @@ from flashrwkv2.post_norm import infer_post_norm_output_forward_varlen
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.sm120
+@pytest.mark.cuda
 @pytest.mark.memcheck
 @pytest.mark.parametrize("channels", (8, 4096))
 def test_post_norm_output(channels: int) -> None:

@@ -80,14 +80,7 @@ def _select_deltalog_merge_interval(
 
 def _extension():
     import flashrwkv2
-
-    extension = getattr(flashrwkv2, "_C", None)
-    if extension is None:
-        raise RuntimeError(
-            "FlashRWKV2 CUDA extension is not built; build flashrwkv2._C before "
-            "using the accelerated recurrent operator"
-        )
-    return extension
+    return flashrwkv2._extension()
 
 
 def _validate_packed_inputs(*tensors: torch.Tensor) -> tuple[torch.Tensor, ...]:

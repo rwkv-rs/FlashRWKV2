@@ -92,8 +92,7 @@ def _reference(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.sm90
-@pytest.mark.sm120
+@pytest.mark.cuda
 @pytest.mark.parametrize(
     "dtype,head_size",
     [

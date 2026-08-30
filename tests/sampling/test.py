@@ -18,7 +18,7 @@ from flashrwkv2 import (
 
 pytestmark = [
     pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required"),
-    pytest.mark.sm120,
+    pytest.mark.cuda,
 ]
 
 
@@ -296,15 +296,13 @@ def test_rejects_invalid_inputs_before_launch() -> None:
 
 
 @pytest.mark.resource
-def test_sm120_sampling_resource_usage() -> None:
+def test_sampling_resource_usage() -> None:
     if torch.cuda.get_device_capability()[0] != 12:
         pytest.skip("resource gate requires the SM120 backend")
     tool = shutil.which("cuobjdump")
     if tool is None:
         pytest.fail("cuobjdump is required for the SM120 sampling resource gate")
-    assert flashrwkv2._C is not None
-    assert flashrwkv2._C.__name__ == "flashrwkv2._C_sm120"
-    extension_path = flashrwkv2._C.__file__
+    extension_path = flashrwkv2._extension().__file__
     output = subprocess.run(
         (tool, "--dump-resource-usage", extension_path),
         check=True,
