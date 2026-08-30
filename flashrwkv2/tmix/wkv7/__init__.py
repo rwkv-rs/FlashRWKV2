@@ -1111,6 +1111,8 @@ def infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
             "prepare_tmix_wkv7_recurrent_fp32io16_state or "
             "prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor"
         )
+    if not isinstance(r, torch.Tensor):
+        raise TypeError("r must be a torch.Tensor")
     packed = (r, decay_logits, k, v, a, b)
     launch_max_seqlen = _dispatch_max_seqlen(max_seqlen, validated_metadata)
     use_deltalog = (
@@ -1208,6 +1210,8 @@ def infer_tmix_wkv7_recurrent_fp16_forward_varlen(
         raise TypeError(
             "state must come from prepare_tmix_wkv7_recurrent_fp16_state"
         )
+    if not isinstance(r, torch.Tensor):
+        raise TypeError("r must be a torch.Tensor")
 
     packed = (r, decay_logits, k, v, a, b)
     launch_max_seqlen = _dispatch_max_seqlen(max_seqlen, validated_metadata)
