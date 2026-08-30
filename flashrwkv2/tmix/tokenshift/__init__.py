@@ -118,30 +118,6 @@ def infer_tmix_postnorm_tokenshift_forward_varlen(
         launch_max_seqlen,
     )
     token_predecessor = ticket._token_predecessor()
-    if (
-        x.shape == (1, 4096)
-        and state_indices.numel() == 1
-        and launch_metadata[3] == 1
-    ):
-        outputs = tuple(torch.empty_like(x) for _ in range(7))
-        _extension().tmix_postnorm_tokenshift_t1_c4096_out(
-            x,
-            res,
-            shift_state_pool,
-            weight,
-            bias,
-            x_r,
-            x_w,
-            x_k,
-            x_v,
-            x_a,
-            x_g,
-            *launch_metadata,
-            token_predecessor,
-            *outputs,
-            float(eps),
-        )
-        return outputs
     return tuple(
         _extension().tmix_postnorm_tokenshift_forward_varlen(
             x,

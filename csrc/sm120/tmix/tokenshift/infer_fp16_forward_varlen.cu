@@ -14,7 +14,6 @@
 #include "validation.h"
 
 #include <cstdint>
-#include <utility>
 #include <vector>
 
 using dtype = torch::headeronly::Half;
@@ -395,41 +394,6 @@ void tmix_tokenshift_forward_varlen(
   FLASHRWKV_CUDA_CHECK(cudaGetLastError());
 }
 
-void tmix_res_ln_tokenshift_fused_forward_out_cuda(
-    torch::stable::Tensor x,
-    torch::stable::Tensor res,
-    torch::stable::Tensor shift_state,
-    torch::stable::Tensor weight,
-    torch::stable::Tensor bias,
-    torch::stable::Tensor x_r,
-    torch::stable::Tensor x_w,
-    torch::stable::Tensor x_k,
-    torch::stable::Tensor x_v,
-    torch::stable::Tensor x_a,
-    torch::stable::Tensor x_g,
-    torch::stable::Tensor token_predecessor,
-    torch::stable::Tensor metadata_status,
-    std::vector<torch::stable::Tensor>& outputs,
-    double eps) {
-  // Match Albatross's C=4096 scalar-statistics launch.  The predecessor
-  // descriptor changes only the previous-row address; it does not reduce the
-  // channel work available to this row-owned block.
-  res_ln_tmix_tokenshift_fused_kernel<1024><<<
-      1, 1024, 0,
-      flashrwkv2::validation::current_cuda_stream()>>>(
-      x.mutable_data_ptr<dtype>(), res.mutable_data_ptr<dtype>(), shift_state.mutable_data_ptr<dtype>(),
-      weight.mutable_data_ptr<dtype>(), bias.mutable_data_ptr<dtype>(), x_r.mutable_data_ptr<dtype>(),
-      x_w.mutable_data_ptr<dtype>(), x_k.mutable_data_ptr<dtype>(), x_v.mutable_data_ptr<dtype>(),
-      x_a.mutable_data_ptr<dtype>(), x_g.mutable_data_ptr<dtype>(), outputs[0].mutable_data_ptr<dtype>(),
-      outputs[1].mutable_data_ptr<dtype>(), outputs[2].mutable_data_ptr<dtype>(),
-      outputs[3].mutable_data_ptr<dtype>(), outputs[4].mutable_data_ptr<dtype>(),
-      outputs[5].mutable_data_ptr<dtype>(), outputs[6].mutable_data_ptr<dtype>(),
-      token_predecessor.mutable_data_ptr<int>(), metadata_status.mutable_data_ptr<int>(),
-      1,
-      static_cast<float>(eps));
-  FLASHRWKV_CUDA_CHECK(cudaGetLastError());
-}
-
 std::vector<torch::stable::Tensor> tmix_res_ln_tokenshift_fused_forward_cuda(
     torch::stable::Tensor x,
     torch::stable::Tensor res,
@@ -448,10 +412,22 @@ std::vector<torch::stable::Tensor> tmix_res_ln_tokenshift_fused_forward_cuda(
   std::vector<torch::stable::Tensor> outputs;
   outputs.reserve(7);
   for (int i = 0; i < 7; ++i) outputs.push_back(torch::stable::empty_like(x));
-  tmix_res_ln_tokenshift_fused_forward_out_cuda(
-      std::move(x), std::move(res), std::move(shift_state),
-      std::move(weight), std::move(bias), std::move(x_r), std::move(x_w),
-      std::move(x_k), std::move(x_v), std::move(x_a), std::move(x_g),
-      std::move(token_predecessor), std::move(metadata_status), outputs, eps);
+  // Match Albatross's C=4096 scalar-statistics launch.  The predecessor
+  // descriptor changes only the previous-row address; it does not reduce the
+  // channel work available to this row-owned block.
+  res_ln_tmix_tokenshift_fused_kernel<1024><<<
+      static_cast<int>(x.size(0)), 1024, 0,
+      flashrwkv2::validation::current_cuda_stream()>>>(
+      x.mutable_data_ptr<dtype>(), res.mutable_data_ptr<dtype>(), shift_state.mutable_data_ptr<dtype>(),
+      weight.mutable_data_ptr<dtype>(), bias.mutable_data_ptr<dtype>(), x_r.mutable_data_ptr<dtype>(),
+      x_w.mutable_data_ptr<dtype>(), x_k.mutable_data_ptr<dtype>(), x_v.mutable_data_ptr<dtype>(),
+      x_a.mutable_data_ptr<dtype>(), x_g.mutable_data_ptr<dtype>(), outputs[0].mutable_data_ptr<dtype>(),
+      outputs[1].mutable_data_ptr<dtype>(), outputs[2].mutable_data_ptr<dtype>(),
+      outputs[3].mutable_data_ptr<dtype>(), outputs[4].mutable_data_ptr<dtype>(),
+      outputs[5].mutable_data_ptr<dtype>(), outputs[6].mutable_data_ptr<dtype>(),
+      token_predecessor.mutable_data_ptr<int>(), metadata_status.mutable_data_ptr<int>(),
+      x.size(0),
+      static_cast<float>(eps));
+  FLASHRWKV_CUDA_CHECK(cudaGetLastError());
   return outputs;
 }

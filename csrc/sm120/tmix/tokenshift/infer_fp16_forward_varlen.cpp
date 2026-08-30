@@ -42,22 +42,6 @@ std::vector<torch::stable::Tensor> tmix_res_ln_tokenshift_fused_forward_cuda(
     torch::stable::Tensor token_predecessor,
     torch::stable::Tensor metadata_status,
     double eps);
-void tmix_res_ln_tokenshift_fused_forward_out_cuda(
-    torch::stable::Tensor x,
-    torch::stable::Tensor res,
-    torch::stable::Tensor shift_state,
-    torch::stable::Tensor weight,
-    torch::stable::Tensor bias,
-    torch::stable::Tensor x_r,
-    torch::stable::Tensor x_w,
-    torch::stable::Tensor x_k,
-    torch::stable::Tensor x_v,
-    torch::stable::Tensor x_a,
-    torch::stable::Tensor x_g,
-    torch::stable::Tensor token_predecessor,
-    torch::stable::Tensor metadata_status,
-    std::vector<torch::stable::Tensor>& outputs,
-    double eps);
 std::vector<torch::stable::Tensor> post_norm_forward_varlen_cuda(
     torch::stable::Tensor x,
     torch::stable::Tensor res,
@@ -102,8 +86,7 @@ std::vector<torch::stable::Tensor> tmix_postnorm_tokenshift_forward_varlen(
     int64_t max_seqlen,
     torch::stable::Tensor token_predecessor,
     double eps,
-    bool,
-    std::vector<torch::stable::Tensor>* output_buffers = nullptr) {
+    bool) {
   check_cuda_contiguous(x, "x");
   const auto device_index = x.get_device_index();
   STD_TORCH_CHECK(
@@ -154,16 +137,6 @@ std::vector<torch::stable::Tensor> tmix_postnorm_tokenshift_forward_varlen(
           cu_seqlens.numel() == state_indices.numel() + 1,
       "invalid packed metadata");
   const int64_t batch_size = state_indices.numel();
-  if (output_buffers != nullptr) {
-    STD_TORCH_CHECK(
-        batch_size == 1 && channels == 4096 && total_tokens == 1 &&
-            max_seqlen == 1,
-        "TMix PostNorm TokenShift out path requires B=1,T=1,C=4096");
-    tmix_res_ln_tokenshift_fused_forward_out_cuda(
-        x, res, shift_state_pool, weight, bias, x_r, x_w, x_k, x_v,
-        x_a, x_g, token_predecessor, metadata_status, *output_buffers, eps);
-    return {};
-  }
   if (batch_size == 1 && channels == 4096 && total_tokens == 1 &&
       max_seqlen == 1) {
     return tmix_res_ln_tokenshift_fused_forward_cuda(
@@ -213,43 +186,10 @@ tmix_postnorm_tokenshift_forward_varlen_boxed(
           eps, false));
 }
 
-void tmix_postnorm_tokenshift_t1_c4096_out(
-    torch::stable::Tensor x, torch::stable::Tensor res,
-    torch::stable::Tensor shift_state_pool, torch::stable::Tensor weight,
-    torch::stable::Tensor bias, torch::stable::Tensor x_r,
-    torch::stable::Tensor x_w, torch::stable::Tensor x_k,
-    torch::stable::Tensor x_v, torch::stable::Tensor x_a,
-    torch::stable::Tensor x_g, torch::stable::Tensor cu_seqlens,
-    torch::stable::Tensor state_indices, torch::stable::Tensor metadata_status,
-    int64_t max_seqlen, torch::stable::Tensor token_predecessor,
-    torch::stable::Tensor out_res, torch::stable::Tensor out_r,
-    torch::stable::Tensor out_w, torch::stable::Tensor out_k,
-    torch::stable::Tensor out_v, torch::stable::Tensor out_a,
-    torch::stable::Tensor out_g, double eps) {
-  std::vector<torch::stable::Tensor> outputs;
-  outputs.reserve(7);
-  outputs.push_back(std::move(out_res));
-  outputs.push_back(std::move(out_r));
-  outputs.push_back(std::move(out_w));
-  outputs.push_back(std::move(out_k));
-  outputs.push_back(std::move(out_v));
-  outputs.push_back(std::move(out_a));
-  outputs.push_back(std::move(out_g));
-  tmix_postnorm_tokenshift_forward_varlen(
-      std::move(x), std::move(res), std::move(shift_state_pool),
-      std::move(weight), std::move(bias), std::move(x_r), std::move(x_w),
-      std::move(x_k), std::move(x_v), std::move(x_a), std::move(x_g),
-      std::move(cu_seqlens), std::move(state_indices),
-      std::move(metadata_status), max_seqlen, std::move(token_predecessor),
-      eps, true, &outputs);
-}
-
 STABLE_TORCH_LIBRARY_FRAGMENT(flashrwkv2, module) {
   module.def("tmix_postnorm_tokenshift_forward_varlen(Tensor x, Tensor res, Tensor(a!) shift_state_pool, Tensor weight, Tensor bias, Tensor x_r, Tensor x_w, Tensor x_k, Tensor x_v, Tensor x_a, Tensor x_g, Tensor cu_seqlens, Tensor state_indices, Tensor metadata_status, int max_seqlen, Tensor token_predecessor, float eps) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)");
-  module.def("tmix_postnorm_tokenshift_t1_c4096_out(Tensor x, Tensor res, Tensor(a!) shift_state_pool, Tensor weight, Tensor bias, Tensor x_r, Tensor x_w, Tensor x_k, Tensor x_v, Tensor x_a, Tensor x_g, Tensor cu_seqlens, Tensor state_indices, Tensor metadata_status, int max_seqlen, Tensor token_predecessor, Tensor(b!) out_res, Tensor(c!) out_r, Tensor(d!) out_w, Tensor(e!) out_k, Tensor(f!) out_v, Tensor(g!) out_a, Tensor(h!) out_g, float eps) -> ()");
 }
 
 STABLE_TORCH_LIBRARY_IMPL(flashrwkv2, CUDA, module) {
   module.impl("tmix_postnorm_tokenshift_forward_varlen", TORCH_BOX(&tmix_postnorm_tokenshift_forward_varlen_boxed));
-  module.impl("tmix_postnorm_tokenshift_t1_c4096_out", TORCH_BOX(&tmix_postnorm_tokenshift_t1_c4096_out));
 }
