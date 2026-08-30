@@ -57,6 +57,10 @@ handle 的 `memory_layout` 是唯一显存统计入口，返回实际分配的
 策略保留 Albatross `3465da5070beceb4bab9e07b03abee1642a0bdf8` 的普通
 `WKV_DELTALOG_TUNED_M` 精确表作为候选表。FP32IO16 在 SM120、FP16 token IO、
 `D=64`、固定容量 `T=1` 且 `(C, sequence_capacity)` 精确命中时使用对应 `M`。
+这里的 `sequence_capacity` 是 state handle 支持的单次 launch 上限；实际 T1
+launch 可以包含不超过该上限的任意正数个 sequence，并通过 `state_indices`
+访问 state pool 中任意 slot。DeltaLog status workspace 按上限预分配，launch
+只使用与本次 sequence 数匹配的连续前缀。
 FlashRWKV2 的普通 FP16-state launcher 在 `(768,64)`、`(768,128)`、`(1024,64)`、
 `(2048,32)`、`(2048,64)`、`(2560,32)` 与 `(4096,32)` 上更快，因此这些候选点
 自动回退普通 FP16；其余表内 FP16 点使用 DeltaLog。FP32 state 的 BF16 IO、
