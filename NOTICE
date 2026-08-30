@@ -26,16 +26,16 @@ RWKV/Albatross integration at rwkv-rs/vllm-rwkv commit
 - benchmarks/benchmark_training.py
 - benchmarks/kernel_benchmark.py
 
-The SM120 FP16/FP32 recurrent and DeltaLog implementations contain material
+The portable FP16/FP32 recurrent and DeltaLog implementations contain material
 adapted from BlinkDL/Albatross faster3a_2607 commit
 3e41bc43ed5e8332927ddd7e0ce4816cf200a6ea:
 
-- csrc/sm120/tmix/wkv7/infer_recurrent_fp16_forward_varlen.cpp
-- csrc/sm120/tmix/wkv7/infer_recurrent_fp16_forward_varlen.cu
-- csrc/sm120/tmix/wkv7/infer_recurrent_fp32io16_forward_varlen.cpp
-- csrc/sm120/tmix/wkv7/infer_recurrent_fp32io16_forward_varlen.cu
-- csrc/sm120/tmix/wkv7/infer_recurrent_deltalog_fp16_forward_varlen.cpp
-- csrc/sm120/tmix/wkv7/infer_recurrent_deltalog_fp16_forward_varlen.cu
+- csrc/sm80/tmix/wkv7/infer_recurrent_fp16_forward_varlen.cpp
+- csrc/sm80/tmix/wkv7/infer_recurrent_fp16_forward_varlen.cu
+- csrc/sm80/tmix/wkv7/infer_recurrent_fp32io16_forward_varlen.cpp
+- csrc/sm80/tmix/wkv7/infer_recurrent_fp32io16_forward_varlen.cu
+- csrc/sm80/tmix/wkv7/infer_recurrent_deltalog_fp16_forward_varlen.cpp
+- csrc/sm80/tmix/wkv7/infer_recurrent_deltalog_fp16_forward_varlen.cu
 
 The FP16 update replaces the earlier state-layout compatibility transpose
 inside the established recurrent families with direct [K,V] access. The
@@ -47,21 +47,21 @@ The following fused FP16 inference block operators are adapted from
 BlinkDL/Albatross faster3a_2607 commit
 ee3308f6922e59f2166c7fac3c5a192340a2b48e:
 
-- csrc/sm120/tmix/tokenshift/infer_fp16_forward_varlen.cpp
-- csrc/sm120/tmix/tokenshift/infer_fp16_forward_varlen.cu
-- csrc/sm120/tmix/wkv_prepare/infer_fp16_forward_varlen.cpp
-- csrc/sm120/tmix/wkv_prepare/infer_fp16_forward_varlen.cu
-- csrc/sm120/tmix/wkv_prepare/internal/kk_a_gate/infer_fp16_forward_varlen.cu
-- csrc/sm120/tmix/wkv_prepare/internal/lowrank/infer_fp16_forward_varlen.cu
-- csrc/sm120/tmix/readout/infer_fp16_forward_varlen.cpp
-- csrc/sm120/tmix/readout/infer_fp16_forward_varlen.cu
-- csrc/sm120/cmix/infer_fp16_forward_varlen.cpp
-- csrc/sm120/cmix/infer_fp16_forward_varlen.cu
-- csrc/sm120/cmix/internal/activation/infer_fp16_forward_varlen.cu
-- csrc/sm120/cmix/internal/dense/infer_fp16_forward_varlen.cu
-- csrc/sm120/cmix/internal/sparse/infer_fp16_forward_varlen.cu
-- csrc/sm120/post_norm/infer_fp16_forward_varlen.cpp
-- csrc/sm120/post_norm/infer_fp16_forward_varlen.cu
+- csrc/sm80/tmix/tokenshift/infer_fp16_forward_varlen.cpp
+- csrc/sm80/tmix/tokenshift/infer_fp16_forward_varlen.cu
+- csrc/sm80/tmix/wkv_prepare/infer_fp16_forward_varlen.cpp
+- csrc/sm80/tmix/wkv_prepare/infer_fp16_forward_varlen.cu
+- csrc/sm80/tmix/wkv_prepare/internal/kk_a_gate/infer_fp16_forward_varlen.cu
+- csrc/sm80/tmix/wkv_prepare/internal/lowrank/infer_fp16_forward_varlen.cu
+- csrc/sm80/tmix/readout/infer_fp16_forward_varlen.cpp
+- csrc/sm80/tmix/readout/infer_fp16_forward_varlen.cu
+- csrc/sm80/cmix/infer_fp16_forward_varlen.cpp
+- csrc/sm80/cmix/infer_fp16_forward_varlen.cu
+- csrc/sm80/cmix/internal/activation/infer_fp16_forward_varlen.cu
+- csrc/sm80/cmix/internal/dense/infer_fp16_forward_varlen.cu
+- csrc/sm80/cmix/internal/sparse/infer_fp16_forward_varlen.cu
+- csrc/sm80/post_norm/infer_fp16_forward_varlen.cpp
+- csrc/sm80/post_norm/infer_fp16_forward_varlen.cu
 
 The fused block derived files are licensed under the Apache License,
 Version 2.0; see LICENSES/Apache-2.0.txt.
@@ -78,32 +78,32 @@ methods adapted from BlinkDL/RWKV-LM commit
 - csrc/statetune/wkv7/statetune_common_recurrent_fp32io16_bindings.cpp
 - csrc/pretrain/wkv7/pretrain_common_head_l2wrap_ce_bf16_forward_registration.cpp
 - csrc/pretrain/wkv7/pretrain_common_head_l2wrap_ce_bf16_forward.cu
-- csrc/sm90/cmix/pretrain_bf16_forward.cpp
-- csrc/sm90/cmix/pretrain_bf16_forward.cu
-- csrc/sm90/cmix/pretrain_bf16_backward.cpp
-- csrc/sm90/cmix/pretrain_bf16_backward.cu
-- csrc/sm90/cmix/statetune_bf16_forward.cpp
-- csrc/sm90/cmix/statetune_bf16_forward.cu
-- csrc/sm90/cmix/statetune_bf16_backward.cpp
-- csrc/sm90/cmix/statetune_bf16_backward.cu
+- csrc/sm80/cmix/pretrain_bf16_forward.cpp
+- csrc/sm80/cmix/pretrain_bf16_forward.cu
+- csrc/sm80/cmix/pretrain_bf16_backward.cpp
+- csrc/sm80/cmix/pretrain_bf16_backward.cu
+- csrc/sm80/cmix/statetune_bf16_forward.cpp
+- csrc/sm80/cmix/statetune_bf16_forward.cu
+- csrc/sm80/cmix/statetune_bf16_backward.cpp
+- csrc/sm80/cmix/statetune_bf16_backward.cu
 - csrc/pretrain/wkv7/pretrain_common_l2wrap_ce_bf16_forward_backward_registration.cpp
 - csrc/pretrain/wkv7/pretrain_common_l2wrap_ce_bf16_forward_backward.cu
 - csrc/pretrain/wkv7/pretrain_common_tmix_a_gate_bf16_forward_backward_registration.cpp
 - csrc/pretrain/wkv7/pretrain_common_tmix_a_gate_bf16_forward_backward.cu
 - csrc/pretrain/wkv7/pretrain_common_tmix_kk_pre_bf16_forward_backward_registration.cpp
 - csrc/pretrain/wkv7/pretrain_sm90_tmix_kk_pre_bf16_forward_backward.cu
-- csrc/sm90/tmix/readout/pretrain_bf16_forward.cpp
-- csrc/sm90/tmix/readout/pretrain_bf16_forward.cu
-- csrc/sm90/tmix/readout/pretrain_bf16_backward.cpp
-- csrc/sm90/tmix/readout/pretrain_bf16_backward.cu
-- csrc/sm90/tmix/tokenshift/pretrain_bf16_forward.cpp
-- csrc/sm90/tmix/tokenshift/pretrain_bf16_forward.cu
-- csrc/sm90/tmix/tokenshift/pretrain_bf16_backward.cpp
-- csrc/sm90/tmix/tokenshift/pretrain_bf16_backward.cu
-- csrc/sm90/tmix/tokenshift/statetune_bf16_forward.cpp
-- csrc/sm90/tmix/tokenshift/statetune_bf16_forward.cu
-- csrc/sm90/tmix/tokenshift/statetune_bf16_backward.cpp
-- csrc/sm90/tmix/tokenshift/statetune_bf16_backward.cu
+- csrc/sm80/tmix/readout/pretrain_bf16_forward.cpp
+- csrc/sm80/tmix/readout/pretrain_bf16_forward.cu
+- csrc/sm80/tmix/readout/pretrain_bf16_backward.cpp
+- csrc/sm80/tmix/readout/pretrain_bf16_backward.cu
+- csrc/sm80/tmix/tokenshift/pretrain_bf16_forward.cpp
+- csrc/sm80/tmix/tokenshift/pretrain_bf16_forward.cu
+- csrc/sm80/tmix/tokenshift/pretrain_bf16_backward.cpp
+- csrc/sm80/tmix/tokenshift/pretrain_bf16_backward.cu
+- csrc/sm80/tmix/tokenshift/statetune_bf16_forward.cpp
+- csrc/sm80/tmix/tokenshift/statetune_bf16_forward.cu
+- csrc/sm80/tmix/tokenshift/statetune_bf16_backward.cpp
+- csrc/sm80/tmix/tokenshift/statetune_bf16_backward.cu
 - csrc/pretrain/wkv7/pretrain_common_tmix_vres_gate_bf16_forward_backward_registration.cpp
 - csrc/pretrain/wkv7/pretrain_common_tmix_vres_gate_bf16_forward_backward.cu
 
@@ -114,14 +114,14 @@ The FLA chunk_rwkv7 and fused_recurrent_rwkv7 implementations are used only
 through an external correctness and benchmark dependency. No FLA
 implementation source is bundled here.
 
-The SM120 sampling operator contains material mechanically adapted from
+The sampling operator contains material mechanically adapted from
 Triang-jyed-driung/Rapid-Sampling commit
 e0297f7830c3fa581d49ddddddba32f35ea7f733, with indexed per-request state and
 penalty behavior adapted from rwkv-rs/vllm-rwkv commit
 fd440426689f10e240b5761e1a7c82e4c37deb8d:
 
-- csrc/sm120/sampling/infer_fp32_forward_varlen.cpp
-- csrc/sm120/sampling/infer_fp32_forward_varlen.cu
+- csrc/sm80/sampling/infer_fp32_forward_varlen.cpp
+- csrc/sm80/sampling/infer_fp32_forward_varlen.cu
 
 The Rapid-Sampling contributor authorized this material for inclusion under
 the MIT License. The vLLM-derived changes retain their source attribution and

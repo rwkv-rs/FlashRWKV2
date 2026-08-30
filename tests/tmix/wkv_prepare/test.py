@@ -20,7 +20,7 @@ def test_wkv_prepare_public_contract() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.sm120
+@pytest.mark.cuda
 @pytest.mark.memcheck
 @pytest.mark.parametrize("later_layer", [False, True])
 @pytest.mark.parametrize("head_size", [64, 128, 256])
@@ -131,7 +131,7 @@ def test_wkv_prepare_first_and_later_layer_reference(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.sm120
+@pytest.mark.cuda
 def test_wkv_prepare_projection_lora_matches_reference_and_fails_closed() -> None:
     torch.manual_seed(20260819)
     rows, channels, rank, lora_rank = 1, 4096, 32, 8

@@ -4,10 +4,7 @@
 
 from __future__ import annotations
 
-import importlib
 import json
-import os
-import sys
 from pathlib import Path
 from typing import Any
 
@@ -21,8 +18,7 @@ _TOLERANCES = json.loads(
 )
 
 _TEST_MARKERS = (
-    "sm90: requires the FlashRWKV2 SM90 native backend",
-    "sm120: requires the FlashRWKV2 SM120 native backend",
+    "cuda: requires the FlashRWKV2 runtime-built CUDA extension",
     "cuda_graph: captures and replays a real CUDA Graph",
     "resource: validates compiled CUDA binary resource usage",
     "memcheck: minimal Compute Sanitizer memcheck coverage",
@@ -30,28 +26,10 @@ _TEST_MARKERS = (
 )
 
 
-def _forced_test_backend() -> Any | None:
-    forced_backend = os.environ.get("FLASHRWKV_TEST_BACKEND")
-    if not forced_backend:
-        return None
-    if forced_backend not in {"_C_sm90", "_C_sm120"}:
-        raise pytest.UsageError(
-            f"invalid FLASHRWKV_TEST_BACKEND={forced_backend!r}"
-        )
-
-    import flashrwkv2
-
-    backend = importlib.import_module(f"flashrwkv2.{forced_backend}")
-    flashrwkv2._C = backend
-    sys.modules["flashrwkv2._C"] = backend
-    return backend
-
-
 def pytest_configure(config: pytest.Config) -> None:
-    """Register private markers and inject the requested installed backend."""
+    """Register private markers."""
     for marker in _TEST_MARKERS:
         config.addinivalue_line("markers", marker)
-    _forced_test_backend()
 
 
 def require_cuda_backend(
@@ -59,52 +37,18 @@ def require_cuda_backend(
     compatible_major: int | tuple[int, ...],
     *required_symbols: str,
 ) -> Any:
-    """Return the selected backend, skipping only unavailable hardware."""
-    expected_backends = (
-        (expected_backend,) if isinstance(expected_backend, str) else expected_backend
-    )
-    compatible_majors = (
-        (compatible_major,)
-        if isinstance(compatible_major, int)
-        else compatible_major
-    )
-    if len(expected_backends) != len(compatible_majors):
-        raise ValueError("expected backends and compatible majors must align")
-    backend_by_major = dict(zip(compatible_majors, expected_backends, strict=True))
-
+    """Return the runtime-built extension, skipping only unavailable hardware."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
-    forced_backend = _forced_test_backend()
-    if forced_backend is not None:
-        if forced_backend.__name__.removeprefix("flashrwkv2.") not in expected_backends:
-            pytest.skip(
-                f"forced test backend {forced_backend.__name__} "
-                f"does not own any of {expected_backends}"
-            )
-        missing = [
-            name for name in required_symbols if not hasattr(forced_backend, name)
-        ]
-        assert not missing, (
-            f"{forced_backend.__name__} is missing required symbols: {missing}"
-        )
-        return forced_backend
     capability = tuple(torch.cuda.get_device_capability())
-    expected_for_device = backend_by_major.get(capability[0])
-    if expected_for_device is None:
-        pytest.skip(
-            f"{expected_backends} require compute capability majors "
-            f"{compatible_majors}, found sm{capability[0]}{capability[1]}"
-        )
+    if capability < (8, 0):
+        pytest.skip(f"CUDA source requires CC >= 8.0, found sm{capability[0]}{capability[1]}")
 
     import flashrwkv2
 
-    backend = flashrwkv2._C
-    assert backend is not None, "matching CUDA hardware did not load a backend"
-    assert backend.__name__ == f"flashrwkv2.{expected_for_device}"
+    backend = flashrwkv2._extension()
     missing = [name for name in required_symbols if not hasattr(backend, name)]
-    assert not missing, (
-        f"{expected_for_device} is missing required symbols: {missing}"
-    )
+    assert not missing, f"runtime extension is missing required symbols: {missing}"
     return backend
 
 

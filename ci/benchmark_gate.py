@@ -467,7 +467,7 @@ def run_module(
         "schema_version": SCHEMA_VERSION,
         "status": status,
         "module": module,
-        "target": "sm120",
+        "target": f"sm{environment['capability'][0]}{environment['capability'][1]}",
         "revision": revision,
         "benchmark_contract_sha256": _contract_hash(module),
         "environment": environment,
@@ -520,7 +520,7 @@ def run_suite(
                 "schema_version": SCHEMA_VERSION,
                 "status": "unavailable",
                 "module": module,
-                "target": "sm120",
+                "target": f"sm{environment['capability'][0]}{environment['capability'][1]}",
                 "revision": revision,
                 "warning": warning,
             }
@@ -670,7 +670,7 @@ def fetch_main_baselines(
             (
                 row
                 for row in artifacts
-                if row.get("name", "").startswith("flashrwkv2-quality-v4-")
+                if row.get("name", "").startswith("flashrwkv2-quality-v5-")
                 and not row.get("expired")
             ),
             None,

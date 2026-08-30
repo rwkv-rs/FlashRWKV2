@@ -34,7 +34,7 @@ param_size: 参数规模, 仅有 0.1b, 0.4b, 1.5b(often used in RL), 2.9b, 7.2b(
 Python 源码：./flashrwkv2/<module_name>[/<sub_module_name>]/__init__.py
 测试代码：  ./tests/<module_name>[/<sub_module_name>]/test.py
 性能基准：  ./benchmarks/<module_name>[/<sub_module_name>]/bench.py
-C++/CUDA：  ./csrc/sm{80|89|90|120}/<module_name>[/<sub_module_name>]/
+C++/CUDA：  ./csrc/sm80/<module_name>[/<sub_module_name>]/
            {pretrain|rl_infctx|statetune|infer}_
            [{recurrent[_kda]|chunk}_]{numerical-mode}_
            {forward|backward}[_varlen].{cpp|cu}
@@ -44,12 +44,9 @@ C++/CUDA：  ./csrc/sm{80|89|90|120}/<module_name>[/<sub_module_name>]/
 
 - `<module_name>` 和可选的 `<sub_module_name>` 必须在四类目录中保持一致；
   没有子模块时，省略整个 `[/<sub_module_name>]`。
-- CUDA 源码的第一层目录必须是 `sm80`、`sm89`、`sm90` 或 `sm120`，
-  不要使用未列出的架构名称。
-- `sm80` 是面向 Compute Capability 8.0 及以上设备的通用正确性兜底实现；
-  `sm89`、`sm90` 和 `sm120` 分别承载 Ada、Hopper 和 Blackwell 的特调实现。
-  同一 Compute Capability 下的不同 GPU 产品共享架构目录，产品差异通过经过验证的
-  执行配置表达，不要新增按产品型号命名的 CUDA 源码目录。
+- CUDA 源码仅维护在 `csrc/sm80`，面向 Compute Capability 8.0 及以上设备。
+  安装后的首次 CUDA 调用针对当前可见 GPU 原生编译；架构与产品差异通过同一源码中
+  经过验证的执行配置表达，不新增其他架构或产品型号命名的 CUDA 源码目录。
 - CUDA 文件名依次表示使用场景、算法、数值模式和执行方向；使用场景只能是
   `pretrain`、`rl_infctx`、`statetune` 或 `infer`，(如果是wkv7 kernel, 算法只能是 `recurrent`、
   `recurrent_kda` 或 `chunk`)方向只能是 `forward` 或 `backward`，
@@ -61,7 +58,7 @@ C++/CUDA：  ./csrc/sm{80|89|90|120}/<module_name>[/<sub_module_name>]/
 flashrwkv2/tmix/wkv7/__init__.py
 tests/tmix/wkv7/test.py
 benchmarks/tmix/wkv7/bench.py
-csrc/sm90/tmix/wkv7/infer_recurrent_fp16_forward_varlen.cu
+csrc/sm80/tmix/wkv7/infer_recurrent_fp16_forward_varlen.cu
 ```
 
 算子模块的规范名称还包括：顶层 `post_norm` 公开最终 Res 后 LN，并向融合岛
@@ -105,8 +102,8 @@ Kernel 通常按照训练阶段的完成顺序设计：`pretrain` 和 `infer` �
 例如，下面的链接保留了 `statetune` 的构建入口，同时只维护一份实现：
 
 ```text
-csrc/sm90/tmix/wkv7/pretrain_recurrent_fp16_forward.cu
-csrc/sm90/tmix/wkv7/statetune_recurrent_fp16_forward.cu
+csrc/sm80/tmix/wkv7/pretrain_recurrent_fp16_forward.cu
+csrc/sm80/tmix/wkv7/statetune_recurrent_fp16_forward.cu
     -> pretrain_recurrent_fp16_forward.cu
 ```
 
@@ -128,6 +125,7 @@ ssh rwkv-sha-pro6000x8
 cd ~/Projects/MachineLearning/flashrwkv2
 ```
 use git to sync your changes instead of rsync.
+对于 CI/CD 已有的 build, test, bench, release 任务, 请勿手动拉起, 避免重复执行.
 
 ## 提交与 Pull Request 指南
 

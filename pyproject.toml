@@ -1,8 +1,6 @@
 [build-system]
 requires = [
-  "ninja",
   "setuptools>=77.0.3,<81.0.0",
-  "torch==2.13.0",
   "wheel",
 ]
 build-backend = "setuptools.build_meta"
@@ -14,7 +12,7 @@ description = "High-performance CUDA operator library for RWKV-7"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-  "torch==2.13.0",
+  "torch>=2.11,<2.14",
 ]
 license = "MIT"
 
@@ -37,8 +35,7 @@ pythonpath = [".", "tests"]
 norecursedirs = ["tests_old", "benchmarks_old"]
 python_files = ["test.py", "test_*.py"]
 markers = [
-  "sm90: requires the FlashRWKV2 SM90 native backend",
-  "sm120: requires the FlashRWKV2 SM120 native backend",
+  "cuda: requires the FlashRWKV2 runtime-built CUDA extension",
   "cuda_graph: captures and replays a real CUDA Graph",
   "resource: validates compiled CUDA binary resource usage",
   "memcheck: minimal Compute Sanitizer memcheck coverage",

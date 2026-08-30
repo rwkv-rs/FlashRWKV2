@@ -22,7 +22,7 @@ from flashrwkv2.tmix.wkv7 import (
     prepare_tmix_wkv7_recurrent_metadata,
 )
 
-pytestmark = pytest.mark.sm120
+pytestmark = pytest.mark.cuda
 
 ROOT = Path(__file__).resolve().parents[3]
 TOLERANCES = json.loads(
@@ -155,28 +155,28 @@ def rwkv7_fp16_reference(
 
 def _require_cuda_extension() -> None:
     require_cuda_backend(
-        "_C_sm120", 12, "tmix_wkv7_recurrent_fp32_from_decay_logits"
+        "_C", 8, "tmix_wkv7_recurrent_fp32_from_decay_logits"
     )
 
 
 def _require_fp16_extension() -> None:
     require_cuda_backend(
-        "_C_sm120", 12, "tmix_wkv7_recurrent_fp16_from_decay_logits"
+        "_C", 8, "tmix_wkv7_recurrent_fp16_from_decay_logits"
     )
 
 
 def _require_deltalog_extension() -> None:
     require_cuda_backend(
-        "_C_sm120",
-        12,
+        "_C",
+        8,
         "tmix_wkv7_recurrent_deltalog_fp16_from_decay_logits",
     )
 
 
 def _require_fp32io16_deltalog_extension() -> None:
     require_cuda_backend(
-        "_C_sm120",
-        12,
+        "_C",
+        8,
         "tmix_wkv7_recurrent_deltalog_fp32io16_from_decay_logits",
     )
 

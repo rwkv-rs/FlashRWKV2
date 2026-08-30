@@ -18,10 +18,10 @@ from flashrwkv2.tmix.wkv7 import _extension
 
 SOURCE_REVISION = "952102498e9ed367ea0a59ee64106916d474d30f"
 SOURCE_PATHS = (
-    "csrc/sm90/loss/l2wrap_ce/pretrain_bf16_forward.cpp",
-    "csrc/sm90/loss/l2wrap_ce/pretrain_bf16_forward.cu",
-    "csrc/sm90/loss/l2wrap_ce/pretrain_bf16_backward.cpp",
-    "csrc/sm90/loss/l2wrap_ce/pretrain_bf16_backward.cu",
+    "csrc/sm80/loss/l2wrap_ce/pretrain_bf16_forward.cpp",
+    "csrc/sm80/loss/l2wrap_ce/pretrain_bf16_forward.cu",
+    "csrc/sm80/loss/l2wrap_ce/pretrain_bf16_backward.cpp",
+    "csrc/sm80/loss/l2wrap_ce/pretrain_bf16_backward.cu",
 )
 
 

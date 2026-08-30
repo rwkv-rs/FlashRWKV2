@@ -9,14 +9,7 @@ import torch
 
 def _extension():
     import flashrwkv2
-
-    extension = getattr(flashrwkv2, "_C", None)
-    if extension is None:
-        raise RuntimeError(
-            "FlashRWKV2 CUDA extension is not built; build flashrwkv2._C before "
-            "using the sampling operators"
-        )
-    return extension
+    return flashrwkv2._extension()
 
 
 def _scalar(value: object, name: str) -> int | float | None:

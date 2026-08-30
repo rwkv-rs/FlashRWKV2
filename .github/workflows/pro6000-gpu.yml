@@ -2,933 +2,356 @@ name: Quality Gate
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
   push:
     branches: [main]
   workflow_dispatch:
-    inputs:
-      pr_number:
-        description: Open in-repository pull request number
-        required: false
-        type: number
-      source_revision:
-        description: Exact pull request head or current main revision
-        required: true
-        type: string
 
 permissions:
   actions: read
   contents: read
-  pull-requests: write
 
 concurrency:
-  group: quality-${{ github.event.pull_request.number || inputs.pr_number || github.ref }}
+  group: flashrwkv2-quality-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
   plan:
-    name: Plan
+    name: Plan source validation
     runs-on: ubuntu-latest
     outputs:
-      base_sha: ${{ steps.revision.outputs.base_sha }}
-      head_sha: ${{ steps.revision.outputs.head_sha }}
-      pr_number: ${{ steps.revision.outputs.pr_number }}
-      trusted: ${{ steps.revision.outputs.trusted }}
-      source_tree_sha: ${{ steps.quality.outputs.source_tree_sha }}
-      base_tree_sha: ${{ steps.quality.outputs.base_tree_sha }}
-      build_input_hash: ${{ steps.quality.outputs.build_input_hash }}
-      affected_modules: ${{ steps.quality.outputs.affected_modules }}
-      affected_sm90_modules: ${{ steps.quality.outputs.affected_sm90_modules }}
-      affected_sm120_modules: ${{ steps.quality.outputs.affected_sm120_modules }}
-      benchmark_modules: ${{ steps.quality.outputs.benchmark_modules }}
-      scope: ${{ steps.quality.outputs.scope }}
-      function_targets: ${{ steps.quality.outputs.function_targets }}
-      sm90_correctness_nodeids: ${{ steps.quality.outputs.sm90_correctness_nodeids }}
-      sm120_correctness_nodeids: ${{ steps.quality.outputs.sm120_correctness_nodeids }}
-      sm90_memcheck_nodeids: ${{ steps.quality.outputs.sm90_memcheck_nodeids }}
-      sm120_memcheck_nodeids: ${{ steps.quality.outputs.sm120_memcheck_nodeids }}
-      sm90_racecheck_nodeids: ${{ steps.quality.outputs.sm90_racecheck_nodeids }}
-      sm120_racecheck_nodeids: ${{ steps.quality.outputs.sm120_racecheck_nodeids }}
-      cpu_test_paths: ${{ steps.quality.outputs.cpu_test_paths }}
-      cuda_graph_modules: ${{ steps.quality.outputs.cuda_graph_modules }}
-      sm90_racecheck_modules: ${{ steps.quality.outputs.sm90_racecheck_modules }}
-      sm120_racecheck_modules: ${{ steps.quality.outputs.sm120_racecheck_modules }}
-      contract_required: ${{ steps.quality.outputs.contract_required }}
-      coverage_requires_parent: ${{ steps.quality.outputs.coverage_requires_parent }}
-      run_gpu: ${{ steps.quality.outputs.run_gpu }}
-      run_benchmark: ${{ steps.quality.outputs.run_benchmark }}
-      run_sanitizer: ${{ steps.quality.outputs.run_sanitizer }}
-      package_smoke_only: ${{ steps.quality.outputs.package_smoke_only }}
-      reuse_evidence: ${{ steps.reuse.outputs.reuse_evidence }}
-      evidence_name: ${{ steps.reuse.outputs.evidence_name }}
-      evidence_run_id: ${{ steps.reuse.outputs.evidence_run_id }}
-      wheel_name: ${{ steps.reuse.outputs.wheel_name }}
-      wheel_run_id: ${{ steps.reuse.outputs.wheel_run_id }}
+      base_sha: ${{ steps.plan.outputs.base_sha }}
+      source_tree_sha: ${{ steps.plan.outputs.source_tree_sha }}
+      build_input_hash: ${{ steps.plan.outputs.build_input_hash }}
+      run_gpu: ${{ steps.plan.outputs.run_gpu }}
+      affected_cuda_modules: ${{ steps.plan.outputs.affected_cuda_modules }}
+      cuda_racecheck_modules: ${{ steps.plan.outputs.cuda_racecheck_modules }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Resolve immutable target and trust boundary
-        id: revision
-        uses: actions/github-script@v7
+      - name: Validate CI contracts and create plan
+        id: plan
         env:
-          DISPATCH_PR: ${{ inputs.pr_number }}
-          DISPATCH_SHA: ${{ inputs.source_revision }}
-        with:
-          script: |
-            const trustedAssociations = new Set(['OWNER', 'MEMBER', 'COLLABORATOR']);
-            const trustedPermissions = new Set(['admin', 'maintain', 'write']);
-            const isTrustedPull = (pull, repositoryId, authorPermission = '') =>
-              !pull.draft && pull.head.repo?.id === repositoryId &&
-              (trustedAssociations.has(pull.author_association) ||
-                (pull.author_association === 'CONTRIBUTOR' &&
-                  trustedPermissions.has(authorPermission)));
-            const authorPermission = async pull => {
-              if (pull.author_association !== 'CONTRIBUTOR') return '';
-              const {data} = await github.rest.repos.getCollaboratorPermissionLevel({
-                ...context.repo, username: pull.user.login,
-              });
-              return data.permission;
-            };
-            const matchesCurrentRevision = (pull, eventPull) =>
-              pull.state === 'open' && pull.head.sha === eventPull.head.sha &&
-              pull.base.sha === eventPull.base.sha;
-            const trustCases = [
-              [{draft: false, head: {repo: {id: 7}}, author_association: 'MEMBER'}, 7, '', true],
-              [{draft: true, head: {repo: {id: 7}}, author_association: 'MEMBER'}, 7, '', false],
-              [{draft: false, head: {repo: {id: 8}}, author_association: 'MEMBER'}, 7, '', false],
-              [{draft: false, head: {repo: {id: 7}}, author_association: 'NONE'}, 7, 'admin', false],
-              [{draft: false, head: {repo: {id: 7}}, author_association: 'CONTRIBUTOR'}, 7, 'admin', true],
-              [{draft: false, head: {repo: {id: 7}}, author_association: 'CONTRIBUTOR'}, 7, 'read', false],
-            ];
-            if (trustCases.some(([pull, repositoryId, permission, expected]) =>
-                isTrustedPull(pull, repositoryId, permission) !== expected)) {
-              core.setFailed('trust boundary self-test failed');
-              return;
-            }
-            if (matchesCurrentRevision(
-                {state: 'open', head: {sha: 'current'}, base: {sha: 'base'}},
-                {head: {sha: 'stale'}, base: {sha: 'base'}})) {
-              core.setFailed('stale revision self-test failed');
-              return;
-            }
-            let baseSha;
-            let headSha;
-            let prNumber = '';
-            let trusted = true;
-            if (context.eventName === 'pull_request') {
-              const eventPull = context.payload.pull_request;
-              prNumber = String(context.payload.number);
-              const {data: pull} = await github.rest.pulls.get({
-                ...context.repo, pull_number: Number(prNumber),
-              });
-              if (!matchesCurrentRevision(pull, eventPull)) {
-                core.setFailed('pull request event no longer matches the current open revision');
-                return;
-              }
-              baseSha = pull.base.sha;
-              headSha = pull.head.sha;
-              const permission = await authorPermission(pull);
-              trusted = isTrustedPull(
-                pull, context.payload.repository.id, permission
-              );
-              core.info(JSON.stringify({
-                prNumber,
-                draft: pull.draft,
-                headSha,
-                headRepositoryId: pull.head.repo?.id,
-                repositoryId: context.payload.repository.id,
-                authorAssociation: pull.author_association,
-                authorPermission: permission,
-                trusted,
-              }));
-            } else if (context.eventName === 'push') {
-              baseSha = context.payload.before;
-              headSha = context.sha;
-              if (/^0+$/.test(baseSha)) {
-                const {data: commit} = await github.rest.repos.getCommit({
-                  ...context.repo, ref: headSha,
-                });
-                if (!commit.parents.length) {
-                  core.setFailed('initial main push has no comparison parent');
-                  return;
-                }
-                baseSha = commit.parents[0].sha;
-              }
-            } else {
-              headSha = process.env.DISPATCH_SHA;
-              prNumber = process.env.DISPATCH_PR;
-              if (!/^[0-9a-f]{40}$/.test(headSha)) {
-                core.setFailed('source_revision must be a full lowercase Git OID');
-                return;
-              }
-              if (prNumber) {
-                const {data: pull} = await github.rest.pulls.get({
-                  ...context.repo, pull_number: Number(prNumber),
-                });
-                if (pull.state !== 'open' || pull.head.sha !== headSha ||
-                    pull.head.repo?.id !== context.payload.repository.id) {
-                  core.setFailed('dispatch target is not the current head of an open in-repository PR');
-                  return;
-                }
-                baseSha = pull.base.sha;
-                trusted = isTrustedPull(
-                  pull,
-                  context.payload.repository.id,
-                  await authorPermission(pull),
-                );
-              } else {
-                const {data: main} = await github.rest.repos.getBranch({
-                  ...context.repo, branch: 'main',
-                });
-                if (context.ref !== 'refs/heads/main' || main.commit.sha !== headSha) {
-                  core.setFailed('dispatch without pr_number must target current main');
-                  return;
-                }
-                const {data: commit} = await github.rest.repos.getCommit({
-                  ...context.repo, ref: headSha,
-                });
-                if (!commit.parents.length) {
-                  core.setFailed('current main revision has no comparison parent');
-                  return;
-                }
-                baseSha = commit.parents[0].sha;
-              }
-            }
-            core.setOutput('base_sha', baseSha);
-            core.setOutput('head_sha', headSha);
-            core.setOutput('pr_number', prNumber);
-            core.setOutput('trusted', String(trusted));
-      - name: Check out exact source revision
-        env:
-          HEAD_SHA: ${{ steps.revision.outputs.head_sha }}
-        run: git checkout --detach "$HEAD_SHA"
-      - name: Generate fail-closed validation plan
-        id: quality
-        env:
-          GH_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: |
+          if ! git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null; then
+            BASE_SHA="$(git rev-parse HEAD^)"
+          fi
+          python3 ci/select_targets.py --self-test
+          python3 ci/quality_gate.py self-test
           python3 ci/quality_gate.py plan \
-            --base '${{ steps.revision.outputs.base_sha }}' \
-            --head '${{ steps.revision.outputs.head_sha }}' \
+            --base "$BASE_SHA" \
+            --head "$(git rev-parse HEAD)" \
             --output artifacts/plan.json \
-            --github-output "$GITHUB_OUTPUT"
-      - name: Resolve reusable tree evidence and build artifact
-        id: reuse
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          python3 ci/quality_gate.py resolve \
-            --plan artifacts/plan.json \
-            --repository "$GITHUB_REPOSITORY" \
-            --current-run "$GITHUB_RUN_ID" \
-            --output artifacts/reuse.json \
             --github-output "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
         with:
-          name: flashrwkv2-plan-${{ steps.quality.outputs.source_tree_sha }}
-          path: |
-            artifacts/plan.json
-            artifacts/reuse.json
+          name: flashrwkv2-plan-v5-${{ steps.plan.outputs.source_tree_sha }}
+          path: artifacts/plan.json
           if-no-files-found: error
-          retention-days: 90
+
+  package:
+    name: Build source distributions
+    needs: [plan, contract]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v6
+      - name: Build without Torch or CUDA
+        run: uv build --out-dir artifacts/dist
+      - name: Verify universal source wheel and sdist
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import tarfile
+          import zipfile
+          from pathlib import Path
+
+          dist = Path("artifacts/dist")
+          wheels = list(dist.glob("*.whl"))
+          sdists = list(dist.glob("*.tar.gz"))
+          if len(wheels) != 1 or len(sdists) != 1:
+              raise SystemExit("expected exactly one wheel and one sdist")
+          wheel, sdist = wheels[0], sdists[0]
+          if not wheel.name.endswith("-py3-none-any.whl"):
+              raise SystemExit(f"wheel is not universal: {wheel.name}")
+
+          sources = {
+              path.relative_to("csrc").as_posix(): path.read_bytes()
+              for path in Path("csrc").rglob("*")
+              if path.is_file()
+          }
+          if not sources or not any(name.startswith("sm80/") for name in sources):
+              raise SystemExit("repository CUDA source tree is incomplete")
+          if any(name.startswith(("sm89/", "sm90/", "sm120/")) for name in sources):
+              raise SystemExit("repository contains a duplicate architecture source tree")
+
+          with zipfile.ZipFile(wheel) as archive:
+              names = set(archive.namelist())
+              if any(name.endswith((".so", ".pyd", ".dll")) for name in names):
+                  raise SystemExit("wheel contains a compiled extension")
+              for relative, expected in sources.items():
+                  name = f"flashrwkv2/_csrc/{relative}"
+                  if name not in names or archive.read(name) != expected:
+                      raise SystemExit(f"wheel source mismatch: {relative}")
+
+          with tarfile.open(sdist) as archive:
+              members = {member.name: member for member in archive.getmembers()}
+              prefix = sdist.name.removesuffix(".tar.gz")
+              if any(name.endswith((".so", ".pyd", ".dll")) for name in members):
+                  raise SystemExit("sdist contains a compiled extension")
+              for relative, expected in sources.items():
+                  name = f"{prefix}/csrc/{relative}"
+                  member = members.get(name)
+                  if member is None or archive.extractfile(member).read() != expected:
+                      raise SystemExit(f"sdist source mismatch: {relative}")
+
+          Path("artifacts/package-validation.json").write_text(json.dumps({
+              "checks": {
+                  "package_identity": "passed",
+                  "source_contents": "passed",
+              },
+              "artifacts": {
+                  "wheel": {"name": wheel.name, "sha256": hashlib.sha256(wheel.read_bytes()).hexdigest()},
+                  "sdist": {"name": sdist.name, "sha256": hashlib.sha256(sdist.read_bytes()).hexdigest()},
+              },
+          }, indent=2) + "\n")
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flashrwkv2-wheel-v5-${{ needs.plan.outputs.build_input_hash }}
+          path: |
+            artifacts/dist/*
+            artifacts/package-validation.json
+          if-no-files-found: error
+          retention-days: 30
 
   contract:
-    name: Contract
+    name: Source and CPU contract
     needs: plan
-    if: needs.plan.outputs.reuse_evidence != 'true' && needs.plan.outputs.contract_required == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.plan.outputs.head_sha }}
           fetch-depth: 0
           persist-credentials: false
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
       - name: Validate source and helpers
-        env:
-          BASE_SHA: ${{ needs.plan.outputs.base_sha }}
         run: |
-          git diff --check "$BASE_SHA" HEAD --
+          git diff --check '${{ needs.plan.outputs.base_sha }}' HEAD --
           uv sync --frozen --no-install-project --group dev
           .venv/bin/ruff check --select E9,F63,F7,F82 flashrwkv2 tests benchmarks setup.py
           .venv/bin/ruff check ci benchmarks
           .venv/bin/python ci/select_targets.py --self-test
           .venv/bin/python ci/quality_gate.py self-test
           .venv/bin/python ci/benchmark_gate.py self-test
-      - name: Run only affected CPU-visible tests
-        env:
-          PATHS_JSON: ${{ needs.plan.outputs.cpu_test_paths }}
-          CUDA_VISIBLE_DEVICES: ""
-          PYTHONPATH: ${{ github.workspace }}
-        run: |
-          mapfile -t paths < <(python3 -c 'import json,os; print("\n".join(json.loads(os.environ["PATHS_JSON"])))')
-          if (( ${#paths[@]} )); then
-            .venv/bin/python -m pytest -q "${paths[@]}" -m 'not sm90 and not sm120'
-          fi
+          CUDA_VISIBLE_DEVICES="" .venv/bin/python -m pytest -q tests/test_runtime.py
 
   untrusted:
     name: Reject untrusted GPU revision
+    if: >-
+      needs.plan.outputs.run_gpu == 'true' && github.event_name == 'pull_request' &&
+      (github.event.pull_request.head.repo.full_name != github.repository ||
+       !contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association))
     needs: plan
-    if: needs.plan.outputs.reuse_evidence != 'true' && needs.plan.outputs.run_gpu == 'true' && needs.plan.outputs.trusted != 'true'
     runs-on: ubuntu-latest
     steps:
       - run: |
           echo 'Native GPU validation requires a reviewed in-repository revision.' >&2
           exit 1
 
-  gpu:
-    name: Build and validate final wheel
-    needs: plan
-    if: needs.plan.outputs.reuse_evidence != 'true' && needs.plan.outputs.run_gpu == 'true' && needs.plan.outputs.trusted == 'true'
+  torch-source-compatibility:
+    name: Torch ${{ matrix.torch }} runtime build
+    if: >-
+      needs.plan.outputs.run_gpu == 'true' &&
+      (github.event_name != 'pull_request' ||
+       (github.event.pull_request.head.repo.full_name == github.repository &&
+        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association)))
+    needs: [plan, contract, package]
     runs-on: [self-hosted, linux, x64, rwkv-sha-pro6000x8]
-    timeout-minutes: 15
+    timeout-minutes: 180
     concurrency:
       group: flashrwkv2-pro6000-exclusive
       cancel-in-progress: false
-    outputs:
-      reuse_evidence: ${{ steps.locked_reuse.outputs.reuse_evidence }}
-      evidence_name: ${{ steps.locked_reuse.outputs.evidence_name }}
-      evidence_run_id: ${{ steps.locked_reuse.outputs.evidence_run_id }}
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        torch: ["2.11.0", "2.12.0", "2.13.0"]
+    env:
+      TORCH_EXTENSIONS_DIR: ${{ runner.temp }}/flashrwkv2-${{ github.run_id }}-torch-${{ matrix.torch }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.plan.outputs.head_sha }}
-          fetch-depth: 0
           persist-credentials: false
-      - name: Select an idle physical GPU
-        run: |
-          declare -A busy=()
-          while IFS= read -r uuid; do
-            uuid="${uuid//[[:space:]]/}"
-            [[ -z "$uuid" ]] || busy["$uuid"]=1
-          done < <(nvidia-smi --query-compute-apps=gpu_uuid --format=csv,noheader,nounits)
-          while IFS=, read -r index uuid; do
-            index="${index//[[:space:]]/}"
-            uuid="${uuid//[[:space:]]/}"
-            if [[ -z "${busy[$uuid]+present}" ]]; then
-              echo "CUDA_VISIBLE_DEVICES=$index" >> "$GITHUB_ENV"
-              echo "FLASHRWKV_PHYSICAL_GPU=$index" >> "$GITHUB_ENV"
-              echo "selected physical GPU $index ($uuid)"
-              exit 0
-            fi
-          done < <(nvidia-smi --query-gpu=index,uuid --format=csv,noheader,nounits)
-          echo 'no idle physical GPU is available' >&2
-          exit 1
-      - uses: astral-sh/setup-uv@v6
-        with:
-          enable-cache: false
       - uses: actions/download-artifact@v4
         with:
-          name: flashrwkv2-plan-${{ needs.plan.outputs.source_tree_sha }}
-          path: artifacts/control
-      - name: Recheck evidence after acquiring the GPU lock
-        id: locked_reuse
+          name: flashrwkv2-wheel-v5-${{ needs.plan.outputs.build_input_hash }}
+          path: artifacts/package
+      - uses: astral-sh/setup-uv@v6
+      - name: Install the same source wheel
         env:
-          GH_TOKEN: ${{ github.token }}
+          TORCH_VERSION: ${{ matrix.torch }}
         run: |
-          python3 ci/quality_gate.py resolve \
-            --plan artifacts/control/plan.json \
-            --repository "$GITHUB_REPOSITORY" \
-            --current-run "$GITHUB_RUN_ID" \
-            --output artifacts/control/locked-reuse.json \
-            --github-output "$GITHUB_OUTPUT"
-      - name: Download a reusable final wheel
-        if: steps.locked_reuse.outputs.reuse_evidence != 'true' && steps.locked_reuse.outputs.reuse_wheel == 'true'
+          uv venv .venv --python 3.12 --clear
+          uv pip install --python .venv/bin/python "torch==$TORCH_VERSION" pytest numpy ninja
+          uv pip install --python .venv/bin/python --no-deps artifacts/package/dist/*.whl
+      - name: Compile once and verify cache hit
         env:
-          GH_TOKEN: ${{ github.token }}
+          TORCH_VERSION: ${{ matrix.torch }}
         run: |
-          python3 ci/quality_gate.py extract \
-            --repository "$GITHUB_REPOSITORY" \
-            --artifact '${{ steps.locked_reuse.outputs.wheel_name }}' \
-            --run-id '${{ steps.locked_reuse.outputs.wheel_run_id }}' \
-            --output artifacts/package
-      - name: Build and repair the final wheel once
-        if: steps.locked_reuse.outputs.reuse_evidence != 'true' && steps.locked_reuse.outputs.reuse_wheel != 'true'
-        run: |
-          set -o pipefail
-          mkdir -p artifacts/package/dist artifacts/raw-wheel
-          command -v ccache
-          export CCACHE_COMPILERCHECK=content
-          export CCACHE_NOHASHDIR=true
-          ccache --zero-stats
-          uv sync --frozen --no-install-project --group dev
-          uv export --frozen --group dev --no-emit-project \
-            --output-file artifacts/package/locked-requirements.txt
-          uv build --no-build-isolation --wheel --out-dir artifacts/raw-wheel \
-            2>&1 | tee artifacts/package/wheel-build.log
-          ccache --show-stats | tee artifacts/package/ccache-stats.txt
-          hits="$(ccache --show-stats | awk '/^[[:space:]]+Hits:/ {print $2}')"
-          test "${hits:-0}" -gt 0
-          test "$(find artifacts/raw-wheel -maxdepth 1 -name '*.whl' | wc -l)" -eq 1
-          uv tool run --with patchelf auditwheel repair \
-            --plat manylinux_2_38_x86_64 \
-            --exclude 'libtorch*.so' \
-            --exclude libc10.so \
-            --exclude libc10_cuda.so \
-            --exclude libcudart.so.13 \
-            --wheel-dir artifacts/package/dist \
-            artifacts/raw-wheel/*.whl
-          test "$(find artifacts/package/dist -maxdepth 1 -name '*.whl' | wc -l)" -eq 1
-          uvx twine check artifacts/package/dist/*.whl
-          uv tool run auditwheel show artifacts/package/dist/*.whl \
-            | tee artifacts/package/wheel-audit.txt
-          grep -q 'manylinux_2_38_x86_64' artifacts/package/wheel-audit.txt
-          BUILD_INPUT_HASH='${{ needs.plan.outputs.build_input_hash }}' python3 - <<'PY'
-          import hashlib, json, os
+          .venv/bin/python -m flashrwkv2.compile > artifacts/compile-first.json
+          .venv/bin/python -m flashrwkv2.compile > artifacts/compile-second.json
+          .venv/bin/python - <<'PY'
+          import json
+          import os
+          import subprocess
           from pathlib import Path
-          wheel = next(Path('artifacts/package/dist').glob('*.whl'))
-          payload = {
-              'build_input_hash': os.environ['BUILD_INPUT_HASH'],
-              'wheel': wheel.name,
-              'wheel_sha256': hashlib.sha256(wheel.read_bytes()).hexdigest(),
-          }
-          Path('artifacts/package/build-identity.json').write_text(
-              json.dumps(payload, indent=2) + '\n'
-          )
-          PY
-      - name: Verify reusable build identity
-        if: steps.locked_reuse.outputs.reuse_evidence != 'true' && steps.locked_reuse.outputs.reuse_wheel == 'true'
-        env:
-          BUILD_INPUT_HASH: ${{ needs.plan.outputs.build_input_hash }}
-        run: |
-          python3 - <<'PY'
-          import hashlib, json, os
-          from pathlib import Path
-          identity = json.loads(next(Path('artifacts/package').rglob('build-identity.json')).read_text())
-          wheel = next(Path('artifacts/package').rglob('*.whl'))
-          if identity['build_input_hash'] != os.environ['BUILD_INPUT_HASH']:
-              raise SystemExit('reused build input hash mismatch')
-          if identity['wheel_sha256'] != hashlib.sha256(wheel.read_bytes()).hexdigest():
-              raise SystemExit('reused wheel SHA256 mismatch')
-          PY
-      - name: Build this source tree's sdist once
-        if: steps.locked_reuse.outputs.reuse_evidence != 'true'
-        run: |
-          uv build --sdist --out-dir artifacts/package/dist
-          test "$(find artifacts/package/dist -maxdepth 1 -name '*.tar.gz' | wc -l)" -eq 1
-          uvx twine check artifacts/package/dist/*
-      - name: Upload reusable final wheel
-        if: steps.locked_reuse.outputs.reuse_evidence != 'true' && steps.locked_reuse.outputs.reuse_wheel != 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: flashrwkv2-wheel-v4-${{ needs.plan.outputs.build_input_hash }}
-          path: |
-            artifacts/package/dist/*.whl
-            artifacts/package/locked-requirements.txt
-            artifacts/package/wheel-audit.txt
-            artifacts/package/wheel-build.log
-            artifacts/package/ccache-stats.txt
-            artifacts/package/build-identity.json
-          if-no-files-found: error
-          retention-days: 90
-      - name: Install only the final manylinux wheel
-        if: steps.locked_reuse.outputs.reuse_evidence != 'true'
-        run: |
-          wheel="$(find artifacts/package -name '*.whl' -print -quit)"
-          requirements="$(find artifacts/package -name locked-requirements.txt -print -quit)"
-          test -n "$wheel" && test -n "$requirements"
-          uv venv --python 3.12 .runtime-venv
-          uv pip install --python .runtime-venv/bin/python -r "$requirements"
-          uv pip install --python .runtime-venv/bin/python --no-deps "$wheel"
-      - name: Verify package identity and native binary contents
-        if: steps.locked_reuse.outputs.reuse_evidence != 'true'
-        run: |
-          set -o pipefail
-          package_root="$RUNNER_TEMP/flashrwkv2-package-$GITHUB_RUN_ID"
-          mkdir -p "$package_root/unpacked"
-          wheel="$(find artifacts/package -name '*.whl' -print -quit)"
-          [[ "$(basename "$wheel")" == *manylinux_2_38_x86_64.whl ]]
-          .runtime-venv/bin/python -m zipfile -e "$wheel" "$package_root/unpacked"
-          sm90="$(find "$package_root/unpacked" -name '_C_sm90*.so' -print -quit)"
-          sm120="$(find "$package_root/unpacked" -name '_C_sm120*.so' -print -quit)"
-          test -n "$sm90" && test -n "$sm120"
-          cuobjdump --list-elf "$sm90" | tee artifacts/package/sm90-elf.txt
-          cuobjdump --dump-ptx "$sm90" | tee artifacts/package/sm90-ptx.txt
-          cuobjdump --list-elf "$sm120" | tee artifacts/package/sm120-elf.txt
-          grep -q 'sm_90' artifacts/package/sm90-elf.txt
-          grep -q '\.target sm_90' artifacts/package/sm90-ptx.txt
-          grep -q 'sm_120' artifacts/package/sm120-elf.txt
-          (
-            cd "$RUNNER_TEMP"
-            "$GITHUB_WORKSPACE/.runtime-venv/bin/python" - <<'PY'
-          import importlib, importlib.util, os, tomllib
-          from pathlib import Path
-          import flashrwkv2, torch
-          project = tomllib.loads(
-              Path(os.environ['GITHUB_WORKSPACE'], 'pyproject.toml').read_text()
-          )['project']
-          if flashrwkv2.__version__ != project['version']:
-              raise SystemExit('installed wheel version mismatch')
-          if torch.cuda.get_device_capability(0) != (12, 0):
-              raise SystemExit(f'unexpected GPU capability: {torch.cuda.get_device_capability(0)}')
-          if flashrwkv2._C is None or flashrwkv2._C.__name__ != 'flashrwkv2._C_sm120':
-              raise SystemExit('native SM120 backend was not selected')
-          backends = {}
-          for backend in ('flashrwkv2._C_sm90', 'flashrwkv2._C_sm120'):
-              if importlib.util.find_spec(backend) is None:
-                  raise SystemExit(f'wheel lacks {backend}')
-              backends[backend] = importlib.import_module(backend)
-          public_sm90 = {
-              name for name in dir(backends['flashrwkv2._C_sm90'])
-              if not name.startswith('_')
-          }
-          public_sm120 = {
-              name for name in dir(backends['flashrwkv2._C_sm120'])
-              if not name.startswith('_')
-          }
-          missing_sm120 = sorted(public_sm90 - public_sm120)
-          if missing_sm120:
-              raise SystemExit(
-                  f'SM120 backend lacks SM90 workload symbols: {missing_sm120}'
-              )
-          PY
-          )
-      - name: Run affected correctness and CUDA Graph tests once
-        if: steps.locked_reuse.outputs.reuse_evidence != 'true' && needs.plan.outputs.package_smoke_only != 'true'
-        env:
-          SM90_JSON: ${{ needs.plan.outputs.sm90_correctness_nodeids }}
-          SM120_JSON: ${{ needs.plan.outputs.sm120_correctness_nodeids }}
-          PYTHONPATH: ${{ github.workspace }}/tests:${{ github.workspace }}/benchmarks
-        run: |
-          set -o pipefail
-          test_root="$RUNNER_TEMP/flashrwkv2-correctness-$GITHUB_RUN_ID"
-          mkdir -p "$test_root" artifacts/validation
-          run_nodeids() {
-            local backend="$1" marker="$2" nodeids_json="$3"
-            mapfile -t nodeids < <(NODEIDS_JSON="$nodeids_json" python3 -c 'import json,os; print("\n".join(json.loads(os.environ["NODEIDS_JSON"])))')
-            (( ${#nodeids[@]} )) || return 0
-            for index in "${!nodeids[@]}"; do
-              nodeids[$index]="$GITHUB_WORKSPACE/${nodeids[$index]}"
-            done
-            (
-              cd "$test_root"
-              FLASHRWKV_TEST_BACKEND="$backend" \
-                "$GITHUB_WORKSPACE/.runtime-venv/bin/python" -m pytest -p utils -q \
-                "${nodeids[@]}" -m "$marker" -c /dev/null --rootdir="$test_root"
-            ) 2>&1 | tee "$GITHUB_WORKSPACE/artifacts/validation/function-$marker.log"
-          }
-          run_nodeids _C_sm120 sm120 "$SM120_JSON"
-          run_nodeids _C_sm90 sm90 "$SM90_JSON"
-          python3 - <<'PY'
-          import json, os
-          from pathlib import Path
-          results = []
-          for backend, name in (("sm120", "SM120_JSON"), ("sm90", "SM90_JSON")):
-              nodeids = json.loads(os.environ[name])
-              if nodeids:
-                  results.append({
-                      "kind": "correctness",
-                      "backend": backend,
-                      "status": "passed",
-                      "nodeids": nodeids,
-                  })
-          Path("artifacts/validation/correctness-results.json").write_text(
-              json.dumps(results, indent=2) + "\n"
-          )
-          PY
-      - name: Run only marked sanitizer cases
-        if: steps.locked_reuse.outputs.reuse_evidence != 'true' && needs.plan.outputs.run_sanitizer == 'true'
-        env:
-          SM90_JSON: ${{ needs.plan.outputs.sm90_memcheck_nodeids }}
-          SM120_JSON: ${{ needs.plan.outputs.sm120_memcheck_nodeids }}
-          SM90_RACE_JSON: ${{ needs.plan.outputs.sm90_racecheck_nodeids }}
-          SM120_RACE_JSON: ${{ needs.plan.outputs.sm120_racecheck_nodeids }}
-          PYTHONPATH: ${{ github.workspace }}/tests:${{ github.workspace }}/benchmarks
-        run: |
-          set -o pipefail
-          command -v compute-sanitizer
-          test_root="$RUNNER_TEMP/flashrwkv2-sanitizer-$GITHUB_RUN_ID"
-          mkdir -p "$test_root" artifacts/validation
-          sanitize_nodeids() {
-            local backend="$1" arch="$2" tool="$3" nodeids_json="$4"
-            mapfile -t nodeids < <(NODEIDS_JSON="$nodeids_json" python3 -c 'import json,os; print("\n".join(json.loads(os.environ["NODEIDS_JSON"])))')
-            (( ${#nodeids[@]} )) || return 0
-            for index in "${!nodeids[@]}"; do
-              nodeids[$index]="$GITHUB_WORKSPACE/${nodeids[$index]}"
-            done
-            (
-              cd "$test_root"
-              FLASHRWKV_TEST_BACKEND="$backend" compute-sanitizer \
-                --tool "$tool" --target-processes all --error-exitcode 97 \
-                "$GITHUB_WORKSPACE/.runtime-venv/bin/python" -m pytest -p utils -q \
-                "${nodeids[@]}" -m "$arch and $tool" -x -c /dev/null \
-                --rootdir="$test_root"
-            ) 2>&1 | tee "$GITHUB_WORKSPACE/artifacts/validation/function-$arch-$tool.log"
-          }
-          sanitize_nodeids _C_sm120 sm120 memcheck "$SM120_JSON"
-          sanitize_nodeids _C_sm90 sm90 memcheck "$SM90_JSON"
-          sanitize_nodeids _C_sm120 sm120 racecheck "$SM120_RACE_JSON"
-          sanitize_nodeids _C_sm90 sm90 racecheck "$SM90_RACE_JSON"
-          python3 - <<'PY'
-          import json, os
-          from pathlib import Path
-          results = []
-          for backend, modules_name, race_name in (
-              ("sm120", "SM120_JSON", "SM120_RACE_JSON"),
-              ("sm90", "SM90_JSON", "SM90_RACE_JSON"),
-          ):
-              nodeids = json.loads(os.environ[modules_name])
-              if nodeids:
-                  results.append({
-                      "kind": "memcheck",
-                      "backend": backend,
-                      "status": "passed",
-                      "nodeids": nodeids,
-                  })
-              race_nodeids = json.loads(os.environ[race_name])
-              if race_nodeids:
-                  results.append({
-                      "kind": "racecheck",
-                      "backend": backend,
-                      "status": "passed",
-                      "nodeids": race_nodeids,
-                  })
-          Path("artifacts/validation/sanitizer-results.json").write_text(
-              json.dumps(results, indent=2) + "\n"
-          )
-          PY
-      - name: Run affected SM120 benchmark suite and advisory comparison
-        if: steps.locked_reuse.outputs.reuse_evidence != 'true' && needs.plan.outputs.run_benchmark == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          MODULES_JSON: ${{ needs.plan.outputs.benchmark_modules }}
-          HEAD_SHA: ${{ needs.plan.outputs.head_sha }}
-        run: |
-          mkdir -p artifacts/benchmark/baseline artifacts/benchmark/candidate
-          wheel="$(find artifacts/package -name '*.whl' -print -quit)"
-          export FLASH_RWKV_WHEEL_SHA256="$(sha256sum "$wheel" | cut -d' ' -f1)"
-          missing="$MODULES_JSON"
-          if .runtime-venv/bin/python ci/benchmark_gate.py fetch-baselines \
-              --repository "$GITHUB_REPOSITORY" --modules "$MODULES_JSON" \
-              --python .runtime-venv/bin/python \
-              --output artifacts/benchmark/baseline \
-              --github-output artifacts/benchmark/fetch-output.txt; then
-            missing="$(sed -n 's/^missing_modules=//p' artifacts/benchmark/fetch-output.txt)"
-          fi
-          if [[ "$missing" != '[]' ]]; then
-            requirements="$(find artifacts/package -name locked-requirements.txt -print -quit)"
-            uv venv --python 3.12 .baseline-venv
-            uv pip install --python .baseline-venv/bin/python -r "$requirements"
-            pypi_wheel="$(python3 - <<'PY'
-          import json, urllib.request
-          from pathlib import Path
-          with urllib.request.urlopen('https://pypi.org/pypi/flashrwkv2/json') as response:
-              payload = json.load(response)
-          matches = [
-              row for row in payload['urls']
-              if row['filename'].endswith('cp312-cp312-manylinux_2_38_x86_64.whl')
-          ]
-          if len(matches) != 1:
-              raise SystemExit('latest PyPI release lacks one compatible final wheel')
-          destination = Path('artifacts/benchmark') / matches[0]['filename']
-          urllib.request.urlretrieve(matches[0]['url'], destination)
-          print(destination)
-          PY
-            )" || true
-            if [[ -n "$pypi_wheel" ]] && uv pip install --python .baseline-venv/bin/python --no-deps "$pypi_wheel"; then
-              baseline_sha="$(sha256sum "$pypi_wheel" | cut -d' ' -f1)"
-              FLASH_RWKV_WHEEL_SHA256="$baseline_sha" \
-                .runtime-venv/bin/python ci/benchmark_gate.py run-suite \
-                --modules "$missing" --python .baseline-venv/bin/python \
-                --revision pypi-latest --status baseline \
-                --output artifacts/benchmark/baseline \
-                --summary artifacts/benchmark/pypi-summary.json || true
-            fi
-          fi
-          .runtime-venv/bin/python ci/benchmark_gate.py run-suite \
-            --modules "$MODULES_JSON" --python .runtime-venv/bin/python \
-            --revision "$HEAD_SHA" --status candidate \
-            --output artifacts/benchmark/candidate \
-            --summary artifacts/benchmark/candidate-summary.json \
-            --require-complete
-          .runtime-venv/bin/python ci/benchmark_gate.py compare-suite \
-            --modules "$MODULES_JSON" \
-            --baseline artifacts/benchmark/baseline \
-            --candidate artifacts/benchmark/candidate \
-            --output artifacts/benchmark/summary.json
-      - name: Preserve benchmark failures as warnings
-        if: always() && steps.locked_reuse.outputs.reuse_evidence != 'true' && needs.plan.outputs.run_benchmark == 'true'
-        env:
-          MODULES_JSON: ${{ needs.plan.outputs.benchmark_modules }}
-        run: |
-          python3 - <<'PY'
-          import json, os
-          from pathlib import Path
-          path = Path('artifacts/benchmark/summary.json')
-          if not path.is_file():
-              modules = json.loads(os.environ['MODULES_JSON'])
-              payload = {
-                  'schema_version': 2,
-                  'status': 'warning',
-                  'modules': modules,
-                  'warnings': [
-                      {'kind': 'benchmark-unavailable', 'module': module}
-                      for module in modules
-                  ],
-              }
-              path.parent.mkdir(parents=True, exist_ok=True)
-              path.write_text(json.dumps(payload, indent=2) + '\n')
-          PY
-      - name: Record blocking validation evidence
-        if: steps.locked_reuse.outputs.reuse_evidence != 'true'
-        env:
-          PLAN_PATH: ${{ github.workspace }}/artifacts/control/plan.json
-        run: |
-          mkdir -p artifacts/validation
-          (
-            cd "$RUNNER_TEMP"
-            "$GITHUB_WORKSPACE/.runtime-venv/bin/python" - <<'PY'
-          import json, os, platform, subprocess
-          from pathlib import Path
-          import torch
-          plan = json.loads(Path(os.environ['PLAN_PATH']).read_text())
-          impact = plan['impact']
-          results = []
-          if not impact['package_smoke_only']:
-              path = Path(os.environ['GITHUB_WORKSPACE'], 'artifacts/validation/correctness-results.json')
-              if not path.is_file():
-                  raise SystemExit('correctness result record is missing')
-              results.extend(json.loads(path.read_text()))
-          if impact['run_sanitizer']:
-              path = Path(os.environ['GITHUB_WORKSPACE'], 'artifacts/validation/sanitizer-results.json')
-              if not path.is_file():
-                  raise SystemExit('sanitizer result record is missing')
-              results.extend(json.loads(path.read_text()))
-          checks = {
-              'package_identity': 'passed',
-              'binary_contents': 'passed',
-              'sm90': 'PTX-on-SM120' if impact['affected_sm90_modules'] and not impact['package_smoke_only'] else 'not-required',
-              'sm120': 'native-sm120' if impact['affected_sm120_modules'] and not impact['package_smoke_only'] else 'not-required',
-              'cuda_graph': 'passed' if plan['cuda_graph_modules'] else 'not-required',
-              'memcheck': 'passed' if impact['run_sanitizer'] else 'not-required',
-              'racecheck': 'passed' if (
-                  plan['sm90_racecheck_modules'] or plan['sm120_racecheck_modules']
-                  or plan['sm90_racecheck_nodeids'] or plan['sm120_racecheck_nodeids']
-              ) else 'not-required',
-          }
-          payload = {
-              'checks': checks,
-              'environment': {
-                  'gpu': torch.cuda.get_device_name(0),
-                  'capability': list(torch.cuda.get_device_capability(0)),
-                  'driver': subprocess.check_output(
-                      [
-                          'nvidia-smi', '--query-gpu=driver_version',
-                          '--format=csv,noheader',
-                          f"--id={os.environ['FLASHRWKV_PHYSICAL_GPU']}",
-                      ],
-                      text=True,
-                  ).strip(),
-                  'torch': torch.__version__,
-                  'torch_cuda': torch.version.cuda,
-                  'python': platform.python_version(),
-              },
-              'results': results,
-          }
-          Path(os.environ['GITHUB_WORKSPACE'], 'artifacts/validation/validation.json').write_text(
-              json.dumps(payload, indent=2) + '\n'
-          )
-          PY
-          )
-      - name: Upload aggregate input
-        if: steps.locked_reuse.outputs.reuse_evidence != 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: flashrwkv2-quality-stage-${{ needs.plan.outputs.source_tree_sha }}
-          path: |
-            artifacts/package/dist/
-            artifacts/package/locked-requirements.txt
-            artifacts/package/wheel-audit.txt
-            artifacts/validation/
-            artifacts/benchmark/*.json
-            artifacts/benchmark/*-output.txt
-            artifacts/benchmark/baseline/*.json
-            artifacts/benchmark/candidate/*.json
-          if-no-files-found: error
-          retention-days: 7
 
-  aggregate:
-    name: aggregate
-    if: always()
-    needs: [plan, contract, untrusted, gpu]
+          first = json.loads(Path("artifacts/compile-first.json").read_text())
+          second = json.loads(Path("artifacts/compile-second.json").read_text())
+          if first["status"] not in {"compiled", "cached"} or second["status"] != "cached":
+              raise SystemExit(f"unexpected runtime cache states: {first}, {second}")
+          if first["target"] != "sm120" or second["cache_key"] != first["cache_key"]:
+              raise SystemExit(f"unexpected runtime target/cache identity: {first}, {second}")
+          library = Path(second["library"])
+          if not library.is_file():
+              raise SystemExit(f"runtime library is missing: {library}")
+          listing = subprocess.run(
+              ["cuobjdump", "--list-elf", str(library)],
+              check=True,
+              capture_output=True,
+              text=True,
+          ).stdout
+          if "sm_120" not in listing or any(f"sm_{cc}" in listing for cc in (80, 89, 90)):
+              raise SystemExit(f"runtime library is not native-only sm120:\n{listing}")
+          Path(f"artifacts/validation-{os.environ['TORCH_VERSION']}.json").write_text(
+              json.dumps({
+                  "checks": {
+                      f"torch_{os.environ['TORCH_VERSION'].split('.')[0]}_{os.environ['TORCH_VERSION'].split('.')[1]}": "passed",
+                      "runtime_build_cache": "passed",
+                  },
+                  "environment": {
+                      "target": second["target"],
+                      "cache_key": second["cache_key"],
+                      "library": second["library"],
+                  },
+                  "results": [],
+              }, indent=2) + "\n"
+          )
+          PY
+      - name: Full correctness, backward, and CUDA Graph suite
+        if: matrix.torch == '2.13.0'
+        run: .venv/bin/python -m pytest -q tests
+      - name: Compute Sanitizer memcheck
+        if: matrix.torch == '2.13.0'
+        run: compute-sanitizer --error-exitcode=1 --tool memcheck .venv/bin/python -m pytest -q tests -m memcheck
+      - name: Compute Sanitizer racecheck
+        if: matrix.torch == '2.13.0'
+        run: compute-sanitizer --error-exitcode=1 --tool racecheck .venv/bin/python -m pytest -q tests -m racecheck
+      - name: Record complete CUDA coverage
+        if: matrix.torch == '2.13.0'
+        env:
+          MODULES: ${{ needs.plan.outputs.affected_cuda_modules }}
+          RACECHECK_MODULES: ${{ needs.plan.outputs.cuda_racecheck_modules }}
+        run: |
+          .venv/bin/python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          path = Path("artifacts/validation-2.13.0.json")
+          payload = json.loads(path.read_text())
+          modules = json.loads(os.environ["MODULES"])
+          racecheck = json.loads(os.environ["RACECHECK_MODULES"])
+          payload["checks"].update({
+              "cuda": "native-runtime",
+              "cuda_graph": "passed",
+              "memcheck": "passed",
+              "racecheck": "passed",
+          })
+          payload["results"] = [
+              {"kind": "correctness", "status": "passed", "modules": modules},
+              {"kind": "memcheck", "status": "passed", "modules": modules},
+              {"kind": "racecheck", "status": "passed", "modules": racecheck},
+          ]
+          path.write_text(json.dumps(payload, indent=2) + "\n")
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flashrwkv2-validation-torch-${{ matrix.torch }}-${{ needs.plan.outputs.source_tree_sha }}
+          path: |
+            artifacts/compile-*.json
+            artifacts/validation-${{ matrix.torch }}.json
+          if-no-files-found: error
+
+  finalize:
+    name: Bind exact artifacts and evidence
+    if: >-
+      always() && needs.plan.result == 'success' && needs.package.result == 'success' &&
+      (needs.torch-source-compatibility.result == 'success' ||
+       (needs.plan.outputs.run_gpu != 'true' && needs.torch-source-compatibility.result == 'skipped'))
+    needs: [plan, contract, package, torch-source-compatibility]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.plan.outputs.head_sha }}
-          fetch-depth: 0
           persist-credentials: false
-      - name: Enforce blocking job outcomes
-        env:
-          CONTRACT: ${{ needs.contract.result }}
-          UNTRUSTED: ${{ needs.untrusted.result }}
-          GPU: ${{ needs.gpu.result }}
-          REUSE: ${{ needs.plan.outputs.reuse_evidence }}
-          RUN_GPU: ${{ needs.plan.outputs.run_gpu }}
-          TRUSTED: ${{ needs.plan.outputs.trusted }}
-        run: |
-          [[ "$CONTRACT" == success || "$CONTRACT" == skipped ]]
-          [[ "$UNTRUSTED" == skipped ]]
-          if [[ "$REUSE" != true && "$RUN_GPU" == true && "$TRUSTED" == true ]]; then
-            [[ "$GPU" == success ]]
-          fi
       - uses: actions/download-artifact@v4
         with:
-          name: flashrwkv2-plan-${{ needs.plan.outputs.source_tree_sha }}
-          path: evidence/control
-      - name: Resolve inherited base-tree coverage
-        id: inherited
-        if: needs.plan.outputs.reuse_evidence != 'true' && needs.plan.outputs.coverage_requires_parent == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          python3 ci/quality_gate.py resolve-tree \
-            --tree '${{ needs.plan.outputs.base_tree_sha }}' \
-            --repository "$GITHUB_REPOSITORY" \
-            --current-run "$GITHUB_RUN_ID" \
-            --output evidence/control/inherited.json \
-            --github-output "$GITHUB_OUTPUT"
-          test "$(python3 -c 'import json; print(str(json.load(open("evidence/control/inherited.json"))["found"]).lower())')" = true
-          python3 ci/quality_gate.py extract \
-            --repository "$GITHUB_REPOSITORY" \
-            --artifact "$(python3 -c 'import json; print(json.load(open("evidence/control/inherited.json"))["evidence_name"])')" \
-            --run-id "$(python3 -c 'import json; print(json.load(open("evidence/control/inherited.json"))["evidence_run_id"])')" \
-            --output evidence/inherited
-      - name: Resolve the evidence source
-        id: source
-        env:
-          INITIAL_REUSE: ${{ needs.plan.outputs.reuse_evidence }}
-          INITIAL_RUN: ${{ needs.plan.outputs.evidence_run_id }}
-          LOCKED_REUSE: ${{ needs.gpu.outputs.reuse_evidence }}
-          LOCKED_RUN: ${{ needs.gpu.outputs.evidence_run_id }}
-        run: |
-          if [[ "$INITIAL_REUSE" == true ]]; then
-            echo 'reuse=true' >> "$GITHUB_OUTPUT"
-            echo "run_id=$INITIAL_RUN" >> "$GITHUB_OUTPUT"
-          elif [[ "$LOCKED_REUSE" == true ]]; then
-            echo 'reuse=true' >> "$GITHUB_OUTPUT"
-            echo "run_id=$LOCKED_RUN" >> "$GITHUB_OUTPUT"
-          else
-            echo 'reuse=false' >> "$GITHUB_OUTPUT"
-          fi
-      - name: Download reusable evidence
-        if: steps.source.outputs.reuse == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          python3 ci/quality_gate.py extract \
-            --repository "$GITHUB_REPOSITORY" \
-            --artifact 'flashrwkv2-quality-v4-${{ needs.plan.outputs.source_tree_sha }}' \
-            --run-id '${{ steps.source.outputs.run_id }}' \
-            --output evidence/final
+          name: flashrwkv2-plan-v5-${{ needs.plan.outputs.source_tree_sha }}
+          path: artifacts
       - uses: actions/download-artifact@v4
-        if: steps.source.outputs.reuse != 'true' && needs.plan.outputs.run_gpu == 'true'
         with:
-          name: flashrwkv2-quality-stage-${{ needs.plan.outputs.source_tree_sha }}
-          path: evidence/stage
-      - name: Finalize new atomic quality evidence
-        if: steps.source.outputs.reuse != 'true'
-        run: |
-          mkdir -p evidence/final
-          cp evidence/control/plan.json evidence/final/plan.json
-          wheel="$(find evidence/stage/package/dist -maxdepth 1 -name '*.whl' -print -quit 2>/dev/null || true)"
-          sdist="$(find evidence/stage -name '*.tar.gz' -print -quit 2>/dev/null || true)"
-          benchmark="$(find evidence/stage -path '*/benchmark/summary.json' -print -quit 2>/dev/null || true)"
-          validation="$(find evidence/stage -name validation.json -print -quit 2>/dev/null || true)"
-          inherited="$(find evidence/inherited -name quality-manifest.json -print -quit 2>/dev/null || true)"
-          requirements="$(find evidence/stage -name locked-requirements.txt -print -quit 2>/dev/null || true)"
-          audit="$(find evidence/stage -name wheel-audit.txt -print -quit 2>/dev/null || true)"
-          args=(--plan evidence/control/plan.json --output evidence/final/quality-manifest.json)
-          [[ -z "$wheel" ]] || args+=(--wheel "$wheel")
-          [[ -z "$sdist" ]] || args+=(--sdist "$sdist")
-          [[ -z "$benchmark" ]] || args+=(--benchmark "$benchmark")
-          [[ -z "$validation" ]] || args+=(--validation "$validation")
-          [[ -z "$inherited" ]] || args+=(--inherit-manifest "$inherited")
-          [[ -z "$requirements" ]] || args+=(--requirements "$requirements")
-          [[ -z "$audit" ]] || args+=(--audit "$audit")
-          python3 ci/quality_gate.py finalize "${args[@]}"
-          [[ -z "$wheel" ]] || mkdir -p evidence/final/dist
-          [[ -z "$wheel" ]] || cp "$wheel" evidence/final/dist/
-          [[ -z "$sdist" ]] || cp "$sdist" evidence/final/dist/
-          if [[ -d evidence/stage/benchmark ]]; then
-            cp -R evidence/stage/benchmark evidence/final/
-          fi
-          if [[ -d evidence/stage/validation ]]; then
-            cp -R evidence/stage/validation evidence/final/
-          fi
-          if [[ -n "$requirements" || -n "$audit" ]]; then
-            mkdir -p evidence/final/package-metadata
-            [[ -z "$requirements" ]] || cp "$requirements" evidence/final/package-metadata/
-            [[ -z "$audit" ]] || cp "$audit" evidence/final/package-metadata/
-          fi
-          verify_args=(--manifest evidence/final/quality-manifest.json --expected-tree '${{ needs.plan.outputs.source_tree_sha }}')
-          [[ -z "$wheel" ]] || verify_args+=(--wheel "$wheel")
-          [[ -z "$sdist" ]] || verify_args+=(--sdist "$sdist")
-          python3 ci/quality_gate.py verify "${verify_args[@]}"
-      - name: Verify reused evidence identity
-        if: steps.source.outputs.reuse == 'true'
+          name: flashrwkv2-wheel-v5-${{ needs.plan.outputs.build_input_hash }}
+          path: artifacts/package
+      - uses: actions/download-artifact@v4
+        if: needs.plan.outputs.run_gpu == 'true'
+        with:
+          pattern: flashrwkv2-validation-torch-*-${{ needs.plan.outputs.source_tree_sha }}
+          path: artifacts/validation
+          merge-multiple: true
+      - name: Merge validation evidence
         run: |
           python3 - <<'PY'
           import json
           from pathlib import Path
-          manifest = json.loads(next(Path('evidence/final').rglob('quality-manifest.json')).read_text())
-          plan = json.loads(Path('evidence/control/plan.json').read_text())
-          if manifest.get('status') != 'passed':
-              raise SystemExit('reused evidence did not pass')
-          if manifest.get('source', {}).get('source_tree_sha') != plan['source_tree_sha']:
-              raise SystemExit('reused evidence tree mismatch')
+
+          payload = {"checks": {}, "environment": {}, "results": []}
+          paths = [Path("artifacts/package/package-validation.json")]
+          paths.extend(sorted(Path("artifacts/validation").glob("validation-*.json")))
+          for path in paths:
+              current = json.loads(path.read_text())
+              payload["checks"].update(current.get("checks", {}))
+              payload["environment"].update(current.get("environment", {}))
+              payload["results"].extend(current.get("results", []))
+          Path("artifacts/validation.json").write_text(json.dumps(payload, indent=2) + "\n")
           PY
+      - name: Finalize and verify exact source distributions
+        run: |
+          python3 ci/quality_gate.py finalize \
+            --plan artifacts/plan.json \
+            --wheel artifacts/package/dist/*.whl \
+            --sdist artifacts/package/dist/*.tar.gz \
+            --validation artifacts/validation.json \
+            --output artifacts/quality-manifest.json
+          python3 ci/quality_gate.py verify \
+            --manifest artifacts/quality-manifest.json \
+            --expected-tree '${{ needs.plan.outputs.source_tree_sha }}' \
+            --wheel artifacts/package/dist/*.whl \
+            --sdist artifacts/package/dist/*.tar.gz
       - uses: actions/upload-artifact@v4
         with:
-          name: flashrwkv2-quality-v4-${{ needs.plan.outputs.source_tree_sha }}
-          path: evidence/final/
+          name: flashrwkv2-quality-v5-${{ needs.plan.outputs.source_tree_sha }}
+          path: |
+            artifacts/quality-manifest.json
+            artifacts/package/dist/*
           if-no-files-found: error
           retention-days: 90
-      - name: Write affected benchmark summary
-        run: |
-          python3 - <<'PY'
-          import json, os
-          from pathlib import Path
-          manifest = json.loads(next(Path('evidence/final').rglob('quality-manifest.json')).read_text())
-          benchmark = manifest.get('benchmark', {})
-          lines = ['## FlashRWKV2 Quality Gate', '', f"Tree: `{manifest['source']['source_tree_sha']}`"]
-          lines += ['', f"SM90 evidence: `{manifest['checks']['sm90']}`"]
-          modules = benchmark.get('modules', [])
-          lines += ['', 'Benchmarks: ' + (', '.join(f'`{m}`' for m in modules) if modules else 'not required')]
-          for warning in benchmark.get('warnings', []):
-              if warning.get('kind') == 'performance-regression':
-                  lines.append(
-                      f"- warning `{warning['module']}/{warning['profile']}`: "
-                      f"{warning['baseline_mean_us']:.6f} -> {warning['candidate_mean_us']:.6f} us "
-                      f"({warning['percent']:+.3f}%)"
-                  )
-              else:
-                  lines.append(f"- warning `{warning.get('module', 'suite')}`: {warning['kind']}")
-          Path(os.environ['GITHUB_STEP_SUMMARY']).write_text('\n'.join(lines) + '\n')
-          Path('evidence/comment.md').write_text('\n'.join(lines) + '\n')
-          PY
-      - name: Update pull request sticky comment
-        if: needs.plan.outputs.pr_number != ''
-        uses: actions/github-script@v7
-        env:
-          PR_NUMBER: ${{ needs.plan.outputs.pr_number }}
-        with:
-          script: |
-            const fs = require('fs');
-            const marker = '<!-- flashrwkv2-quality-v4 -->';
-            const body = `${marker}\n${fs.readFileSync('evidence/comment.md', 'utf8')}`;
-            const issue_number = Number(process.env.PR_NUMBER);
-            const comments = await github.paginate(github.rest.issues.listComments, {
-              ...context.repo, issue_number, per_page: 100,
-            });
-            const old = comments.find(comment => comment.body?.startsWith(marker));
-            if (old) {
-              await github.rest.issues.updateComment({...context.repo, comment_id: old.id, body});
-            } else {
-              await github.rest.issues.createComment({...context.repo, issue_number, body});
-            }

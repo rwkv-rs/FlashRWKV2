@@ -1,58 +1,22 @@
 # SPDX-License-Identifier: MIT
 
-import importlib as _importlib
 import sys as _sys
-
-import torch as _torch
 
 # PyTorch must be loaded before the private extensions, which link against its
 # native libraries.
 
 
-_NATIVE_BACKENDS = (
-    ((9, 0), "_C_sm90"),
-    ((12, 0), "_C_sm120"),
-)
+_C = None
 
 
-def _backend_module_name(capability: tuple[int, int]) -> str:
-    major, minor = capability
-    compatible = (
-        (target, module_name)
-        for target, module_name in _NATIVE_BACKENDS
-        if target[0] == major and target[1] <= minor
-    )
-    try:
-        return max(compatible, key=lambda backend: backend[0])[1]
-    except ValueError as error:
-        rendered = f"sm{major}{minor}"
-        available = ", ".join(
-            f"sm{target[0]}{target[1]}" for target, _ in _NATIVE_BACKENDS
-        )
-        raise RuntimeError(
-            "FlashRWKV2 has no binary-compatible native backend for "
-            f"{rendered}; available cubin backends are {available}"
-        ) from error
+def _extension():
+    global _C
+    if _C is None:
+        from .compile import load_extension
 
-
-def _load_native_backend():
-    if not _torch.cuda.is_available():
-        return None
-    capability = tuple(_torch.cuda.get_device_capability())
-    module_name = _backend_module_name(capability)
-    try:
-        module = _importlib.import_module(f"{__name__}.{module_name}")
-    except ImportError as error:
-        rendered = f"sm{capability[0]}{capability[1]}"
-        raise RuntimeError(
-            f"FlashRWKV2 selected backend {module_name} for {rendered}, "
-            "but that private extension is not installed or cannot be loaded"
-        ) from error
-    _sys.modules[f"{__name__}._C"] = module
-    return module
-
-
-_C = _load_native_backend()
+        _C = load_extension().module
+        _sys.modules[f"{__name__}._C"] = _C
+    return _C
 
 from .cmix import infer_cmix_forward_varlen, pretrain_cmix_bf16, statetune_cmix_bf16
 from .embedding import infer_embedding_ln0_forward_varlen

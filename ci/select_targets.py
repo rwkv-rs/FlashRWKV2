@@ -31,23 +31,6 @@ MODULES = (
 )
 WORKLOAD_TARGETS = ("tmix/wkv7/rl_infctx",)
 TARGETS = MODULES + WORKLOAD_TARGETS
-BACKENDS_BY_TARGET = {
-    "cmix": ("sm90", "sm120"),
-    "embedding": ("sm120",),
-    "head/l2wrap_ce": ("sm90", "sm120"),
-    "head/linear": ("sm120",),
-    "loss/l2wrap_ce": ("sm90", "sm120"),
-    "sampling": ("sm120",),
-    "tmix/a_gate": ("sm90", "sm120"),
-    "tmix/kk_pre": ("sm90", "sm120"),
-    "tmix/readout": ("sm90", "sm120"),
-    "tmix/tokenshift": ("sm90", "sm120"),
-    "post_norm": ("sm120",),
-    "tmix/vres_gate": ("sm90", "sm120"),
-    "tmix/wkv_prepare": ("sm120",),
-    "tmix/wkv7": ("sm90", "sm120"),
-    "tmix/wkv7/rl_infctx": ("sm90", "sm120"),
-}
 RACECHECK_TARGETS = {
     "cmix",
     "embedding",
@@ -77,7 +60,7 @@ BENCHMARK_SHARED_FILES = {
     "ci/benchmark_gate.py",
 }
 SHARED_PRIMITIVE_CALLERS = {
-    "csrc/sm120/internal/linear/": (
+    "csrc/sm80/internal/linear/": (
         "cmix",
         "head/linear",
         "tmix/readout",
@@ -115,8 +98,7 @@ class Impact:
     head_sha: str
     change_class: str
     affected_modules: tuple[str, ...]
-    affected_sm90_modules: tuple[str, ...]
-    affected_sm120_modules: tuple[str, ...]
+    affected_cuda_modules: tuple[str, ...]
     run_gpu: bool
     run_benchmark: bool
     run_sanitizer: bool
@@ -141,7 +123,7 @@ def _target_from_path(path: str, prefix: str) -> str | None:
 
 def validate_layout(root: Path = ROOT) -> None:
     missing: list[str] = []
-    backend_mismatches: list[str] = []
+    source_mismatches: list[str] = []
     for module in MODULES:
         for owner, filename in (
             ("flashrwkv2", "__init__.py"),
@@ -151,32 +133,22 @@ def validate_layout(root: Path = ROOT) -> None:
             candidate = root / owner / module / filename
             if not candidate.is_file():
                 missing.append(str(candidate.relative_to(root)))
-        for architecture in ("sm90", "sm120"):
-            source_root = root / "csrc" / architecture / module
-            has_sources = source_root.is_dir() and any(
-                path.suffix in {".cpp", ".cu"}
-                for path in source_root.rglob("*")
-                if path.is_file()
-            )
-            expected = architecture in BACKENDS_BY_TARGET[module]
-            if has_sources != expected:
-                backend_mismatches.append(
-                    f"{module}/{architecture}: expected_sources={expected}, "
-                    f"actual_sources={has_sources}"
-                )
+        source_root = root / "csrc/sm80" / module
+        if not source_root.is_dir() or not any(
+            path.suffix in {".cpp", ".cu"}
+            for path in source_root.rglob("*")
+            if path.is_file()
+        ):
+            source_mismatches.append(f"{module}/sm80")
 
     for candidate in (
         root / "flashrwkv2/tmix/wkv7/rl_infctx.py",
         root / "tests/tmix/wkv7/rl_infctx/test.py",
         root / "benchmarks/tmix/wkv7/rl_infctx/bench.py",
-        root / "csrc/sm90/tmix/wkv7/rl_infctx_chunk_fp32io16_forward.cpp",
-        root / "csrc/sm90/tmix/wkv7/rl_infctx_chunk_fp32io16_forward.cu",
-        root / "csrc/sm90/tmix/wkv7/rl_infctx_chunk_fp32io16_backward.cpp",
-        root / "csrc/sm90/tmix/wkv7/rl_infctx_chunk_fp32io16_backward.cu",
-        root / "csrc/sm120/tmix/wkv7/rl_infctx_chunk_fp32io16_forward.cpp",
-        root / "csrc/sm120/tmix/wkv7/rl_infctx_chunk_fp32io16_forward.cu",
-        root / "csrc/sm120/tmix/wkv7/rl_infctx_chunk_fp32io16_backward.cpp",
-        root / "csrc/sm120/tmix/wkv7/rl_infctx_chunk_fp32io16_backward.cu",
+        root / "csrc/sm80/tmix/wkv7/rl_infctx_chunk_fp32io16_forward.cpp",
+        root / "csrc/sm80/tmix/wkv7/rl_infctx_chunk_fp32io16_forward.cu",
+        root / "csrc/sm80/tmix/wkv7/rl_infctx_chunk_fp32io16_backward.cpp",
+        root / "csrc/sm80/tmix/wkv7/rl_infctx_chunk_fp32io16_backward.cu",
     ):
         if not candidate.is_file():
             missing.append(str(candidate.relative_to(root)))
@@ -197,8 +169,8 @@ def validate_layout(root: Path = ROOT) -> None:
     errors = []
     if missing:
         errors.append("missing paths: " + ", ".join(missing))
-    if backend_mismatches:
-        errors.append("backend ownership: " + ", ".join(backend_mismatches))
+    if source_mismatches:
+        errors.append("CUDA source ownership: " + ", ".join(source_mismatches))
     if missing_docs:
         errors.append(
             "missing csrc docs: " + ", ".join(map(str, missing_docs))
@@ -222,8 +194,7 @@ def classify(
         sorted({path.strip().removeprefix("./") for path in paths if path.strip()})
     )
     modules: set[str] = set()
-    sm90_modules: set[str] = set()
-    sm120_modules: set[str] = set()
+    cuda_modules: set[str] = set()
     reasons: list[str] = []
     run_gpu = False
     run_benchmark = False
@@ -237,8 +208,7 @@ def classify(
             head_sha=head_sha,
             change_class="release_metadata",
             affected_modules=(),
-            affected_sm90_modules=(),
-            affected_sm120_modules=(),
+            affected_cuda_modules=(),
             run_gpu=True,
             run_benchmark=False,
             run_sanitizer=False,
@@ -266,9 +236,7 @@ def classify(
             continue
         if path in BENCHMARK_SHARED_FILES:
             modules.update(MODULES)
-            sm120_modules.update(
-                module for module in MODULES if "sm120" in BACKENDS_BY_TARGET[module]
-            )
+            cuda_modules.update(MODULES)
             run_gpu = run_benchmark = True
             reasons.append("shared-benchmark-behavior")
             continue
@@ -291,7 +259,7 @@ def classify(
         )
         if shared_callers is not None:
             modules.update(shared_callers)
-            sm120_modules.update(shared_callers)
+            cuda_modules.update(shared_callers)
             run_gpu = run_benchmark = run_sanitizer = True
             reasons.append(f"shared-primitive:{path}")
             continue
@@ -312,19 +280,7 @@ def classify(
         if module:
             modules.add(module)
             run_gpu = True
-            if owner == "csrc":
-                architecture = path.split("/", 2)[1]
-                if architecture == "sm90":
-                    sm90_modules.add(module)
-                elif architecture == "sm120":
-                    sm120_modules.add(module)
-                else:
-                    run_all = True
-            else:
-                if "sm90" in BACKENDS_BY_TARGET[module]:
-                    sm90_modules.add(module)
-                if "sm120" in BACKENDS_BY_TARGET[module]:
-                    sm120_modules.add(module)
+            cuda_modules.add(module)
             if owner in {"flashrwkv2", "benchmarks", "csrc"}:
                 run_benchmark = True
             if owner == "csrc" and suffix in {".cpp", ".cu", ".cuh", ".h", ".hpp"}:
@@ -342,15 +298,9 @@ def classify(
 
     if run_all:
         modules = set(TARGETS)
-        sm90_modules = {
-            module for module in TARGETS if "sm90" in BACKENDS_BY_TARGET[module]
-        }
-        sm120_modules = {
-            module for module in TARGETS if "sm120" in BACKENDS_BY_TARGET[module]
-        }
+        cuda_modules = set(TARGETS)
     affected_modules = tuple(sorted(modules))
-    affected_sm90_modules = tuple(sorted(sm90_modules))
-    affected_sm120_modules = tuple(sorted(sm120_modules))
+    affected_cuda_modules = tuple(sorted(cuda_modules))
     if not changed:
         change_class = "empty"
     elif only_docs and not run_gpu:
@@ -371,8 +321,7 @@ def classify(
         head_sha=head_sha,
         change_class=change_class,
         affected_modules=affected_modules,
-        affected_sm90_modules=affected_sm90_modules,
-        affected_sm120_modules=affected_sm120_modules,
+        affected_cuda_modules=affected_cuda_modules,
         run_gpu=run_gpu,
         run_benchmark=run_benchmark,
         run_sanitizer=run_sanitizer,
@@ -504,24 +453,13 @@ def _write_github_outputs(path: Path, impact: Impact, artifact_path: Path) -> No
         "head_sha": impact.head_sha,
         "change_class": impact.change_class,
         "affected_modules": json.dumps(impact.affected_modules, separators=(",", ":")),
-        "affected_sm90_modules": json.dumps(
-            impact.affected_sm90_modules, separators=(",", ":")
+        "affected_cuda_modules": json.dumps(
+            impact.affected_cuda_modules, separators=(",", ":")
         ),
-        "affected_sm120_modules": json.dumps(
-            impact.affected_sm120_modules, separators=(",", ":")
-        ),
-        "sm90_racecheck_modules": json.dumps(
+        "cuda_racecheck_modules": json.dumps(
             tuple(
                 module
-                for module in impact.affected_sm90_modules
-                if module in RACECHECK_TARGETS
-            ),
-            separators=(",", ":"),
-        ),
-        "sm120_racecheck_modules": json.dumps(
-            tuple(
-                module
-                for module in impact.affected_sm120_modules
+                for module in impact.affected_cuda_modules
                 if module in RACECHECK_TARGETS
             ),
             separators=(",", ":"),
@@ -548,38 +486,26 @@ def _self_test() -> None:
         and test.run_gpu
         and not test.run_benchmark
     )
-    assert test.affected_sm90_modules == ()
-    assert test.affected_sm120_modules == ("tmix/wkv_prepare",)
-    native = classify(["csrc/sm120/tmix/wkv7/infer_recurrent_fp16_forward_varlen.cu"])
+    assert test.affected_cuda_modules == ("tmix/wkv_prepare",)
+    native = classify(["csrc/sm80/tmix/wkv7/infer_recurrent_fp16_forward_varlen.cu"])
     assert (
         native.affected_modules == ("tmix/wkv7",)
         and native.run_sanitizer
         and native.run_benchmark
     )
-    assert native.affected_sm90_modules == ()
-    assert native.affected_sm120_modules == ("tmix/wkv7",)
+    assert native.affected_cuda_modules == ("tmix/wkv7",)
     assert "tmix/wkv7" in RACECHECK_TARGETS
     benchmark = classify(["benchmarks/cmix/bench.py"])
     assert benchmark.affected_modules == ("cmix",) and benchmark.run_benchmark
     rl_infctx = classify(
-        ["csrc/sm90/tmix/wkv7/rl_infctx_chunk_fp32io16_forward.cu"]
+        ["csrc/sm80/tmix/wkv7/rl_infctx_chunk_fp32io16_forward.cu"]
     )
     assert rl_infctx.affected_modules == ("tmix/wkv7/rl_infctx",)
-    assert rl_infctx.affected_sm90_modules == ("tmix/wkv7/rl_infctx",)
-    assert rl_infctx.affected_sm120_modules == ()
+    assert rl_infctx.affected_cuda_modules == ("tmix/wkv7/rl_infctx",)
     assert rl_infctx.run_benchmark and rl_infctx.run_sanitizer
-    native_rl_infctx = classify(
-        ["csrc/sm120/tmix/wkv7/rl_infctx_chunk_fp32io16_forward.cu"]
-    )
-    assert native_rl_infctx.affected_modules == ("tmix/wkv7/rl_infctx",)
-    assert native_rl_infctx.affected_sm90_modules == ()
-    assert native_rl_infctx.affected_sm120_modules == ("tmix/wkv7/rl_infctx",)
-    assert native_rl_infctx.run_benchmark and native_rl_infctx.run_sanitizer
     shared = classify(["setup.py"])
     assert shared.run_all and shared.affected_modules == tuple(sorted(TARGETS))
-    assert "embedding" not in shared.affected_sm90_modules
-    assert "head/linear" not in shared.affected_sm90_modules
-    assert "head/l2wrap_ce" in shared.affected_sm120_modules
+    assert shared.affected_cuda_modules == tuple(sorted(TARGETS))
     test_utils = classify(["tests/utils.py"])
     assert test_utils.run_all and test_utils.run_gpu and test_utils.run_sanitizer
     assert not test_utils.run_benchmark
@@ -590,13 +516,12 @@ def _self_test() -> None:
     assert not runtime.run_gpu and runtime.change_class == "metadata"
     benchmark_shared = classify(["benchmarks/_timing.py"])
     assert benchmark_shared.run_benchmark and not benchmark_shared.run_sanitizer
-    assert benchmark_shared.affected_sm90_modules == ()
-    assert benchmark_shared.affected_sm120_modules
-    primitive = classify(["csrc/sm120/internal/linear/backend.cuh"])
+    assert benchmark_shared.affected_cuda_modules
+    primitive = classify(["csrc/sm80/internal/linear/backend.cuh"])
     assert primitive.affected_modules == tuple(
-        sorted(SHARED_PRIMITIVE_CALLERS["csrc/sm120/internal/linear/"])
+        sorted(SHARED_PRIMITIVE_CALLERS["csrc/sm80/internal/linear/"])
     )
-    assert primitive.affected_sm90_modules == ()
+    assert primitive.affected_cuda_modules == primitive.affected_modules
     assert primitive.run_sanitizer and not primitive.run_all
     unknown = classify(["flashrwkv2/new_family.py"])
     assert unknown.run_all and unknown.run_sanitizer

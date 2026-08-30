@@ -53,7 +53,7 @@ def _reference(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.sm120
+@pytest.mark.cuda
 @pytest.mark.memcheck
 @pytest.mark.racecheck
 def test_chunk_ragged_tail_and_slot_update() -> None:
@@ -109,7 +109,7 @@ def test_chunk_ragged_tail_and_slot_update() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.sm120
+@pytest.mark.cuda
 def test_chunk_rejects_non_bf16() -> None:
     device = torch.device("cuda")
     shape = (1, 1, 64)
@@ -125,7 +125,7 @@ def test_chunk_rejects_non_bf16() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.sm120
+@pytest.mark.cuda
 def test_chunk_rejects_duplicate_slots_without_state_write() -> None:
     device = torch.device("cuda")
     shape = (2, 1, 64)
@@ -143,7 +143,7 @@ def test_chunk_rejects_duplicate_slots_without_state_write() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.sm120
+@pytest.mark.cuda
 @pytest.mark.cuda_graph
 def test_chunk_cuda_graph_consumes_live_metadata_ticket() -> None:
     torch.manual_seed(23)
