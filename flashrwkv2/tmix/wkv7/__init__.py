@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 from itertools import pairwise
 
 import torch
@@ -95,7 +94,6 @@ def _extension():
 
 def _validate_packed_inputs(
     *tensors: torch.Tensor,
-    required_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, ...]:
     names = ("r", "decay_logits", "k", "v", "a", "b")
     for name, tensor in zip(names, tensors):
@@ -105,21 +103,6 @@ def _validate_packed_inputs(
             raise ValueError(f"{name} must have packed shape [total_tokens,H,D]")
         if not tensor.is_contiguous():
             raise ValueError(f"{name} must be contiguous")
-    reference = tensors[0]
-    if not reference.is_cuda:
-        raise ValueError("recurrent token tensors must be CUDA")
-    if any(tensor.shape != reference.shape for tensor in tensors[1:]):
-        raise RuntimeError("r,decay_logits,k,v,a,b shape mismatch")
-    if required_dtype is not None and any(
-        tensor.dtype != required_dtype for tensor in tensors
-    ):
-        raise TypeError("FP16-state token tensors must have dtype float16")
-    if reference.dtype not in {torch.float16, torch.bfloat16}:
-        raise RuntimeError("token tensors must be float16 or bfloat16")
-    if any(tensor.dtype != reference.dtype for tensor in tensors[1:]):
-        raise RuntimeError("r,decay_logits,k,v,a,b dtype mismatch")
-    if any(tensor.device != reference.device for tensor in tensors[1:]):
-        raise RuntimeError("recurrent token tensors must be on the same device")
     return tensors
 
 
@@ -138,41 +121,6 @@ def _validate_state(state: torch.Tensor) -> None:
         or state.shape[2] != state.shape[3]
     ):
         raise ValueError("state_pool must have shape [state_pool_slots,H,D,D]")
-
-
-def _validate_recurrent_launch(
-    packed: tuple[torch.Tensor, ...],
-    state_pool: torch.Tensor,
-    scale: float,
-    decay_bias: torch.Tensor | None,
-) -> None:
-    r = packed[0]
-    head_size = state_pool.shape[2]
-    if head_size not in {64, 128, 256}:
-        raise RuntimeError(
-            f"recurrent head size must be 64, 128, or 256, got {head_size}"
-        )
-    if r.shape[1:] != state_pool.shape[1:3]:
-        raise RuntimeError("r must have shape [total_tokens,H,D] matching state")
-    if r.device != state_pool.device:
-        raise RuntimeError("recurrent token tensors must be on the same device as state")
-    if not math.isfinite(float(scale)):
-        raise RuntimeError("scale must be finite")
-    if decay_bias is None:
-        return
-    if not isinstance(decay_bias, torch.Tensor):
-        raise TypeError("decay_bias must be a torch.Tensor or None")
-    if not decay_bias.is_cuda or not decay_bias.is_contiguous():
-        raise ValueError("decay_bias must be contiguous CUDA")
-    if decay_bias.device != state_pool.device:
-        raise RuntimeError("decay_bias must be on the same device as state")
-    if decay_bias.dtype != r.dtype:
-        raise TypeError("decay_bias must match the token tensor dtype")
-    if decay_bias.shape not in {
-        (state_pool.shape[1] * head_size,),
-        (state_pool.shape[1], head_size),
-    }:
-        raise ValueError("decay_bias must have shape [H*D] or [H,D]")
 
 
 def _validate_fp16_state(state: torch.Tensor) -> None:
@@ -1058,9 +1006,12 @@ def _run_fp32io16(
     max_seqlen: int | None,
     validated_metadata: object | None,
 ) -> torch.Tensor:
-    packed = (r, decay_logits, k, v, a, b)
-    _validate_state(state)
-    _validate_recurrent_launch(packed, state, scale, decay_bias)
+    if validated_metadata is None:
+        packed = _validate_packed_inputs(r, decay_logits, k, v, a, b)
+        _validate_state(state)
+        _check_metadata_inputs(cu_seqlens, state_indices)
+    else:
+        packed = (r, decay_logits, k, v, a, b)
     ticket = (
         validated_metadata
         if validated_metadata is not None
@@ -1160,8 +1111,7 @@ def infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
             "prepare_tmix_wkv7_recurrent_fp32io16_state or "
             "prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor"
         )
-    packed = _validate_packed_inputs(r, decay_logits, k, v, a, b)
-    _check_metadata_inputs(cu_seqlens, state_indices)
+    packed = (r, decay_logits, k, v, a, b)
     launch_max_seqlen = _dispatch_max_seqlen(max_seqlen, validated_metadata)
     use_deltalog = (
         state._merge_interval != 0
@@ -1259,10 +1209,7 @@ def infer_tmix_wkv7_recurrent_fp16_forward_varlen(
             "state must come from prepare_tmix_wkv7_recurrent_fp16_state"
         )
 
-    packed = _validate_packed_inputs(
-        r, decay_logits, k, v, a, b, required_dtype=torch.float16
-    )
-    _check_metadata_inputs(cu_seqlens, state_indices)
+    packed = (r, decay_logits, k, v, a, b)
     launch_max_seqlen = _dispatch_max_seqlen(max_seqlen, validated_metadata)
     use_deltalog = (
         state._merge_interval != 0
@@ -1327,10 +1274,13 @@ def _run_fp16(
 ) -> torch.Tensor:
     """Run the private ordinary FP16 implementation."""
 
-    packed = (r, decay_logits, k, v, a, b)
-    _validate_fp16_state(state_pool)
-    _validate_fp16_elapsed_state(elapsed_state_pool, state_pool)
-    _validate_recurrent_launch(packed, state_pool, scale, decay_bias)
+    if validated_metadata is None:
+        packed = _validate_packed_inputs(r, decay_logits, k, v, a, b)
+        _validate_fp16_state(state_pool)
+        _validate_fp16_elapsed_state(elapsed_state_pool, state_pool)
+        _check_metadata_inputs(cu_seqlens, state_indices)
+    else:
+        packed = (r, decay_logits, k, v, a, b)
     launch_max_seqlen = _validate_launch_max_seqlen(max_seqlen)
     ticket = (
         validated_metadata

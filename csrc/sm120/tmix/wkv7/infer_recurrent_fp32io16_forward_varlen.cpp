@@ -30,6 +30,7 @@ void tmix_wkv7_recurrent_fp32_from_decay_logits_cuda(
 
 using flashrwkv2::validation::check_cuda_contiguous;
 using flashrwkv2::validation::check_same_device;
+using flashrwkv2::validation::check_recurrent_layout;
 using flashrwkv2::validation::prepare_recurrent_graph_metadata_cuda;
 using flashrwkv2::validation::prepare_recurrent_metadata_cuda;
 
@@ -143,6 +144,26 @@ void tmix_wkv7_recurrent_fp32_from_decay_logits(
     std::optional<torch::stable::Tensor> decay_bias,
     torch::stable::Tensor metadata_status,
     int64_t max_seqlen) {
+  check_recurrent_layout(
+      query_start_loc, state_indices, state, r, decay_logits, k, v, a, b,
+      output, scale);
+
+  if (decay_bias.has_value()) {
+    check_cuda_contiguous(*decay_bias, "decay_bias");
+    check_same_device(state, *decay_bias, "decay_bias");
+    STD_TORCH_CHECK(
+        decay_bias->scalar_type() == r.scalar_type(),
+        "decay_bias must match the token tensor dtype");
+    const int64_t num_heads = state.size(1);
+    const int64_t head_size = state.size(2);
+    STD_TORCH_CHECK(
+        (decay_bias->dim() == 1 &&
+         decay_bias->numel() == num_heads * head_size) ||
+            (decay_bias->dim() == 2 && decay_bias->size(0) == num_heads &&
+             decay_bias->size(1) == head_size),
+        "decay_bias must have shape [H*D] or [H,D]");
+  }
+
   tmix_wkv7_recurrent_fp32_from_decay_logits_cuda(
       query_start_loc, state_indices, state, r, decay_logits,
       decay_bias.value_or(torch::stable::Tensor()), k, v, a, b, output,
