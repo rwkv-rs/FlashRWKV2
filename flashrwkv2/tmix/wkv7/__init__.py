@@ -93,7 +93,10 @@ def _extension():
     return torch.ops.flashrwkv2
 
 
-def _validate_packed_inputs(*tensors: torch.Tensor) -> tuple[torch.Tensor, ...]:
+def _validate_packed_inputs(
+    *tensors: torch.Tensor,
+    required_dtype: torch.dtype | None = None,
+) -> tuple[torch.Tensor, ...]:
     names = ("r", "decay_logits", "k", "v", "a", "b")
     for name, tensor in zip(names, tensors):
         if not isinstance(tensor, torch.Tensor):
@@ -107,6 +110,10 @@ def _validate_packed_inputs(*tensors: torch.Tensor) -> tuple[torch.Tensor, ...]:
         raise ValueError("recurrent token tensors must be CUDA")
     if any(tensor.shape != reference.shape for tensor in tensors[1:]):
         raise RuntimeError("r,decay_logits,k,v,a,b shape mismatch")
+    if required_dtype is not None and any(
+        tensor.dtype != required_dtype for tensor in tensors
+    ):
+        raise TypeError("FP16-state token tensors must have dtype float16")
     if reference.dtype not in {torch.float16, torch.bfloat16}:
         raise RuntimeError("token tensors must be float16 or bfloat16")
     if any(tensor.dtype != reference.dtype for tensor in tensors[1:]):
@@ -1252,9 +1259,9 @@ def infer_tmix_wkv7_recurrent_fp16_forward_varlen(
             "state must come from prepare_tmix_wkv7_recurrent_fp16_state"
         )
 
-    packed = _validate_packed_inputs(r, decay_logits, k, v, a, b)
-    if any(tensor.dtype != torch.float16 for tensor in packed):
-        raise TypeError("FP16-state token tensors must have dtype float16")
+    packed = _validate_packed_inputs(
+        r, decay_logits, k, v, a, b, required_dtype=torch.float16
+    )
     _check_metadata_inputs(cu_seqlens, state_indices)
     launch_max_seqlen = _dispatch_max_seqlen(max_seqlen, validated_metadata)
     use_deltalog = (
