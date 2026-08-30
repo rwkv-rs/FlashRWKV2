@@ -1134,8 +1134,14 @@ def test_public_state_preparation_owns_complete_zeroed_allocation(
     prepare,
     state_dtype: torch.dtype,
     has_elapsed: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _require_cuda_extension()
+    monkeypatch.setattr(
+        wkv7_module,
+        "_select_deltalog_merge_interval",
+        lambda *_: 2,
+    )
     state = prepare(
         9,
         4096,
@@ -2055,8 +2061,15 @@ def test_deltalog_native_launcher_is_private_provider_detail() -> None:
         )
 
 
-def test_unified_fp16_exact_policy_and_complete_state_lifecycle() -> None:
+def test_unified_fp16_exact_policy_and_complete_state_lifecycle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     _require_deltalog_extension()
+    monkeypatch.setattr(
+        wkv7_module,
+        "_select_deltalog_merge_interval",
+        lambda *_: 2,
+    )
     (
         steps,
         cu_seqlens,
@@ -2120,8 +2133,15 @@ def test_unified_fp16_exact_policy_and_complete_state_lifecycle() -> None:
     assert _relative_rmse(selected_state, ordinary_state) <= 4.0e-3
 
 
-def test_unified_fp32io16_exact_policy_and_complete_state_lifecycle() -> None:
+def test_unified_fp32io16_exact_policy_and_complete_state_lifecycle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     _require_fp32io16_deltalog_extension()
+    monkeypatch.setattr(
+        wkv7_module,
+        "_select_deltalog_merge_interval",
+        lambda *_: 2,
+    )
     (
         steps,
         cu_seqlens,
@@ -2459,10 +2479,25 @@ def test_unified_state_materialize_and_pending_log_fallback(
         assert torch.equal(selected_elapsed, ordinary_elapsed)
 
 
-def test_state_prepare_uses_mode_specific_profitable_policy() -> None:
+def test_state_prepare_uses_mode_specific_profitable_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     _require_deltalog_extension()
     _require_fp32io16_deltalog_extension()
     sequence_capacity, num_heads, head_size = 64, 12, 64
+    assert (
+        wkv7_module._select_deltalog_merge_interval(
+            768, sequence_capacity, head_size, (12, 0), "fp16"
+        )
+        == 0
+    )
+    assert (
+        wkv7_module._select_deltalog_merge_interval(
+            768, sequence_capacity, head_size, (12, 0), "fp32io16"
+        )
+        == 3
+    )
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (8, 9))
     fp16_state_pool = torch.zeros(
         (sequence_capacity, num_heads, head_size, head_size),
         device="cuda",
@@ -2485,17 +2520,25 @@ def test_state_prepare_uses_mode_specific_profitable_policy() -> None:
     assert fp16_state._merge_interval == 0
     assert fp16_state._deltalog_phase_pool is None
     assert fp16_state._deltalog_pool is None
-    assert fp32io16_state._merge_interval == 3
-    assert fp32io16_state._deltalog_phase_pool is not None
-    assert fp32io16_state._deltalog_pool is not None
+    assert fp32io16_state._merge_interval == 0
+    assert fp32io16_state._deltalog_phase_pool is None
+    assert fp32io16_state._deltalog_pool is None
 
 
 @pytest.mark.parametrize("operator", ("fp16", "fp32io16"))
-def test_unified_deltalog_policy_falls_back_for_non_t1(operator: str) -> None:
+def test_unified_deltalog_policy_falls_back_for_non_t1(
+    operator: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     if operator == "fp16":
         _require_deltalog_extension()
     else:
         _require_fp32io16_deltalog_extension()
+    monkeypatch.setattr(
+        wkv7_module,
+        "_select_deltalog_merge_interval",
+        lambda *_: 2,
+    )
     case = _make_case(
         dtype=torch.float16,
         head_size=64,
@@ -2569,8 +2612,15 @@ def test_unified_deltalog_policy_falls_back_for_non_t1(operator: str) -> None:
     assert _relative_rmse(selected_state, ordinary_state) <= 4.0e-3
 
 
-def test_unified_fp32io16_deltalog_policy_falls_back_for_bf16_io() -> None:
+def test_unified_fp32io16_deltalog_policy_falls_back_for_bf16_io(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     _require_fp32io16_deltalog_extension()
+    monkeypatch.setattr(
+        wkv7_module,
+        "_select_deltalog_merge_interval",
+        lambda *_: 2,
+    )
     case = _make_case(
         dtype=torch.bfloat16,
         head_size=64,

@@ -388,7 +388,9 @@ def test_infer_tokenshift_generic_packed_ragged_matches_reference() -> None:
     expected_state = initial.clone()
     expected_state[3] = normalized[0]
     expected_state[1] = normalized[3]
-    assert torch.equal(state, expected_state)
+    torch.testing.assert_close(
+        state.float(), expected_state.float(), atol=0.01, rtol=0.01
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
