@@ -9,6 +9,7 @@ on:
 permissions:
   actions: read
   contents: read
+  pull-requests: read
 
 concurrency:
   group: flashrwkv2-quality-${{ github.event.pull_request.number || github.ref }}
@@ -25,11 +26,35 @@ jobs:
       run_gpu: ${{ steps.plan.outputs.run_gpu }}
       affected_cuda_modules: ${{ steps.plan.outputs.affected_cuda_modules }}
       cuda_racecheck_modules: ${{ steps.plan.outputs.cuda_racecheck_modules }}
+      trusted: ${{ steps.trust.outputs.trusted }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Resolve GPU trust boundary
+        id: trust
+        uses: actions/github-script@v7
+        with:
+          script: |
+            if (context.eventName !== 'pull_request') {
+              core.setOutput('trusted', 'true');
+              return;
+            }
+            const pull = context.payload.pull_request;
+            const trustedAssociations = new Set(['OWNER', 'MEMBER', 'COLLABORATOR']);
+            const trustedPermissions = new Set(['admin', 'maintain', 'write']);
+            let trusted = pull.head.repo?.full_name === process.env.GITHUB_REPOSITORY &&
+              trustedAssociations.has(pull.author_association);
+            if (!trusted && pull.head.repo?.full_name === process.env.GITHUB_REPOSITORY &&
+                pull.author_association === 'CONTRIBUTOR') {
+              const {data} = await github.rest.repos.getCollaboratorPermissionLevel({
+                ...context.repo,
+                username: pull.user.login,
+              });
+              trusted = trustedPermissions.has(data.permission);
+            }
+            core.setOutput('trusted', String(trusted));
       - name: Validate CI contracts and create plan
         id: plan
         env:
@@ -45,6 +70,7 @@ jobs:
             --head "$(git rev-parse HEAD)" \
             --output artifacts/plan.json \
             --github-output "$GITHUB_OUTPUT"
+          echo "base_sha=$BASE_SHA" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
         with:
           name: flashrwkv2-plan-v5-${{ steps.plan.outputs.source_tree_sha }}
@@ -157,9 +183,7 @@ jobs:
   untrusted:
     name: Reject untrusted GPU revision
     if: >-
-      needs.plan.outputs.run_gpu == 'true' && github.event_name == 'pull_request' &&
-      (github.event.pull_request.head.repo.full_name != github.repository ||
-       !contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association))
+      needs.plan.outputs.run_gpu == 'true' && needs.plan.outputs.trusted != 'true'
     needs: plan
     runs-on: ubuntu-latest
     steps:
@@ -170,10 +194,7 @@ jobs:
   torch-source-compatibility:
     name: Torch ${{ matrix.torch }} runtime build
     if: >-
-      needs.plan.outputs.run_gpu == 'true' &&
-      (github.event_name != 'pull_request' ||
-       (github.event.pull_request.head.repo.full_name == github.repository &&
-        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association)))
+      needs.plan.outputs.run_gpu == 'true' && needs.plan.outputs.trusted == 'true'
     needs: [plan, contract, package]
     runs-on: [self-hosted, linux, x64, rwkv-sha-pro6000x8]
     timeout-minutes: 180
