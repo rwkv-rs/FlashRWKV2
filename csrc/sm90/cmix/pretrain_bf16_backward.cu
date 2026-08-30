@@ -15,6 +15,35 @@
 
 namespace {
 
+void gemm_bf16(
+    const torch::stable::Tensor& left,
+    const torch::stable::Tensor& right,
+    torch::stable::Tensor& output,
+    int64_t m,
+    int64_t n,
+    int64_t k,
+    bool transpose_left,
+    bool transpose_right) {
+  const float alpha = 1.0f;
+  const float beta = 0.0f;
+  const cublasStatus_t status = cublasGemmEx(
+      flashrwkv2::validation::current_cuda_blas_handle(),
+      transpose_right ? CUBLAS_OP_T : CUBLAS_OP_N,
+      transpose_left ? CUBLAS_OP_T : CUBLAS_OP_N,
+      static_cast<int>(n), static_cast<int>(m), static_cast<int>(k),
+      &alpha,
+      right.const_data_ptr<torch::headeronly::BFloat16>(), CUDA_R_16BF,
+      static_cast<int>(right.size(-1)),
+      left.const_data_ptr<torch::headeronly::BFloat16>(), CUDA_R_16BF,
+      static_cast<int>(left.size(-1)),
+      &beta,
+      output.mutable_data_ptr<torch::headeronly::BFloat16>(), CUDA_R_16BF,
+      static_cast<int>(n), CUBLAS_COMPUTE_32F,
+      CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+  STD_TORCH_CHECK(status == CUBLAS_STATUS_SUCCESS, "CMix BF16 GEMM failed");
+}
+
+
 __device__ inline __nv_bfloat162 load_bf16x2(const torch::headeronly::BFloat16* ptr) {
     return *reinterpret_cast<const __nv_bfloat162*>(ptr);
 }
@@ -286,27 +315,31 @@ std::vector<torch::stable::Tensor> pretrain_cmix_backward_cuda(
     torch::stable::Tensor value_weight,
     torch::stable::Tensor mixed,
     torch::stable::Tensor act) {
-    auto grad_out_2d = torch::stable::contiguous(
-        torch::stable::view(grad_out, {-1, grad_out.size(2)}));
-    auto mixed_2d = torch::stable::contiguous(
-        torch::stable::view(mixed, {-1, mixed.size(2)}));
-
-    auto grad_out_t = torch::stable::transpose(grad_out_2d, 0, 1);
-    auto grad_value_weight = torch::stable::matmul(grad_out_t, act);
-    auto grad_hidden = torch::stable::contiguous(
-        torch::stable::matmul(grad_out_2d, value_weight));
+    const int64_t bt_size = grad_out.size(0) * grad_out.size(1);
+    auto grad_value_weight = torch::stable::empty_like(value_weight);
+    gemm_bf16(
+        grad_out, act, grad_value_weight, grad_out.size(2), act.size(1),
+        bt_size, true, false);
+    auto grad_hidden = torch::stable::new_empty(
+        grad_out, {bt_size, value_weight.size(1)});
+    gemm_bf16(
+        grad_out, value_weight, grad_hidden, bt_size, value_weight.size(1),
+        grad_out.size(2), false, false);
     relu_sq_backward_from_output_inplace_cuda(grad_hidden, act);
-    auto grad_hidden_t = torch::stable::transpose(grad_hidden, 0, 1);
-    auto grad_key_weight = torch::stable::matmul(grad_hidden_t, mixed_2d);
-    auto grad_mixed_2d = torch::stable::contiguous(
-        torch::stable::matmul(grad_hidden, key_weight));
-    auto grad_mixed = torch::stable::view(grad_mixed_2d, x.sizes());
+    auto grad_key_weight = torch::stable::empty_like(key_weight);
+    gemm_bf16(
+        grad_hidden, mixed, grad_key_weight, grad_hidden.size(1), x.size(2),
+        bt_size, true, false);
+    auto grad_mixed = torch::stable::empty_like(x);
+    gemm_bf16(
+        grad_hidden, key_weight, grad_mixed, bt_size, x.size(2),
+        grad_hidden.size(1), false, false);
     auto mix_grads = cmix_tokenshift_backward_cuda(grad_mixed, x, x_k);
 
     return {
         mix_grads[0],
         mix_grads[1],
-        torch::stable::contiguous(grad_key_weight),
-        torch::stable::contiguous(grad_value_weight),
+        grad_key_weight,
+        grad_value_weight,
     };
 }

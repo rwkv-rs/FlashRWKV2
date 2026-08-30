@@ -13,6 +13,35 @@
 
 namespace {
 
+void gemm_bf16(
+    const torch::stable::Tensor& left,
+    const torch::stable::Tensor& right,
+    torch::stable::Tensor& output,
+    int64_t m,
+    int64_t n,
+    int64_t k,
+    bool transpose_left,
+    bool transpose_right) {
+  const float alpha = 1.0f;
+  const float beta = 0.0f;
+  const cublasStatus_t status = cublasGemmEx(
+      flashrwkv2::validation::current_cuda_blas_handle(),
+      transpose_right ? CUBLAS_OP_T : CUBLAS_OP_N,
+      transpose_left ? CUBLAS_OP_T : CUBLAS_OP_N,
+      static_cast<int>(n), static_cast<int>(m), static_cast<int>(k),
+      &alpha,
+      right.const_data_ptr<torch::headeronly::BFloat16>(), CUDA_R_16BF,
+      static_cast<int>(right.size(-1)),
+      left.const_data_ptr<torch::headeronly::BFloat16>(), CUDA_R_16BF,
+      static_cast<int>(left.size(-1)),
+      &beta,
+      output.mutable_data_ptr<torch::headeronly::BFloat16>(), CUDA_R_16BF,
+      static_cast<int>(n), CUBLAS_COMPUTE_32F,
+      CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+  STD_TORCH_CHECK(status == CUBLAS_STATUS_SUCCESS, "CMix BF16 GEMM failed");
+}
+
+
 __device__ inline __nv_bfloat162 load_bf16x2(const torch::headeronly::BFloat16* ptr) {
   return *reinterpret_cast<const __nv_bfloat162*>(ptr);
 }
@@ -105,13 +134,15 @@ std::vector<torch::stable::Tensor> statetune_cmix_backward_cuda(
     torch::stable::Tensor key_weight, torch::stable::Tensor value_weight,
     torch::stable::Tensor mixed, torch::stable::Tensor activation) {
   const int64_t bt_size = x.size(0) * x.size(1);
-  auto grad_output_2d = torch::stable::contiguous(
-      torch::stable::view(grad_output, {bt_size, x.size(2)}));
-  auto mixed_2d = torch::stable::view(mixed, {bt_size, x.size(2)});
-  auto grad_output_t = torch::stable::transpose(grad_output_2d, 0, 1);
-  auto grad_value_weight = torch::stable::matmul(grad_output_t, activation);
-  auto grad_hidden = torch::stable::contiguous(
-      torch::stable::matmul(grad_output_2d, value_weight));
+  auto grad_value_weight = torch::stable::empty_like(value_weight);
+  gemm_bf16(
+      grad_output, activation, grad_value_weight, grad_output.size(2),
+      activation.size(1), bt_size, true, false);
+  auto grad_hidden = torch::stable::new_empty(
+      grad_output, {bt_size, value_weight.size(1)});
+  gemm_bf16(
+      grad_output, value_weight, grad_hidden, bt_size, value_weight.size(1),
+      grad_output.size(2), false, false);
   auto stream = flashrwkv2::validation::current_cuda_stream();
   const int64_t activation_pairs = activation.numel() / 2;
   relu_square_backward_from_output_kernel<<<
@@ -119,11 +150,14 @@ std::vector<torch::stable::Tensor> statetune_cmix_backward_cuda(
       stream>>>(grad_hidden.mutable_data_ptr<torch::headeronly::BFloat16>(),
                 activation.mutable_data_ptr<torch::headeronly::BFloat16>(), activation_pairs);
   FLASHRWKV_CUDA_CHECK(cudaGetLastError());
-  auto grad_hidden_t = torch::stable::transpose(grad_hidden, 0, 1);
-  auto grad_key_weight = torch::stable::matmul(grad_hidden_t, mixed_2d);
-  auto grad_mixed_2d = torch::stable::contiguous(
-      torch::stable::matmul(grad_hidden, key_weight));
-  auto grad_mixed = torch::stable::view(grad_mixed_2d, x.sizes());
+  auto grad_key_weight = torch::stable::empty_like(key_weight);
+  gemm_bf16(
+      grad_hidden, mixed, grad_key_weight, grad_hidden.size(1), x.size(2),
+      bt_size, true, false);
+  auto grad_mixed = torch::stable::empty_like(x);
+  gemm_bf16(
+      grad_hidden, key_weight, grad_mixed, bt_size, x.size(2),
+      grad_hidden.size(1), false, false);
 
   auto grad_x = torch::stable::empty_like(x);
   auto grad_initial = torch::stable::empty_like(initial_shift);
@@ -146,7 +180,5 @@ std::vector<torch::stable::Tensor> statetune_cmix_backward_cuda(
       stream>>>(grad_x_k_fp32.mutable_data_ptr<float>(),
                 grad_x_k.mutable_data_ptr<torch::headeronly::BFloat16>(), channel_pairs);
   FLASHRWKV_CUDA_CHECK(cudaGetLastError());
-  return {grad_x, grad_initial, grad_x_k,
-          torch::stable::contiguous(grad_key_weight),
-          torch::stable::contiguous(grad_value_weight)};
+  return {grad_x, grad_initial, grad_x_k, grad_key_weight, grad_value_weight};
 }

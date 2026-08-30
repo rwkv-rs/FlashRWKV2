@@ -15,6 +15,35 @@
 
 namespace {
 
+void gemm_bf16(
+    const torch::stable::Tensor& left,
+    const torch::stable::Tensor& right,
+    torch::stable::Tensor& output,
+    int64_t m,
+    int64_t n,
+    int64_t k,
+    bool transpose_left,
+    bool transpose_right) {
+  const float alpha = 1.0f;
+  const float beta = 0.0f;
+  const cublasStatus_t status = cublasGemmEx(
+      flashrwkv2::validation::current_cuda_blas_handle(),
+      transpose_right ? CUBLAS_OP_T : CUBLAS_OP_N,
+      transpose_left ? CUBLAS_OP_T : CUBLAS_OP_N,
+      static_cast<int>(n), static_cast<int>(m), static_cast<int>(k),
+      &alpha,
+      right.const_data_ptr<torch::headeronly::BFloat16>(), CUDA_R_16BF,
+      static_cast<int>(right.size(-1)),
+      left.const_data_ptr<torch::headeronly::BFloat16>(), CUDA_R_16BF,
+      static_cast<int>(left.size(-1)),
+      &beta,
+      output.mutable_data_ptr<torch::headeronly::BFloat16>(), CUDA_R_16BF,
+      static_cast<int>(n), CUBLAS_COMPUTE_32F,
+      CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+  STD_TORCH_CHECK(status == CUBLAS_STATUS_SUCCESS, "CMix BF16 GEMM failed");
+}
+
+
 __device__ inline __nv_bfloat162 load_bf16x2(const torch::headeronly::BFloat16* ptr) {
     return *reinterpret_cast<const __nv_bfloat162*>(ptr);
 }
@@ -284,13 +313,17 @@ std::vector<torch::stable::Tensor> pretrain_cmix_forward_cuda(
     torch::stable::Tensor key_weight,
     torch::stable::Tensor value_weight) {
     auto mixed = cmix_tokenshift_forward_cuda(x, x_k);
-    auto mixed_2d = torch::stable::view(mixed, {-1, mixed.size(2)});
-    auto key_weight_t = torch::stable::transpose(key_weight, 0, 1);
-    auto act = torch::stable::contiguous(torch::stable::matmul(mixed_2d, key_weight_t));
+    const int64_t bt_size = x.size(0) * x.size(1);
+    auto act = torch::stable::new_empty(
+        x, {bt_size, key_weight.size(0)});
+    gemm_bf16(
+        mixed, key_weight, act, bt_size, key_weight.size(0), x.size(2),
+        false, true);
     relu_sq_inplace_cuda(act);
-    auto value_weight_t = torch::stable::transpose(value_weight, 0, 1);
-    auto out_2d = torch::stable::matmul(act, value_weight_t);
-    auto out = torch::stable::contiguous(torch::stable::view(
-        out_2d, {x.size(0), x.size(1), value_weight.size(0)}));
+    auto out = torch::stable::new_empty(
+        x, {x.size(0), x.size(1), value_weight.size(0)});
+    gemm_bf16(
+        act, value_weight, out, bt_size, value_weight.size(0),
+        act.size(1), false, true);
     return {out, mixed, act};
 }
