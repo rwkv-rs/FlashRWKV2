@@ -899,11 +899,12 @@ def infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
     packed = _validate_packed_inputs(r, decay_logits, k, v, a, b)
     _check_metadata_inputs(cu_seqlens, state_indices)
     launch_max_seqlen = _dispatch_max_seqlen(max_seqlen, validated_metadata)
+    launch_sequences = state_indices.numel()
     use_deltalog = (
         state._merge_interval != 0
         and r.dtype == torch.float16
-        and r.shape[0] == state._sequence_capacity
-        and state_indices.numel() == state._sequence_capacity
+        and r.shape[0] == launch_sequences
+        and 0 < launch_sequences <= state._sequence_capacity
         and launch_max_seqlen in {-1, 1}
     )
     if use_deltalog:
@@ -915,7 +916,9 @@ def infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
             state_pool=state._state_pool,
             deltalog_phase_pool=state._deltalog_phase_pool,
             deltalog_pool=state._deltalog_pool,
-            deltalog_status=state._deltalog_status,
+            deltalog_status=state._deltalog_status[
+                : 1 + 2 * launch_sequences
+            ],
             cu_seqlens=cu_seqlens,
             state_indices=state_indices,
             scale=scale,
@@ -1000,10 +1003,11 @@ def infer_tmix_wkv7_recurrent_fp16_forward_varlen(
         raise TypeError("FP16-state token tensors must have dtype float16")
     _check_metadata_inputs(cu_seqlens, state_indices)
     launch_max_seqlen = _dispatch_max_seqlen(max_seqlen, validated_metadata)
+    launch_sequences = state_indices.numel()
     use_deltalog = (
         state._merge_interval != 0
-        and r.shape[0] == state._sequence_capacity
-        and state_indices.numel() == state._sequence_capacity
+        and r.shape[0] == launch_sequences
+        and 0 < launch_sequences <= state._sequence_capacity
         and launch_max_seqlen in {-1, 1}
     )
     if use_deltalog:
@@ -1016,7 +1020,9 @@ def infer_tmix_wkv7_recurrent_fp16_forward_varlen(
             elapsed_state_pool=state._elapsed_state_pool,
             deltalog_phase_pool=state._deltalog_phase_pool,
             deltalog_pool=state._deltalog_pool,
-            deltalog_status=state._deltalog_status,
+            deltalog_status=state._deltalog_status[
+                : 1 + 2 * launch_sequences
+            ],
             cu_seqlens=cu_seqlens,
             state_indices=state_indices,
             scale=scale,

@@ -2204,6 +2204,133 @@ def test_unified_fp32io16_exact_policy_and_complete_state_lifecycle(
 
 
 @pytest.mark.parametrize("operator", ("fp16", "fp32io16"))
+@pytest.mark.parametrize("batch_size", (1, 4, 7))
+def test_unified_deltalog_supports_partial_sequence_capacity(
+    operator: str,
+    batch_size: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if operator == "fp16":
+        _require_deltalog_extension()
+    else:
+        _require_fp32io16_deltalog_extension()
+    monkeypatch.setattr(
+        wkv7_module,
+        "_select_deltalog_merge_interval",
+        lambda *_: 4,
+    )
+    (
+        steps,
+        cu_seqlens,
+        initial_state,
+        initial_elapsed,
+        _,
+        _,
+        decay_bias,
+    ) = _make_deltalog_cycle_case(
+        4,
+        batch_size=batch_size,
+        num_heads=2,
+    )
+    sequence_capacity = 8
+    state_pool_slots = initial_state.shape[0]
+    state_indices = torch.tensor(
+        [
+            (3 * sequence_index + 1) % state_pool_slots
+            for sequence_index in range(batch_size)
+        ],
+        device=initial_state.device,
+        dtype=torch.int32,
+    )
+    ordinary_state = (
+        initial_state.clone()
+        if operator == "fp16"
+        else initial_state.float()
+    )
+    selected_state = ordinary_state.clone()
+    ordinary_elapsed = initial_elapsed.clone()
+    selected_elapsed = initial_elapsed.clone()
+    if operator == "fp16":
+        selected_handle = _bind_fp16_state(
+            selected_state,
+            selected_elapsed,
+            sequence_capacity=sequence_capacity,
+        )
+
+        def run_ordinary(packed: tuple[torch.Tensor, ...]) -> torch.Tensor:
+            return wkv7_module._run_fp16(
+                *packed,
+                state_pool=ordinary_state,
+                elapsed_state_pool=ordinary_elapsed,
+                cu_seqlens=cu_seqlens,
+                state_indices=state_indices,
+                decay_bias=decay_bias,
+                max_seqlen=1,
+            )
+
+        infer = infer_tmix_wkv7_recurrent_fp16_forward_varlen
+    else:
+        selected_handle = _bind_fp32io16_state(
+            selected_state,
+            sequence_capacity=sequence_capacity,
+        )
+
+        def run_ordinary(packed: tuple[torch.Tensor, ...]) -> torch.Tensor:
+            return wkv7_module._run_fp32io16(
+                *packed,
+                state=ordinary_state,
+                cu_seqlens=cu_seqlens,
+                state_indices=state_indices,
+                scale=1.0,
+                decay_bias=decay_bias,
+                max_seqlen=1,
+                validated_metadata=None,
+            )
+
+        infer = infer_tmix_wkv7_recurrent_fp32io16_forward_varlen
+
+    status = selected_handle._deltalog_status
+    phase = selected_handle._deltalog_phase_pool
+    logs = selected_handle._deltalog_pool
+    assert status is not None
+    assert phase is not None
+    assert logs is not None
+    assert status.numel() == 1 + 2 * sequence_capacity
+    untouched = torch.tensor(
+        sorted(set(range(initial_state.shape[0])) - set(state_indices.tolist())),
+        device=initial_state.device,
+        dtype=torch.long,
+    )
+    untouched_state = selected_state.index_select(0, untouched).clone()
+
+    for packed in steps:
+        ordinary_output = run_ordinary(packed)
+        selected_output = infer(
+            *packed,
+            state=selected_handle,
+            cu_seqlens=cu_seqlens,
+            state_indices=state_indices,
+            decay_bias=decay_bias,
+            max_seqlen=1,
+        )
+        torch.cuda.synchronize()
+        assert _relative_rmse(selected_output, ordinary_output) <= 4.0e-3
+
+    selected_handle.materialize_slots_(state_indices)
+    torch.cuda.synchronize()
+    assert status.numel() == 1 + 2 * sequence_capacity
+    assert torch.count_nonzero(phase).item() == 0
+    assert torch.count_nonzero(logs).item() == 0
+    assert _relative_rmse(selected_state, ordinary_state) <= 4.0e-3
+    assert torch.equal(
+        selected_state.index_select(0, untouched),
+        untouched_state,
+    )
+    if operator == "fp16":
+        assert torch.equal(selected_elapsed, ordinary_elapsed)
+
+
+@pytest.mark.parametrize("operator", ("fp16", "fp32io16"))
 def test_unified_state_slot_checkpoint_cow_reset_and_memory(
     operator: str,
 ) -> None:
@@ -2447,18 +2574,26 @@ def test_unified_state_materialize_and_pending_log_fallback(
 
     fallback_slots = slots[4:].contiguous()
     fallback_cu = torch.arange(
-        fallback_slots.numel() + 1,
+        0,
+        2 * fallback_slots.numel() + 1,
+        2,
         device=slots.device,
         dtype=torch.int32,
     )
-    fallback_inputs = tuple(tensor[4:].contiguous() for tensor in steps[1])
+    fallback_inputs = tuple(
+        torch.stack(
+            (first[4:], second[4:]),
+            dim=1,
+        ).flatten(0, 1).contiguous()
+        for first, second in zip(steps[0], steps[1], strict=True)
+    )
     expected_output = infer(
         *fallback_inputs,
         state=ordinary_handle,
         cu_seqlens=fallback_cu,
         state_indices=fallback_slots,
         decay_bias=decay_bias,
-        max_seqlen=1,
+        max_seqlen=2,
     )
     observed_output = infer(
         *fallback_inputs,
@@ -2466,7 +2601,7 @@ def test_unified_state_materialize_and_pending_log_fallback(
         cu_seqlens=fallback_cu,
         state_indices=fallback_slots,
         decay_bias=decay_bias,
-        max_seqlen=1,
+        max_seqlen=2,
     )
     torch.cuda.synchronize()
     assert _relative_rmse(observed_output, expected_output) <= 4.0e-3
