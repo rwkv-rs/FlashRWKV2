@@ -54,6 +54,23 @@ using flashrwkv2::validation::check_cuda_contiguous;
 
 namespace {
 
+std::vector<torch::stable::Tensor> empty_like_pack(
+    const torch::stable::Tensor& reference,
+    int64_t count) {
+  auto storage = torch::stable::new_empty(
+      reference, {count * reference.numel()});
+  auto* data = storage.mutable_data_ptr<torch::headeronly::Half>();
+  std::vector<torch::stable::Tensor> outputs;
+  outputs.reserve(count);
+  for (int64_t index = 0; index < count; ++index) {
+    outputs.push_back(torch::stable::from_blob(
+        data + index * reference.numel(), reference.sizes(),
+        reference.strides(), reference.device(), reference.scalar_type(),
+        [storage](void*) mutable {}));
+  }
+  return outputs;
+}
+
 void check_tensor(
     const torch::stable::Tensor& tensor,
     int32_t device_index,
@@ -145,11 +162,7 @@ std::vector<torch::stable::Tensor> tmix_postnorm_tokenshift_forward_varlen(
   }
   auto post_norm = post_norm_forward_varlen_cuda(
       x, res, weight, bias, eps, batch_size);
-  std::vector<torch::stable::Tensor> shifted;
-  shifted.reserve(6);
-  for (int index = 0; index < 6; ++index) {
-    shifted.push_back(torch::stable::empty_like(x));
-  }
+  auto shifted = empty_like_pack(x, 6);
   tmix_tokenshift_forward_varlen(
       static_cast<int>(batch_size), static_cast<int>(total_tokens),
       static_cast<int>(channels), static_cast<int>(max_seqlen), post_norm[1],

@@ -249,17 +249,36 @@ std::vector<torch::stable::Tensor> pretrain_tmix_tokenshift_backward_cuda(
     torch::stable::Tensor x_a,
     torch::stable::Tensor x_g) {
     auto grad_x = torch::stable::empty_like(x);
-    auto grad_x_r = torch::stable::new_empty(x, {x.size(2)});
-    auto grad_x_w = torch::stable::new_empty(x, {x.size(2)});
-    auto grad_x_k = torch::stable::new_empty(x, {x.size(2)});
-    auto grad_x_v = torch::stable::new_empty(x, {x.size(2)});
-    auto grad_x_a = torch::stable::new_empty(x, {x.size(2)});
-    auto grad_x_g = torch::stable::new_empty(x, {x.size(2)});    auto grad_x_r_fp32 = torch::stable::new_zeros(x, {x.size(2)}, torch::headeronly::ScalarType::Float);
-    auto grad_x_w_fp32 = torch::stable::new_zeros(x, {x.size(2)}, torch::headeronly::ScalarType::Float);
-    auto grad_x_k_fp32 = torch::stable::new_zeros(x, {x.size(2)}, torch::headeronly::ScalarType::Float);
-    auto grad_x_v_fp32 = torch::stable::new_zeros(x, {x.size(2)}, torch::headeronly::ScalarType::Float);
-    auto grad_x_a_fp32 = torch::stable::new_zeros(x, {x.size(2)}, torch::headeronly::ScalarType::Float);
-    auto grad_x_g_fp32 = torch::stable::new_zeros(x, {x.size(2)}, torch::headeronly::ScalarType::Float);
+    auto parameter_storage = torch::stable::new_empty(x, {6 * x.size(2)});
+    auto accumulator_storage = torch::stable::new_zeros(
+        x, {6 * x.size(2)}, torch::headeronly::ScalarType::Float);
+    std::vector<torch::stable::Tensor> parameter_grads;
+    std::vector<torch::stable::Tensor> accumulators;
+    parameter_grads.reserve(6);
+    accumulators.reserve(6);
+    for (int64_t index = 0; index < 6; ++index) {
+      parameter_grads.push_back(torch::stable::from_blob(
+          parameter_storage.mutable_data_ptr<torch::headeronly::BFloat16>() +
+              index * x.size(2),
+          {x.size(2)}, {1}, x.device(), x.scalar_type(),
+          [parameter_storage](void*) mutable {}));
+      accumulators.push_back(torch::stable::from_blob(
+          accumulator_storage.mutable_data_ptr<float>() + index * x.size(2),
+          {x.size(2)}, {1}, x.device(), torch::headeronly::ScalarType::Float,
+          [accumulator_storage](void*) mutable {}));
+    }
+    auto& grad_x_r = parameter_grads[0];
+    auto& grad_x_w = parameter_grads[1];
+    auto& grad_x_k = parameter_grads[2];
+    auto& grad_x_v = parameter_grads[3];
+    auto& grad_x_a = parameter_grads[4];
+    auto& grad_x_g = parameter_grads[5];
+    auto& grad_x_r_fp32 = accumulators[0];
+    auto& grad_x_w_fp32 = accumulators[1];
+    auto& grad_x_k_fp32 = accumulators[2];
+    auto& grad_x_v_fp32 = accumulators[3];
+    auto& grad_x_a_fp32 = accumulators[4];
+    auto& grad_x_g_fp32 = accumulators[5];
 
     const int threads = 256;
     const int64_t bt_size = x.size(0) * x.size(1);

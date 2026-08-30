@@ -23,6 +23,23 @@ constexpr int LN_SMALL_THREADS = 1024;
 constexpr int LN_SMALL512_THREADS = 512;
 constexpr int LN_SMALL_C = 4096;
 
+std::vector<torch::stable::Tensor> empty_like_pack(
+    const torch::stable::Tensor& reference,
+    int64_t count) {
+  auto storage = torch::stable::new_empty(
+      reference, {count * reference.numel()});
+  auto* data = storage.mutable_data_ptr<dtype>();
+  std::vector<torch::stable::Tensor> outputs;
+  outputs.reserve(count);
+  for (int64_t index = 0; index < count; ++index) {
+    outputs.push_back(torch::stable::from_blob(
+        data + index * reference.numel(), reference.sizes(),
+        reference.strides(), reference.device(), reference.scalar_type(),
+        [storage](void*) mutable {}));
+  }
+  return outputs;
+}
+
 __device__ __forceinline__ float warp_sum(float x) {
 #pragma unroll
   for (int offset = 16; offset > 0; offset >>= 1) {
@@ -505,8 +522,9 @@ torch::stable::Tensor ln_forward_varlen_cuda(torch::stable::Tensor x, torch::sta
 }
 
 std::vector<torch::stable::Tensor> res_ln_f16_cuda(torch::stable::Tensor x, torch::stable::Tensor res, torch::stable::Tensor weight, torch::stable::Tensor bias, double eps) {
-  auto x_out = torch::stable::empty_like(x);
-  auto y = torch::stable::empty_like(x);
+  auto outputs = empty_like_pack(x, 2);
+  auto& x_out = outputs[0];
+  auto& y = outputs[1];
   const int64_t c64 = x.size(-1);
   STD_TORCH_CHECK(c64 <= INT_MAX, "C too large");
   const int C = static_cast<int>(c64);
@@ -523,7 +541,7 @@ std::vector<torch::stable::Tensor> res_ln_f16_cuda(torch::stable::Tensor x, torc
             x_out.mutable_data_ptr<dtype>(), y.mutable_data_ptr<dtype>(), rows,
             static_cast<float>(eps));
     FLASHRWKV_CUDA_CHECK(cudaGetLastError());
-    return {x_out, y};
+    return outputs;
   }
   if (C == LN_SMALL_C) {
     res_ln_f16_small_kernel<LN_SMALL512_THREADS, true, true>
@@ -533,7 +551,7 @@ std::vector<torch::stable::Tensor> res_ln_f16_cuda(torch::stable::Tensor x, torc
             x_out.mutable_data_ptr<dtype>(), y.mutable_data_ptr<dtype>(), rows,
             static_cast<float>(eps));
     FLASHRWKV_CUDA_CHECK(cudaGetLastError());
-    return {x_out, y};
+    return outputs;
   }
   res_ln_f16_kernel<<<static_cast<int>(rows), LN_THREADS, 0, stream>>>(
       C,
@@ -546,7 +564,7 @@ std::vector<torch::stable::Tensor> res_ln_f16_cuda(torch::stable::Tensor x, torc
       rows,
       static_cast<float>(eps));
   FLASHRWKV_CUDA_CHECK(cudaGetLastError());
-  return {x_out, y};
+  return outputs;
 }
 
 std::vector<torch::stable::Tensor> post_norm_forward_varlen_cuda(
@@ -563,8 +581,9 @@ std::vector<torch::stable::Tensor> post_norm_forward_varlen_cuda(
     // Welford and rows >= 192 selects cache-rounded Welford.  The caller must
     // provide the real packed batch size; guessing it from total_tokens would
     // change the Albatross policy for ragged requests.
-    auto x_out = torch::stable::empty_like(x);
-    auto y = torch::stable::empty_like(x);
+    auto outputs = empty_like_pack(x, 2);
+    auto& x_out = outputs[0];
+    auto& y = outputs[1];
     auto stream = flashrwkv2::validation::current_cuda_stream();
     if (rows < 192) {
       res_ln_f16_welford_kernel<false>
@@ -582,7 +601,7 @@ std::vector<torch::stable::Tensor> post_norm_forward_varlen_cuda(
               static_cast<float>(eps));
     }
     FLASHRWKV_CUDA_CHECK(cudaGetLastError());
-    return {x_out, y};
+    return outputs;
   }
   return res_ln_f16_cuda(x, res, weight, bias, eps);
 }
@@ -593,7 +612,36 @@ torch::stable::Tensor post_norm_output_forward_varlen_cuda(
     torch::stable::Tensor weight,
     torch::stable::Tensor bias,
     double eps) {
-  // The final output contract returns one normalized row per packed token.
-  auto outputs = res_ln_f16_cuda(x, res, weight, bias, eps);
-  return outputs[1];
+  // The final output contract does not expose the intermediate Res row.  The
+  // fused kernels finish statistics before the output pass, so the same
+  // allocation can safely receive the transient Res value and final LN value.
+  auto output = torch::stable::empty_like(x);
+  const int64_t c64 = x.size(-1);
+  STD_TORCH_CHECK(c64 <= INT_MAX, "C too large");
+  const int C = static_cast<int>(c64);
+  const int64_t rows = x.numel() / C;
+  auto stream = flashrwkv2::validation::current_cuda_stream();
+  if (C == LN_SMALL_C && rows < 1024) {
+    res_ln_f16_small_kernel<LN_SMALL512_THREADS / 2, true, true>
+        <<<static_cast<int>(rows), LN_SMALL512_THREADS / 2, 0, stream>>>(
+            x.mutable_data_ptr<dtype>(), res.mutable_data_ptr<dtype>(),
+            weight.mutable_data_ptr<dtype>(), bias.mutable_data_ptr<dtype>(),
+            output.mutable_data_ptr<dtype>(), output.mutable_data_ptr<dtype>(),
+            rows, static_cast<float>(eps));
+  } else if (C == LN_SMALL_C) {
+    res_ln_f16_small_kernel<LN_SMALL512_THREADS, true, true>
+        <<<static_cast<int>(rows), LN_SMALL512_THREADS, 0, stream>>>(
+            x.mutable_data_ptr<dtype>(), res.mutable_data_ptr<dtype>(),
+            weight.mutable_data_ptr<dtype>(), bias.mutable_data_ptr<dtype>(),
+            output.mutable_data_ptr<dtype>(), output.mutable_data_ptr<dtype>(),
+            rows, static_cast<float>(eps));
+  } else {
+    res_ln_f16_kernel<<<static_cast<int>(rows), LN_THREADS, 0, stream>>>(
+        C, x.mutable_data_ptr<dtype>(), res.mutable_data_ptr<dtype>(),
+        weight.mutable_data_ptr<dtype>(), bias.mutable_data_ptr<dtype>(),
+        output.mutable_data_ptr<dtype>(), output.mutable_data_ptr<dtype>(),
+        rows, static_cast<float>(eps));
+  }
+  FLASHRWKV_CUDA_CHECK(cudaGetLastError());
+  return output;
 }

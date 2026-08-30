@@ -190,11 +190,24 @@ std::vector<torch::stable::Tensor> statetune_tmix_tokenshift_backward_cuda(
     torch::stable::Tensor x_k, torch::stable::Tensor x_v, torch::stable::Tensor x_a,
     torch::stable::Tensor x_g) {
   auto grad_x = torch::stable::empty_like(x);
-  auto grad_initial = torch::stable::empty_like(initial_shift);  std::vector<torch::stable::Tensor> accumulators;
+  auto grad_initial = torch::stable::empty_like(initial_shift);
+  auto accumulator_storage = torch::stable::new_zeros(
+      x, {6 * x.size(2)}, torch::headeronly::ScalarType::Float);
+  auto coefficient_storage = torch::stable::new_empty(x, {6 * x.size(2)});
+  std::vector<torch::stable::Tensor> accumulators;
   std::vector<torch::stable::Tensor> coefficient_grads;
+  accumulators.reserve(6);
+  coefficient_grads.reserve(6);
   for (int i = 0; i < 6; ++i) {
-    accumulators.push_back(torch::stable::new_zeros(x, {x.size(2)}, torch::headeronly::ScalarType::Float));
-    coefficient_grads.push_back(torch::stable::new_empty(x, {x.size(2)}));
+    accumulators.push_back(torch::stable::from_blob(
+        accumulator_storage.mutable_data_ptr<float>() + i * x.size(2),
+        {x.size(2)}, {1}, x.device(), torch::headeronly::ScalarType::Float,
+        [accumulator_storage](void*) mutable {}));
+    coefficient_grads.push_back(torch::stable::from_blob(
+        coefficient_storage.mutable_data_ptr<torch::headeronly::BFloat16>() +
+            i * x.size(2),
+        {x.size(2)}, {1}, x.device(), x.scalar_type(),
+        [coefficient_storage](void*) mutable {}));
   }
   constexpr int threads = 256;
   const int64_t bc_pairs = x.size(0) * (x.size(2) / 2);

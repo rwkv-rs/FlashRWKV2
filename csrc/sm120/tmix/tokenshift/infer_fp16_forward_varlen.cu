@@ -20,6 +20,23 @@ using dtype = torch::headeronly::Half;
 
 namespace {
 
+std::vector<torch::stable::Tensor> empty_like_pack(
+    const torch::stable::Tensor& reference,
+    int64_t count) {
+  auto storage = torch::stable::new_empty(
+      reference, {count * reference.numel()});
+  auto* data = storage.mutable_data_ptr<dtype>();
+  std::vector<torch::stable::Tensor> outputs;
+  outputs.reserve(count);
+  for (int64_t index = 0; index < count; ++index) {
+    outputs.push_back(torch::stable::from_blob(
+        data + index * reference.numel(), reference.sizes(),
+        reference.strides(), reference.device(), reference.scalar_type(),
+        [storage](void*) mutable {}));
+  }
+  return outputs;
+}
+
 constexpr unsigned int kMaxGridDimYZ = 65535;
 
 inline int64_t ceil_div(int64_t n, int64_t d) {
@@ -409,9 +426,7 @@ std::vector<torch::stable::Tensor> tmix_res_ln_tokenshift_fused_forward_cuda(
     torch::stable::Tensor token_predecessor,
     torch::stable::Tensor metadata_status,
     double eps) {
-  std::vector<torch::stable::Tensor> outputs;
-  outputs.reserve(7);
-  for (int i = 0; i < 7; ++i) outputs.push_back(torch::stable::empty_like(x));
+  auto outputs = empty_like_pack(x, 7);
   // Match Albatross's C=4096 scalar-statistics launch.  The predecessor
   // descriptor changes only the previous-row address; it does not reduce the
   // channel work available to this row-owned block.

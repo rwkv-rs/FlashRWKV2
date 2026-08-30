@@ -18,9 +18,26 @@
 
 namespace {
 
-constexpr unsigned int kMaxGridDimYZ = 65535;
-
 using dtype = torch::headeronly::Half;
+
+std::vector<torch::stable::Tensor> empty_like_pack(
+    const torch::stable::Tensor& reference,
+    int64_t count) {
+  auto storage = torch::stable::new_empty(
+      reference, {count * reference.numel()});
+  auto* data = storage.mutable_data_ptr<dtype>();
+  std::vector<torch::stable::Tensor> outputs;
+  outputs.reserve(count);
+  for (int64_t index = 0; index < count; ++index) {
+    outputs.push_back(torch::stable::from_blob(
+        data + index * reference.numel(), reference.sizes(),
+        reference.strides(), reference.device(), reference.scalar_type(),
+        [storage](void*) mutable {}));
+  }
+  return outputs;
+}
+
+constexpr unsigned int kMaxGridDimYZ = 65535;
 
 __device__ inline __half2 load_h2(const dtype* ptr) {
   return *reinterpret_cast<const __half2*>(ptr);
@@ -323,8 +340,9 @@ std::vector<torch::stable::Tensor> cmix_res_ln_tokenshift_fused_forward_cuda(
     torch::stable::Tensor token_predecessor,
     torch::stable::Tensor metadata_status,
     double eps) {
-  auto res_out = torch::stable::empty_like(x);
-  auto mixed = torch::stable::empty_like(x);
+  auto outputs = empty_like_pack(x, 2);
+  auto& res_out = outputs[0];
+  auto& mixed = outputs[1];
   // Match Albatross's C=4096 scalar-statistics launch.  Packed predecessor
   // addressing does not change the per-row channel parallelism.
   res_ln_cmix_tokenshift_fused_kernel<1024><<<
@@ -336,5 +354,5 @@ std::vector<torch::stable::Tensor> cmix_res_ln_tokenshift_fused_forward_cuda(
       token_predecessor.mutable_data_ptr<int>(), metadata_status.mutable_data_ptr<int>(),
       x.size(0), static_cast<float>(eps));
   FLASHRWKV_CUDA_CHECK(cudaGetLastError());
-  return {res_out, mixed};
+  return outputs;
 }

@@ -14,6 +14,23 @@
 
 namespace {
 
+std::vector<torch::stable::Tensor> empty_like_pack(
+    const torch::stable::Tensor& reference,
+    int64_t count) {
+  auto storage = torch::stable::new_empty(
+      reference, {count * reference.numel()});
+  auto* data = storage.mutable_data_ptr<torch::headeronly::BFloat16>();
+  std::vector<torch::stable::Tensor> outputs;
+  outputs.reserve(count);
+  for (int64_t index = 0; index < count; ++index) {
+    outputs.push_back(torch::stable::from_blob(
+        data + index * reference.numel(), reference.sizes(),
+        reference.strides(), reference.device(), reference.scalar_type(),
+        [storage](void*) mutable {}));
+  }
+  return outputs;
+}
+
 __device__ inline __nv_bfloat162 load_bf16x2(const torch::headeronly::BFloat16* ptr) {
     return *reinterpret_cast<const __nv_bfloat162*>(ptr);
 }
@@ -242,12 +259,13 @@ std::vector<torch::stable::Tensor> pretrain_tmix_tokenshift_forward_cuda(
     torch::stable::Tensor x_v,
     torch::stable::Tensor x_a,
     torch::stable::Tensor x_g) {
-    auto out_r = torch::stable::empty_like(x);
-    auto out_w = torch::stable::empty_like(x);
-    auto out_k = torch::stable::empty_like(x);
-    auto out_v = torch::stable::empty_like(x);
-    auto out_a = torch::stable::empty_like(x);
-    auto out_g = torch::stable::empty_like(x);
+    auto outputs = empty_like_pack(x, 6);
+    auto& out_r = outputs[0];
+    auto& out_w = outputs[1];
+    auto& out_k = outputs[2];
+    auto& out_v = outputs[3];
+    auto& out_a = outputs[4];
+    auto& out_g = outputs[5];
     const int threads = 256;
     const int64_t bt_size = x.size(0) * x.size(1);
     const int64_t c_size = x.size(2);
@@ -273,5 +291,5 @@ std::vector<torch::stable::Tensor> pretrain_tmix_tokenshift_forward_cuda(
         x.size(1),
         c_size);
     FLASHRWKV_CUDA_CHECK(cudaGetLastError());
-    return {out_r, out_w, out_k, out_v, out_a, out_g};
+    return outputs;
 }
