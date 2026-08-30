@@ -214,7 +214,7 @@ def test_compile_cli_keeps_build_diagnostics_out_of_json(monkeypatch, capfd) -> 
 def test_cache_key_changes_with_every_compatibility_input() -> None:
     baseline = {
         "source_sha256": "source-a",
-        "flashrwkv2": "0.1.0a12",
+        "flashrwkv2": "0.1.0a13",
         "python_executable": "/venv/a/bin/python",
         "sys_prefix": "/venv/a",
         "python": "3.12",
