@@ -188,6 +188,29 @@ def test_runtime_cache_retries_after_failed_build(monkeypatch, tmp_path) -> None
     assert calls["build"] == 2
 
 
+def test_compile_cli_keeps_build_diagnostics_out_of_json(monkeypatch, capfd) -> None:
+    from flashrwkv2 import compile as compiler
+
+    result = SimpleNamespace(
+        json=lambda: {
+            "status": "compiled",
+            "target": "sm89",
+            "cache_key": "key",
+            "library": "/cache/extension.so",
+        }
+    )
+
+    def load_extension():
+        os.write(1, b"native build diagnostics\n")
+        return result
+
+    monkeypatch.setattr(compiler, "load_extension", load_extension)
+    compiler.main()
+    stdout, stderr = capfd.readouterr()
+    assert json.loads(stdout) == result.json()
+    assert "native build diagnostics" in stderr
+
+
 def test_cache_key_changes_with_every_compatibility_input() -> None:
     baseline = {
         "source_sha256": "source-a",

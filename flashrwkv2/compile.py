@@ -339,7 +339,16 @@ def load_extension() -> CompileResult:
 
 
 def main() -> None:
-    print(json.dumps(load_extension().json(), sort_keys=True))
+    sys.stdout.flush()
+    saved_stdout = os.dup(1)
+    try:
+        os.dup2(2, 1)
+        result = load_extension()
+    finally:
+        sys.stdout.flush()
+        os.dup2(saved_stdout, 1)
+        os.close(saved_stdout)
+    print(json.dumps(result.json(), sort_keys=True))
 
 
 if __name__ == "__main__":
