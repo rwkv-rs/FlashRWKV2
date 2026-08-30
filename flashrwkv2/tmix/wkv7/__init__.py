@@ -751,8 +751,8 @@ class _RecurrentMetadataTicket:
         self._state_indices_version = _tensor_version(state_indices)
         self._query_start_loc_data = query_start_loc.data_ptr()
         self._state_indices_data = state_indices.data_ptr()
-        self._query_start_loc_shape = tuple(query_start_loc.shape)
-        self._state_indices_shape = tuple(state_indices.shape)
+        self._query_start_loc_shape = query_start_loc.shape
+        self._state_indices_shape = state_indices.shape
         self._query_start_loc_stride = query_start_loc.stride()
         self._state_indices_stride = state_indices.stride()
         self._total_tokens = total_tokens
@@ -761,6 +761,12 @@ class _RecurrentMetadataTicket:
         self.__graph_mode = graph_mode
         self._device = query_start_loc.device
         self._stream = torch.cuda.current_stream(self._device).cuda_stream
+        self._launch_metadata = (
+            self.__query_start_loc_snapshot,
+            self.__state_indices_snapshot,
+            self.__status,
+            self.__max_seqlen,
+        )
 
     def _check_compatible(
         self,
@@ -769,7 +775,7 @@ class _RecurrentMetadataTicket:
         total_tokens: int,
         state_pool_size: int,
         max_seqlen: int,
-    ) -> None:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
         if query_start_loc is not self._query_start_loc:
             raise RuntimeError("validated_metadata query_start_loc identity mismatch")
         if state_indices is not self._state_indices:
@@ -780,8 +786,8 @@ class _RecurrentMetadataTicket:
         ):
             raise RuntimeError("validated_metadata metadata data_ptr mismatch")
         if (
-            tuple(query_start_loc.shape) != self._query_start_loc_shape
-            or tuple(state_indices.shape) != self._state_indices_shape
+            query_start_loc.shape != self._query_start_loc_shape
+            or state_indices.shape != self._state_indices_shape
             or query_start_loc.stride() != self._query_start_loc_stride
             or state_indices.stride() != self._state_indices_stride
         ):
@@ -806,6 +812,7 @@ class _RecurrentMetadataTicket:
                 "validated_metadata stream mismatch; prepare and consume the ticket "
                 "on the same CUDA stream"
             )
+        return self._launch_metadata
 
     def _query_start_loc_snapshot(self) -> torch.Tensor:
         return self.__query_start_loc_snapshot
@@ -845,14 +852,8 @@ def _metadata_launch_args(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
     if not isinstance(ticket, _RecurrentMetadataTicket):
         raise TypeError("validated_metadata must come from prepare_tmix_wkv7_recurrent_metadata")
-    ticket._check_compatible(
+    return ticket._check_compatible(
         query_start_loc, state_indices, total_tokens, state_pool_size, max_seqlen
-    )
-    return (
-        ticket._query_start_loc_snapshot(),
-        ticket._state_indices_snapshot(),
-        ticket._status(),
-        ticket._max_seqlen(),
     )
 
 

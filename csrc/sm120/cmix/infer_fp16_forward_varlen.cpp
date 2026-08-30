@@ -52,16 +52,18 @@ torch::stable::Tensor cmix_sparse_down_relu_forward_varlen(
     bool deterministic);
 
 using flashrwkv2::validation::check_cuda_contiguous;
-using flashrwkv2::validation::check_same_device;
 
 namespace {
 
 void check_half(
     const torch::stable::Tensor& tensor,
-    const torch::stable::Tensor& reference,
+    int32_t device_index,
     const char* name) {
   check_cuda_contiguous(tensor, name);
-  check_same_device(reference, tensor, name);
+  STD_TORCH_CHECK(
+      tensor.get_device_index() == device_index,
+      name,
+      " must be on the same device as x");
   STD_TORCH_CHECK(tensor.scalar_type() == torch::headeronly::ScalarType::Half, name, " must be float16");
 }
 
@@ -76,25 +78,38 @@ torch::stable::Tensor cmix_tokenshift_forward_varlen(
     torch::stable::Tensor metadata_status,
     int64_t max_seqlen,
     torch::stable::Tensor token_predecessor) {
-  check_half(x, x, "x");
-  STD_TORCH_CHECK(x.dim() == 2 && x.size(0) > 0 && x.size(1) > 0,
+  check_cuda_contiguous(x, "x");
+  const auto device_index = x.get_device_index();
+  STD_TORCH_CHECK(
+      x.scalar_type() == torch::headeronly::ScalarType::Half,
+      "x must be float16");
+  const auto x_sizes = x.sizes();
+  STD_TORCH_CHECK(x_sizes.size() == 2 && x_sizes[0] > 0 && x_sizes[1] > 0,
               "x must have packed shape [total_tokens,C]");
-  const int64_t total_tokens = x.size(0);
-  const int64_t channels = x.size(1);
-  check_half(shift_state_pool, x, "shift_state_pool");
-  STD_TORCH_CHECK(shift_state_pool.dim() == 2 && shift_state_pool.size(0) > 0 &&
-                  shift_state_pool.size(1) == channels,
+  const int64_t total_tokens = x_sizes[0];
+  const int64_t channels = x_sizes[1];
+  check_half(shift_state_pool, device_index, "shift_state_pool");
+  const auto shift_state_sizes = shift_state_pool.sizes();
+  STD_TORCH_CHECK(shift_state_sizes.size() == 2 && shift_state_sizes[0] > 0 &&
+                  shift_state_sizes[1] == channels,
               "shift_state_pool must have shape [slots,C]");
-  check_half(x_k, x, "x_k");
-  STD_TORCH_CHECK(x_k.dim() == 1 && x_k.size(0) == channels,
+  check_half(x_k, device_index, "x_k");
+  const auto x_k_sizes = x_k.sizes();
+  STD_TORCH_CHECK(x_k_sizes.size() == 1 && x_k_sizes[0] == channels,
               "x_k must have shape [C]");
   check_cuda_contiguous(cu_seqlens, "cu_seqlens");
   check_cuda_contiguous(state_indices, "state_indices");
-  check_same_device(x, cu_seqlens, "cu_seqlens");
-  check_same_device(x, state_indices, "state_indices");
+  STD_TORCH_CHECK(
+      cu_seqlens.get_device_index() == device_index,
+      "cu_seqlens must be on the same device as x");
+  STD_TORCH_CHECK(
+      state_indices.get_device_index() == device_index,
+      "state_indices must be on the same device as x");
+  const auto cu_seqlens_sizes = cu_seqlens.sizes();
+  const auto state_indices_sizes = state_indices.sizes();
   STD_TORCH_CHECK(cu_seqlens.scalar_type() == torch::headeronly::ScalarType::Int &&
                   state_indices.scalar_type() == torch::headeronly::ScalarType::Int &&
-                  cu_seqlens.dim() == 1 && state_indices.dim() == 1 &&
+                  cu_seqlens_sizes.size() == 1 && state_indices_sizes.size() == 1 &&
                   state_indices.numel() > 0 &&
                   cu_seqlens.numel() == state_indices.numel() + 1,
               "invalid packed metadata");
@@ -123,38 +138,52 @@ std::vector<torch::stable::Tensor> cmix_postnorm_tokenshift_forward_varlen(
     int64_t max_seqlen,
     torch::stable::Tensor token_predecessor,
     double eps) {
-  check_half(x, x, "x");
+  check_cuda_contiguous(x, "x");
+  const auto device_index = x.get_device_index();
   STD_TORCH_CHECK(
-      x.dim() == 2 && x.size(0) > 0 && x.size(1) > 0 && x.size(1) % 2 == 0,
+      x.scalar_type() == torch::headeronly::ScalarType::Half,
+      "x must be float16");
+  const auto x_sizes = x.sizes();
+  STD_TORCH_CHECK(
+      x_sizes.size() == 2 && x_sizes[0] > 0 && x_sizes[1] > 0 &&
+          x_sizes[1] % 2 == 0,
       "CMix PostNorm TokenShift requires packed shape [total_tokens,C] with even C");
-  const int64_t total_tokens = x.size(0);
-  const int64_t channels = x.size(1);
-  check_half(res, x, "res");
-  STD_TORCH_CHECK(res.sizes() == x.sizes(), "res shape mismatch");
-  check_half(shift_state_pool, x, "shift_state_pool");
+  const int64_t total_tokens = x_sizes[0];
+  const int64_t channels = x_sizes[1];
+  check_half(res, device_index, "res");
+  STD_TORCH_CHECK(res.sizes() == x_sizes, "res shape mismatch");
+  check_half(shift_state_pool, device_index, "shift_state_pool");
+  const auto shift_state_sizes = shift_state_pool.sizes();
   STD_TORCH_CHECK(
-      shift_state_pool.dim() == 2 && shift_state_pool.size(0) > 0 &&
-          shift_state_pool.size(1) == channels,
+      shift_state_sizes.size() == 2 && shift_state_sizes[0] > 0 &&
+          shift_state_sizes[1] == channels,
       "shift_state_pool must have shape [slots,C]");
   for (const auto& item : {
            std::pair<const torch::stable::Tensor*, const char*>{&weight, "weight"},
            {&bias, "bias"},
            {&x_k, "x_k"},
        }) {
-    check_half(*item.first, x, item.second);
+    check_half(*item.first, device_index, item.second);
+    const auto sizes = item.first->sizes();
     STD_TORCH_CHECK(
-        item.first->dim() == 1 && item.first->size(0) == channels,
+        sizes.size() == 1 && sizes[0] == channels,
         item.second, " must have shape [C]");
   }
   STD_TORCH_CHECK(std::isfinite(eps) && eps > 0.0, "eps must be finite and positive");
   check_cuda_contiguous(cu_seqlens, "cu_seqlens");
   check_cuda_contiguous(state_indices, "state_indices");
-  check_same_device(x, cu_seqlens, "cu_seqlens");
-  check_same_device(x, state_indices, "state_indices");
+  STD_TORCH_CHECK(
+      cu_seqlens.get_device_index() == device_index,
+      "cu_seqlens must be on the same device as x");
+  STD_TORCH_CHECK(
+      state_indices.get_device_index() == device_index,
+      "state_indices must be on the same device as x");
+  const auto cu_seqlens_sizes = cu_seqlens.sizes();
+  const auto state_indices_sizes = state_indices.sizes();
   STD_TORCH_CHECK(
       cu_seqlens.scalar_type() == torch::headeronly::ScalarType::Int &&
           state_indices.scalar_type() == torch::headeronly::ScalarType::Int &&
-          cu_seqlens.dim() == 1 && state_indices.dim() == 1 &&
+          cu_seqlens_sizes.size() == 1 && state_indices_sizes.size() == 1 &&
           state_indices.numel() > 0 &&
           cu_seqlens.numel() == state_indices.numel() + 1,
       "invalid packed metadata");
@@ -196,7 +225,8 @@ std::tuple<torch::stable::Tensor, torch::stable::Tensor> cmix_forward_varlen(
       state_indices, metadata_status, max_seqlen, token_predecessor, eps);
   auto preact = cmix_linear_ffn_key_dispatch_f16_cuda(front[1], key_weight);
   torch::stable::Tensor output;
-  if (x.size(1) == 4096 && x.size(0) <= 19) {
+  const auto x_sizes = x.sizes();
+  if (x_sizes[1] == 4096 && x_sizes[0] <= 19) {
     output = cmix_sparse_down_relu_forward_varlen(
         preact, value_weight, state_indices.numel(),
         max_seqlen, deterministic);

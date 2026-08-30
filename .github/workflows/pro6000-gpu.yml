@@ -519,7 +519,7 @@ jobs:
                       r'module\.def\(\s*"([^"]+)"\s*\)', path.read_text()
                   )
               )
-          expected_count = {'sm90': 25, 'sm120': 47}[architecture]
+          expected_count = {'sm90': 25, 'sm120': 48}[architecture]
           if len(required) != expected_count:
               raise SystemExit(
                   f'{architecture} source has {len(required)} schemas, expected {expected_count}'
