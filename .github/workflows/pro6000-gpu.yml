@@ -186,7 +186,7 @@ jobs:
       matrix:
         torch: ["2.11.0", "2.12.0", "2.13.0"]
     env:
-      TORCH_EXTENSIONS_DIR: ${{ runner.temp }}/flashrwkv2-${{ github.run_id }}-torch-${{ matrix.torch }}
+      TORCH_EXTENSIONS_DIR: ${{ github.workspace }}/.torch-extensions-${{ github.run_id }}-torch-${{ matrix.torch }}
     steps:
       - uses: actions/checkout@v4
         with:
