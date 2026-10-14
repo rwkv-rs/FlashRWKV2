@@ -9,7 +9,7 @@ import torch
 from . import (
     _check_metadata_inputs,
     _extension,
-    _resolve_max_seqlen,
+    _validate_launch_max_seqlen,
     prepare_tmix_wkv7_recurrent_metadata,
 )
 
@@ -85,10 +85,7 @@ def infer_tmix_wkv7_chunk_bf16_forward_varlen(
         or state_indices.device != r.device
     ):
         raise ValueError("chunk metadata must be contiguous CUDA int32")
-    if validated_metadata is not None and max_seqlen is None:
-        launch_max_seqlen = int(validated_metadata._max_seqlen())
-    else:
-        launch_max_seqlen = _resolve_max_seqlen(cu_seqlens, max_seqlen)
+    launch_max_seqlen = _validate_launch_max_seqlen(max_seqlen)
     ticket = (
         validated_metadata
         if validated_metadata is not None
@@ -97,9 +94,11 @@ def infer_tmix_wkv7_chunk_bf16_forward_varlen(
             state_indices,
             total_tokens=r.shape[0],
             state_pool_size=state_pool.shape[0],
-            max_seqlen=launch_max_seqlen,
+            max_seqlen=max_seqlen,
         )
     )
+    if max_seqlen is None:
+        launch_max_seqlen = int(ticket._max_seqlen())
     if decay_bias is not None:
         if (
             decay_bias.dtype != torch.bfloat16

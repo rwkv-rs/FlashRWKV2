@@ -856,15 +856,15 @@ at::Tensor sampling_temperature_topk_topp_scalar_cuda(at::Tensor logits, at::Ten
   return sampling_forward<false>(logits, {}, states, slot_indices, num_active_samples, controls);
 }
 
-at::Tensor sampling_temperature_topk_topp_per_request_cuda(at::Tensor logits, at::Tensor states,
-                                                           at::Tensor slot_indices,
-                                                           at::Tensor temperatures,
-                                                           at::Tensor top_ks, at::Tensor top_ps,
-                                                           at::Tensor num_active_samples) {
-  SamplingControls controls;
-  controls.temperatures = temperatures.data_ptr<float>();
-  controls.top_ks = top_ks.data_ptr<int>();
-  controls.top_ps = top_ps.data_ptr<float>();
+at::Tensor sampling_temperature_topk_topp_per_request_cuda(
+    at::Tensor logits, at::Tensor states, at::Tensor slot_indices,
+    at::Tensor temperatures, at::Tensor top_ks, at::Tensor top_ps,
+    double temperature, int64_t top_k, double top_p, at::Tensor num_active_samples) {
+  auto controls = sampling_scalar_controls(0., 0., 1., temperature, top_k, top_p,
+                                           static_cast<int>(logits.size(1)));
+  controls.temperatures = temperatures.defined() ? temperatures.data_ptr<float>() : nullptr;
+  controls.top_ks = top_ks.defined() ? top_ks.data_ptr<int>() : nullptr;
+  controls.top_ps = top_ps.defined() ? top_ps.data_ptr<float>() : nullptr;
   return sampling_forward<false>(logits, {}, states, slot_indices, num_active_samples, controls);
 }
 
@@ -884,14 +884,18 @@ at::Tensor sampling_six_parameter_scalar_cuda(at::Tensor logits, at::Tensor pena
 at::Tensor sampling_six_parameter_per_request_cuda(
     at::Tensor logits, at::Tensor penalties, at::Tensor states, at::Tensor slot_indices,
     at::Tensor presence_penalties, at::Tensor frequency_penalties, at::Tensor penalty_decays,
-    at::Tensor temperatures, at::Tensor top_ks, at::Tensor top_ps, at::Tensor num_active_samples) {
-  SamplingControls controls;
-  controls.presences = presence_penalties.data_ptr<float>();
-  controls.frequencies = frequency_penalties.data_ptr<float>();
-  controls.decays = penalty_decays.data_ptr<float>();
-  controls.temperatures = temperatures.data_ptr<float>();
-  controls.top_ks = top_ks.data_ptr<int>();
-  controls.top_ps = top_ps.data_ptr<float>();
+    at::Tensor temperatures, at::Tensor top_ks, at::Tensor top_ps,
+    double presence_penalty, double frequency_penalty, double penalty_decay,
+    double temperature, int64_t top_k, double top_p, at::Tensor num_active_samples) {
+  auto controls = sampling_scalar_controls(presence_penalty, frequency_penalty, penalty_decay,
+                                           temperature, top_k, top_p,
+                                           static_cast<int>(logits.size(1)));
+  controls.presences = presence_penalties.defined() ? presence_penalties.data_ptr<float>() : nullptr;
+  controls.frequencies = frequency_penalties.defined() ? frequency_penalties.data_ptr<float>() : nullptr;
+  controls.decays = penalty_decays.defined() ? penalty_decays.data_ptr<float>() : nullptr;
+  controls.temperatures = temperatures.defined() ? temperatures.data_ptr<float>() : nullptr;
+  controls.top_ks = top_ks.defined() ? top_ks.data_ptr<int>() : nullptr;
+  controls.top_ps = top_ps.defined() ? top_ps.data_ptr<float>() : nullptr;
   return sampling_forward<true>(logits, penalties, states, slot_indices, num_active_samples,
                                 controls);
 }

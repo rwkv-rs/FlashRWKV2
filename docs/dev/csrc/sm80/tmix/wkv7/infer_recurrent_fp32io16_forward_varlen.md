@@ -11,3 +11,8 @@
 随后重复验证已移除；静态 snapshot、ticket identity/version/stream 契约不变。
 live/capacity preparation 继续全程在设备上处理内容校验，且同一 ticket 在
 各层 TMix/WKV7/CMix 间共享。
+
+Ticket 不在创建时准备 TokenShift predecessor：只在 TokenShift/CMix 首次取用
+时由共享 provider 构建，静态调用及同一 capture 内的消费者复用。WKV-only
+调用省去 predecessor 缓冲和 launch。默认最大长度直接由 ticket 摘要推断，
+TokenShift、CMix 和 chunk 的 Python 入口不再先做差分/max/item 的重复同步。

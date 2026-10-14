@@ -86,21 +86,25 @@ def test_chunk_ragged_tail_and_slot_update() -> None:
         state_indices,
         0.5,
     )
-    output = infer_tmix_wkv7_chunk_bf16_forward_varlen(
-        r,
-        decay_logits,
-        k,
-        v,
-        a,
-        b,
-        state_pool=state_pool,
-        cu_seqlens=cu_seqlens,
-        state_indices=state_indices,
-        chunk_size=8,
-        max_seqlen=17,
-        scale=0.5,
-    )
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
+    ) as profile:
+        output = infer_tmix_wkv7_chunk_bf16_forward_varlen(
+            r,
+            decay_logits,
+            k,
+            v,
+            a,
+            b,
+            state_pool=state_pool,
+            cu_seqlens=cu_seqlens,
+            state_indices=state_indices,
+            chunk_size=8,
+            scale=0.5,
+        )
     torch.cuda.synchronize()
+    assert not any(event.name == "aten::max" for event in profile.events())
+    assert not any("build_token_predecessor_kernel" in event.name for event in profile.events())
     assert output.shape == v.shape
     assert torch.allclose(output.float(), expected_output.float(), atol=0.2, rtol=0.08)
     assert torch.allclose(state_pool.float(), expected_state.float(), atol=0.2, rtol=0.08)

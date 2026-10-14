@@ -28,7 +28,6 @@ struct PreparedRecurrentMetadata {
   torch::Tensor query_start_loc;
   torch::Tensor state_indices;
   torch::Tensor status;
-  torch::Tensor token_predecessor;
   torch::Tensor workspace;
 };
 
@@ -49,6 +48,11 @@ RecurrentDimensions check_recurrent_layout(
     const torch::Tensor& b,
     const torch::Tensor& output,
     double scale);
+torch::Tensor build_recurrent_token_predecessor_cuda(
+    const torch::Tensor& query_start_loc,
+    const torch::Tensor& state_indices,
+    const torch::Tensor& status,
+    int64_t total_tokens);
 PreparedRecurrentMetadata prepare_recurrent_metadata_cuda(
     torch::Tensor query_start_loc,
     torch::Tensor state_indices,

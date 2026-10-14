@@ -390,6 +390,8 @@ def _fractional_probabilities(
         ("per_request", 8),
         ("six_parameter", 8),
         ("per_request", 65536),
+        ("mixed", 8),
+        ("mixed", 65536),
     ],
 )
 def test_single_request_launches_only_the_sampling_kernel(
@@ -411,6 +413,8 @@ def test_single_request_launches_only_the_sampling_kernel(
             "top_k": _slots([1]),
             "top_p": torch.ones(1, device="cuda"),
         }
+    if provider == "mixed":
+        controls = {"temperature": torch.ones(1, device="cuda"), "top_k": 1}
     with torch.profiler.profile(
         activities=[
             torch.profiler.ProfilerActivity.CPU,
@@ -442,6 +446,104 @@ def test_single_request_launches_only_the_sampling_kernel(
         )
         == 1
     ), kernels
+
+
+@pytest.mark.memcheck
+@pytest.mark.racecheck
+@pytest.mark.parametrize(
+    "six_parameter,vector_mask",
+    [(False, mask) for mask in (1, 2, 4, 3, 5, 6)]
+    + [(True, mask) for mask in (1, 2, 4, 8, 16, 32, 21, 42)],
+)
+def test_mixed_controls_match_vectors_without_materializing_scalars(
+    six_parameter: bool, vector_mask: int,
+) -> None:
+    torch.manual_seed(47)
+    batch_size, vocab_size, num_slots = 3, 32, 8
+    logits = torch.randn(batch_size, vocab_size, device="cuda")
+    slots = _slots([7, 2, 5])
+    states = setup_sampling_states(53, num_slots)
+    vector_states = states.clone()
+    penalties = torch.randn(num_slots, vocab_size, device="cuda").mul_(0.1)
+    vector_penalties = penalties.clone()
+    values = {"temperature": 0.8, "top_k": 9, "top_p": 0.7}
+    if six_parameter:
+        values = {
+            "presence_penalty": 0.2,
+            "frequency_penalty": 0.3,
+            "penalty_decay": 0.9,
+            **values,
+        }
+    vectors = {
+        name: torch.full(
+            (batch_size,), value, device="cuda",
+            dtype=torch.int32 if name == "top_k" else torch.float32,
+        )
+        for name, value in values.items()
+    }
+    controls = {
+        name: vectors[name] if vector_mask & (1 << index) else value
+        for index, (name, value) in enumerate(values.items())
+    }
+    if six_parameter:
+        expected = infer_sampling_six_parameter_forward_varlen(
+            logits, vector_penalties, vector_states, slots, **vectors
+        )
+    else:
+        expected = infer_sampling_temperature_topk_topp_forward_varlen(
+            logits, vector_states, slots, **vectors
+        )
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as profile:
+        if six_parameter:
+            actual = infer_sampling_six_parameter_forward_varlen(
+                logits, penalties, states, slots, **controls
+            )
+        else:
+            actual = infer_sampling_temperature_topk_topp_forward_varlen(
+                logits, states, slots, **controls
+            )
+        torch.cuda.synchronize()
+    assert torch.equal(actual, expected)
+    assert torch.equal(states, vector_states)
+    assert torch.equal(penalties, vector_penalties)
+    assert not any(event.name == "aten::full" for event in profile.events())
+
+
+@pytest.mark.cuda_graph
+@pytest.mark.memcheck
+@pytest.mark.racecheck
+@pytest.mark.parametrize("six_parameter", [False, True])
+def test_mixed_controls_graph_replay_reads_live_vectors(six_parameter: bool) -> None:
+    logits = torch.tensor([[0.0, 2.0, 4.0, 6.0]], device="cuda")
+    slots = _slots([3])
+    states = setup_sampling_states(59, 4)
+    penalties = torch.zeros(4, 4, device="cuda")
+    top_k = _slots([1])
+    temperature = torch.ones(1, device="cuda")
+    controls = {"temperature": temperature, "top_k": top_k, "top_p": 1.0}
+    if six_parameter:
+        controls.update(presence_penalty=0.1, frequency_penalty=0.2, penalty_decay=0.9)
+
+    def sample():
+        if six_parameter:
+            return infer_sampling_six_parameter_forward_varlen(
+                logits, penalties, states, slots, **controls
+            )
+        return infer_sampling_temperature_topk_topp_forward_varlen(
+            logits, states, slots, **controls
+        )
+
+    sample()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = sample()
+    for value in (0, 2, 1):
+        logits.fill_(-8.0)
+        logits[0, value] = 8.0
+        temperature.fill_(0.7 + 0.1 * value)
+        top_k.fill_(1)
+        graph.replay()
+        assert output.item() == value
 
 
 @pytest.mark.cuda_graph

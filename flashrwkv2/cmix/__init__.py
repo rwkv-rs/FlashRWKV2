@@ -9,7 +9,7 @@ import torch
 from ..tmix.wkv7 import (
     _check_metadata_inputs,
     _extension,
-    _resolve_max_seqlen,
+    _validate_launch_max_seqlen,
     prepare_tmix_wkv7_recurrent_metadata,
 )
 
@@ -80,27 +80,18 @@ def infer_cmix_forward_varlen(
     _check_metadata_inputs(cu_seqlens, state_indices)
     if state_indices.ndim != 1 or state_indices.numel() == 0:
         raise ValueError("state_indices must have shape [B]")
-    if validated_metadata is None:
-        launch_max_seqlen = _resolve_max_seqlen(cu_seqlens, max_seqlen)
-        ticket = prepare_tmix_wkv7_recurrent_metadata(
+    launch_max_seqlen = _validate_launch_max_seqlen(max_seqlen)
+    ticket = (
+        validated_metadata
+        if validated_metadata is not None
+        else prepare_tmix_wkv7_recurrent_metadata(
             cu_seqlens,
             state_indices,
             total_tokens=x.shape[0],
             state_pool_size=shift_state_pool.shape[0],
-            max_seqlen=launch_max_seqlen,
+            max_seqlen=max_seqlen,
         )
-    else:
-        if max_seqlen is None:
-            launch_max_seqlen = -1
-        elif (
-            not isinstance(max_seqlen, int)
-            or isinstance(max_seqlen, bool)
-            or max_seqlen <= 0
-        ):
-            raise ValueError("max_seqlen must be a positive integer")
-        else:
-            launch_max_seqlen = int(max_seqlen)
-        ticket = validated_metadata
+    )
     return tuple(
         _extension().cmix_forward_varlen(
             x,

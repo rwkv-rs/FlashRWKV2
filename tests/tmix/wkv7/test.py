@@ -450,7 +450,10 @@ def test_fp32_wkv_zero_active_precapture_warmup_then_graph_replay() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.cuda_graph
-def test_metadata_ticket_predecessor_matches_cpu_reference_and_live_updates() -> None:
+@pytest.mark.parametrize("consume_in_graph", [False, True])
+def test_metadata_ticket_predecessor_matches_cpu_reference_and_live_updates(
+    consume_in_graph: bool,
+) -> None:
     _require_cuda_extension()
     device = torch.device("cuda")
     inactive = torch.iinfo(torch.int32).min
@@ -493,6 +496,10 @@ def test_metadata_ticket_predecessor_matches_cpu_reference_and_live_updates() ->
             num_active_tokens=active_tokens,
             num_active_sequences=active_sequences,
         )
+
+        if consume_in_graph:
+            captured_predecessor = live_ticket._token_predecessor()
+            assert live_ticket._token_predecessor().data_ptr() == captured_predecessor.data_ptr()
 
     graph.replay()
     torch.cuda.synchronize()
@@ -900,9 +907,36 @@ def test_static_metadata_validates_once_and_reads_only_a_summary() -> None:
     assert sum("validate_recurrent_metadata_kernel" in name for name in kernels) == 1, (
         kernels
     )
-    assert sum("build_token_predecessor_kernel" in name for name in kernels) == 1, (
+    assert not any("build_token_predecessor_kernel" in name for name in kernels), (
         kernels
     )
+
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as profile:
+        first = ticket._token_predecessor()
+        second = ticket._token_predecessor()
+        torch.cuda.synchronize()
+    assert first.data_ptr() == second.data_ptr()
+    assert first.cpu().tolist() == [-1, 0, 1, -6, -14, 4, 5, 6, -22, 8, -35]
+    assert sum("build_token_predecessor_kernel" in event.name for event in profile.events()) == 1
+
+
+@pytest.mark.parametrize("numerical_mode", ["fp16", "fp32io16"])
+def test_wkv_only_call_does_not_build_token_predecessor(numerical_mode: str) -> None:
+    _require_cuda_extension()
+    packed = tuple(torch.zeros(3, 1, 64, device="cuda", dtype=torch.float16) for _ in range(6))
+    cu = torch.tensor([0, 1, 3], device="cuda", dtype=torch.int32)
+    slots = torch.tensor([3, 1], device="cuda", dtype=torch.int32)
+    if numerical_mode == "fp16":
+        state = prepare_tmix_wkv7_recurrent_fp16_state(4, 64, sequence_capacity=2, device="cuda")
+        infer = infer_tmix_wkv7_recurrent_fp16_forward_varlen
+    else:
+        state = prepare_tmix_wkv7_recurrent_fp32io16_state(4, 64, sequence_capacity=2, device="cuda")
+        infer = infer_tmix_wkv7_recurrent_fp32io16_forward_varlen
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as profile:
+        output = infer(*packed, state=state, cu_seqlens=cu, state_indices=slots)
+        torch.cuda.synchronize()
+    assert torch.count_nonzero(output).item() == 0
+    assert not any("build_token_predecessor_kernel" in event.name for event in profile.events())
 
 
 @pytest.mark.parametrize("max_seqlen", [None, 4])

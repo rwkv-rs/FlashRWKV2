@@ -12,28 +12,18 @@ def _extension():
     return flashrwkv2._extension()
 
 
-def _scalar(value: object, name: str) -> int | float | None:
-    if isinstance(value, bool):
-        raise TypeError(f"{name} must be numeric, not bool")
-    if isinstance(value, Real):
-        return value
-    if not isinstance(value, torch.Tensor):
-        raise TypeError(f"{name} must be a scalar or torch.Tensor")
-    return None
-
-
-def _parameter_vector(
+def _parameter(
     value: float | torch.Tensor,
     *,
     name: str,
     batch_size: int,
     dtype: torch.dtype,
     device: torch.device,
-) -> torch.Tensor:
+) -> int | float | torch.Tensor:
     if isinstance(value, bool):
         raise TypeError(f"{name} must be numeric, not bool")
     if isinstance(value, Real):
-        return torch.full((batch_size,), value, dtype=dtype, device=device)
+        return int(value) if dtype == torch.int32 else float(value)
     if not isinstance(value, torch.Tensor):
         raise TypeError(f"{name} must be a scalar or torch.Tensor")
     if value.shape != (batch_size,):
@@ -154,40 +144,26 @@ def infer_sampling_temperature_topk_topp_forward_varlen(
     launch_capacity, active_samples = _validate_activity(
         logits, sample_capacity, num_active_samples
     )
-    scalar_temperature = _scalar(temperature, "temperature")
-    scalar_top_k = _scalar(top_k, "top_k")
-    scalar_top_p = _scalar(top_p, "top_p")
-    if None not in (scalar_temperature, scalar_top_k, scalar_top_p):
-        return _extension().sampling_temperature_topk_topp_forward_varlen(
-            logits,
-            states,
-            slot_indices,
-            float(scalar_temperature),
-            int(scalar_top_k),
-            float(scalar_top_p),
-            launch_capacity,
-            active_samples,
-        )
     batch_size = logits.shape[0]
     return _extension().sampling_temperature_topk_topp_forward_varlen(
         logits,
         states,
         slot_indices,
-        _parameter_vector(
+        _parameter(
             temperature,
             name="temperature",
             batch_size=batch_size,
             dtype=torch.float32,
             device=logits.device,
         ),
-        _parameter_vector(
+        _parameter(
             top_k,
             name="top_k",
             batch_size=batch_size,
             dtype=torch.int32,
             device=logits.device,
         ),
-        _parameter_vector(
+        _parameter(
             top_p,
             name="top_p",
             batch_size=batch_size,
@@ -241,26 +217,9 @@ def infer_sampling_six_parameter_forward_varlen(
         "top_k",
         "top_p",
     )
-    scalars = tuple(_scalar(value, name) for value, name in zip(values, names, strict=True))
-    if all(value is not None for value in scalars):
-        return _extension().sampling_six_parameter_forward_varlen(
-            logits,
-            penalties,
-            states,
-            slot_indices,
-            float(scalars[0]),
-            float(scalars[1]),
-            float(scalars[2]),
-            float(scalars[3]),
-            int(scalars[4]),
-            float(scalars[5]),
-            launch_capacity,
-            active_samples,
-        )
-
     batch_size = logits.shape[0]
-    vectors = tuple(
-        _parameter_vector(
+    controls = tuple(
+        _parameter(
             value,
             name=name,
             batch_size=batch_size,
@@ -274,7 +233,7 @@ def infer_sampling_six_parameter_forward_varlen(
         penalties,
         states,
         slot_indices,
-        *vectors,
+        *controls,
         launch_capacity,
         active_samples,
     )

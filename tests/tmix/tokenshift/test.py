@@ -199,7 +199,8 @@ def test_statetune_tokenshift_rejects_invalid_cuda_contracts() -> None:
 @pytest.mark.cuda
 @pytest.mark.memcheck
 @pytest.mark.racecheck
-def test_infer_tmix_postnorm_tokenshift_matches_albatross_t1_path() -> None:
+@pytest.mark.parametrize("use_ticket", [False, True])
+def test_infer_tmix_postnorm_tokenshift_matches_albatross_t1_path(use_ticket: bool) -> None:
     torch.manual_seed(19)
     device = torch.device("cuda")
     c = 4096
@@ -221,18 +222,20 @@ def test_infer_tmix_postnorm_tokenshift_matches_albatross_t1_path() -> None:
         max_seqlen=1,
     )
 
-    outputs = infer_tmix_postnorm_tokenshift_forward_varlen(
-        x,
-        res,
-        weight,
-        bias,
-        *params,
-        shift_state_pool=shift_state,
-        cu_seqlens=cu_seqlens,
-        state_indices=state_indices,
-        validated_metadata=ticket,
-    )
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as profile:
+        outputs = infer_tmix_postnorm_tokenshift_forward_varlen(
+            x,
+            res,
+            weight,
+            bias,
+            *params,
+            shift_state_pool=shift_state,
+            cu_seqlens=cu_seqlens,
+            state_indices=state_indices,
+            validated_metadata=ticket if use_ticket else None,
+        )
 
+    assert not any(event.name == "aten::max" for event in profile.events())
     summed = x.float() + res.float()
     mean = summed.mean(dim=-1, keepdim=True)
     rstd = torch.rsqrt((summed - mean).square().mean(dim=-1, keepdim=True) + eps)

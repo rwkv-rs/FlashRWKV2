@@ -8,6 +8,7 @@
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAGraphsC10Utils.h>
 
 #include <cstdint>
 #include <limits>
@@ -75,7 +76,6 @@ class RecurrentMetadataTicket final {
       torch::Tensor query_start_loc_snapshot,
       torch::Tensor state_indices_snapshot,
       torch::Tensor status,
-      torch::Tensor token_predecessor,
       torch::Tensor workspace,
       torch::Tensor num_active_tokens,
       torch::Tensor num_active_sequences,
@@ -89,7 +89,6 @@ class RecurrentMetadataTicket final {
         query_start_loc_snapshot_(std::move(query_start_loc_snapshot)),
         state_indices_snapshot_(std::move(state_indices_snapshot)),
         status_(std::move(status)),
-        token_predecessor_(std::move(token_predecessor)),
         workspace_(std::move(workspace)),
         num_active_tokens_(std::move(num_active_tokens)),
         num_active_sequences_(std::move(num_active_sequences)),
@@ -105,6 +104,7 @@ class RecurrentMetadataTicket final {
         state_pool_size_(state_pool_size),
         max_seqlen_(max_seqlen),
         graph_mode_(graph_mode),
+        metadata_captured_(graph_mode && c10::cuda::isStreamCapturingMayInitCtx(stream)),
         device_(query_start_loc_.device()),
         stream_(stream) {}
 
@@ -170,8 +170,18 @@ class RecurrentMetadataTicket final {
 
   const torch::Tensor& status() const { return status_; }
 
-  const torch::Tensor& token_predecessor() const {
-    return token_predecessor_;
+  torch::Tensor token_predecessor() {
+    if (token_predecessor_.defined()) {
+      return token_predecessor_;
+    }
+    auto predecessor = flashrwkv2::validation::build_recurrent_token_predecessor_cuda(
+        query_start_loc_snapshot_, state_indices_snapshot_, status_, total_tokens_);
+    // Cache the producer with its consumers during capture. Inspecting a live
+    // ticket after replay must not cache a value that its graph never updates.
+    if (!metadata_captured_ || c10::cuda::isStreamCapturingMayInitCtx(stream_)) {
+      token_predecessor_ = predecessor;
+    }
+    return predecessor;
   }
 
   int64_t max_seqlen() const { return max_seqlen_; }
@@ -208,6 +218,7 @@ class RecurrentMetadataTicket final {
   int64_t state_pool_size_;
   int64_t max_seqlen_;
   bool graph_mode_;
+  bool metadata_captured_;
   c10::Device device_;
   cudaStream_t stream_;
 };
@@ -258,7 +269,6 @@ std::shared_ptr<RecurrentMetadataTicket> prepare_tmix_wkv7_recurrent_metadata(
       std::move(query_start_loc), std::move(state_indices),
       std::move(prepared.query_start_loc),
       std::move(prepared.state_indices), std::move(prepared.status),
-      std::move(prepared.token_predecessor),
       std::move(prepared.workspace), torch::Tensor(), torch::Tensor(),
       total_tokens, state_pool_size, max_seqlen, false, stream);
 }
@@ -309,7 +319,6 @@ std::shared_ptr<RecurrentMetadataTicket> prepare_tmix_wkv7_recurrent_graph_metad
       std::move(query_start_loc), std::move(state_indices),
       std::move(prepared.query_start_loc),
       std::move(prepared.state_indices), std::move(prepared.status),
-      std::move(prepared.token_predecessor),
       std::move(prepared.workspace), std::move(num_active_tokens),
       std::move(num_active_sequences), token_capacity, state_pool_size,
       max_seqlen_capacity, true, stream);

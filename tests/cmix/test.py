@@ -34,19 +34,20 @@ def test_infer_cmix_highest_fusion_island_matches_reference() -> None:
     cu = torch.tensor([0, 1], device=device, dtype=torch.int32)
     slots = torch.tensor([2], device=device, dtype=torch.int32)
 
-    summed, output = infer_cmix_forward_varlen(
-        x,
-        res,
-        weight,
-        bias,
-        x_k,
-        key,
-        value,
-        shift_state_pool=shift,
-        cu_seqlens=cu,
-        state_indices=slots,
-        max_seqlen=1,
-    )
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as profile:
+        summed, output = infer_cmix_forward_varlen(
+            x,
+            res,
+            weight,
+            bias,
+            x_k,
+            key,
+            value,
+            shift_state_pool=shift,
+            cu_seqlens=cu,
+            state_indices=slots,
+        )
+    assert not any(event.name == "aten::max" for event in profile.events())
     summed_ref = x.float() + res.float()
     mean = summed_ref.mean(dim=-1, keepdim=True)
     centered = summed_ref - mean

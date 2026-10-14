@@ -684,20 +684,6 @@ def _check_metadata_inputs(
         raise TypeError("state_indices must be a torch.Tensor")
 
 
-def _resolve_max_seqlen(
-    cu_seqlens: torch.Tensor,
-    max_seqlen: int | None,
-) -> int:
-    if max_seqlen is not None:
-        value = int(max_seqlen)
-        if value <= 0:
-            raise ValueError("max_seqlen must be positive")
-        return value
-    if cu_seqlens.numel() < 2:
-        raise ValueError("cu_seqlens must contain at least one sequence")
-    return int((cu_seqlens[1:] - cu_seqlens[:-1]).max().item())
-
-
 def prepare_tmix_wkv7_recurrent_metadata(
     cu_seqlens: torch.Tensor,
     state_indices: torch.Tensor,

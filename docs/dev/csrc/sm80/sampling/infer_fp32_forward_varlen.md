@@ -4,7 +4,12 @@
 `setup_sampling_states`, `sampling_temperature_topk_topp_forward_varlen`, and
 `sampling_six_parameter_forward_varlen`. Python inputs remain compact FP32
 `[B,V]` logits, an explicit Philox slot pool, and unique int32 slot indices.
-Scalar and per-request controls share the same filtering algorithm.
+Scalar, per-request, and mixed controls share the same filtering algorithm.
+Each control reaches CUDA as a host scalar or a pointer to its existing request
+vector. Mixed Python calls no longer allocate or fill CUDA vectors for scalar
+companions. Registered names, argument order, scalar calls, vector calls, and
+public Python signatures are preserved; the existing vector overload also
+accepts scalars independently for each control.
 
 The CUDA implementation is adapted from [Rapid-Sampling revision
 7da725adbb5afc5b92f6c53383c3999f6809860f](https://github.com/Triang-jyed-driung/Rapid-Sampling/blob/7da725adbb5afc5b92f6c53383c3999f6809860f/sampling.cu).

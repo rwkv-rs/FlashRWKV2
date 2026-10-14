@@ -162,7 +162,8 @@ std::vector<torch::Tensor> tmix_postnorm_tokenshift_forward_varlen(
     launch_query_start_loc = std::move(prepared.query_start_loc);
     launch_state_indices = std::move(prepared.state_indices);
     metadata_status = std::move(prepared.status);
-    token_predecessor = std::move(prepared.token_predecessor);
+    token_predecessor = flashrwkv2::validation::build_recurrent_token_predecessor_cuda(
+        launch_query_start_loc, launch_state_indices, metadata_status, total_tokens);
   }
   if (FLASHRWKV_TARGET_SM == 120 && batch_size == 1 && channels == 4096 && total_tokens == 1 &&
       max_seqlen == 1) {
