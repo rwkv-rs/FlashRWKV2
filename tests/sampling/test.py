@@ -38,8 +38,10 @@ def test_reproducible_state_pool() -> None:
 @pytest.mark.racecheck
 def test_scalar_and_per_request_top1_match_with_indexed_slots() -> None:
     logits = torch.tensor(
-        [[0.0, 4.0, 1.0, -2.0, 0.5, 0.0, -1.0, 2.0],
-         [3.0, 0.0, 1.0, -2.0, 0.5, 5.0, -1.0, 2.0]],
+        [
+            [0.0, 4.0, 1.0, -2.0, 0.5, 0.0, -1.0, 2.0],
+            [3.0, 0.0, 1.0, -2.0, 0.5, 5.0, -1.0, 2.0],
+        ],
         dtype=torch.float32,
         device="cuda",
     )
@@ -63,14 +65,20 @@ def test_scalar_and_per_request_top1_match_with_indexed_slots() -> None:
     assert torch.equal(scalar, vector)
     inactive = torch.tensor([0, 2, 4], device="cuda")
     baseline = setup_sampling_states(7, 5)
-    assert torch.equal(scalar_states.index_select(0, inactive), baseline.index_select(0, inactive))
-    assert torch.equal(vector_states.index_select(0, inactive), baseline.index_select(0, inactive))
+    assert torch.equal(
+        scalar_states.index_select(0, inactive), baseline.index_select(0, inactive)
+    )
+    assert torch.equal(
+        vector_states.index_select(0, inactive), baseline.index_select(0, inactive)
+    )
 
 
 def test_six_parameter_penalty_semantics_and_slot_isolation() -> None:
     logits = torch.tensor(
-        [[0.0, 8.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-         [0.0, 0.0, 0.0, 0.0, 0.0, 9.0, 0.0, 0.0]],
+        [
+            [0.0, 8.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0, 0.0, 9.0, 0.0, 0.0],
+        ],
         dtype=torch.float32,
         device="cuda",
     )
@@ -122,6 +130,36 @@ def test_top_p_zero_and_nonfinite_logits_are_safe_top1() -> None:
     assert output.item() == 1
 
 
+def test_presence_marker_survives_cancelled_penalties() -> None:
+    logits = torch.tensor([[0.0, 8.0, 0.0, 0.0]], device="cuda")
+    penalties = torch.zeros_like(logits)
+    states = setup_sampling_states(29, 1)
+    slots = _slots([0])
+    first = infer_sampling_six_parameter_forward_varlen(
+        logits,
+        penalties,
+        states,
+        slots,
+        presence_penalty=0.3,
+        frequency_penalty=-0.3,
+        top_k=1,
+    )
+    assert first.item() == 1
+    assert penalties[0, 1].item() == 0.0
+    assert torch.signbit(penalties[0, 1]).item()
+    second = infer_sampling_six_parameter_forward_varlen(
+        logits,
+        penalties,
+        states,
+        slots,
+        presence_penalty=0.3,
+        frequency_penalty=-0.3,
+        top_k=1,
+    )
+    assert second.item() == 1
+    assert penalties[0, 1].item() == pytest.approx(-0.3)
+
+
 def test_empirical_distribution_without_scipy() -> None:
     batch_size = 4096
     row = torch.tensor([0.0, 0.5, 1.0, -0.5, -1.0, 0.25, 0.75, -0.25], device="cuda")
@@ -153,9 +191,7 @@ def test_sampling_cuda_graph_dynamic_active_rows_are_side_effect_free() -> None:
     slots = _slots([3, 1, 99, 99])
     active = torch.tensor([2], device="cuda", dtype=torch.int32)
     states = setup_sampling_states(101, num_slots)
-    penalties = torch.zeros(
-        num_slots, vocab_size, device="cuda", dtype=torch.float32
-    )
+    penalties = torch.zeros(num_slots, vocab_size, device="cuda", dtype=torch.float32)
 
     # Warm the exact scalar six-parameter family before capture.
     warm_states = setup_sampling_states(101, capacity)
@@ -313,11 +349,181 @@ def test_sampling_resource_usage() -> None:
     hot = {
         name: body
         for name, body in blocks
-        if "batch_sampling_" in name and "kernel" in name
+        if "sampling_kernel" in name or "sampling_cooperative_kernel" in name
     }
     assert len(hot) == 3, sorted(hot)
     for name, body in hot.items():
-        fields = {key: int(value) for key, value in re.findall(r"(REG|STACK|LOCAL):(\d+)", body)}
+        fields = {
+            key: int(value)
+            for key, value in re.findall(r"(REG|STACK|LOCAL):(\d+)", body)
+        }
         assert fields["REG"] <= 64, (name, fields)
-        assert fields["STACK"] == 0, (name, fields)
+        # Cooperative grid barriers use a small call stack, independently of spills.
+        stack_limit = 64 if "sampling_cooperative_kernel" in name else 0
+        assert fields["STACK"] <= stack_limit, (name, fields)
         assert fields["LOCAL"] == 0, (name, fields)
+
+
+def _fractional_probabilities(
+    logits: torch.Tensor, top_k: int, top_p: float
+) -> torch.Tensor:
+    probabilities = logits.double().softmax(dim=0)
+    filtered = torch.zeros_like(probabilities)
+    remaining_k = probabilities.numel() if top_k <= 0 else top_k
+    remaining_p = top_p
+    for value in probabilities.unique().sort(descending=True).values:
+        equal = probabilities == value
+        count = int(equal.sum())
+        fraction = min(1.0, remaining_k / count, remaining_p / (float(value) * count))
+        if fraction <= 0.0:
+            break
+        filtered[equal] = value * fraction
+        remaining_k -= count * fraction
+        remaining_p -= float(value) * count * fraction
+    return filtered / filtered.sum()
+
+
+@pytest.mark.parametrize("provider", ["scalar", "per_request", "six_parameter"])
+@pytest.mark.parametrize(
+    "values,top_k,top_p",
+    [
+        ([0.0, 0.5, 1.0, -0.5, -1.0, 0.25, 0.75, -0.25], 3, 0.8),
+        ([2.0, 2.0, 2.0, 2.0, 0.0, 0.0, 0.0, 0.0], 1, 1.0),
+        (
+            [0.0, -0.28768207, -0.69314718, -1.38629436, -80.0, -80.0, -80.0, -80.0],
+            -1,
+            0.55,
+        ),
+    ],
+)
+def test_fractional_filter_distribution(
+    provider: str, values: list[float], top_k: int, top_p: float
+) -> None:
+    batch_size = 8192
+    row = torch.tensor(values, dtype=torch.float32)
+    logits = row.cuda().expand(batch_size, -1).contiguous()
+    slots = torch.arange(batch_size - 1, -1, -1, dtype=torch.int32, device="cuda")
+    states = setup_sampling_states(31415, batch_size)
+    controls = {"top_k": top_k, "top_p": top_p}
+    if provider == "per_request":
+        controls = {
+            "temperature": torch.ones(batch_size, device="cuda"),
+            "top_k": torch.full((batch_size,), top_k, device="cuda", dtype=torch.int32),
+            "top_p": torch.full((batch_size,), top_p, device="cuda"),
+        }
+    if provider == "six_parameter":
+        samples = infer_sampling_six_parameter_forward_varlen(
+            logits, torch.zeros_like(logits), states, slots, **controls
+        )
+    else:
+        samples = infer_sampling_temperature_topk_topp_forward_varlen(
+            logits, states, slots, **controls
+        )
+    observed = torch.bincount(samples.long(), minlength=row.numel()).cpu().double()
+    expected = _fractional_probabilities(row, top_k, top_p)
+    assert observed[expected == 0].sum() == 0
+    assert torch.max(torch.abs(observed / batch_size - expected)) < 0.025
+
+
+@pytest.mark.memcheck
+@pytest.mark.racecheck
+@pytest.mark.cuda_graph
+def test_cooperative_sampling_dynamic_activity_and_slots() -> None:
+    logits = torch.full((1, 65536), -80.0, device="cuda")
+    logits[0, 44000] = 8.0
+    slots = _slots([3])
+    active = _slots([1])
+    states = setup_sampling_states(2718, 5)
+    initial = states.clone()
+    top_ks = _slots([1])
+    temperatures = torch.ones(1, device="cuda")
+    top_ps = torch.ones(1, device="cuda")
+
+    # Warm up the cooperative specialization before stream capture.
+    infer_sampling_temperature_topk_topp_forward_varlen(logits, states, slots, top_k=1)
+    states.copy_(initial)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = infer_sampling_temperature_topk_topp_forward_varlen(
+            logits,
+            states,
+            slots,
+            temperature=temperatures,
+            top_k=top_ks,
+            top_p=top_ps,
+            sample_capacity=1,
+            num_active_samples=active,
+        )
+    graph.replay()
+    torch.cuda.synchronize()
+    assert output.item() == 44000
+    assert not torch.equal(states[3], initial[3])
+    assert torch.equal(states[[0, 1, 2, 4]], initial[[0, 1, 2, 4]])
+
+    active.zero_()
+    slots.fill_(99)
+    before = states.clone()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert output.item() == -1
+    assert torch.equal(states, before)
+
+    # Invalid active metadata also exits before every cooperative grid barrier.
+    active.fill_(1)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert output.item() == -1
+    assert torch.equal(states, before)
+
+    slots.fill_(1)
+    logits[0, 44000] = -80.0
+    logits[0, 60001] = 9.0
+    graph.replay()
+    torch.cuda.synchronize()
+    assert output.item() == 60001
+    assert not torch.equal(states[1], before[1])
+    assert torch.equal(states[[0, 2, 3, 4]], before[[0, 2, 3, 4]])
+
+
+@pytest.mark.parametrize("dense_ties", [False, True])
+@pytest.mark.cuda_graph
+def test_cooperative_ties_and_candidate_cache_overflow(dense_ties: bool) -> None:
+    vocab_size, draws_per_replay, replays = 65536, 16, 128
+    logits = torch.full((1, vocab_size), -80.0, device="cuda")
+    # Dense ties exceed the per-thread candidate cache during histogram refinement.
+    candidates = (
+        torch.arange(vocab_size, device="cuda")
+        if dense_ties
+        else torch.tensor([17, 2051, 16388, 44000, 65535], device="cuda")
+    )
+    logits[0, candidates] = 0.0
+    states = setup_sampling_states(1618, 4)
+    slots = _slots([2])
+    infer_sampling_temperature_topk_topp_forward_varlen(logits, states, slots, top_k=1)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        outputs = torch.stack(
+            [
+                infer_sampling_temperature_topk_topp_forward_varlen(
+                    logits, states, slots, top_k=1
+                )
+                for _ in range(draws_per_replay)
+            ]
+        ).flatten()
+    samples = torch.empty((replays, draws_per_replay), dtype=torch.int32, device="cuda")
+    for index in range(replays):
+        graph.replay()
+        samples[index].copy_(outputs)
+    torch.cuda.synchronize()
+    flat = samples.flatten().long()
+    if dense_ties:
+        groups = flat // 2048
+        expected = 1.0 / 32
+        bins = 32
+    else:
+        assert torch.isin(flat, candidates).all()
+        groups = torch.searchsorted(candidates, flat)
+        expected = 1.0 / candidates.numel()
+        bins = candidates.numel()
+    observed = torch.bincount(groups, minlength=bins).double() / flat.numel()
+    assert torch.max(torch.abs(observed - expected)) < 0.045
