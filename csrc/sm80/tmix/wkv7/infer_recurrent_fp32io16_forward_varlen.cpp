@@ -8,7 +8,7 @@
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
-#include <c10/cuda/CUDAGraphsC10Utils.h>
+#include <c10/cuda/CUDAException.h>
 
 #include <cstdint>
 #include <limits>
@@ -68,6 +68,12 @@ std::optional<uint32_t> tensor_version(const torch::Tensor& tensor) {
   return tensor.unsafeGetTensorImpl()->version_counter().current_version();
 }
 
+bool stream_is_capturing(cudaStream_t stream) {
+  cudaStreamCaptureStatus status;
+  C10_CUDA_CHECK(cudaStreamIsCapturing(stream, &status));
+  return status == cudaStreamCaptureStatusActive;
+}
+
 class RecurrentMetadataTicket final {
  public:
   RecurrentMetadataTicket(
@@ -104,7 +110,7 @@ class RecurrentMetadataTicket final {
         state_pool_size_(state_pool_size),
         max_seqlen_(max_seqlen),
         graph_mode_(graph_mode),
-        metadata_captured_(graph_mode && c10::cuda::isStreamCapturingMayInitCtx(stream)),
+        metadata_captured_(graph_mode && stream_is_capturing(stream)),
         device_(query_start_loc_.device()),
         stream_(stream) {}
 
@@ -178,7 +184,7 @@ class RecurrentMetadataTicket final {
         query_start_loc_snapshot_, state_indices_snapshot_, status_, total_tokens_);
     // Cache the producer with its consumers during capture. Inspecting a live
     // ticket after replay must not cache a value that its graph never updates.
-    if (!metadata_captured_ || c10::cuda::isStreamCapturingMayInitCtx(stream_)) {
+    if (!metadata_captured_ || stream_is_capturing(stream_)) {
       token_predecessor_ = predecessor;
     }
     return predecessor;
