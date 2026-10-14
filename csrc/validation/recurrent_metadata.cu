@@ -13,15 +13,6 @@
 namespace flashrwkv2::validation {
 namespace {
 
-enum MetadataError : int {
-  kInvalidEndpoint = 1 << 0,
-  kInvalidSequenceRange = 1 << 1,
-  kInvalidStateSlot = 1 << 2,
-  kDuplicateStateSlot = 1 << 3,
-  kInvalidActiveCount = 1 << 4,
-  kSequenceTooLong = 1 << 5,
-};
-
 __global__ void validate_recurrent_metadata_kernel(
     const int* __restrict__ query_start_loc,
     const int* __restrict__ state_indices,
@@ -31,15 +22,19 @@ __global__ void validate_recurrent_metadata_kernel(
     int max_seqlen,
     const int* __restrict__ num_active_tokens,
     const int* __restrict__ num_active_sequences,
+    int64_t table_capacity,
     int* __restrict__ status,
     int* __restrict__ seen_slots,
     int* __restrict__ query_start_loc_snapshot,
-    int* __restrict__ state_indices_snapshot) {
+    int* __restrict__ state_indices_snapshot,
+    int* __restrict__ validation_summary) {
   __shared__ int shared_status;
   __shared__ int active_tokens;
   __shared__ int active_sequences;
+  __shared__ int actual_max_seqlen;
   if (threadIdx.x == 0) {
     shared_status = 0;
+    actual_max_seqlen = 0;
     active_tokens = num_active_tokens == nullptr ? total_tokens
                                                   : num_active_tokens[0];
     active_sequences = num_active_sequences == nullptr
@@ -55,8 +50,7 @@ __global__ void validate_recurrent_metadata_kernel(
   }
   __syncthreads();
 
-  for (int slot = static_cast<int>(threadIdx.x); slot < state_pool_size;
-       slot += static_cast<int>(blockDim.x)) {
+  for (int64_t slot = threadIdx.x; slot < table_capacity; slot += blockDim.x) {
     seen_slots[slot] = -1;
   }
 
@@ -104,12 +98,24 @@ __global__ void validate_recurrent_metadata_kernel(
     } else if (token_end - token_start > max_seqlen) {
       error |= kSequenceTooLong;
     }
+    if (validation_summary != nullptr && error == 0)
+      atomicMax(&actual_max_seqlen, token_end - token_start);
 
     const int state_slot = validated_state_indices[sequence_index];
     if (state_slot < 0 || state_slot >= state_pool_size) {
       error |= kInvalidStateSlot;
-    } else if (atomicCAS(seen_slots + state_slot, -1, sequence_index) != -1) {
-      error |= kDuplicateStateSlot;
+    } else {
+      const unsigned mask = static_cast<unsigned>(table_capacity - 1);
+      unsigned index = (static_cast<unsigned>(state_slot) * 2654435761u) >> __clz(mask);
+      while (true) {
+        const int previous = atomicCAS(seen_slots + index, -1, state_slot);
+        if (previous == -1) break;
+        if (previous == state_slot) {
+          error |= kDuplicateStateSlot;
+          break;
+        }
+        index = (index + 1) & mask;
+      }
     }
 
     if (error != 0) {
@@ -119,6 +125,12 @@ __global__ void validate_recurrent_metadata_kernel(
 
   __syncthreads();
   if (threadIdx.x == 0) {
+    if (validation_summary != nullptr) {
+      validation_summary[0] = shared_status;
+      validation_summary[1] = actual_max_seqlen;
+      validation_summary[2] = validated_query_start_loc[0];
+      validation_summary[3] = validated_query_start_loc[num_sequences];
+    }
     status[0] = shared_status;
     if (shared_status == 0) {
       status[1] = active_tokens;
@@ -193,10 +205,13 @@ PreparedRecurrentMetadata launch_recurrent_metadata_validation(
     int64_t num_sequences,
     int64_t state_pool_size,
     int64_t max_seqlen,
-    bool snapshot) {
+    bool snapshot,
+    torch::Tensor validation_summary) {
   const c10::cuda::CUDAGuard device_guard(query_start_loc.device());
   auto status = torch::empty({3}, query_start_loc.options());
-  auto seen_slots = torch::empty({state_pool_size}, query_start_loc.options());
+  int64_t table_capacity = 1;
+  while (table_capacity < 2 * num_sequences) table_capacity <<= 1;
+  auto seen_slots = torch::empty({table_capacity}, query_start_loc.options());
   auto query_start_loc_snapshot = snapshot
       ? torch::empty_like(query_start_loc)
       : query_start_loc;
@@ -220,10 +235,12 @@ PreparedRecurrentMetadata launch_recurrent_metadata_validation(
       num_active_sequences.defined()
           ? num_active_sequences.data_ptr<int>()
           : nullptr,
+      table_capacity,
       status.data_ptr<int>(),
       seen_slots.data_ptr<int>(),
       snapshot ? query_start_loc_snapshot.data_ptr<int>() : nullptr,
-      snapshot ? state_indices_snapshot.data_ptr<int>() : nullptr);
+      snapshot ? state_indices_snapshot.data_ptr<int>() : nullptr,
+      validation_summary.defined() ? validation_summary.data_ptr<int>() : nullptr);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   const int predecessor_blocks = static_cast<int>((total_tokens + threads - 1) / threads);
   build_token_predecessor_kernel<<<
@@ -251,12 +268,13 @@ PreparedRecurrentMetadata prepare_recurrent_metadata_cuda(
     torch::Tensor query_start_loc,
     torch::Tensor state_indices,
     int64_t total_tokens,
-    int64_t state_pool_size) {
+    int64_t state_pool_size,
+    torch::Tensor validation_summary) {
   const int64_t num_sequences = state_indices.numel();
   return launch_recurrent_metadata_validation(
       std::move(query_start_loc), std::move(state_indices), torch::Tensor(),
       torch::Tensor(), total_tokens, num_sequences, state_pool_size,
-      total_tokens, true);
+      total_tokens, true, std::move(validation_summary));
 }
 
 PreparedRecurrentMetadata prepare_recurrent_graph_metadata_cuda(
@@ -275,7 +293,7 @@ PreparedRecurrentMetadata prepare_recurrent_graph_metadata_cuda(
       std::move(query_start_loc), std::move(state_indices),
       std::move(num_active_tokens), std::move(num_active_sequences),
       token_capacity, sequence_capacity, state_pool_size,
-      max_seqlen_capacity, false);
+      max_seqlen_capacity, false, torch::Tensor());
 }
 
 }  // namespace flashrwkv2::validation

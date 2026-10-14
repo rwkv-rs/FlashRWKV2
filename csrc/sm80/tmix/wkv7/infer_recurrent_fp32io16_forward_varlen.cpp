@@ -10,11 +10,9 @@
 #include <c10/cuda/CUDAGuard.h>
 
 #include <cstdint>
-#include <algorithm>
 #include <limits>
 #include <memory>
 #include <optional>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -42,41 +40,24 @@ using flashrwkv2::validation::prepare_recurrent_metadata_cuda;
 
 namespace {
 
-int64_t check_recurrent_metadata_values(
-    const torch::Tensor& query_start_loc,
-    const torch::Tensor& state_indices,
-    int64_t total_tokens,
-    int64_t state_pool_size) {
-  auto query_start_loc_cpu = query_start_loc.to(torch::kCPU).contiguous();
-  auto state_indices_cpu = state_indices.to(torch::kCPU).contiguous();
-  const auto* offsets = query_start_loc_cpu.data_ptr<int32_t>();
-  const auto* slots = state_indices_cpu.data_ptr<int32_t>();
-  const int64_t num_sequences = state_indices.numel();
-  int64_t max_seqlen = 0;
-
-  TORCH_CHECK(offsets[0] == 0, "query_start_loc must start at 0");
+int64_t check_recurrent_metadata_summary(
+    const torch::Tensor& validation_summary, int64_t total_tokens) {
+  auto summary_cpu = validation_summary.to(torch::kCPU);
+  const auto* summary = summary_cpu.data_ptr<int32_t>();
+  TORCH_CHECK(summary[2] == 0, "query_start_loc must start at 0");
   TORCH_CHECK(
-      offsets[num_sequences] == total_tokens,
+      summary[3] == total_tokens,
       "the final query_start_loc offset must equal total_tokens");
-  std::unordered_set<int32_t> seen_slots;
-  for (int64_t sequence_index = 0; sequence_index < num_sequences;
-       ++sequence_index) {
-    const int32_t token_start = offsets[sequence_index];
-    const int32_t token_end = offsets[sequence_index + 1];
-    TORCH_CHECK(
-        token_start >= 0 && token_end > token_start &&
-            token_end <= total_tokens,
-        "query_start_loc must be strictly increasing with non-empty sequences");
-    const int32_t state_slot = slots[sequence_index];
-    TORCH_CHECK(
-        state_slot >= 0 && state_slot < state_pool_size,
-        "state_indices entries must be within the state pool");
-    TORCH_CHECK(
-        seen_slots.insert(state_slot).second,
-        "state_indices must be unique within one call");
-    max_seqlen = std::max<int64_t>(max_seqlen, token_end - token_start);
-  }
-  return max_seqlen;
+  TORCH_CHECK(
+      (summary[0] & flashrwkv2::validation::kInvalidSequenceRange) == 0,
+      "query_start_loc must be strictly increasing with non-empty sequences");
+  TORCH_CHECK(
+      (summary[0] & flashrwkv2::validation::kInvalidStateSlot) == 0,
+      "state_indices entries must be within the state pool");
+  TORCH_CHECK(
+      (summary[0] & flashrwkv2::validation::kDuplicateStateSlot) == 0,
+      "state_indices must be unique within one call");
+  return summary[1];
 }
 
 std::optional<uint32_t> tensor_version(const torch::Tensor& tensor) {
@@ -259,8 +240,13 @@ std::shared_ptr<RecurrentMetadataTicket> prepare_tmix_wkv7_recurrent_metadata(
       state_pool_size > 0 &&
           state_pool_size <= std::numeric_limits<int>::max(),
       "state_pool_size must be positive and fit in int32");
-  const int64_t inferred_max_seqlen = check_recurrent_metadata_values(
-      query_start_loc, state_indices, total_tokens, state_pool_size);
+  const c10::cuda::CUDAGuard device_guard(query_start_loc.device());
+  const cudaStream_t stream =
+      at::cuda::getCurrentCUDAStream(query_start_loc.device().index()).stream();
+  auto summary = torch::empty({4}, query_start_loc.options());
+  auto prepared = prepare_recurrent_metadata_cuda(
+      query_start_loc, state_indices, total_tokens, state_pool_size, summary);
+  const int64_t inferred_max_seqlen = check_recurrent_metadata_summary(summary, total_tokens);
   if (max_seqlen <= 0) {
     max_seqlen = inferred_max_seqlen;
   } else {
@@ -268,11 +254,6 @@ std::shared_ptr<RecurrentMetadataTicket> prepare_tmix_wkv7_recurrent_metadata(
         max_seqlen == inferred_max_seqlen,
         "max_seqlen must equal the largest packed sequence length");
   }
-  const c10::cuda::CUDAGuard device_guard(query_start_loc.device());
-  const cudaStream_t stream =
-      at::cuda::getCurrentCUDAStream(query_start_loc.device().index()).stream();
-  auto prepared = prepare_recurrent_metadata_cuda(
-      query_start_loc, state_indices, total_tokens, state_pool_size);
   return std::make_shared<RecurrentMetadataTicket>(
       std::move(query_start_loc), std::move(state_indices),
       std::move(prepared.query_start_loc),

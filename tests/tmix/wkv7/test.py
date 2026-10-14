@@ -867,6 +867,85 @@ def test_public_rejects_devices_bias_scale_and_state_indices_contracts() -> None
         )
 
 
+def test_static_metadata_validates_once_and_reads_only_a_summary() -> None:
+    _require_cuda_extension()
+    cu = torch.tensor([0, 3, 4, 8, 10, 11], dtype=torch.int32, device="cuda")
+    slots = torch.tensor([0, 5, 13, 21, 34], dtype=torch.int32, device="cuda")
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ],
+        record_shapes=True,
+    ) as profile:
+        ticket = prepare_tmix_wkv7_recurrent_metadata(
+            cu, slots, total_tokens=11, state_pool_size=8192
+        )
+        torch.cuda.synchronize()
+    assert ticket._max_seqlen() == 4
+    assert ticket._active_status().cpu().tolist() == [0, 11, 5]
+    assert torch.equal(ticket._query_start_loc_snapshot(), cu)
+    assert torch.equal(ticket._state_indices_snapshot(), slots)
+    copies = [
+        event.input_shapes[0]
+        for event in profile.events()
+        if event.name == "aten::_to_copy"
+    ]
+    assert copies == [[4]], copies
+    kernels = [
+        event.name
+        for event in profile.events()
+        if event.device_type == torch.autograd.DeviceType.CUDA
+    ]
+    assert sum("validate_recurrent_metadata_kernel" in name for name in kernels) == 1, (
+        kernels
+    )
+    assert sum("build_token_predecessor_kernel" in name for name in kernels) == 1, (
+        kernels
+    )
+
+
+@pytest.mark.parametrize("max_seqlen", [None, 4])
+def test_static_metadata_infers_and_checks_the_exact_max_seqlen(
+    max_seqlen: int | None,
+) -> None:
+    _require_cuda_extension()
+    cu = torch.tensor([0, 3, 4, 8], dtype=torch.int32, device="cuda")
+    slots = torch.tensor([0, 2, 5], dtype=torch.int32, device="cuda")
+    ticket = prepare_tmix_wkv7_recurrent_metadata(
+        cu, slots, total_tokens=8, state_pool_size=8192, max_seqlen=max_seqlen
+    )
+    assert ticket._max_seqlen() == 4
+    for wrong_max in (3, 5):
+        with pytest.raises(RuntimeError, match="largest packed sequence length"):
+            prepare_tmix_wkv7_recurrent_metadata(
+                cu, slots, total_tokens=8, state_pool_size=8192, max_seqlen=wrong_max
+            )
+
+
+@pytest.mark.memcheck
+@pytest.mark.racecheck
+@pytest.mark.parametrize("duplicate", [False, True])
+def test_recurrent_metadata_hash_collisions_and_duplicate_slots(
+    duplicate: bool,
+) -> None:
+    _require_cuda_extension()
+    slots = torch.tensor([0, 5, 13, 21], dtype=torch.int32, device="cuda")
+    cu = torch.arange(5, dtype=torch.int32, device="cuda")
+    if duplicate:
+        slots[-1] = slots[0]
+        with pytest.raises(RuntimeError, match="unique within one call"):
+            prepare_tmix_wkv7_recurrent_metadata(
+                cu, slots, total_tokens=4, state_pool_size=8192
+            )
+    else:
+        ticket = prepare_tmix_wkv7_recurrent_metadata(
+            cu, slots, total_tokens=4, state_pool_size=8192
+        )
+        assert ticket._active_status().cpu().tolist() == [0, 4, 4]
+        assert ticket._token_predecessor().cpu().tolist() == [-1, -6, -14, -22]
+
+
 def test_ticket_rejects_identity_version_and_stream_mismatches() -> None:
     _require_cuda_extension()
     case = _make_case(dtype=torch.bfloat16, head_size=64, lengths=(4, 5))

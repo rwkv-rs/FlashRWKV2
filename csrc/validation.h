@@ -9,6 +9,15 @@
 
 namespace flashrwkv2::validation {
 
+enum RecurrentMetadataError : int {
+  kInvalidEndpoint = 1 << 0,
+  kInvalidSequenceRange = 1 << 1,
+  kInvalidStateSlot = 1 << 2,
+  kDuplicateStateSlot = 1 << 3,
+  kInvalidActiveCount = 1 << 4,
+  kSequenceTooLong = 1 << 5,
+};
+
 struct RecurrentDimensions {
   int64_t num_sequences;
   int64_t num_heads;
@@ -44,7 +53,8 @@ PreparedRecurrentMetadata prepare_recurrent_metadata_cuda(
     torch::Tensor query_start_loc,
     torch::Tensor state_indices,
     int64_t total_tokens,
-    int64_t state_pool_size);
+    int64_t state_pool_size,
+    torch::Tensor validation_summary = torch::Tensor());
 PreparedRecurrentMetadata prepare_recurrent_graph_metadata_cuda(
     torch::Tensor query_start_loc,
     torch::Tensor state_indices,

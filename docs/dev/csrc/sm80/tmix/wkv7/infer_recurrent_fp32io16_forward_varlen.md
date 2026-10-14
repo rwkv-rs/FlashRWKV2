@@ -4,3 +4,10 @@
 `infer_tmix_wkv7_recurrent_fp32io16_forward_varlen` 的内部自动调度调用，不是独立
 的 Python 公共接口。外部调用方只持有
 `prepare_tmix_wkv7_recurrent_fp32io16_state` 返回的统一 state handle。
+
+该 C++ 文件还注册既有 recurrent metadata ticket preparation。静态 ticket 的
+内容检查只由共享 CUDA validator 执行一次，C++ 回读四个 int32 的摘要来保持
+原有错误信息和最大序列长度推断。完整 metadata 的 CPU 拷贝、CPU 去重扫描和
+随后重复验证已移除；静态 snapshot、ticket identity/version/stream 契约不变。
+live/capacity preparation 继续全程在设备上处理内容校验，且同一 ticket 在
+各层 TMix/WKV7/CMix 间共享。
