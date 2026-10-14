@@ -383,6 +383,207 @@ def _fractional_probabilities(
     return filtered / filtered.sum()
 
 
+@pytest.mark.parametrize(
+    "provider,vocab_size",
+    [
+        ("scalar", 8),
+        ("per_request", 8),
+        ("six_parameter", 8),
+        ("per_request", 65536),
+    ],
+)
+def test_single_request_launches_only_the_sampling_kernel(
+    provider: str, vocab_size: int
+) -> None:
+    logits = torch.full((1, vocab_size), -80.0, device="cuda")
+    logits[0, 1] = 8.0
+    states = setup_sampling_states(31, 8192)
+    slots = _slots([8191])
+    penalties = (
+        torch.zeros(8192, vocab_size, device="cuda")
+        if provider == "six_parameter"
+        else None
+    )
+    controls = {"top_k": 1}
+    if provider == "per_request":
+        controls = {
+            "temperature": torch.ones(1, device="cuda"),
+            "top_k": _slots([1]),
+            "top_p": torch.ones(1, device="cuda"),
+        }
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ]
+    ) as profile:
+        if penalties is None:
+            output = infer_sampling_temperature_topk_topp_forward_varlen(
+                logits, states, slots, **controls
+            )
+        else:
+            output = infer_sampling_six_parameter_forward_varlen(
+                logits, penalties, states, slots, **controls
+            )
+        torch.cuda.synchronize()
+    assert output.item() == 1
+    kernels = [
+        event.name
+        for event in profile.events()
+        if event.device_type == torch.autograd.DeviceType.CUDA
+    ]
+    assert not any("validate_sampling_metadata_kernel" in name for name in kernels), (
+        kernels
+    )
+    assert (
+        sum(
+            "sampling_kernel" in name or "sampling_cooperative_kernel" in name
+            for name in kernels
+        )
+        == 1
+    ), kernels
+
+
+@pytest.mark.cuda_graph
+@pytest.mark.memcheck
+@pytest.mark.racecheck
+@pytest.mark.parametrize("provider", ["scalar", "per_request", "six_parameter"])
+def test_single_request_dynamic_activity_preserves_rng_and_penalties(
+    provider: str,
+) -> None:
+    logits = torch.tensor([[0.0, 8.0, 0.0, 0.0]], device="cuda")
+    states = setup_sampling_states(41, 16)
+    initial = states.clone()
+    penalties = torch.zeros(16, 4, device="cuda")
+    slots, active = _slots([15]), _slots([1])
+    controls = {"top_k": 1}
+    if provider == "per_request":
+        controls = {
+            "temperature": torch.ones(1, device="cuda"),
+            "top_k": _slots([1]),
+            "top_p": torch.ones(1, device="cuda"),
+        }
+
+    def call() -> torch.Tensor:
+        if provider == "six_parameter":
+            return infer_sampling_six_parameter_forward_varlen(
+                logits,
+                penalties,
+                states,
+                slots,
+                presence_penalty=0.5,
+                frequency_penalty=0.25,
+                sample_capacity=1,
+                num_active_samples=active,
+                **controls,
+            )
+        return infer_sampling_temperature_topk_topp_forward_varlen(
+            logits,
+            states,
+            slots,
+            sample_capacity=1,
+            num_active_samples=active,
+            **controls,
+        )
+
+    call()
+    states.copy_(initial)
+    penalties.zero_()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = call()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert output.item() == 1
+    assert torch.equal(states[:15], initial[:15])
+    assert not torch.equal(states[15], initial[15])
+    if provider == "six_parameter":
+        assert penalties[15, 1].item() == pytest.approx(0.75)
+    for count, slot in ((0, -1), (-1, 15), (2, 15), (1, -1), (1, 16)):
+        active.fill_(count)
+        slots.fill_(slot)
+        before_states, before_penalties = states.clone(), penalties.clone()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert output.item() == -1
+        assert torch.equal(states, before_states)
+        assert torch.equal(penalties, before_penalties)
+
+
+@pytest.mark.cuda_graph
+@pytest.mark.memcheck
+@pytest.mark.racecheck
+def test_sampling_hash_collisions_and_invalid_batches_preserve_state() -> None:
+    capacity, pool_size, vocab_size = 4, 8192, 8
+    # These slots collide in the initial bucket of the eight-entry Fibonacci hash table.
+    colliding_slots = [
+        slot
+        for slot in range(pool_size)
+        if ((slot * 2654435761) & 0xFFFFFFFF) >> 29 == 0
+    ][:capacity]
+    slots = _slots(colliding_slots)
+    active = _slots([capacity])
+    logits = torch.zeros(capacity, vocab_size, device="cuda")
+    logits[
+        torch.arange(capacity, device="cuda"),
+        torch.arange(1, capacity + 1, device="cuda"),
+    ] = 8.0
+    states = setup_sampling_states(37, pool_size)
+    penalties = torch.zeros(pool_size, vocab_size, device="cuda")
+    infer_sampling_six_parameter_forward_varlen(
+        logits, penalties, states, slots, top_k=1
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = infer_sampling_six_parameter_forward_varlen(
+            logits,
+            penalties,
+            states,
+            slots,
+            top_k=1,
+            frequency_penalty=0.25,
+            sample_capacity=capacity,
+            num_active_samples=active,
+        )
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(output, _slots([1, 2, 3, 4]))
+    assert torch.equal(
+        penalties[slots.long(), torch.arange(1, 5, device="cuda")],
+        torch.full((capacity,), 0.25, device="cuda"),
+    )
+
+    first, second, third, fourth = colliding_slots
+    cases = [
+        ([first, second, third, first], 4),
+        ([first, second, pool_size, fourth], 4),
+        ([first, second, -1, fourth], 4),
+        (colliding_slots, -1),
+        (colliding_slots, capacity + 1),
+        ([pool_size] * capacity, 0),
+    ]
+    for values, count in cases:
+        slots.copy_(_slots(values))
+        active.fill_(count)
+        before_states, before_penalties = states.clone(), penalties.clone()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(output, _slots([-1] * capacity))
+        assert torch.equal(states, before_states)
+        assert torch.equal(penalties, before_penalties)
+
+    # An inactive duplicate tail does not invalidate the active prefix.
+    slots.copy_(_slots([first, second, first, second]))
+    active.fill_(2)
+    before = states.clone()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(output, _slots([1, 2, -1, -1]))
+    unchanged = torch.ones(pool_size, dtype=torch.bool, device="cuda")
+    unchanged[slots[:2].long()] = False
+    assert torch.equal(states[unchanged], before[unchanged])
+
+
 @pytest.mark.parametrize("provider", ["scalar", "per_request", "six_parameter"])
 @pytest.mark.parametrize(
     "values,top_k,top_p",

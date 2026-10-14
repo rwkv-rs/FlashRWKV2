@@ -453,13 +453,24 @@ __device__ __forceinline__ void sampling_body(int V, const float* logits, float*
   }
 }
 
+__device__ __forceinline__ bool sampling_row_is_active(int row, const int* slot_indices,
+                                                       int64_t num_slots,
+                                                       const int* num_active_samples,
+                                                       const int* status) {
+  if (status != nullptr) return status[0] == 0 && row < status[1];
+  // A single-row call cannot contain duplicate slots. Check it at the consumer.
+  const int active = num_active_samples == nullptr ? 1 : num_active_samples[0];
+  return active == 1 && slot_indices[0] >= 0 && slot_indices[0] < num_slots;
+}
+
 template <bool Penalties>
 __global__ void __launch_bounds__(1024, 1)
     sampling_kernel(int V, const float* logits, float* penalties, int* outputs, RAND* states,
                     float* probs, unsigned* weights, SamplingControls controls,
-                    HistogramLayout layout, const int* slot_indices, const int* status) {
+                    HistogramLayout layout, const int* slot_indices, int64_t num_slots,
+                    const int* num_active_samples, const int* status) {
   const int row = blockIdx.x;
-  if (status[0] != 0 || row >= status[1]) {
+  if (!sampling_row_is_active(row, slot_indices, num_slots, num_active_samples, status)) {
     if (threadIdx.x == 0) outputs[row] = -1;
     return;
   }
@@ -556,9 +567,9 @@ __global__ void __launch_bounds__(1024, 1)
     sampling_cooperative_kernel(int V, const float* logits, int* outputs, RAND* states,
                                 float* probs, unsigned* weights, float* partials,
                                 unsigned* histograms, HistogramLayout layout,
-                                const int* slot_indices, const int* status,
-                                SamplingControls controls) {
-  if (status[0] != 0 || status[1] == 0) {
+                                const int* slot_indices, int64_t num_slots,
+                                const int* num_active_samples, SamplingControls controls) {
+  if (!sampling_row_is_active(0, slot_indices, num_slots, num_active_samples, nullptr)) {
     if (blockIdx.x == 0 && threadIdx.x == 0) outputs[0] = -1;
     return;
   }
@@ -670,8 +681,8 @@ namespace {
 
 __global__ void validate_sampling_metadata_kernel(const int* __restrict__ slot_indices,
                                                   const int* __restrict__ num_active_samples,
-                                                  int sample_capacity, int num_slots,
-                                                  int* __restrict__ status,
+                                                  int sample_capacity, int64_t num_slots,
+                                                  int64_t table_capacity, int* __restrict__ status,
                                                   int* __restrict__ seen_slots) {
   __shared__ int active_samples;
   __shared__ int error;
@@ -683,16 +694,35 @@ __global__ void validate_sampling_metadata_kernel(const int* __restrict__ slot_i
     }
   }
   __syncthreads();
-  for (int slot = static_cast<int>(threadIdx.x); slot < num_slots;
-       slot += static_cast<int>(blockDim.x)) {
-    seen_slots[slot] = -1;
+  if (active_samples <= 1) {
+    if (threadIdx.x == 0) {
+      if (active_samples == 1 && (slot_indices[0] < 0 || slot_indices[0] >= num_slots)) error = 1;
+      status[0] = error;
+      status[1] = error == 0 ? active_samples : 0;
+    }
+    return;
+  }
+  for (int64_t index = threadIdx.x; index < table_capacity; index += blockDim.x) {
+    seen_slots[index] = -1;
   }
   __syncthreads();
   for (int row = static_cast<int>(threadIdx.x); row < active_samples;
        row += static_cast<int>(blockDim.x)) {
     const int slot = slot_indices[row];
-    if (slot < 0 || slot >= num_slots || atomicCAS(seen_slots + slot, -1, row) != -1) {
+    if (slot < 0 || slot >= num_slots) {
       atomicExch(&error, 1);
+      continue;
+    }
+    const unsigned mask = static_cast<unsigned>(table_capacity - 1);
+    unsigned index = (static_cast<unsigned>(slot) * 2654435761u) >> __clz(mask);
+    while (true) {
+      const int previous = atomicCAS(seen_slots + index, -1, slot);
+      if (previous == -1) break;
+      if (previous == slot) {
+        atomicExch(&error, 1);
+        break;
+      }
+      index = (index + 1) & mask;
     }
   }
   __syncthreads();
@@ -711,11 +741,13 @@ SamplingMetadata prepare_sampling_metadata(const at::Tensor& logits, const at::T
                                            const at::Tensor& slot_indices,
                                            const at::Tensor& num_active_samples) {
   auto status = at::empty({2}, slot_indices.options());
-  auto workspace = at::empty({states.size(0)}, slot_indices.options());
+  int64_t table_capacity = 1;
+  while (table_capacity < 2 * logits.size(0)) table_capacity <<= 1;
+  auto workspace = at::empty({table_capacity}, slot_indices.options());
   validate_sampling_metadata_kernel<<<1, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
       slot_indices.data_ptr<int>(),
       num_active_samples.defined() ? num_active_samples.data_ptr<int>() : nullptr,
-      static_cast<int>(logits.size(0)), static_cast<int>(states.size(0)), status.data_ptr<int>(),
+      static_cast<int>(logits.size(0)), states.size(0), table_capacity, status.data_ptr<int>(),
       workspace.data_ptr<int>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return SamplingMetadata{std::move(status), std::move(workspace)};
@@ -759,22 +791,26 @@ at::Tensor sampling_forward(at::Tensor logits, at::Tensor penalties, at::Tensor 
   auto probs = at::empty(logits.sizes(), logits.options());
   auto weights = at::empty(logits.sizes(), logits.options().dtype(at::kInt));
   auto output = at::empty({B}, logits.options().dtype(at::kInt));
-  auto metadata = prepare_sampling_metadata(logits, states, slot_indices, num_active_samples);
+  SamplingMetadata metadata;
+  if (B > 1) metadata = prepare_sampling_metadata(logits, states, slot_indices, num_active_samples);
   auto stream = at::cuda::getCurrentCUDAStream();
   const float* l = logits.data_ptr<float>();
   float* prob = probs.data_ptr<float>();
   unsigned* w = reinterpret_cast<unsigned*>(weights.data_ptr<int>());
   RAND* rng = reinterpret_cast<RAND*>(states.data_ptr());
   int* out = output.data_ptr<int>();
-  const int *slots = slot_indices.data_ptr<int>(), *status = metadata.status.data_ptr<int>();
+  int64_t num_slots = states.size(0);
+  const int* slots = slot_indices.data_ptr<int>();
+  const int* status = metadata.status.defined() ? metadata.status.data_ptr<int>() : nullptr;
+  const int* active = num_active_samples.defined() ? num_active_samples.data_ptr<int>() : nullptr;
   if constexpr (!Penalties) {
     if (B == 1 && V == 65536 && sampling_cooperative_available(logits.get_device())) {
       auto partials = at::empty({2 * SAMPLING_TILES}, logits.options());
       auto histograms = at::empty({SAMPLING_TILES * 512 * 2}, logits.options().dtype(at::kInt));
       float* part = partials.data_ptr<float>();
       unsigned* hist = reinterpret_cast<unsigned*>(histograms.data_ptr<int>());
-      void* args[] = {&V,    &l,    &out,    &rng,   &prob,   &w,
-                      &part, &hist, &layout, &slots, &status, &controls};
+      void* args[] = {&V,    &l,      &out,   &rng,       &prob,   &w,       &part,
+                      &hist, &layout, &slots, &num_slots, &active, &controls};
       C10_CUDA_CHECK(cudaLaunchCooperativeKernel(
           reinterpret_cast<void*>(sampling_cooperative_kernel), dim3(SAMPLING_TILES),
           dim3(SAMPLING_THREADS), args, COOPERATIVE_BYTES, stream));
@@ -790,7 +826,7 @@ at::Tensor sampling_forward(at::Tensor logits, at::Tensor penalties, at::Tensor 
   }
   sampling_kernel<Penalties><<<B, SAMPLING_THREADS, HISTOGRAM_BYTES, stream>>>(
       V, l, Penalties ? penalties.data_ptr<float>() : nullptr, out, rng, prob, w, controls, layout,
-      slots, status);
+      slots, num_slots, active, status);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return output;
 }

@@ -37,6 +37,16 @@ upstream penalty update and is intentionally retained. Scalar temperature
 and top-p keep the existing clamping behavior. CUDA Graph replay can change
 active count, slots, logits, and per-request controls without recapture.
 
+Single-row calls check the active count and slot range inside the sampling
+kernel, including the cooperative path. They allocate no metadata status or
+deduplication workspace and launch no separate validation kernel. Multi-row
+calls validate the entire active batch before any state writes, using an
+open-addressed Fibonacci hash table sized to the next power of two at least
+twice the row capacity. The workspace and its initialization depend on row
+capacity, not RNG pool size. Zero- or one-active-row validation skips table
+initialization. Hash collisions use linear probing; duplicate active slots
+reject the whole batch, while inactive tails are ignored.
+
 The RNG storage layout and seeded reproducibility within a launch path remain
 supported. Integer sampling changes the token sequence relative to the old
 floating CDF implementation. Correctness tests cover fractional distributions,
