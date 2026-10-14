@@ -8,6 +8,7 @@ import subprocess
 
 import pytest
 import torch
+from utils import TorchOperationRecorder
 
 import flashrwkv2
 from flashrwkv2 import (
@@ -493,7 +494,7 @@ def test_mixed_controls_match_vectors_without_materializing_scalars(
         expected = infer_sampling_temperature_topk_topp_forward_varlen(
             logits, vector_states, slots, **vectors
         )
-    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as profile:
+    with TorchOperationRecorder() as recorder:
         if six_parameter:
             actual = infer_sampling_six_parameter_forward_varlen(
                 logits, penalties, states, slots, **controls
@@ -506,7 +507,7 @@ def test_mixed_controls_match_vectors_without_materializing_scalars(
     assert torch.equal(actual, expected)
     assert torch.equal(states, vector_states)
     assert torch.equal(penalties, vector_penalties)
-    assert not any(event.name == "aten::full" for event in profile.events())
+    assert "aten::full" not in recorder.operations
 
 
 @pytest.mark.cuda_graph

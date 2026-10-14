@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from utils import TorchOperationRecorder
 
 from flashrwkv2.tmix.tokenshift import (
     infer_tmix_postnorm_tokenshift_forward_varlen,
@@ -222,7 +223,7 @@ def test_infer_tmix_postnorm_tokenshift_matches_albatross_t1_path(use_ticket: bo
         max_seqlen=1,
     )
 
-    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as profile:
+    with TorchOperationRecorder() as recorder:
         outputs = infer_tmix_postnorm_tokenshift_forward_varlen(
             x,
             res,
@@ -235,7 +236,7 @@ def test_infer_tmix_postnorm_tokenshift_matches_albatross_t1_path(use_ticket: bo
             validated_metadata=ticket if use_ticket else None,
         )
 
-    assert not any(event.name == "aten::max" for event in profile.events())
+    assert "aten::max" not in recorder.operations
     summed = x.float() + res.float()
     mean = summed.mean(dim=-1, keepdim=True)
     rstd = torch.rsqrt((summed - mean).square().mean(dim=-1, keepdim=True) + eps)

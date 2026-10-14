@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from utils import TorchOperationRecorder
 
 from flashrwkv2.cmix import (
     infer_cmix_forward_varlen,
@@ -34,7 +35,7 @@ def test_infer_cmix_highest_fusion_island_matches_reference() -> None:
     cu = torch.tensor([0, 1], device=device, dtype=torch.int32)
     slots = torch.tensor([2], device=device, dtype=torch.int32)
 
-    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as profile:
+    with TorchOperationRecorder() as recorder:
         summed, output = infer_cmix_forward_varlen(
             x,
             res,
@@ -47,7 +48,7 @@ def test_infer_cmix_highest_fusion_island_matches_reference() -> None:
             cu_seqlens=cu,
             state_indices=slots,
         )
-    assert not any(event.name == "aten::max" for event in profile.events())
+    assert "aten::max" not in recorder.operations
     summed_ref = x.float() + res.float()
     mean = summed_ref.mean(dim=-1, keepdim=True)
     centered = summed_ref - mean

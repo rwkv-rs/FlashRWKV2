@@ -911,7 +911,9 @@ def test_static_metadata_validates_once_and_reads_only_a_summary() -> None:
         kernels
     )
 
-    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as profile:
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
+    ) as profile:
         first = ticket._token_predecessor()
         second = ticket._token_predecessor()
         torch.cuda.synchronize()
@@ -920,23 +922,35 @@ def test_static_metadata_validates_once_and_reads_only_a_summary() -> None:
     assert sum("build_token_predecessor_kernel" in event.name for event in profile.events()) == 1
 
 
-@pytest.mark.parametrize("numerical_mode", ["fp16", "fp32io16"])
+@pytest.mark.parametrize("numerical_mode", ["fp16", "fp32io16", "chunk"])
 def test_wkv_only_call_does_not_build_token_predecessor(numerical_mode: str) -> None:
     _require_cuda_extension()
-    packed = tuple(torch.zeros(3, 1, 64, device="cuda", dtype=torch.float16) for _ in range(6))
+    dtype = torch.bfloat16 if numerical_mode == "chunk" else torch.float16
+    packed = tuple(torch.zeros(3, 1, 64, device="cuda", dtype=dtype) for _ in range(6))
     cu = torch.tensor([0, 1, 3], device="cuda", dtype=torch.int32)
     slots = torch.tensor([3, 1], device="cuda", dtype=torch.int32)
     if numerical_mode == "fp16":
         state = prepare_tmix_wkv7_recurrent_fp16_state(4, 64, sequence_capacity=2, device="cuda")
         infer = infer_tmix_wkv7_recurrent_fp16_forward_varlen
-    else:
+    elif numerical_mode == "fp32io16":
         state = prepare_tmix_wkv7_recurrent_fp32io16_state(4, 64, sequence_capacity=2, device="cuda")
         infer = infer_tmix_wkv7_recurrent_fp32io16_forward_varlen
-    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as profile:
-        output = infer(*packed, state=state, cu_seqlens=cu, state_indices=slots)
+    else:
+        state = torch.zeros(4, 1, 64, 64, device="cuda", dtype=dtype)
+        infer = wkv7_module.infer_tmix_wkv7_chunk_bf16_forward_varlen
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
+    ) as profile:
+        state_argument = {"state_pool": state} if numerical_mode == "chunk" else {"state": state}
+        output = infer(*packed, **state_argument, cu_seqlens=cu, state_indices=slots)
         torch.cuda.synchronize()
     assert torch.count_nonzero(output).item() == 0
-    assert not any("build_token_predecessor_kernel" in event.name for event in profile.events())
+    kernels = [
+        event.name for event in profile.events()
+        if event.device_type == torch.autograd.DeviceType.CUDA
+    ]
+    assert kernels, "CUDA profiler did not capture any kernels"
+    assert not any("build_token_predecessor_kernel" in name for name in kernels)
 
 
 @pytest.mark.parametrize("max_seqlen", [None, 4])

@@ -10,6 +10,7 @@ from typing import Any
 
 import pytest
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
 
 _TOLERANCES = json.loads(
     (Path(__file__).parent / "fixtures/tolerances-v1.json").read_text(
@@ -30,6 +31,18 @@ def pytest_configure(config: pytest.Config) -> None:
     """Register private markers."""
     for marker in _TEST_MARKERS:
         config.addinivalue_line("markers", marker)
+
+
+class TorchOperationRecorder(TorchDispatchMode):
+    """Record ATen calls without initializing a CUDA profiler."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.operations: list[str] = []
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        self.operations.append(func._schema.name)
+        return func(*args, **(kwargs or {}))
 
 
 def require_cuda_backend(
