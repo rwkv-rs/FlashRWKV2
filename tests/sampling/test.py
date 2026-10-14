@@ -485,10 +485,11 @@ def test_cooperative_sampling_dynamic_activity_and_slots() -> None:
     assert torch.equal(states[[0, 2, 3, 4]], before[[0, 2, 3, 4]])
 
 
-@pytest.mark.parametrize("dense_ties", [False, True])
+@pytest.mark.parametrize("case", ["ties", "dense_ties", "fractional"])
 @pytest.mark.cuda_graph
-def test_cooperative_ties_and_candidate_cache_overflow(dense_ties: bool) -> None:
+def test_cooperative_ties_and_candidate_cache_overflow(case: str) -> None:
     vocab_size, draws_per_replay, replays = 65536, 16, 128
+    dense_ties = case == "dense_ties"
     logits = torch.full((1, vocab_size), -80.0, device="cuda")
     # Dense ties exceed the per-thread candidate cache during histogram refinement.
     candidates = (
@@ -497,15 +498,23 @@ def test_cooperative_ties_and_candidate_cache_overflow(dense_ties: bool) -> None
         else torch.tensor([17, 2051, 16388, 44000, 65535], device="cuda")
     )
     logits[0, candidates] = 0.0
+    top_k, top_p = 1, 1.0
+    values = torch.zeros(candidates.numel())
+    if case == "fractional":
+        values = torch.tensor([0.0, -0.28768207, -0.69314718, -1.38629436, -80.0])
+        logits[0, candidates] = values.cuda()
+        top_k, top_p = -1, 0.55
     states = setup_sampling_states(1618, 4)
     slots = _slots([2])
-    infer_sampling_temperature_topk_topp_forward_varlen(logits, states, slots, top_k=1)
+    infer_sampling_temperature_topk_topp_forward_varlen(
+        logits, states, slots, top_k=top_k, top_p=top_p
+    )
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         outputs = torch.stack(
             [
                 infer_sampling_temperature_topk_topp_forward_varlen(
-                    logits, states, slots, top_k=1
+                    logits, states, slots, top_k=top_k, top_p=top_p
                 )
                 for _ in range(draws_per_replay)
             ]
@@ -523,7 +532,7 @@ def test_cooperative_ties_and_candidate_cache_overflow(dense_ties: bool) -> None
     else:
         assert torch.isin(flat, candidates).all()
         groups = torch.searchsorted(candidates, flat)
-        expected = 1.0 / candidates.numel()
+        expected = _fractional_probabilities(values, top_k, top_p).cuda()
         bins = candidates.numel()
     observed = torch.bincount(groups, minlength=bins).double() / flat.numel()
     assert torch.max(torch.abs(observed - expected)) < 0.045

@@ -16,6 +16,8 @@
 #include <type_traits>
 #include <utility>
 
+namespace {
+
 using RAND = curandStatePhilox4_32_10_t;
 constexpr int RAND_SETUP_THREADS = 256;
 struct HistogramLayout {
@@ -30,7 +32,6 @@ __device__ __forceinline__ float safe_float(float x) {
 
 template <typename T, bool Maximum>
 __device__ __forceinline__ T warp_reduce(T value) {
-#if __CUDA_ARCH__ >= 800
   if constexpr (Maximum && std::is_same<T, float>::value) {
     unsigned bits = __float_as_uint(value);
     unsigned ordered = (bits & 0x80000000u) ? ~bits : (bits ^ 0x80000000u);
@@ -38,9 +39,7 @@ __device__ __forceinline__ T warp_reduce(T value) {
     return __uint_as_float((ordered & 0x80000000u) ? (ordered ^ 0x80000000u) : ~ordered);
   } else if constexpr (!Maximum && std::is_same<T, unsigned>::value) {
     return __reduce_add_sync(0xffffffff, value);
-  } else
-#endif
-  {
+  } else {
 #pragma unroll
     for (int offset = 16; offset; offset >>= 1) {
       T other = __shfl_down_sync(0xffffffff, value, offset);
@@ -652,6 +651,8 @@ __global__ void __launch_bounds__(1024, 1)
     }
   }
 }
+
+}  // namespace
 
 int64_t sampling_state_size_cuda() { return static_cast<int64_t>(sizeof(RAND)); }
 
