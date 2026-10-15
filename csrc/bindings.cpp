@@ -10,11 +10,15 @@ void register_flashrwkv2_bindings(py::module_& module) {
   register_infer_tmix_wkv7_recurrent_deltalog_fp32io16_bindings(module);
   register_tmix_tokenshift_bindings(module);
   register_tmix_wkv_prepare_bindings(module);
+  register_pretrain_tmix_wkv_prepare_forward_bindings(module);
+  register_pretrain_tmix_wkv_prepare_backward_bindings(module);
   register_tmix_readout_bindings(module);
   register_cmix_bindings(module);
   register_post_norm_bindings(module);
   register_embedding_bindings(module);
   register_head_linear_bindings(module);
+  register_pretrain_head_linear_forward_bindings(module);
+  register_pretrain_head_linear_backward_bindings(module);
   register_sampling_bindings(module);
   register_infer_tmix_wkv7_chunk_bindings(module);
   register_pretrain_l2wrap_ce_forward_bindings(module);

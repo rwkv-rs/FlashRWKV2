@@ -5,6 +5,8 @@
 // Local adaptation: propagate full ChannelMix nonzero initial and returned shift gradients.
 
 #include <torch/extension.h>
+#include "../internal/linear/backend.cuh"
+#include <optional>
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
@@ -15,25 +17,6 @@
 
 namespace {
 
-void gemm_bf16(
-    const torch::Tensor& left, const torch::Tensor& right,
-    torch::Tensor& output, int64_t m, int64_t n, int64_t k,
-    bool transpose_left, bool transpose_right) {
-  const float alpha = 1.0f;
-  const float beta = 0.0f;
-  const cublasStatus_t status = cublasGemmEx(
-      at::cuda::getCurrentCUDABlasHandle(),
-      transpose_right ? CUBLAS_OP_T : CUBLAS_OP_N,
-      transpose_left ? CUBLAS_OP_T : CUBLAS_OP_N,
-      static_cast<int>(n), static_cast<int>(m), static_cast<int>(k), &alpha,
-      right.data_ptr<at::BFloat16>(), CUDA_R_16BF,
-      static_cast<int>(right.size(-1)),
-      left.data_ptr<at::BFloat16>(), CUDA_R_16BF,
-      static_cast<int>(left.size(-1)), &beta,
-      output.data_ptr<at::BFloat16>(), CUDA_R_16BF, static_cast<int>(n),
-      CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-  TORCH_CHECK(status == CUBLAS_STATUS_SUCCESS, "CMix BF16 GEMM failed");
-}
 
 __device__ inline __nv_bfloat162 load_bf16x2(const at::BFloat16* ptr) {
   return *reinterpret_cast<const __nv_bfloat162*>(ptr);
@@ -126,33 +109,35 @@ std::vector<torch::Tensor> statetune_cmix_backward_cuda(
     torch::Tensor grad_output, torch::Tensor grad_next_shift,
     torch::Tensor x, torch::Tensor initial_shift, torch::Tensor x_k,
     torch::Tensor key_weight, torch::Tensor value_weight,
-    torch::Tensor mixed, torch::Tensor activation) {
-  const int64_t bt_size = x.size(0) * x.size(1);
-  auto grad_value_weight = torch::empty_like(value_weight);
-  gemm_bf16(
-      grad_output, activation, grad_value_weight, grad_output.size(2),
-      activation.size(1), bt_size, true, false);
-  auto grad_hidden = torch::empty(
-      {bt_size, value_weight.size(1)}, grad_output.options());
-  gemm_bf16(
-      grad_output, value_weight, grad_hidden, bt_size, value_weight.size(1),
-      grad_output.size(2), false, false);
+    torch::Tensor mixed, torch::Tensor activation,
+    std::optional<torch::Tensor> key_lora_a,
+    std::optional<torch::Tensor> key_lora_b,
+    std::optional<torch::Tensor> value_lora_a,
+    std::optional<torch::Tensor> value_lora_b,
+    double key_lora_scale, double value_lora_scale,
+    bool key_use_nora, bool value_use_nora,
+    std::vector<torch::Tensor> adapter_state, std::vector<bool> needs) {
+  if (needs.empty()) needs = std::vector<bool>(9, true);
+  if (adapter_state.empty()) adapter_state = std::vector<torch::Tensor>(4);
+  auto value_grads = internal_linear_train_backward(
+      grad_output, activation, value_weight,
+      value_lora_a.value_or(torch::Tensor()), value_lora_b.value_or(torch::Tensor()),
+      adapter_state[2], adapter_state[3], value_lora_scale, value_use_nora,
+      true, needs[4], needs[7], needs[8]);
+  auto grad_value_weight = value_grads[1];
+  auto grad_hidden = value_grads[0];
   auto stream = at::cuda::getCurrentCUDAStream();
   const int64_t activation_pairs = activation.numel() / 2;
-  relu_square_backward_from_output_kernel<<<
-      static_cast<int>(ceil_div(activation_pairs, kThreads)), kThreads, 0,
-      stream>>>(grad_hidden.data_ptr<at::BFloat16>(),
-                activation.data_ptr<at::BFloat16>(), activation_pairs);
+  relu_square_backward_from_output_kernel<<<static_cast<int>(ceil_div(activation_pairs, kThreads)), kThreads, 0, stream>>>(
+      grad_hidden.data_ptr<at::BFloat16>(), activation.data_ptr<at::BFloat16>(), activation_pairs);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-  auto grad_key_weight = torch::empty_like(key_weight);
-  gemm_bf16(
-      grad_hidden, mixed, grad_key_weight, grad_hidden.size(1), x.size(2),
-      bt_size, true, false);
-  auto grad_mixed = torch::empty_like(x);
-  gemm_bf16(
-      grad_hidden, key_weight, grad_mixed, bt_size, x.size(2),
-      grad_hidden.size(1), false, false);
-
+  auto key_grads = internal_linear_train_backward(
+      grad_hidden, mixed, key_weight,
+      key_lora_a.value_or(torch::Tensor()), key_lora_b.value_or(torch::Tensor()),
+      adapter_state[0], adapter_state[1], key_lora_scale, key_use_nora,
+      true, needs[3], needs[5], needs[6]);
+  auto grad_key_weight = key_grads[1];
+  auto grad_mixed = key_grads[0].view(x.sizes());
   auto grad_x = torch::empty_like(x);
   auto grad_initial = torch::empty_like(initial_shift);
   auto grad_x_k_fp32 =
@@ -175,5 +160,5 @@ std::vector<torch::Tensor> statetune_cmix_backward_cuda(
                 grad_x_k.data_ptr<at::BFloat16>(), channel_pairs);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return {grad_x, grad_initial, grad_x_k, grad_key_weight,
-          grad_value_weight};
+          grad_value_weight, key_grads[2], key_grads[3], value_grads[2], value_grads[3]};
 }

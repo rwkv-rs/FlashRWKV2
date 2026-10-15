@@ -13,9 +13,7 @@ import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
 _TOLERANCES = json.loads(
-    (Path(__file__).parent / "fixtures/tolerances-v1.json").read_text(
-        encoding="utf-8"
-    )
+    (Path(__file__).parent / "fixtures/tolerances-v1.json").read_text(encoding="utf-8")
 )
 
 _TEST_MARKERS = (
@@ -55,7 +53,9 @@ def require_cuda_backend(
         pytest.skip("CUDA is required")
     capability = tuple(torch.cuda.get_device_capability())
     if capability < (8, 0):
-        pytest.skip(f"CUDA source requires CC >= 8.0, found sm{capability[0]}{capability[1]}")
+        pytest.skip(
+            f"CUDA source requires CC >= 8.0, found sm{capability[0]}{capability[1]}"
+        )
 
     import flashrwkv2
 
@@ -99,3 +99,18 @@ def assert_finite_positive(value: float | torch.Tensor) -> None:
     assert scalar.numel() == 1
     assert torch.isfinite(scalar).item()
     assert scalar.item() > 0
+
+
+def nora_linear_reference(x, weight, a, b, scale=1.0, use_nora=True):
+    """PEFT NoRA expression with FP32 norm reduction and BF16 GEMMs."""
+    normalized = a.float()
+    if use_nora:
+        normalized = normalized / (normalized.norm(dim=0, keepdim=True) + 1.0e-6)
+    normalized = normalized.to(x.dtype)
+    return x @ weight.t() + ((x @ normalized.t()) @ b.to(x.dtype).t()) * scale
+
+
+def assert_relative_rmse(actual, expected, tolerance=0.025):
+    error = (actual.float() - expected.float()).square().mean().sqrt()
+    magnitude = expected.float().square().mean().sqrt().clamp_min(1.0e-8)
+    assert (error / magnitude).item() < tolerance, (error.item(), magnitude.item())

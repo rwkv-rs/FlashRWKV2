@@ -2,6 +2,30 @@
 #pragma once
 
 #include <ATen/ATen.h>
+#include <vector>
+
+void internal_linear_train_check_adapter(
+    const at::Tensor& x, const at::Tensor& weight,
+    const at::Tensor& a, const at::Tensor& b, double scale);
+void internal_linear_train_check(
+    const at::Tensor& x, const at::Tensor& weight,
+    const at::Tensor& a, const at::Tensor& b, double scale);
+void internal_linear_train_check_backward(
+    const at::Tensor& grad, const at::Tensor& x, const at::Tensor& weight);
+at::Tensor internal_linear_train_normalize_backward(at::Tensor a, at::Tensor grad);
+at::Tensor internal_linear_train_gemm(
+    const at::Tensor& left, const at::Tensor& right,
+    bool transpose_left = false, bool transpose_right = false,
+    double scale = 1.0, bool fp32_output = false,
+    at::Tensor output = {}, double beta = 0.0);
+std::vector<at::Tensor> internal_linear_train_forward(
+    at::Tensor x, at::Tensor weight, at::Tensor a, at::Tensor b,
+    double scale, bool use_nora);
+std::vector<at::Tensor> internal_linear_train_backward(
+    at::Tensor grad, at::Tensor x, at::Tensor weight,
+    at::Tensor a, at::Tensor b, at::Tensor features, at::Tensor normalized_a,
+    double scale, bool use_nora, bool need_x, bool need_weight,
+    bool need_a, bool need_b);
 
 // Native-private primitives shared by semantic operator owners. None of these
 // symbols may be registered with pybind. Caller-specific dispatch is deliberately

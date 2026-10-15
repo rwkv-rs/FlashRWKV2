@@ -59,9 +59,10 @@ def test_infer_cmix_highest_fusion_island_matches_reference() -> None:
         + bias.float()
     )
     normalized_f16 = normalized.to(torch.float16)
-    mixed = normalized_f16.float() + (
-        initial[2].float() - normalized_f16.float()
-    ) * x_k.float()
+    mixed = (
+        normalized_f16.float()
+        + (initial[2].float() - normalized_f16.float()) * x_k.float()
+    )
     activation = torch.relu(mixed @ key.float().t()).square()
     expected_output = activation @ value.float()
     torch.testing.assert_close(summed.float(), summed_ref, atol=0.01, rtol=0.01)
@@ -79,31 +80,21 @@ def test_infer_cmix_t1_fused_varlen_preserves_fragmented_slots(
     torch.manual_seed(20260824 + batch_size)
     device = torch.device("cuda")
     channels, features = 4096, 128
-    x = torch.randn(
-        batch_size, channels, device=device, dtype=torch.float16
-    ).mul_(0.02)
+    x = torch.randn(batch_size, channels, device=device, dtype=torch.float16).mul_(0.02)
     res = torch.randn_like(x).mul_(0.02)
-    weight = torch.randn(
-        channels, device=device, dtype=torch.float16
-    ).mul_(0.05).add_(1)
-    bias = torch.randn(
-        channels, device=device, dtype=torch.float16
-    ).mul_(0.01)
-    x_k = torch.randn(
-        channels, device=device, dtype=torch.float16
-    ).mul_(0.1)
-    key = torch.randn(
-        features, channels, device=device, dtype=torch.float16
-    ).mul_(0.01)
+    weight = (
+        torch.randn(channels, device=device, dtype=torch.float16).mul_(0.05).add_(1)
+    )
+    bias = torch.randn(channels, device=device, dtype=torch.float16).mul_(0.01)
+    x_k = torch.randn(channels, device=device, dtype=torch.float16).mul_(0.1)
+    key = torch.randn(features, channels, device=device, dtype=torch.float16).mul_(0.01)
     value = torch.randn_like(key).mul_(0.01)
     initial = torch.randn(
         batch_size + 3, channels, device=device, dtype=torch.float16
     ).mul_(0.02)
     state = initial.clone()
     cu = torch.arange(batch_size + 1, device=device, dtype=torch.int32)
-    slots = torch.arange(
-        batch_size - 1, -1, -1, device=device, dtype=torch.int32
-    )
+    slots = torch.arange(batch_size - 1, -1, -1, device=device, dtype=torch.int32)
     ticket = prepare_tmix_wkv7_recurrent_metadata(
         cu,
         slots,
@@ -134,9 +125,7 @@ def test_infer_cmix_t1_fused_varlen_preserves_fragmented_slots(
         + bias.float()
     ).to(torch.float16)
     previous = initial.index_select(0, slots.to(torch.int64))
-    mixed = normalized.float() + (
-        previous.float() - normalized.float()
-    ) * x_k.float()
+    mixed = normalized.float() + (previous.float() - normalized.float()) * x_k.float()
     expected = torch.relu(mixed @ key.float().t()).square() @ value.float()
     torch.testing.assert_close(summed.float(), summed_ref, atol=0.01, rtol=0.01)
     torch.testing.assert_close(output.float(), expected, atol=0.12, rtol=0.07)
@@ -244,6 +233,8 @@ def test_infer_cmix_ticket_mutation_fails_without_state_write() -> None:
             validated_metadata=ticket,
         )
     assert torch.equal(state, before)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.cuda
 @pytest.mark.memcheck
@@ -282,6 +273,7 @@ def test_pretrain_cmix_forward_backward() -> None:
     )
     for actual, reference in zip(actual_grads, expected_grads, strict=True):
         assert torch.allclose(actual.float(), reference.float(), atol=0.06, rtol=0.06)
+
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.cuda
@@ -361,10 +353,20 @@ def test_statetune_cmix_chunk_composition() -> None:
     # differ at cancellation points solely because each chunk is rounded before
     # autograd adds it, which does not exercise the recurrent shift contract.
     x = (torch.randn(b, t, c, device=device) * 0.05).to(torch.bfloat16).requires_grad_()
-    initial = (torch.randn(b, c, device=device) * 0.05).to(torch.bfloat16).requires_grad_()
+    initial = (
+        (torch.randn(b, c, device=device) * 0.05).to(torch.bfloat16).requires_grad_()
+    )
     x_k = (torch.randn(c, device=device) * 0.1).to(torch.bfloat16).requires_grad_()
-    key = (torch.randn(4 * c, c, device=device) * 0.05).to(torch.bfloat16).requires_grad_()
-    value = (torch.randn(c, 4 * c, device=device) * 0.05).to(torch.bfloat16).requires_grad_()
+    key = (
+        (torch.randn(4 * c, c, device=device) * 0.05)
+        .to(torch.bfloat16)
+        .requires_grad_()
+    )
+    value = (
+        (torch.randn(c, 4 * c, device=device) * 0.05)
+        .to(torch.bfloat16)
+        .requires_grad_()
+    )
     whole = statetune_cmix_bf16(x, initial, x_k, key, value)
     upstream = [torch.randn_like(output) for output in whole]
     whole_grads = torch.autograd.grad(
@@ -417,9 +419,7 @@ def test_statetune_cmix_rejects_cpu_and_invalid_shape() -> None:
 def test_statetune_cmix_rejects_misaligned_vec2_input() -> None:
     device = torch.device("cuda")
     x = torch.zeros(1, 2, 8, device=device, dtype=torch.bfloat16)
-    initial = torch.empty(1 * 8 + 1, device=device, dtype=torch.bfloat16)[1:].view(
-        1, 8
-    )
+    initial = torch.empty(1 * 8 + 1, device=device, dtype=torch.bfloat16)[1:].view(1, 8)
     x_k = torch.zeros(8, device=device, dtype=torch.bfloat16)
     key = torch.zeros(32, 8, device=device, dtype=torch.bfloat16)
     value = torch.zeros(8, 32, device=device, dtype=torch.bfloat16)
@@ -462,3 +462,60 @@ def test_statetune_cmix_rejects_invalid_cuda_contracts() -> None:
         foreign = x_k.to("cuda:1")
         with pytest.raises(ValueError, match="x_k must share x's device"):
             statetune_cmix_bf16(x, initial, foreign, key, value)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.cuda
+@pytest.mark.parametrize("stateful", [False, True])
+def test_cmix_nora_training(stateful):
+    from utils import nora_linear_reference, assert_relative_rmse
+
+    torch.manual_seed(73)
+    c, rank = 64, 256
+    x = (
+        torch.randn(2, 17, c, device="cuda", dtype=torch.bfloat16) * 0.1
+    ).requires_grad_()
+    mix = (torch.randn(c, device="cuda", dtype=torch.bfloat16) * 0.1).requires_grad_()
+    initial = (
+        torch.randn(2, c, device="cuda", dtype=torch.bfloat16) * 0.1
+    ).requires_grad_()
+    key = torch.randn(4 * c, c, device="cuda", dtype=torch.bfloat16) * 0.03
+    value = torch.randn(c, 4 * c, device="cuda", dtype=torch.bfloat16) * 0.03
+    ka, kb, va, vb = [
+        (torch.randn(*shape, device="cuda") * 0.03).requires_grad_()
+        for shape in ((rank, c), (4 * c, rank), (rank, 4 * c), (c, rank))
+    ]
+    tensors = [x, mix, ka, kb, va, vb] + ([initial] if stateful else [])
+    refs = [tensor.detach().clone().requires_grad_() for tensor in tensors]
+    options = dict(
+        key_lora_a=ka,
+        key_lora_b=kb,
+        value_lora_a=va,
+        value_lora_b=vb,
+        key_use_nora=True,
+        value_use_nora=True,
+    )
+    if stateful:
+        output, next_shift = statetune_cmix_bf16(x, initial, mix, key, value, **options)
+    else:
+        output = pretrain_cmix_bf16(x, mix, key, value, **options)
+    xr, mr, kar, kbr, var, vbr = refs[:6]
+    previous = torch.cat(
+        (refs[-1][:, None] if stateful else torch.zeros_like(xr[:, :1]), xr[:, :-1]),
+        dim=1,
+    )
+    mixed = xr + (previous - xr) * mr
+    activation = torch.relu(nora_linear_reference(mixed, key, kar, kbr)).square()
+    expected = nora_linear_reference(activation, value, var, vbr)
+    upstream = torch.randn_like(output)
+    actual_loss, expected_loss = (output * upstream).sum(), (expected * upstream).sum()
+    if stateful:
+        boundary_grad = torch.randn_like(initial)
+        actual_loss = actual_loss + (next_shift * boundary_grad).sum()
+        expected_loss = expected_loss + (xr[:, -1] * boundary_grad).sum()
+    grads = torch.autograd.grad(actual_loss, tensors)
+    ref_grads = torch.autograd.grad(expected_loss, refs)
+    assert_relative_rmse(output, expected, 0.04)
+    for actual, reference in zip(grads, ref_grads, strict=True):
+        assert_relative_rmse(actual, reference, 0.05)
+    assert key.grad is None and value.grad is None

@@ -6,6 +6,9 @@
 // FlashRWKV2 owns the module-local memory-bounded wrapper below.
 
 #include <torch/extension.h>
+#include "../../internal/linear/backend.cuh"
+#include <optional>
+#include <c10/cuda/CUDAGuard.h>
 
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_bf16.h>
@@ -257,36 +260,52 @@ void head_l2wrap_ce_reduce_loss_v4_cuda(torch::Tensor loss_rows, torch::Tensor l
 #include <algorithm>
 
 std::vector<torch::Tensor> pretrain_head_l2wrap_ce_cuda(
-    torch::Tensor hidden,
-    torch::Tensor weight,
-    torch::Tensor targets,
-    int64_t chunk_rows) {
-  constexpr int64_t kVocab = 65536;
+    torch::Tensor hidden, torch::Tensor weight, torch::Tensor targets,
+    int64_t chunk_rows, std::optional<torch::Tensor> lora_a,
+    std::optional<torch::Tensor> lora_b, double lora_scale, bool use_nora,
+    std::vector<bool> needs) {
+  const c10::cuda::CUDAGuard guard(hidden.device());
   const int64_t rows = hidden.size(0) * hidden.size(1);
   const int64_t channels = hidden.size(2);
   const int64_t chunk = std::min(chunk_rows, rows);
   auto h2d = hidden.view({rows, channels});
   auto flat_targets = targets.view({rows});
-  auto loss_rows = torch::empty(
-      {rows}, hidden.options().dtype(torch::kFloat32));
+  auto loss_rows = torch::empty({rows}, hidden.options().dtype(torch::kFloat32));
   auto loss = torch::empty({}, hidden.options().dtype(torch::kFloat32));
-  auto grad_hidden = torch::empty_like(hidden);
-  auto grad_h2d = grad_hidden.view({rows, channels});
-  auto grad_weight = torch::zeros_like(weight);
-  auto logits = torch::empty({chunk, kVocab}, hidden.options());
-
+  torch::Tensor grad_hidden, grad_weight, grad_a, grad_b, grad_normalized;
+  if (needs[0]) grad_hidden = torch::empty_like(hidden);
+  if (needs[1]) grad_weight = torch::zeros(weight.sizes(), weight.options().dtype(torch::kFloat32));
+  if (lora_a.has_value() && needs[2])
+    grad_normalized = torch::zeros(lora_a->sizes(), hidden.options().dtype(torch::kFloat32));
+  if (lora_b.has_value() && needs[3])
+    grad_b = torch::zeros(lora_b->sizes(), hidden.options().dtype(torch::kFloat32));
+  auto a = lora_a.value_or(torch::Tensor());
+  auto b = lora_b.value_or(torch::Tensor());
+  auto b_compute = b.defined() ? b.to(at::kBFloat16) : torch::Tensor();
   for (int64_t start = 0; start < rows; start += chunk) {
     const int64_t length = std::min(chunk, rows - start);
     auto h_chunk = h2d.narrow(0, start, length);
-    auto logits_use = logits.narrow(0, 0, length);
-    at::mm_out(logits_use, h_chunk, weight.transpose(0, 1));
-    head_l2wrap_ce_row_chunk_loss_and_grad_v4_cuda(
-        logits_use, flat_targets, loss_rows, start, rows);
-    auto grad_h_chunk = grad_h2d.narrow(0, start, length);
-    at::mm_out(grad_h_chunk, logits_use, weight);
-    grad_weight.addmm_(logits_use.transpose(0, 1), h_chunk);
+    auto projection = internal_linear_train_forward(h_chunk, weight, a, b, lora_scale, use_nora);
+    auto logits = projection[0];
+    head_l2wrap_ce_row_chunk_loss_and_grad_v4_cuda(logits, flat_targets, loss_rows, start, rows);
+    if (needs[0]) {
+      auto grads = internal_linear_train_backward(logits, h_chunk, weight, a, b,
+          projection[1], projection[2], lora_scale, use_nora, true, false, false, false);
+      grad_hidden.view({rows, channels}).narrow(0, start, length).copy_(grads[0]);
+    }
+    if (needs[1]) internal_linear_train_gemm(logits, h_chunk, true, false, 1.0, true, grad_weight, 1.0);
+    if (grad_b.defined())
+      internal_linear_train_gemm(logits, projection[1], true, false, lora_scale, true, grad_b, 1.0);
+    if (grad_normalized.defined()) {
+      auto dz = internal_linear_train_gemm(logits, b_compute, false, false, lora_scale);
+      internal_linear_train_gemm(dz, h_chunk, true, false, 1.0, true, grad_normalized, 1.0);
+    }
   }
-
+  if (grad_normalized.defined()) grad_a = use_nora
+      ? internal_linear_train_normalize_backward(a, grad_normalized)
+      : grad_normalized.to(a.scalar_type());
+  if (grad_b.defined()) grad_b = grad_b.to(b.scalar_type());
+  if (grad_weight.defined()) grad_weight = grad_weight.to(weight.scalar_type());
   head_l2wrap_ce_reduce_loss_v4_cuda(loss_rows, loss);
-  return {loss, grad_hidden, grad_weight};
+  return {loss, grad_hidden, grad_weight, grad_a, grad_b};
 }

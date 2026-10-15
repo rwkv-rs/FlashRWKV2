@@ -75,15 +75,16 @@ APW-only 表。策略与 workspace 在 state preparation 阶段确定；统一�
 `prepare_tmix_wkv7_recurrent_metadata` 和 `setup_sampling_states` 是上述推理入口
 需要的状态 preparation API。
 
-训练接口保持 14 个既有完整语义入口：`pretrain_cmix_bf16`、
+训练接口包括 16 个完整语义入口：`pretrain_tmix_wkv_prepare_bf16`、
+`pretrain_head_linear_bf16`、`pretrain_cmix_bf16`、
 `statetune_cmix_bf16`、`pretrain_tmix_wkv7_recurrent_bf16`、
 `statetune_tmix_wkv7_recurrent_fp32io16`、`rl_infctx_tmix_wkv7_chunk_fp32io16`、
 `rl_infctx_tmix_wkv7_chunk_fp32io16_factor_recompute`、`pretrain_tmix_a_gate_bf16`、
 `pretrain_tmix_kk_pre_bf16`、`pretrain_tmix_readout_bf16`、
 `pretrain_tmix_tokenshift_bf16`、`statetune_tmix_tokenshift_bf16`、
 `pretrain_tmix_vres_gate_bf16`、`pretrain_l2wrap_ce_bf16` 和
-`pretrain_head_l2wrap_ce_bf16`。根包总计导出 32 个唯一名称：13 个推理入口、
-14 个训练入口和上述 5 个状态 preparation 入口。
+`pretrain_head_l2wrap_ce_bf16`。根包总计导出 34 个唯一名称：13 个推理入口、
+16 个训练入口和上述 5 个状态 preparation 入口。
 
 TMix 的 `B=1,T=1,C=4096` 与 CMix 的 `T=1,C=4096` 使用 Albatross 派生的单次 Res+LN+TokenShift fused launch；其他 packed varlen 形状在同一公共入口内部顺序启动 PostNorm 与 TokenShift。CMix 的 dense/sparse 选择也完全由 `infer_cmix_forward_varlen` 内部完成。
 
@@ -95,3 +96,23 @@ TMix 的 `B=1,T=1,C=4096` 与 CMix 的 `T=1,C=4096` 使用 Albatross 派生的�
 phase/logs，或调用
 standalone LN、Res、TokenShift、CMix ReLU²、FFN-down、sparse 子步骤、WKV
 elapsed-state 更新及通用 Linear helper。
+
+## NoRA training
+
+训练投影接受原始 A `[R,K]`、B `[O,R]`、scaling 和 `use_nora`。
+NoRA 定义为 `A / (norm(A, dim=0) + 1e-6)`；范数与归一化反向使用 FP32，
+投影 GEMM 使用 BF16，适配器参数支持 BF16/FP32。scaling 直接使用调用方的 PEFT 值。
+单个无 bias、dropout=0 的适配器可通过 CMix、WKV Prepare、Readout、Head 训练入口接入；
+`use_nora="init"` 由 PEFT 初始化后按普通 LoRA 传入。
+
+CMix 的 `key_lora_*`、`value_lora_*` 分别作用于 key/value projection，
+对应的 `key_use_nora`、`value_use_nora` 控制归一化。
+Readout 的 `output_weight` 可选，传入时同时完成 output projection；
+其适配器使用 `output_lora_*` 和 `output_use_nora`。
+Head logits 和分块 Head CE 使用 `lora_a/lora_b/lora_scale/use_nora`。
+所有入口根据 autograd 的梯度需求跳过冻结基座的完整 dW，保留穿过基座的输入梯度。
+
+WKV Prepare 返回 `(r, decay_logits, key, value, recurrent_a, recurrent_b, gate, v_first)`；
+`decay_logits` 是训练 WKV 的输入，保持现有 WKV 数值契约。
+NoRA 的归一化结果属于本次 forward/backward，不跨 optimizer step 缓存。
+吸收使用 `W.float() + scale * B.float() @ normalized_A.float()`，最后转换为目标权重 dtype。
