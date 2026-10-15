@@ -183,6 +183,14 @@ for _owner, _arguments in {
         ),
     )
 
+BENCHMARKS["cmix"] += (
+    BenchmarkCase(
+        "nora_torch_forward_backward",
+        "benchmarks/cmix/bench.py",
+        ("--operator", "torch", "--backward", "--adapter-rank", "256"),
+    ),
+)
+
 
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
@@ -821,6 +829,7 @@ def _self_test() -> None:
         "pretrain_forward_backward",
         "statetune_forward_backward",
         "nora_forward_backward",
+        "nora_torch_forward_backward",
     }
     assert {case.workload for case in BENCHMARKS["tmix/tokenshift"]} == {
         "infer",

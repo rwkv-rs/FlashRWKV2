@@ -35,11 +35,13 @@ def main() -> None:
     parser.add_argument("--adapter-rank", type=int, default=0)
     args = parser.parse_args()
     device = torch.device("cuda")
-    if args.adapter_rank and args.operator not in {"pretrain", "stateful"}:
-        raise ValueError("adapter-rank requires a native training operator")
+    if args.adapter_rank and args.operator == "infer":
+        raise ValueError("adapter-rank requires a training operator")
     if args.operator == "infer" and args.backward:
         raise ValueError("the inference benchmark does not support --backward")
     dtype = torch.float16 if args.operator == "infer" else torch.bfloat16
+    if args.adapter_rank:
+        torch.manual_seed(113)
     x = torch.zeros(
         args.batch,
         args.seqlen,
@@ -113,6 +115,12 @@ def main() -> None:
         )
         adapter_options.update(key_use_nora=True, value_use_nora=True)
 
+    def torch_nora_projection(source, weight, a, b):
+        normalized = a / (a.norm(dim=0, keepdim=True) + 1.0e-6)
+        return (
+            source @ weight.t() + (source @ normalized.to(dtype).t()) @ b.to(dtype).t()
+        )
+
     def run():
         if args.operator == "infer":
             outputs = infer_cmix_forward_varlen(
@@ -134,6 +142,13 @@ def main() -> None:
             outputs = statetune_cmix_bf16(
                 x, initial_shift, x_k, key, value, **adapter_options
             )
+        elif args.adapter_rank:
+            previous = torch.cat((torch.zeros_like(x[:, :1]), x[:, :-1]), dim=1)
+            mixed = x + (previous - x) * x_k
+            activation = torch.relu(
+                torch_nora_projection(mixed, key, *adapters[:2])
+            ).square()
+            outputs = (torch_nora_projection(activation, value, *adapters[2:]),)
         else:
             outputs = torch_stateful(x, initial_shift, x_k, key, value)
         if args.backward:
