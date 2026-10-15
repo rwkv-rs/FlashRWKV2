@@ -22,6 +22,8 @@ def main() -> None:
     parser.add_argument("--backward", action="store_true")
     parser.add_argument("--adapter-rank", type=int, default=0)
     args = parser.parse_args()
+    if args.adapter_rank and args.operator != "pretrain":
+        raise ValueError("adapter-rank requires the pretrain operator")
     if args.operator == "infer" and args.backward:
         raise ValueError("the inference readout does not support backward")
 
