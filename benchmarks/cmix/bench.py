@@ -35,6 +35,8 @@ def main() -> None:
     parser.add_argument("--adapter-rank", type=int, default=0)
     args = parser.parse_args()
     device = torch.device("cuda")
+    if args.adapter_rank and args.operator not in {"pretrain", "stateful"}:
+        raise ValueError("adapter-rank requires a native training operator")
     if args.operator == "infer" and args.backward:
         raise ValueError("the inference benchmark does not support --backward")
     dtype = torch.float16 if args.operator == "infer" else torch.bfloat16

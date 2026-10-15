@@ -205,7 +205,7 @@ jobs:
       fail-fast: false
       max-parallel: 1
       matrix:
-        torch: ["2.11.0", "2.12.0", "2.13.0"]
+        torch: ["2.13.0", "2.11.0", "2.12.0"]
     env:
       TORCH_EXTENSIONS_DIR: ${{ github.workspace }}/.torch-extensions-${{ github.run_id }}-torch-${{ matrix.torch }}
     steps:
@@ -277,6 +277,14 @@ jobs:
       - name: Compute Sanitizer racecheck
         if: matrix.torch == '2.13.0'
         run: compute-sanitizer --error-exitcode=1 --tool racecheck .venv/bin/python -m pytest -q tests -m racecheck
+      - name: NoRA rank-256 training benchmarks
+        if: matrix.torch == '2.13.0'
+        run: |
+          .venv/bin/python ci/benchmark_gate.py run-suite \
+            --modules '["cmix","tmix/wkv_prepare","tmix/readout","head/linear","head/l2wrap_ce"]' \
+            --python .venv/bin/python --revision '${{ github.sha }}' --status candidate \
+            --output artifacts/nora-benchmarks --summary artifacts/nora-benchmark-summary.json \
+            --require-complete
       - name: Record complete CUDA coverage
         if: matrix.torch == '2.13.0'
         env:
@@ -311,6 +319,8 @@ jobs:
           path: |
             artifacts/compile-*.json
             artifacts/validation-${{ matrix.torch }}.json
+            artifacts/nora-*.json
+            artifacts/nora-benchmarks/
           if-no-files-found: error
 
   finalize:

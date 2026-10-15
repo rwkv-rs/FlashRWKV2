@@ -83,3 +83,96 @@ def test_head_adapter_training_and_merge(use_nora, adapter_dtype):
     assert_relative_rmse(updated, x.float() @ merged.t())
     assert not torch.equal(output, updated)
     assert weight.grad is None
+
+
+class _FSDPNoRAProjection(torch.nn.Module):
+    def __init__(self, device):
+        super().__init__()
+        self.weight = torch.nn.Parameter(
+            torch.randn(257, 64, device=device) * 0.03, requires_grad=False
+        )
+        self.a = torch.nn.Parameter(torch.randn(256, 64, device=device) * 0.03)
+        self.b = torch.nn.Parameter(torch.randn(257, 256, device=device) * 0.01)
+
+    def forward(self, x):
+        from flashrwkv2 import pretrain_head_linear_bf16
+        from torch.utils.checkpoint import checkpoint
+
+        return checkpoint(
+            pretrain_head_linear_bf16,
+            x,
+            self.weight.to(x.dtype),
+            lora_a=self.a.to(x.dtype),
+            lora_b=self.b.to(x.dtype),
+            use_nora=True,
+            use_reentrant=False,
+        )
+
+
+def _fsdp_nora_training_worker(rank, store_path):
+    import copy
+    import io
+
+    import torch.distributed as dist
+    from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
+    from utils import assert_relative_rmse
+
+    torch.cuda.set_device(rank)
+    dist.init_process_group(
+        "nccl", init_method=f"file://{store_path}", rank=rank, world_size=2
+    )
+    try:
+        torch.manual_seed(97)
+        model = _FSDPNoRAProjection(torch.device("cuda", rank))
+        reference = copy.deepcopy(model)
+        initial_a = model.a.detach().clone()
+        fully_shard(
+            model,
+            mp_policy=MixedPrecisionPolicy(
+                param_dtype=torch.bfloat16, reduce_dtype=torch.float32
+            ),
+        )
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        torch.manual_seed(101 + rank)
+        x = torch.randn(5, 64, device=rank, dtype=torch.bfloat16)
+        target = torch.randn(5, 257, device=rank)
+        loss = (model(x).float() - target).square().mean()
+        loss.backward()
+        reference_loss = (reference(x).float() - target).square().mean()
+        reference_loss.backward()
+        for name in ("a", "b"):
+            expected = getattr(reference, name).grad
+            dist.all_reduce(expected)
+            expected.div_(2)
+            actual = getattr(model, name).grad.full_tensor()
+            assert_relative_rmse(actual, expected)
+        assert model.weight.grad is None
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        trained = model(x).detach()
+        state = {
+            name: value.full_tensor().detach()
+            for name, value in model.state_dict().items()
+        }
+        assert not torch.equal(initial_a, state["a"])
+        buffer = io.BytesIO()
+        torch.save(state, buffer)
+        buffer.seek(0)
+        restored = _FSDPNoRAProjection(torch.device("cuda", rank))
+        restored.load_state_dict(torch.load(buffer, weights_only=True))
+        assert_relative_rmse(trained, restored(x), 0.001)
+        normalized = state["a"] / (state["a"].norm(dim=0, keepdim=True) + 1e-6)
+        merged = state["weight"] + state["b"] @ normalized
+        assert_relative_rmse(trained, x.float() @ merged.t())
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    torch.cuda.device_count() < 2, reason="two CUDA devices are required"
+)
+@pytest.mark.cuda
+def test_fsdp_nora_checkpoint_step_and_merge(tmp_path):
+    torch.multiprocessing.spawn(
+        _fsdp_nora_training_worker, args=(str(tmp_path / "store"),), nprocs=2, join=True
+    )
