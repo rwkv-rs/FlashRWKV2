@@ -3,6 +3,8 @@
 // Local adaptation: propagate initial/next shift gradients across chunks.
 
 #include <torch/extension.h>
+#include "../internal/linear/backend.cuh"
+#include <optional>
 
 #include <cstdint>
 #include <utility>
@@ -12,7 +14,14 @@ std::vector<torch::Tensor> statetune_cmix_backward_cuda(
     torch::Tensor grad_output, torch::Tensor grad_next_shift,
     torch::Tensor x, torch::Tensor initial_shift, torch::Tensor x_k,
     torch::Tensor key_weight, torch::Tensor value_weight,
-    torch::Tensor mixed, torch::Tensor activation);
+    torch::Tensor mixed, torch::Tensor activation,
+    std::optional<torch::Tensor> key_lora_a,
+    std::optional<torch::Tensor> key_lora_b,
+    std::optional<torch::Tensor> value_lora_a,
+    std::optional<torch::Tensor> value_lora_b,
+    double key_lora_scale, double value_lora_scale,
+    bool key_use_nora, bool value_use_nora,
+    std::vector<torch::Tensor> adapter_state, std::vector<bool> needs);
 
 namespace {
 void check_bf16_cuda(const torch::Tensor& tensor, const char* name) {
@@ -29,7 +38,14 @@ std::vector<torch::Tensor> statetune_cmix_backward(
     torch::Tensor grad_output, torch::Tensor grad_next_shift,
     torch::Tensor x, torch::Tensor initial_shift, torch::Tensor x_k,
     torch::Tensor key_weight, torch::Tensor value_weight,
-    torch::Tensor mixed, torch::Tensor activation) {
+    torch::Tensor mixed, torch::Tensor activation,
+    std::optional<torch::Tensor> key_lora_a,
+    std::optional<torch::Tensor> key_lora_b,
+    std::optional<torch::Tensor> value_lora_a,
+    std::optional<torch::Tensor> value_lora_b,
+    double key_lora_scale, double value_lora_scale,
+    bool key_use_nora, bool value_use_nora,
+    std::vector<torch::Tensor> adapter_state, std::vector<bool> needs) {
   for (const auto& item : {
            std::pair<const torch::Tensor*, const char*>{&grad_output,
                                                         "grad_output"},
@@ -57,9 +73,19 @@ std::vector<torch::Tensor> statetune_cmix_backward(
   TORCH_CHECK(mixed.sizes() == x.sizes() && activation.dim() == 2 &&
                   activation.size(0) == b * t && activation.size(1) == 4 * c,
               "invalid saved CMix activation shapes");
+  auto ka = key_lora_a.value_or(torch::Tensor());
+  auto kb = key_lora_b.value_or(torch::Tensor());
+  auto va = value_lora_a.value_or(torch::Tensor());
+  auto vb = value_lora_b.value_or(torch::Tensor());
+  internal_linear_train_check(x, key_weight, ka, kb, key_lora_scale);
+  internal_linear_train_check_adapter(x, value_weight, va, vb, value_lora_scale);
+  TORCH_CHECK((needs.empty() || needs.size() == 9) &&
+                  (adapter_state.empty() || adapter_state.size() == 4),
+              "invalid CMix adapter backward specification");
   return statetune_cmix_backward_cuda(
       grad_output, grad_next_shift, x, initial_shift, x_k, key_weight,
-      value_weight, mixed, activation);
+      value_weight, mixed, activation,
+      key_lora_a, key_lora_b, value_lora_a, value_lora_b, key_lora_scale, value_lora_scale, key_use_nora, value_use_nora, adapter_state, needs);
 }
 
 void register_statetune_cmix_backward_bindings(py::module_& module) {
@@ -67,5 +93,10 @@ void register_statetune_cmix_backward_bindings(py::module_& module) {
       "statetune_cmix_backward", &statetune_cmix_backward,
       py::arg("grad_output"), py::arg("grad_next_shift"), py::arg("x"),
       py::arg("initial_shift"), py::arg("x_k"), py::arg("key_weight"),
-      py::arg("value_weight"), py::arg("mixed"), py::arg("activation"));
+      py::arg("value_weight"), py::arg("mixed"), py::arg("activation"),
+      py::arg("key_lora_a") = py::none(), py::arg("key_lora_b") = py::none(),
+      py::arg("value_lora_a") = py::none(), py::arg("value_lora_b") = py::none(),
+      py::arg("key_lora_scale") = 1.0, py::arg("value_lora_scale") = 1.0,
+      py::arg("key_use_nora") = false, py::arg("value_use_nora") = false, py::arg("adapter_state") = std::vector<torch::Tensor>{},
+      py::arg("needs") = std::vector<bool>{});
 }

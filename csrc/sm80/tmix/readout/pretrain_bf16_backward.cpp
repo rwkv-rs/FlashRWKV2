@@ -4,6 +4,7 @@
 // 952102498e9ed367ea0a59ee64106916d474d30f.
 
 #include <torch/extension.h>
+#include "../../internal/linear/backend.cuh"
 
 #include <utility>
 #include <vector>
@@ -92,10 +93,27 @@ std::vector<torch::Tensor> pretrain_tmix_readout_backward(
     torch::Tensor g,
     torch::Tensor mean,
     torch::Tensor rstd,
-    int64_t head_size) {
+    int64_t head_size,
+    std::optional<torch::Tensor> output_weight,
+    std::optional<torch::Tensor> output_lora_a,
+    std::optional<torch::Tensor> output_lora_b,
+    double output_lora_scale, bool output_use_nora, torch::Tensor prelinear,
+    torch::Tensor features, torch::Tensor normalized_a, std::vector<bool> needs) {
+  TORCH_CHECK(needs.size() == 11, "Readout requires eleven gradient flags");
+  std::vector<torch::Tensor> projection_grads(4);
+  if (output_weight.has_value()) {
+    internal_linear_train_check_backward(grad_output, prelinear, *output_weight);
+    projection_grads = internal_linear_train_backward(
+        grad_output, prelinear, *output_weight, output_lora_a.value_or(torch::Tensor()),
+        output_lora_b.value_or(torch::Tensor()), features, normalized_a,
+        output_lora_scale, output_use_nora, true, needs[8], needs[9], needs[10]);
+    grad_output = projection_grads[0];
+  }
   check_inputs(grad_output, x, r, k, v, residual_scale, weight, bias, g, mean, rstd, head_size);
-  return pretrain_tmix_readout_backward_cuda(
+  auto result = pretrain_tmix_readout_backward_cuda(
       grad_output, x, r, k, v, residual_scale, weight, bias, g, mean, rstd, head_size);
+  result.insert(result.end(), {projection_grads[1], projection_grads[2], projection_grads[3]});
+  return result;
 }
 
 void register_pretrain_tmix_readout_backward_bindings(py::module_& module) {
@@ -106,5 +124,7 @@ void register_pretrain_tmix_readout_backward_bindings(py::module_& module) {
       py::arg("grad_output"), py::arg("x"), py::arg("r"), py::arg("k"),
       py::arg("v"), py::arg("residual_scale"), py::arg("weight"),
       py::arg("bias"), py::arg("g"), py::arg("mean"), py::arg("rstd"),
-      py::arg("head_size") = 64);
+      py::arg("head_size"), py::arg("output_weight"), py::arg("output_lora_a"),
+      py::arg("output_lora_b"), py::arg("output_lora_scale"), py::arg("output_use_nora"),
+      py::arg("prelinear"), py::arg("features"), py::arg("normalized_a"), py::arg("needs"));
 }

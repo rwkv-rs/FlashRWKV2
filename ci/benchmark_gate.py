@@ -56,12 +56,8 @@ BENCHMARKS = {
         ),
     ),
     "sampling": (BenchmarkCase("infer", "benchmarks/sampling/bench.py"),),
-    "tmix/a_gate": (
-        BenchmarkCase("pretrain", "benchmarks/tmix/a_gate/bench.py"),
-    ),
-    "tmix/kk_pre": (
-        BenchmarkCase("pretrain", "benchmarks/tmix/kk_pre/bench.py"),
-    ),
+    "tmix/a_gate": (BenchmarkCase("pretrain", "benchmarks/tmix/a_gate/bench.py"),),
+    "tmix/kk_pre": (BenchmarkCase("pretrain", "benchmarks/tmix/kk_pre/bench.py"),),
     "tmix/readout": (
         BenchmarkCase(
             "infer", "benchmarks/tmix/readout/bench.py", ("--operator", "infer")
@@ -144,9 +140,7 @@ BENCHMARKS = {
         BenchmarkCase(
             "pretrain_forward_backward", "benchmarks/tmix/wkv7/pretrain/bench.py"
         ),
-        BenchmarkCase(
-            "statetune", "benchmarks/tmix/wkv7/statetune/bench.py"
-        ),
+        BenchmarkCase("statetune", "benchmarks/tmix/wkv7/statetune/bench.py"),
     ),
     "tmix/wkv7/rl_infctx": (
         BenchmarkCase(
@@ -166,6 +160,28 @@ BENCHMARKS = {
         ),
     ),
 }
+
+
+for _owner, _arguments in {
+    "cmix": ("--operator", "pretrain", "--backward", "--adapter-rank", "256"),
+    "head/linear": ("--tokens", "4", "--adapter-rank", "256"),
+    "head/l2wrap_ce": ("--adapter-rank", "256"),
+    "tmix/readout": (
+        "--operator",
+        "pretrain",
+        "--backward",
+        "--tokens",
+        "32",
+        "--adapter-rank",
+        "256",
+    ),
+    "tmix/wkv_prepare": ("--tokens", "32", "--adapter-rank", "256"),
+}.items():
+    BENCHMARKS[_owner] += (
+        BenchmarkCase(
+            "nora_forward_backward", f"benchmarks/{_owner}/bench.py", _arguments
+        ),
+    )
 
 
 def _sha256(path: Path) -> str:
@@ -594,7 +610,11 @@ def compare_suite(
         baseline_path = baseline_dir / f"{safe}-baseline.json"
         if not candidate_path.is_file():
             warnings.append(
-                {"kind": "benchmark-unavailable", "module": module, "message": "candidate missing"}
+                {
+                    "kind": "benchmark-unavailable",
+                    "module": module,
+                    "message": "candidate missing",
+                }
             )
             continue
         candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
@@ -602,15 +622,11 @@ def compare_suite(
             warnings.append(candidate["warning"])
             continue
         if not baseline_path.is_file():
-            warnings.append(
-                {"kind": "baseline-unavailable", "module": module}
-            )
+            warnings.append({"kind": "baseline-unavailable", "module": module})
             continue
         baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
         if baseline.get("status") == "unavailable":
-            warnings.append(
-                {"kind": "baseline-unavailable", "module": module}
-            )
+            warnings.append({"kind": "baseline-unavailable", "module": module})
             continue
         try:
             warnings.extend(compare_module(baseline, candidate))
@@ -679,7 +695,10 @@ def fetch_main_baselines(
             continue
         request = urllib.request.Request(evidence["archive_download_url"])
         request.add_unredirected_header("Authorization", f"Bearer {token}")
-        with urllib.request.urlopen(request) as response, tempfile.NamedTemporaryFile() as archive:
+        with (
+            urllib.request.urlopen(request) as response,
+            tempfile.NamedTemporaryFile() as archive,
+        ):
             archive.write(response.read())
             archive.flush()
             with zipfile.ZipFile(archive.name) as bundle:
@@ -740,9 +759,7 @@ def _parse_modules(value: str) -> list[str]:
 
 def _self_test() -> None:
     assert _last_json('{\n  "status": "pretty"\n}') == {"status": "pretty"}
-    assert _last_json('diagnostic\n{"status":"compact"}\n') == {
-        "status": "compact"
-    }
+    assert _last_json('diagnostic\n{"status":"compact"}\n') == {"status": "compact"}
     request = urllib.request.Request("https://api.github.com/artifact")
     request.add_unredirected_header("Authorization", "Bearer test-token")
     redirected = urllib.request.HTTPRedirectHandler().redirect_request(
@@ -790,9 +807,7 @@ def _self_test() -> None:
     warnings = compare_module(payload(100.0), payload(100.000001))
     assert len(warnings) == 1 and warnings[0]["kind"] == "performance-regression"
     assert _contract_hash("cmix") == _contract_hash("cmix")
-    configured_paths = {
-        case.path for cases in BENCHMARKS.values() for case in cases
-    }
+    configured_paths = {case.path for cases in BENCHMARKS.values() for case in cases}
     discovered_paths = {
         str(path.relative_to(ROOT))
         for path in (ROOT / "benchmarks").glob("**/bench.py")
@@ -806,6 +821,7 @@ def _self_test() -> None:
         "infer",
         "pretrain_forward_backward",
         "statetune_forward_backward",
+        "nora_forward_backward",
     }
     assert {case.workload for case in BENCHMARKS["tmix/tokenshift"]} == {
         "infer",
@@ -835,7 +851,9 @@ def main() -> int:
     run_parser.add_argument("--modules", required=True)
     run_parser.add_argument("--python", default=sys.executable)
     run_parser.add_argument("--revision", required=True)
-    run_parser.add_argument("--status", choices=("candidate", "baseline"), required=True)
+    run_parser.add_argument(
+        "--status", choices=("candidate", "baseline"), required=True
+    )
     run_parser.add_argument("--output", type=Path, required=True)
     run_parser.add_argument("--summary", type=Path, required=True)
     run_parser.add_argument("--require-complete", action="store_true")
@@ -892,7 +910,9 @@ def main() -> int:
     )
     if args.github_output:
         with args.github_output.open("a", encoding="utf-8") as handle:
-            handle.write(f"missing_modules={json.dumps(missing, separators=(',', ':'))}\n")
+            handle.write(
+                f"missing_modules={json.dumps(missing, separators=(',', ':'))}\n"
+            )
     print(json.dumps({"missing_modules": missing}, separators=(",", ":")))
     return 0
 

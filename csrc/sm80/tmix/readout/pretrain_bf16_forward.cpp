@@ -4,6 +4,7 @@
 // 952102498e9ed367ea0a59ee64106916d474d30f.
 
 #include <torch/extension.h>
+#include "../../internal/linear/backend.cuh"
 
 #include <utility>
 #include <vector>
@@ -81,10 +82,31 @@ std::vector<torch::Tensor> pretrain_tmix_readout_forward(
     torch::Tensor weight,
     torch::Tensor bias,
     torch::Tensor g,
-    int64_t head_size) {
+    int64_t head_size,
+    std::optional<torch::Tensor> output_weight,
+    std::optional<torch::Tensor> output_lora_a,
+    std::optional<torch::Tensor> output_lora_b,
+    double output_lora_scale, bool output_use_nora) {
   check_inputs(x, r, k, v, residual_scale, weight, bias, g, head_size);
-  return pretrain_tmix_readout_cuda(
+  auto result = pretrain_tmix_readout_cuda(
       x, r, k, v, residual_scale, weight, bias, g, head_size);
+  auto prelinear = result[0];
+  auto features = torch::empty({0}, x.options());
+  auto normalized = torch::empty({0}, x.options());
+  if (output_weight.has_value()) {
+    internal_linear_train_check(prelinear, *output_weight,
+        output_lora_a.value_or(torch::Tensor()), output_lora_b.value_or(torch::Tensor()), output_lora_scale);
+    auto projection = internal_linear_train_forward(prelinear, *output_weight,
+        output_lora_a.value_or(torch::Tensor()), output_lora_b.value_or(torch::Tensor()), output_lora_scale, output_use_nora);
+    result[0] = projection[0].view(x.sizes());
+    features = projection[1];
+    normalized = projection[2];
+  } else {
+    TORCH_CHECK(!output_lora_a.has_value() && !output_lora_b.has_value(),
+                "output adapters require output_weight");
+  }
+  result.insert(result.end(), {prelinear, features, normalized});
+  return result;
 }
 
 void register_pretrain_tmix_readout_forward_bindings(py::module_& module) {
@@ -94,5 +116,7 @@ void register_pretrain_tmix_readout_forward_bindings(py::module_& module) {
       "RWKV-7 train_temp fused LN/residual/gate forward",
       py::arg("x"), py::arg("r"), py::arg("k"), py::arg("v"),
       py::arg("residual_scale"), py::arg("weight"), py::arg("bias"),
-      py::arg("g"), py::arg("head_size") = 64);
+      py::arg("g"), py::arg("head_size") = 64, py::arg("output_weight") = py::none(),
+      py::arg("output_lora_a") = py::none(), py::arg("output_lora_b") = py::none(),
+      py::arg("output_lora_scale") = 1.0, py::arg("output_use_nora") = false);
 }

@@ -5,6 +5,8 @@
 // Local adaptation: full ChannelMix with a nonzero initial shift and returned final input.
 
 #include <torch/extension.h>
+#include "../internal/linear/backend.cuh"
+#include <optional>
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
@@ -15,25 +17,6 @@
 
 namespace {
 
-void gemm_bf16(
-    const torch::Tensor& left, const torch::Tensor& right,
-    torch::Tensor& output, int64_t m, int64_t n, int64_t k,
-    bool transpose_left, bool transpose_right) {
-  const float alpha = 1.0f;
-  const float beta = 0.0f;
-  const cublasStatus_t status = cublasGemmEx(
-      at::cuda::getCurrentCUDABlasHandle(),
-      transpose_right ? CUBLAS_OP_T : CUBLAS_OP_N,
-      transpose_left ? CUBLAS_OP_T : CUBLAS_OP_N,
-      static_cast<int>(n), static_cast<int>(m), static_cast<int>(k), &alpha,
-      right.data_ptr<at::BFloat16>(), CUDA_R_16BF,
-      static_cast<int>(right.size(-1)),
-      left.data_ptr<at::BFloat16>(), CUDA_R_16BF,
-      static_cast<int>(left.size(-1)), &beta,
-      output.data_ptr<at::BFloat16>(), CUDA_R_16BF, static_cast<int>(n),
-      CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-  TORCH_CHECK(status == CUBLAS_STATUS_SUCCESS, "CMix BF16 GEMM failed");
-}
 
 __device__ inline __nv_bfloat162 load_bf16x2(const at::BFloat16* ptr) {
   return *reinterpret_cast<const __nv_bfloat162*>(ptr);
@@ -85,7 +68,13 @@ __global__ void relu_square_inplace_kernel(at::BFloat16* data,
 
 std::vector<torch::Tensor> statetune_cmix_forward_cuda(
     torch::Tensor x, torch::Tensor initial_shift, torch::Tensor x_k,
-    torch::Tensor key_weight, torch::Tensor value_weight) {
+    torch::Tensor key_weight, torch::Tensor value_weight,
+    std::optional<torch::Tensor> key_lora_a,
+    std::optional<torch::Tensor> key_lora_b,
+    std::optional<torch::Tensor> value_lora_a,
+    std::optional<torch::Tensor> value_lora_b,
+    double key_lora_scale, double value_lora_scale,
+    bool key_use_nora, bool value_use_nora) {
   auto mixed = torch::empty_like(x);
   const int64_t bt_size = x.size(0) * x.size(1);
   const int64_t mix_pairs = bt_size * (x.size(2) / 2);
@@ -97,20 +86,19 @@ std::vector<torch::Tensor> statetune_cmix_forward_cuda(
       x.size(1), x.size(2));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-  auto activation = torch::empty(
-      {bt_size, key_weight.size(0)}, x.options());
-  gemm_bf16(
-      mixed, key_weight, activation, bt_size, key_weight.size(0), x.size(2),
-      false, true);
+  auto key_result = internal_linear_train_forward(
+      mixed, key_weight, key_lora_a.value_or(torch::Tensor()),
+      key_lora_b.value_or(torch::Tensor()), key_lora_scale, key_use_nora);
+  auto activation = key_result[0];
   const int64_t activation_pairs = activation.numel() / 2;
-  relu_square_inplace_kernel<<<
-      static_cast<int>(ceil_div(activation_pairs, kThreads)), kThreads, 0,
-      stream>>>(activation.data_ptr<at::BFloat16>(), activation_pairs);
+  relu_square_inplace_kernel<<<static_cast<int>(ceil_div(activation_pairs, kThreads)), kThreads, 0, stream>>>(
+      activation.data_ptr<at::BFloat16>(), activation_pairs);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-  auto output = torch::empty_like(x);
-  gemm_bf16(
-      activation, value_weight, output, bt_size, value_weight.size(0),
-      activation.size(1), false, true);
+  auto value_result = internal_linear_train_forward(
+      activation, value_weight, value_lora_a.value_or(torch::Tensor()),
+      value_lora_b.value_or(torch::Tensor()), value_lora_scale, value_use_nora);
+  auto output = value_result[0].view(x.sizes());
   auto next_shift = x.select(1, x.size(1) - 1).contiguous();
-  return {output, next_shift, mixed, activation};
+  return {output, next_shift, mixed, activation,
+           key_result[1], key_result[2], value_result[1], value_result[2]};
 }

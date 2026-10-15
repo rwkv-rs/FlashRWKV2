@@ -16,11 +16,21 @@ from flashrwkv2.tmix.readout import (
 def test_readout_public_contract() -> None:
     parameters = inspect.signature(infer_tmix_readout_forward_varlen).parameters
     assert list(parameters)[:9] == [
-        "wkv_output", "receptance", "key", "value", "r_k",
-        "ln_weight", "ln_bias", "gate", "output_weight",
+        "wkv_output",
+        "receptance",
+        "key",
+        "value",
+        "r_k",
+        "ln_weight",
+        "ln_bias",
+        "gate",
+        "output_weight",
     ]
     assert "output_lora_a" in parameters
-    assert inspect.signature(pretrain_tmix_readout_bf16).parameters["head_size"].default == 64
+    assert (
+        inspect.signature(pretrain_tmix_readout_bf16).parameters["head_size"].default
+        == 64
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -31,13 +41,27 @@ def test_readout_inference_matches_reference(head_size: int) -> None:
     torch.manual_seed(20260816 + head_size)
     rows, channels = 2, 4096
     device = torch.device("cuda")
-    packed = [torch.randn(rows, channels, device=device, dtype=torch.float16) for _ in range(5)]
-    vectors = [torch.randn(channels, device=device, dtype=torch.float16) for _ in range(3)]
+    packed = [
+        torch.randn(rows, channels, device=device, dtype=torch.float16)
+        for _ in range(5)
+    ]
+    vectors = [
+        torch.randn(channels, device=device, dtype=torch.float16) for _ in range(3)
+    ]
     output_weight = torch.randn(channels, channels, device=device, dtype=torch.float16)
     output = infer_tmix_readout_forward_varlen(
-        packed[0], packed[1], packed[2], packed[3], vectors[0], vectors[1],
-        vectors[2], packed[4], output_weight, head_size=head_size,
-        batch_size=1, max_seqlen=rows,
+        packed[0],
+        packed[1],
+        packed[2],
+        packed[3],
+        vectors[0],
+        vectors[1],
+        vectors[2],
+        packed[4],
+        output_weight,
+        head_size=head_size,
+        batch_size=1,
+        max_seqlen=rows,
     )
     heads = channels // head_size
     wkv = packed[0].float().view(rows, heads, head_size)
@@ -48,11 +72,9 @@ def test_readout_inference_matches_reference(head_size: int) -> None:
     normalized = centered * torch.rsqrt(
         centered.square().mean(dim=-1, keepdim=True) + 64.0e-5
     )
-    residual = (
-        receptance
-        * key
-        * vectors[0].float().view(1, heads, head_size)
-    ).sum(dim=-1, keepdim=True)
+    residual = (receptance * key * vectors[0].float().view(1, heads, head_size)).sum(
+        dim=-1, keepdim=True
+    )
     gated = (
         normalized * vectors[1].float().view(1, heads, head_size)
         + vectors[2].float().view(1, heads, head_size)
@@ -85,8 +107,10 @@ def test_readout_pretrain_matches_forward_and_gradient_reference(
         for _ in range(4)
     ]
     residual_scale = (
-        torch.randn(heads, head_size, device=device) * 0.1
-    ).to(torch.bfloat16).requires_grad_()
+        (torch.randn(heads, head_size, device=device) * 0.1)
+        .to(torch.bfloat16)
+        .requires_grad_()
+    )
     weight = torch.randn(
         channels, device=device, dtype=torch.bfloat16, requires_grad=True
     )
@@ -94,8 +118,10 @@ def test_readout_pretrain_matches_forward_and_gradient_reference(
         channels, device=device, dtype=torch.bfloat16, requires_grad=True
     )
     gate = (
-        torch.randn(b, t, channels, device=device) * 0.1
-    ).to(torch.bfloat16).requires_grad_()
+        (torch.randn(b, t, channels, device=device) * 0.1)
+        .to(torch.bfloat16)
+        .requires_grad_()
+    )
     inputs = (*tokens, residual_scale, weight, bias, gate)
     output = pretrain_tmix_readout_bf16(*inputs, head_size=head_size)
 
@@ -124,4 +150,45 @@ def test_readout_pretrain_matches_forward_and_gradient_reference(
         expected, references, grad_outputs=upstream.float()
     )
     for actual, reference in zip(actual_grads, expected_grads, strict=True):
-        torch.testing.assert_close(actual.float(), reference.float(), atol=0.08, rtol=0.08)
+        torch.testing.assert_close(
+            actual.float(), reference.float(), atol=0.08, rtol=0.08
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.cuda
+def test_readout_nora_projection_gradients():
+    from utils import nora_linear_reference, assert_relative_rmse
+
+    torch.manual_seed(79)
+    c = 128
+    tokens = [
+        (
+            torch.randn(1, 3, c, device="cuda", dtype=torch.bfloat16) * 0.1
+        ).requires_grad_()
+        for _ in range(4)
+    ]
+    res_scale = torch.randn(2, 64, device="cuda", dtype=torch.bfloat16).requires_grad_()
+    ln_weight = torch.ones(c, device="cuda", dtype=torch.bfloat16).requires_grad_()
+    ln_bias = torch.zeros_like(ln_weight).requires_grad_()
+    gate = torch.randn_like(tokens[0]).requires_grad_()
+    inputs = [*tokens, res_scale, ln_weight, ln_bias, gate]
+    weight = torch.randn(c, c, device="cuda", dtype=torch.bfloat16) * 0.03
+    a = (torch.randn(256, c, device="cuda") * 0.03).requires_grad_()
+    b = (torch.randn(c, 256, device="cuda") * 0.01).requires_grad_()
+    refs = [tensor.detach().clone().requires_grad_() for tensor in (*inputs, a, b)]
+    output = pretrain_tmix_readout_bf16(
+        *inputs,
+        output_weight=weight,
+        output_lora_a=a,
+        output_lora_b=b,
+        output_use_nora=True,
+    )
+    prelinear = pretrain_tmix_readout_bf16(*refs[:8])
+    expected = nora_linear_reference(prelinear, weight, *refs[8:])
+    upstream = torch.randn_like(output)
+    grads = torch.autograd.grad(output, (*inputs, a, b), upstream)
+    ref_grads = torch.autograd.grad(expected, refs, upstream)
+    assert_relative_rmse(output, expected)
+    for actual, reference in zip(grads, ref_grads, strict=True):
+        assert_relative_rmse(actual, reference, 0.04)

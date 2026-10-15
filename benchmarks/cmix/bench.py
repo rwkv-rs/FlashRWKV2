@@ -32,6 +32,7 @@ def main() -> None:
         default="infer",
     )
     parser.add_argument("--backward", action="store_true")
+    parser.add_argument("--adapter-rank", type=int, default=0)
     args = parser.parse_args()
     device = torch.device("cuda")
     if args.operator == "infer" and args.backward:
@@ -88,6 +89,25 @@ def main() -> None:
         )
         state_indices = torch.arange(args.batch, device=device, dtype=torch.int32)
 
+    adapter_options = {}
+    adapters = []
+    if args.adapter_rank:
+        key.requires_grad_(False)
+        value.requires_grad_(False)
+        adapters = [
+            (torch.randn(*shape, device=device) * 0.01).requires_grad_(args.backward)
+            for shape in (
+                (args.adapter_rank, args.channels),
+                (4 * args.channels, args.adapter_rank),
+                (args.adapter_rank, 4 * args.channels),
+                (args.channels, args.adapter_rank),
+            )
+        ]
+        adapter_options = dict(
+            zip(("key_lora_a", "key_lora_b", "value_lora_a", "value_lora_b"), adapters)
+        )
+        adapter_options.update(key_use_nora=True, value_use_nora=True)
+
     def run():
         if args.operator == "infer":
             outputs = infer_cmix_forward_varlen(
@@ -104,14 +124,16 @@ def main() -> None:
                 max_seqlen=args.seqlen,
             )
         elif args.operator == "pretrain":
-            outputs = (pretrain_cmix_bf16(x, x_k, key, value),)
+            outputs = (pretrain_cmix_bf16(x, x_k, key, value, **adapter_options),)
         elif args.operator == "stateful":
-            outputs = statetune_cmix_bf16(x, initial_shift, x_k, key, value)
+            outputs = statetune_cmix_bf16(
+                x, initial_shift, x_k, key, value, **adapter_options
+            )
         else:
             outputs = torch_stateful(x, initial_shift, x_k, key, value)
         if args.backward:
             sum(output.sum() for output in outputs).backward()
-            for tensor in (x, initial_shift, x_k, key, value):
+            for tensor in (x, initial_shift, x_k, key, value, *adapters):
                 tensor.grad = None
         return outputs
 
@@ -124,9 +146,10 @@ def main() -> None:
                 "batch": args.batch,
                 "seqlen": args.seqlen,
                 "channels": args.channels,
+                "adapter_rank": args.adapter_rank,
                 "profile": (
                     f"operator={args.operator}/backward={args.backward}/"
-                    f"batch={args.batch}/seqlen={args.seqlen}/channels={args.channels}"
+                    f"batch={args.batch}/seqlen={args.seqlen}/channels={args.channels}/adapter_rank={args.adapter_rank}"
                 ),
                 "steady_state": (
                     "zero inference state remains stable across launches"

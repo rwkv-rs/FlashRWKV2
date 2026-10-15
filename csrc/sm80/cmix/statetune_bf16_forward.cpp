@@ -3,13 +3,21 @@
 // Local adaptation: accept a nonzero chunk-boundary shift and return next shift.
 
 #include <torch/extension.h>
+#include "../internal/linear/backend.cuh"
+#include <optional>
 
 #include <cstdint>
 #include <vector>
 
 std::vector<torch::Tensor> statetune_cmix_forward_cuda(
     torch::Tensor x, torch::Tensor initial_shift, torch::Tensor x_k,
-    torch::Tensor key_weight, torch::Tensor value_weight);
+    torch::Tensor key_weight, torch::Tensor value_weight,
+    std::optional<torch::Tensor> key_lora_a,
+    std::optional<torch::Tensor> key_lora_b,
+    std::optional<torch::Tensor> value_lora_a,
+    std::optional<torch::Tensor> value_lora_b,
+    double key_lora_scale, double value_lora_scale,
+    bool key_use_nora, bool value_use_nora);
 
 namespace {
 void check_bf16_cuda(const torch::Tensor& tensor, const char* name) {
@@ -24,7 +32,13 @@ void check_bf16_cuda(const torch::Tensor& tensor, const char* name) {
 
 std::vector<torch::Tensor> statetune_cmix_forward(
     torch::Tensor x, torch::Tensor initial_shift, torch::Tensor x_k,
-    torch::Tensor key_weight, torch::Tensor value_weight) {
+    torch::Tensor key_weight, torch::Tensor value_weight,
+    std::optional<torch::Tensor> key_lora_a,
+    std::optional<torch::Tensor> key_lora_b,
+    std::optional<torch::Tensor> value_lora_a,
+    std::optional<torch::Tensor> value_lora_b,
+    double key_lora_scale, double value_lora_scale,
+    bool key_use_nora, bool value_use_nora) {
   check_bf16_cuda(x, "x");
   check_bf16_cuda(initial_shift, "initial_shift");
   check_bf16_cuda(x_k, "x_k");
@@ -49,13 +63,24 @@ std::vector<torch::Tensor> statetune_cmix_forward(
     TORCH_CHECK(tensor->device() == x.device(),
                 "CMix tensors must share x's device");
   }
+  auto ka = key_lora_a.value_or(torch::Tensor());
+  auto kb = key_lora_b.value_or(torch::Tensor());
+  auto va = value_lora_a.value_or(torch::Tensor());
+  auto vb = value_lora_b.value_or(torch::Tensor());
+  internal_linear_train_check(x, key_weight, ka, kb, key_lora_scale);
+  internal_linear_train_check_adapter(x, value_weight, va, vb, value_lora_scale);
   return statetune_cmix_forward_cuda(
-      x, initial_shift, x_k, key_weight, value_weight);
+      x, initial_shift, x_k, key_weight, value_weight,
+      key_lora_a, key_lora_b, value_lora_a, value_lora_b, key_lora_scale, value_lora_scale, key_use_nora, value_use_nora);
 }
 
 void register_statetune_cmix_forward_bindings(py::module_& module) {
   module.def(
       "statetune_cmix_forward", &statetune_cmix_forward, py::arg("x"),
       py::arg("initial_shift"), py::arg("x_k"), py::arg("key_weight"),
-      py::arg("value_weight"));
+      py::arg("value_weight"),
+      py::arg("key_lora_a") = py::none(), py::arg("key_lora_b") = py::none(),
+      py::arg("value_lora_a") = py::none(), py::arg("value_lora_b") = py::none(),
+      py::arg("key_lora_scale") = 1.0, py::arg("value_lora_scale") = 1.0,
+      py::arg("key_use_nora") = false, py::arg("value_use_nora") = false);
 }

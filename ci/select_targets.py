@@ -63,6 +63,7 @@ SHARED_PRIMITIVE_CALLERS = {
     "csrc/sm80/internal/linear/": (
         "cmix",
         "head/linear",
+        "head/l2wrap_ce",
         "tmix/readout",
         "tmix/wkv_prepare",
     ),

@@ -64,9 +64,7 @@ def infer_cmix_forward_varlen(
         or shift_state_pool.shape[1] != x.shape[1]
         or shift_state_pool.device != x.device
     ):
-        raise ValueError(
-            "shift_state_pool must be contiguous CUDA float16 [slots,C]"
-        )
+        raise ValueError("shift_state_pool must be contiguous CUDA float16 [slots,C]")
     if (
         not isinstance(eps, (float, int))
         or isinstance(eps, bool)
@@ -112,44 +110,101 @@ def infer_cmix_forward_varlen(
     )
 
 
-class _PretrainCmix(torch.autograd.Function):
+class _Cmix(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, x_k, key_weight, value_weight):
-        output, mixed, preact = _extension().pretrain_cmix_forward(
-            x, x_k, key_weight, value_weight
-        )
-        ctx.save_for_backward(x, x_k, key_weight, value_weight, mixed, preact)
-        return output
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        if grad_output is None:
-            return None, None, None, None
-        gradients = _extension().pretrain_cmix_backward(
-            grad_output.contiguous(), *ctx.saved_tensors
-        )
-        return tuple(gradients)
-
-
-class _StatetuneCmix(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x, initial_shift, x_k, key_weight, value_weight):
-        output, next_shift, mixed, activation = _extension().statetune_cmix_forward(
-            x, initial_shift, x_k, key_weight, value_weight
-        )
+    def forward(
+        ctx,
+        x,
+        initial_shift,
+        x_k,
+        key_weight,
+        value_weight,
+        key_lora_a,
+        key_lora_b,
+        value_lora_a,
+        value_lora_b,
+        key_lora_scale,
+        value_lora_scale,
+        key_use_nora,
+        value_use_nora,
+    ):
+        ctx.stateful = initial_shift is not None
+        ctx.options = (key_lora_scale, value_lora_scale, key_use_nora, value_use_nora)
+        adapters = (key_lora_a, key_lora_b, value_lora_a, value_lora_b)
+        if ctx.stateful:
+            output, next_shift, mixed, activation, *adapter_state = (
+                _extension().statetune_cmix_forward(
+                    x,
+                    initial_shift,
+                    x_k,
+                    key_weight,
+                    value_weight,
+                    *adapters,
+                    *ctx.options,
+                )
+            )
+        else:
+            output, mixed, activation, *adapter_state = (
+                _extension().pretrain_cmix_forward(
+                    x, x_k, key_weight, value_weight, *adapters, *ctx.options
+                )
+            )
         ctx.save_for_backward(
-            x, initial_shift, x_k, key_weight, value_weight, mixed, activation
+            x,
+            initial_shift,
+            x_k,
+            key_weight,
+            value_weight,
+            *adapters,
+            mixed,
+            activation,
+            *adapter_state,
         )
-        return output, next_shift
+        return (output, next_shift) if ctx.stateful else output
 
     @staticmethod
-    def backward(ctx, grad_output, grad_next_shift):
-        return tuple(
-            _extension().statetune_cmix_backward(
+    def backward(ctx, grad_output, grad_next_shift=None):
+        x, initial, x_k, key, value, *saved = ctx.saved_tensors
+        adapters, mixed, activation, adapter_state = (
+            saved[:4],
+            saved[4],
+            saved[5],
+            saved[6:],
+        )
+        if grad_output is None:
+            grad_output = torch.zeros_like(x)
+        args = (x, x_k, key, value, mixed, activation)
+        tail = (*adapters, *ctx.options, adapter_state, list(ctx.needs_input_grad[:9]))
+        if ctx.stateful:
+            if grad_next_shift is None:
+                grad_next_shift = torch.zeros_like(initial)
+            gradients = _extension().statetune_cmix_backward(
                 grad_output.contiguous(),
                 grad_next_shift.contiguous(),
-                *ctx.saved_tensors,
+                x,
+                initial,
+                x_k,
+                key,
+                value,
+                mixed,
+                activation,
+                *tail,
             )
+        else:
+            gradients = list(
+                _extension().pretrain_cmix_backward(
+                    grad_output.contiguous(), *args, *tail
+                )
+            )
+            gradients.insert(1, None)
+        return (
+            tuple(
+                gradient if needed else None
+                for gradient, needed in zip(
+                    gradients, ctx.needs_input_grad[:9], strict=True
+                )
+            )
+            + (None,) * 4
         )
 
 
@@ -158,6 +213,15 @@ def pretrain_cmix_bf16(
     x_k: torch.Tensor,
     key_weight: torch.Tensor,
     value_weight: torch.Tensor,
+    *,
+    key_lora_a: torch.Tensor | None = None,
+    key_lora_b: torch.Tensor | None = None,
+    value_lora_a: torch.Tensor | None = None,
+    value_lora_b: torch.Tensor | None = None,
+    key_lora_scale: float = 1.0,
+    value_lora_scale: float = 1.0,
+    key_use_nora: bool = False,
+    value_use_nora: bool = False,
 ) -> torch.Tensor:
     """Train-temp BF16 CMix forward/backward family."""
 
@@ -176,12 +240,28 @@ def pretrain_cmix_bf16(
             raise ValueError(f"{name} must share x's device")
     if x.ndim != 3 or x.numel() == 0 or x_k.shape != (x.shape[-1],):
         raise ValueError("invalid CMix input shapes")
+    if x.shape[-1] % 2:
+        raise ValueError("x channel dimension C must be divisible by 2")
     if key_weight.shape != (4 * x.shape[-1], x.shape[-1]) or value_weight.shape != (
         x.shape[-1],
         4 * x.shape[-1],
     ):
         raise ValueError("CMix weights must have shapes [4C,C] and [C,4C]")
-    return _PretrainCmix.apply(x, x_k, key_weight, value_weight)
+    return _Cmix.apply(
+        x,
+        None,
+        x_k,
+        key_weight,
+        value_weight,
+        key_lora_a,
+        key_lora_b,
+        value_lora_a,
+        value_lora_b,
+        float(key_lora_scale),
+        float(value_lora_scale),
+        key_use_nora,
+        value_use_nora,
+    )
 
 
 def statetune_cmix_bf16(
@@ -190,6 +270,15 @@ def statetune_cmix_bf16(
     x_k: torch.Tensor,
     key_weight: torch.Tensor,
     value_weight: torch.Tensor,
+    *,
+    key_lora_a: torch.Tensor | None = None,
+    key_lora_b: torch.Tensor | None = None,
+    value_lora_a: torch.Tensor | None = None,
+    value_lora_b: torch.Tensor | None = None,
+    key_lora_scale: float = 1.0,
+    value_lora_scale: float = 1.0,
+    key_use_nora: bool = False,
+    value_use_nora: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """BF16 ChannelMix with differentiable chunk-boundary shift state."""
 
@@ -219,7 +308,17 @@ def statetune_cmix_bf16(
         raise ValueError("key_weight must have shape [4C,C]")
     if value_weight.shape != (c, 4 * c):
         raise ValueError("value_weight must have shape [C,4C]")
-    return _StatetuneCmix.apply(*tensors)
+    return _Cmix.apply(
+        *tensors,
+        key_lora_a,
+        key_lora_b,
+        value_lora_a,
+        value_lora_b,
+        float(key_lora_scale),
+        float(value_lora_scale),
+        key_use_nora,
+        value_use_nora,
+    )
 
 
 __all__ = [
