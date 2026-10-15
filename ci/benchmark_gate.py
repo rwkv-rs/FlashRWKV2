@@ -201,17 +201,18 @@ def _python_executable(python: str) -> str:
 
 def _environment(python: str) -> dict[str, Any]:
     program = r"""
-import json, platform, torch
-from pathlib import Path
-extension = getattr(__import__('flashrwkv2'), '_C', None)
-extension_path = Path(getattr(extension, '__file__', ''))
+import contextlib, json, platform, sys, torch
+from flashrwkv2.compile import load_extension
+with contextlib.redirect_stdout(sys.stderr):
+    compiled = load_extension()
 print(json.dumps({
   'python': platform.python_version(),
   'torch': torch.__version__,
   'torch_cuda': torch.version.cuda,
   'gpu': torch.cuda.get_device_name(0),
   'capability': list(torch.cuda.get_device_capability(0)),
-  'extension_path': str(extension_path),
+  'extension_path': compiled.library,
+  'runtime_cache_key': compiled.cache_key,
 }))
 """
     payload = json.loads(
@@ -224,8 +225,6 @@ print(json.dumps({
         ).stdout
     )
     extension_path = Path(payload.pop("extension_path"))
-    if not extension_path.is_file():
-        raise SystemExit("flashrwkv2._C is not loaded from an installed wheel")
     payload["extension_sha256"] = _sha256(extension_path)
     payload["wheel_sha256"] = os.environ.get("FLASH_RWKV_WHEEL_SHA256")
     query = "driver_version,temperature.gpu,power.draw,clocks.current.sm,clocks_event_reasons.active"

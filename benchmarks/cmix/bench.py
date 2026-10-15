@@ -96,6 +96,9 @@ def main() -> None:
     if args.adapter_rank:
         key.requires_grad_(False)
         value.requires_grad_(False)
+        with torch.no_grad():
+            for tensor in (x, initial_shift, x_k, key, value):
+                tensor.normal_(0.0, 0.02)
         adapters = [
             (torch.randn(*shape, device=device) * 0.01).requires_grad_(args.backward)
             for shape in (
