@@ -94,19 +94,21 @@ class _FSDPNoRAProjection(torch.nn.Module):
         self.a = torch.nn.Parameter(torch.randn(256, 64, device=device) * 0.03)
         self.b = torch.nn.Parameter(torch.randn(257, 256, device=device) * 0.01)
 
-    def forward(self, x):
+    def _project(self, x):
         from flashrwkv2 import pretrain_head_linear_bf16
-        from torch.utils.checkpoint import checkpoint
 
-        return checkpoint(
-            pretrain_head_linear_bf16,
+        return pretrain_head_linear_bf16(
             x,
             self.weight.to(x.dtype),
             lora_a=self.a.to(x.dtype),
             lora_b=self.b.to(x.dtype),
             use_nora=True,
-            use_reentrant=False,
         )
+
+    def forward(self, x):
+        from torch.utils.checkpoint import checkpoint
+
+        return checkpoint(self._project, x, use_reentrant=False)
 
 
 def _fsdp_nora_training_worker(rank, store_path):
@@ -134,8 +136,8 @@ def _fsdp_nora_training_worker(rank, store_path):
         )
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
         torch.manual_seed(101 + rank)
-        x = torch.randn(5, 64, device=rank, dtype=torch.bfloat16)
-        target = torch.randn(5, 257, device=rank)
+        x = torch.randn(5, 64, device=torch.device("cuda", rank), dtype=torch.bfloat16)
+        target = torch.randn(5, 257, device=torch.device("cuda", rank))
         loss = (model(x).float() - target).square().mean()
         loss.backward()
         reference_loss = (reference(x).float() - target).square().mean()
