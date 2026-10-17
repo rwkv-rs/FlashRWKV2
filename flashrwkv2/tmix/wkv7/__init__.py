@@ -896,8 +896,8 @@ def infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
     launch_max_seqlen = _dispatch_max_seqlen(max_seqlen, validated_metadata)
     launch_sequences = state_indices.numel()
     use_deltalog = (
-        output_dtype != torch.float32
-        and state._merge_interval != 0
+        state._merge_interval != 0
+        and output_dtype != torch.float32
         and r.dtype == torch.float16
         and r.shape[0] == launch_sequences
         and 0 < launch_sequences <= state._sequence_capacity

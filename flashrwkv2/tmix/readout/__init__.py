@@ -42,10 +42,12 @@ def infer_tmix_readout_forward_varlen(
     ):
         if not isinstance(tensor, torch.Tensor):
             raise TypeError(f"{name} must be a torch.Tensor")
-        valid_dtype = tensor.dtype == torch.float16 or (
-            name == "wkv_output" and tensor.dtype == torch.float32
-        )
-        if not valid_dtype or not tensor.is_cuda or not tensor.is_contiguous():
+        if (
+            (tensor.dtype != torch.float16 and (
+                name != "wkv_output" or tensor.dtype != torch.float32
+            ))
+            or not tensor.is_cuda or not tensor.is_contiguous()
+        ):
             dtype_name = "float16 or float32" if name == "wkv_output" else "float16"
             raise ValueError(f"{name} must be contiguous CUDA {dtype_name}")
         if tensor.device != wkv_output.device or tensor.shape != wkv_output.shape:
