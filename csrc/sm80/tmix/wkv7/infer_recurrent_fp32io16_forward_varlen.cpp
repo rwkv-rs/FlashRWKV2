@@ -349,7 +349,7 @@ void tmix_wkv7_recurrent_fp32_from_decay_logits(
     int64_t max_seqlen) {
   check_recurrent_layout(
       query_start_loc, state_indices, state, r, decay_logits, k, v, a, b,
-      output, scale);
+      output, scale, /*allow_fp32_output=*/true);
 
   if (decay_bias.has_value()) {
     check_cuda_contiguous(*decay_bias, "decay_bias");

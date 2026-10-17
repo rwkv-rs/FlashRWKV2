@@ -19,9 +19,12 @@ def main() -> None:
     parser.add_argument("--tokens", type=int, default=1)
     parser.add_argument("--channels", type=int, default=4096)
     parser.add_argument("--operator", choices=("infer", "pretrain"), default="infer")
+    parser.add_argument("--wkv-dtype", choices=("float16", "float32"), default="float16")
     parser.add_argument("--backward", action="store_true")
     parser.add_argument("--adapter-rank", type=int, default=0)
     args = parser.parse_args()
+    if args.wkv_dtype != "float16" and args.operator != "infer":
+        raise ValueError("wkv-dtype requires the infer operator")
     if args.adapter_rank and args.operator != "pretrain":
         raise ValueError("adapter-rank requires the pretrain operator")
     if args.operator == "infer" and args.backward:
@@ -30,6 +33,7 @@ def main() -> None:
     if args.operator == "infer":
         options = {"device": torch.device("cuda"), "dtype": torch.float16}
         packed = [torch.randn(args.tokens, args.channels, **options) for _ in range(5)]
+        packed[0] = packed[0].to(getattr(torch, args.wkv_dtype))
         affine = [torch.randn(args.channels, **options) for _ in range(3)]
         output_weight = torch.randn(args.channels, args.channels, **options) * 0.01
 
@@ -121,9 +125,11 @@ def main() -> None:
             {
                 "operator": args.operator,
                 "forward_backward": args.backward,
+                "wkv_dtype": args.wkv_dtype if args.operator == "infer" else "bfloat16",
                 "profile": (
                     f"operator={args.operator}/backward={args.backward}/"
                     f"tokens={args.tokens}/channels={args.channels}/adapter_rank={args.adapter_rank}"
+                    + ("/wkv_dtype=float32" if args.operator == "infer" and args.wkv_dtype == "float32" else "")
                 ),
                 "steady_state": "stateless inputs are reused",
                 **timing,

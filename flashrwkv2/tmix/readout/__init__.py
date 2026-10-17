@@ -25,7 +25,11 @@ def infer_tmix_readout_forward_varlen(
     batch_size: int = 1,
     max_seqlen: int | None = None,
 ) -> torch.Tensor:
-    """Run head normalization, RKV residual, gate and output projection."""
+    """Run head LN, RKV residual, gate and FP16 output projection.
+
+    ``wkv_output`` may be FP16 or FP32; all other tensors remain FP16.
+    FP32 WKV values are normalized before the prelinear result is cast to FP16.
+    """
 
     if head_size not in {64, 128, 256}:
         raise ValueError("head_size must be one of 64, 128, or 256")
@@ -38,8 +42,12 @@ def infer_tmix_readout_forward_varlen(
     ):
         if not isinstance(tensor, torch.Tensor):
             raise TypeError(f"{name} must be a torch.Tensor")
-        if tensor.dtype != torch.float16 or not tensor.is_cuda or not tensor.is_contiguous():
-            raise ValueError(f"{name} must be contiguous CUDA float16")
+        valid_dtype = tensor.dtype == torch.float16 or (
+            name == "wkv_output" and tensor.dtype == torch.float32
+        )
+        if not valid_dtype or not tensor.is_cuda or not tensor.is_contiguous():
+            dtype_name = "float16 or float32" if name == "wkv_output" else "float16"
+            raise ValueError(f"{name} must be contiguous CUDA {dtype_name}")
         if tensor.device != wkv_output.device or tensor.shape != wkv_output.shape:
             raise ValueError(f"{name} must match wkv_output's packed shape and device")
     if wkv_output.ndim != 2 or wkv_output.shape[0] <= 0 or wkv_output.shape[1] % head_size:

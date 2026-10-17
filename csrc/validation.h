@@ -47,7 +47,8 @@ RecurrentDimensions check_recurrent_layout(
     const torch::Tensor& a,
     const torch::Tensor& b,
     const torch::Tensor& output,
-    double scale);
+    double scale,
+    bool allow_fp32_output = false);
 torch::Tensor build_recurrent_token_predecessor_cuda(
     const torch::Tensor& query_start_loc,
     const torch::Tensor& state_indices,

@@ -37,14 +37,19 @@ def test_readout_public_contract() -> None:
 @pytest.mark.cuda
 @pytest.mark.memcheck
 @pytest.mark.parametrize("head_size", [64, 128, 256])
-def test_readout_inference_matches_reference(head_size: int) -> None:
+@pytest.mark.parametrize("wkv_dtype", [torch.float16, torch.float32])
+@pytest.mark.parametrize("rows", [2, 64])
+def test_readout_inference_matches_reference(head_size: int, wkv_dtype: torch.dtype, rows: int) -> None:
     torch.manual_seed(20260816 + head_size)
-    rows, channels = 2, 4096
+    channels = 4096
     device = torch.device("cuda")
     packed = [
         torch.randn(rows, channels, device=device, dtype=torch.float16)
         for _ in range(5)
     ]
+    packed[0] = packed[0].to(wkv_dtype)
+    if wkv_dtype == torch.float32:
+        packed[0].mul_(100_000)
     vectors = [
         torch.randn(channels, device=device, dtype=torch.float16) for _ in range(3)
     ]
@@ -63,6 +68,8 @@ def test_readout_inference_matches_reference(head_size: int) -> None:
         batch_size=1,
         max_seqlen=rows,
     )
+    assert output.dtype == torch.float16
+    assert torch.isfinite(output).all()
     heads = channels // head_size
     wkv = packed[0].float().view(rows, heads, head_size)
     receptance = packed[1].float().view(rows, heads, head_size)
@@ -192,3 +199,16 @@ def test_readout_nora_projection_gradients():
     assert_relative_rmse(output, expected)
     for actual, reference in zip(grads, ref_grads, strict=True):
         assert_relative_rmse(actual, reference, 0.04)
+
+
+def test_large_wkv_fp32_head_ln_reference_on_cpu() -> None:
+    # Establish that the intermediate exceeds FP16 range while head LN and
+    # its FP16 output remain well-defined, using an independent FP64 oracle.
+    wkv = torch.linspace(-200_000, 200_000, 64, dtype=torch.float32).repeat(3, 2, 1)
+    assert torch.isfinite(wkv).all()
+    assert not torch.isfinite(wkv.half()).all()
+    centered = wkv - wkv.mean(dim=-1, keepdim=True)
+    normalized = centered * torch.rsqrt(centered.square().mean(dim=-1, keepdim=True) + 64e-5)
+    expected = torch.nn.functional.layer_norm(wkv.double(), (64,), eps=64e-5)
+    assert torch.isfinite(normalized.half()).all()
+    torch.testing.assert_close(normalized.double(), expected, atol=2e-7, rtol=2e-7)

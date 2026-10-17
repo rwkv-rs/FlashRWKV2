@@ -36,6 +36,19 @@ __device__ inline float load_h1(const dtype* ptr) {
   return __half2float(*reinterpret_cast<const __half*>(ptr));
 }
 
+// Only the WKV input changes precision; all affine/residual/gate IO stays FP16.
+__device__ inline float load_h1(const float* ptr) {
+  return *ptr;
+}
+
+__device__ inline float2 load_pair(const dtype* ptr) {
+  return __half22float2(load_h2(ptr));
+}
+
+__device__ inline float2 load_pair(const float* ptr) {
+  return *reinterpret_cast<const float2*>(ptr);
+}
+
 __device__ inline void store_h1(dtype* ptr, float value) {
   *reinterpret_cast<__half*>(ptr) = __float2half_rn(value);
 }
@@ -52,10 +65,10 @@ __device__ inline float warp_sum(float v) {
   return v;
 }
 
-template <int HeadSize>
+template <int HeadSize, typename wkv_t>
 __global__ void tmix_lnx_rkvres_xg_generic_kernel(
     int H,
-    const dtype* __restrict__ x,
+    const wkv_t* __restrict__ x,
     const dtype* __restrict__ r,
     const dtype* __restrict__ k,
     const dtype* __restrict__ v,
@@ -79,7 +92,7 @@ __global__ void tmix_lnx_rkvres_xg_generic_kernel(
   const int64_t offset = static_cast<int64_t>(pair) * 2;
   const int64_t idx = bth * HeadSize + offset;
   const int64_t c = static_cast<int64_t>(h) * HeadSize + offset;
-  const float2 xv = __half22float2(load_h2(x + idx));
+  const float2 xv = load_pair(x + idx);
 
   float sum = warp_sum(xv.x + xv.y);
   if (lane == 0) partial[warp] = sum;
@@ -132,9 +145,10 @@ __global__ void tmix_lnx_rkvres_xg_generic_kernel(
 }
 
 // Exact Albatross basic lnx body; bth_size is total_tokens * heads.
+template <typename wkv_t>
 __global__ void tmix_lnx_rkvres_xg_kernel(
     int H,
-    const dtype* __restrict__ x,
+    const wkv_t* __restrict__ x,
     const dtype* __restrict__ r,
     const dtype* __restrict__ k,
     const dtype* __restrict__ v,
@@ -196,9 +210,10 @@ __global__ void tmix_lnx_rkvres_xg_kernel(
 }
 
 // Exact Albatross warp body with packed row/head indexing.
+template <typename wkv_t>
 __global__ __launch_bounds__(32) void tmix_lnx_rkvres_xg_warp_kernel(
     int H,
-    const dtype* __restrict__ x,
+    const wkv_t* __restrict__ x,
     const dtype* __restrict__ r,
     const dtype* __restrict__ k,
     const dtype* __restrict__ v,
@@ -220,7 +235,7 @@ __global__ __launch_bounds__(32) void tmix_lnx_rkvres_xg_warp_kernel(
   const int64_t idx = base + pair;
   const int64_t c = cbase + pair;
 
-  const float2 xv = __half22float2(load_h2(x + idx));
+  const float2 xv = load_pair(x + idx);
   float sum = warp_sum(xv.x + xv.y);
   const float mean = __shfl_sync(0xffffffffu, sum, 0) * (1.0f / 64.0f);
   const float d0 = xv.x - mean;
@@ -254,9 +269,10 @@ __global__ __launch_bounds__(32) void tmix_lnx_rkvres_xg_warp_kernel(
 // packed-varlen correctness coverage, an actual grid.y extent guard, and
 // benchmark evidence.
 #if 0
+template <typename wkv_t>
 __global__ __launch_bounds__(32) void tmix_lnx_rkvres_xg_warp_2d_kernel(
     int H,
-    const dtype* __restrict__ x,
+    const wkv_t* __restrict__ x,
     const dtype* __restrict__ r,
     const dtype* __restrict__ k,
     const dtype* __restrict__ v,
@@ -275,7 +291,7 @@ __global__ __launch_bounds__(32) void tmix_lnx_rkvres_xg_warp_2d_kernel(
   const int64_t idx = base + pair;
   const int64_t c = cbase + pair;
 
-  const float2 xv = __half22float2(load_h2(x + idx));
+  const float2 xv = load_pair(x + idx);
   float sum = warp_sum(xv.x + xv.y);
   const float mean = __shfl_sync(0xffffffffu, sum, 0) * (1.0f / 64.0f);
   const float d0 = xv.x - mean;
@@ -322,65 +338,73 @@ void tmix_lnx_rkvres_xg_forward_varlen_cuda(
   assert(channels == heads * head_size);
   const auto stream = at::cuda::getCurrentCUDAStream();
   const int64_t rows = static_cast<int64_t>(total_tokens) * heads;
-  if (head_size == 128) {
-    tmix_lnx_rkvres_xg_generic_kernel<128><<<rows, 64, 0, stream>>>(
-        heads, x.data_ptr<dtype>(), r.data_ptr<dtype>(), k.data_ptr<dtype>(),
-        v.data_ptr<dtype>(), r_k.data_ptr<dtype>(), weight.data_ptr<dtype>(),
-        bias.data_ptr<dtype>(), g.data_ptr<dtype>(), output.data_ptr<dtype>(), rows);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-    return;
-  }
-  if (head_size == 256) {
-    tmix_lnx_rkvres_xg_generic_kernel<256><<<rows, 128, 0, stream>>>(
-        heads, x.data_ptr<dtype>(), r.data_ptr<dtype>(), k.data_ptr<dtype>(),
-        v.data_ptr<dtype>(), r_k.data_ptr<dtype>(), weight.data_ptr<dtype>(),
-        bias.data_ptr<dtype>(), g.data_ptr<dtype>(), output.data_ptr<dtype>(), rows);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-    return;
-  }
-  assert(head_size == HEAD_SIZE);
-  const int64_t head_tasks = rows;
+  const auto launch = [&](auto wkv_value) {
+    using wkv_t = decltype(wkv_value);
+    if (head_size == 128) {
+      tmix_lnx_rkvres_xg_generic_kernel<128, wkv_t><<<rows, 64, 0, stream>>>(
+          heads, x.data_ptr<wkv_t>(), r.data_ptr<dtype>(), k.data_ptr<dtype>(),
+          v.data_ptr<dtype>(), r_k.data_ptr<dtype>(), weight.data_ptr<dtype>(),
+          bias.data_ptr<dtype>(), g.data_ptr<dtype>(), output.data_ptr<dtype>(), rows);
+      C10_CUDA_KERNEL_LAUNCH_CHECK();
+      return;
+    }
+    if (head_size == 256) {
+      tmix_lnx_rkvres_xg_generic_kernel<256, wkv_t><<<rows, 128, 0, stream>>>(
+          heads, x.data_ptr<wkv_t>(), r.data_ptr<dtype>(), k.data_ptr<dtype>(),
+          v.data_ptr<dtype>(), r_k.data_ptr<dtype>(), weight.data_ptr<dtype>(),
+          bias.data_ptr<dtype>(), g.data_ptr<dtype>(), output.data_ptr<dtype>(), rows);
+      C10_CUDA_KERNEL_LAUNCH_CHECK();
+      return;
+    }
+    assert(head_size == HEAD_SIZE);
+    const int64_t head_tasks = rows;
 
-  // Exact tuned predicates from rwkv7_fast_v3a.py.  In the canonical tuned
-  // mode the lnx head-grid policy is disabled.  Packed admission uses the
-  // real token/head task supply; B1 remains an exact uniform anchor because a
-  // single packed sequence necessarily has total_tokens == max_seqlen.
-  constexpr int kB1T4096[] = {64, 96, 128, 160, 192, 240, 248, 264, 512};
-  bool use_warp = FLASHRWKV_TARGET_SM == 120 && channels == 4096 &&
-      heads == 64 && head_tasks >= 4096;
-  if (use_warp && batch_size == 1) {
-    use_warp = false;
-    for (const int candidate : kB1T4096) {
-      if (max_seqlen == candidate) {
-        use_warp = true;
-        break;
+    // Exact tuned predicates from rwkv7_fast_v3a.py.  In the canonical tuned
+    // mode the lnx head-grid policy is disabled.  Packed admission uses the
+    // real token/head task supply; B1 remains an exact uniform anchor because a
+    // single packed sequence necessarily has total_tokens == max_seqlen.
+    constexpr int kB1T4096[] = {64, 96, 128, 160, 192, 240, 248, 264, 512};
+    bool use_warp = FLASHRWKV_TARGET_SM == 120 && channels == 4096 &&
+        heads == 64 && head_tasks >= 4096;
+    if (use_warp && batch_size == 1) {
+      use_warp = false;
+      for (const int candidate : kB1T4096) {
+        if (max_seqlen == candidate) {
+          use_warp = true;
+          break;
+        }
       }
     }
-  }
-  // Disabled upstream forced-mode launch retained beside its original owner.
-  // See the #if 0 kernel body above for provenance and re-enable conditions.
+    // Disabled upstream forced-mode launch retained beside its original owner.
+    // See the #if 0 kernel body above for provenance and re-enable conditions.
 #if 0
-  if (use_lnx_head_grid_2d) {
-    tmix_lnx_rkvres_xg_warp_2d_kernel<<<
-        dim3(static_cast<unsigned int>(heads), static_cast<unsigned int>(total_tokens)),
-        dim3(32), 0, stream>>>(
-        heads, x.data_ptr<dtype>(), r.data_ptr<dtype>(), k.data_ptr<dtype>(),
-        v.data_ptr<dtype>(), r_k.data_ptr<dtype>(), weight.data_ptr<dtype>(),
-        bias.data_ptr<dtype>(), g.data_ptr<dtype>(), output.data_ptr<dtype>());
-  }
+    if (use_lnx_head_grid_2d) {
+      tmix_lnx_rkvres_xg_warp_2d_kernel<wkv_t><<<
+          dim3(static_cast<unsigned int>(heads), static_cast<unsigned int>(total_tokens)),
+          dim3(32), 0, stream>>>(
+          heads, x.data_ptr<wkv_t>(), r.data_ptr<dtype>(), k.data_ptr<dtype>(),
+          v.data_ptr<dtype>(), r_k.data_ptr<dtype>(), weight.data_ptr<dtype>(),
+          bias.data_ptr<dtype>(), g.data_ptr<dtype>(), output.data_ptr<dtype>());
+    }
 #endif
-  if (use_warp) {
-    tmix_lnx_rkvres_xg_warp_kernel<<<
-        static_cast<unsigned int>(rows), dim3(32), 0, stream>>>(
-        heads, x.data_ptr<dtype>(), r.data_ptr<dtype>(), k.data_ptr<dtype>(),
-        v.data_ptr<dtype>(), r_k.data_ptr<dtype>(), weight.data_ptr<dtype>(),
-        bias.data_ptr<dtype>(), g.data_ptr<dtype>(), output.data_ptr<dtype>(), rows);
+    if (use_warp) {
+      tmix_lnx_rkvres_xg_warp_kernel<wkv_t><<<
+          static_cast<unsigned int>(rows), dim3(32), 0, stream>>>(
+          heads, x.data_ptr<wkv_t>(), r.data_ptr<dtype>(), k.data_ptr<dtype>(),
+          v.data_ptr<dtype>(), r_k.data_ptr<dtype>(), weight.data_ptr<dtype>(),
+          bias.data_ptr<dtype>(), g.data_ptr<dtype>(), output.data_ptr<dtype>(), rows);
+    } else {
+      tmix_lnx_rkvres_xg_kernel<wkv_t><<<
+          static_cast<unsigned int>(rows), dim3(64), 0, stream>>>(
+          heads, x.data_ptr<wkv_t>(), r.data_ptr<dtype>(), k.data_ptr<dtype>(),
+          v.data_ptr<dtype>(), r_k.data_ptr<dtype>(), weight.data_ptr<dtype>(),
+          bias.data_ptr<dtype>(), g.data_ptr<dtype>(), output.data_ptr<dtype>(), rows);
+    }
+  };
+  if (x.scalar_type() == at::ScalarType::Float) {
+    launch(float{});
   } else {
-    tmix_lnx_rkvres_xg_kernel<<<
-        static_cast<unsigned int>(rows), dim3(64), 0, stream>>>(
-        heads, x.data_ptr<dtype>(), r.data_ptr<dtype>(), k.data_ptr<dtype>(),
-        v.data_ptr<dtype>(), r_k.data_ptr<dtype>(), weight.data_ptr<dtype>(),
-        bias.data_ptr<dtype>(), g.data_ptr<dtype>(), output.data_ptr<dtype>(), rows);
+    launch(dtype{});
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

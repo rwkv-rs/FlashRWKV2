@@ -11,3 +11,8 @@ shape 与 packed-varlen metadata 契约。它只负责验证，不负责模型�
 `PreparedRecurrentMetadata` 返回 offsets、slots、status 和去重 workspace，
 predecessor 则由独立未注册的 `build_recurrent_token_predecessor_cuda` 按需生成，
 避免不使用 TokenShift 的 WKV 消费者承担准备成本。
+
+
+`check_recurrent_layout` 的 native-private `allow_fp32_output` 参数默认为
+`false`。只有普通 FP32-state WKV binding 显式启用，允许 output 为 token dtype
+或 FP32；六路 token 的 dtype、shape、device、contiguity 契约仍保持一致。

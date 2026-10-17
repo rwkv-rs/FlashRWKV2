@@ -309,7 +309,10 @@ def _args(case: dict[str, torch.Tensor | None]) -> tuple[torch.Tensor, ...]:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.cuda_graph
-def test_fp32_wkv_zero_active_precapture_warmup_then_graph_replay() -> None:
+@pytest.mark.parametrize("output_dtype", [None, torch.float32])
+def test_fp32_wkv_zero_active_precapture_warmup_then_graph_replay(
+    output_dtype: torch.dtype | None,
+) -> None:
     _require_cuda_extension()
     torch.manual_seed(20260809)
     device = torch.device("cuda")
@@ -354,6 +357,7 @@ def test_fp32_wkv_zero_active_precapture_warmup_then_graph_replay() -> None:
             cu_seqlens=cu_seqlens,
             state_indices=state_indices,
             validated_metadata=warmup_ticket,
+            output_dtype=output_dtype,
         )
     torch.cuda.current_stream(device).wait_stream(stream)
     torch.cuda.synchronize()
@@ -391,6 +395,7 @@ def test_fp32_wkv_zero_active_precapture_warmup_then_graph_replay() -> None:
         cu_seqlens=cu_seqlens,
         state_indices=state_indices,
         validated_metadata=expected_ticket,
+        output_dtype=output_dtype,
     )
     torch.cuda.synchronize()
 
@@ -412,6 +417,7 @@ def test_fp32_wkv_zero_active_precapture_warmup_then_graph_replay() -> None:
             cu_seqlens=cu_seqlens,
             state_indices=state_indices,
             validated_metadata=ticket,
+            output_dtype=output_dtype,
         )
 
     graph.replay()
@@ -534,6 +540,7 @@ def test_metadata_ticket_predecessor_matches_cpu_reference_and_live_updates(
 def test_public_signature_is_raw_only_and_old_symbols_are_absent() -> None:
     signature = inspect.signature(infer_tmix_wkv7_recurrent_fp32io16_forward_varlen)
     assert "decay_logits" in signature.parameters
+    assert signature.parameters["output_dtype"].default is None
     assert "state" in signature.parameters
     assert "state_pool" not in signature.parameters
     assert "deltalog_phase_pool" not in signature.parameters
@@ -3199,3 +3206,157 @@ def test_pending_deltalog_graph_fallback_materializes_only_active_slots(
         assert torch.equal(observed, wanted)
     assert state._deltalog_phase_pool.cpu().tolist() == [0, 1, 0, 1]
     assert torch.isfinite(graph_output[0]).all()
+
+
+@pytest.mark.memcheck
+@pytest.mark.parametrize(
+    ("head_size", "num_heads", "lengths"),
+    [
+        (64, 2, (1,)),             # small-warp
+        (64, 2, (1, 2, 4)),        # ragged large family
+        (64, 2, (6, 7)),           # group4, value tile 4
+        (64, 2, (5, 5)),           # group4, value tile 8
+        (64, 64, (13,)),           # large family at C=4096
+        (64, 40, (16,) * 64),      # ordinary C=2560 B64T16 route
+        (128, 2, (1, 2, 4)),
+        (256, 2, (1, 2, 4)),
+    ],
+)
+@pytest.mark.parametrize("with_decay_bias", [False, True])
+def test_fp32_output_large_values_reach_readout(
+    head_size: int,
+    num_heads: int,
+    lengths: tuple[int, ...],
+    with_decay_bias: bool,
+) -> None:
+    _require_cuda_extension()
+    case = _make_case(
+        dtype=torch.float16, head_size=head_size, num_heads=num_heads,
+        lengths=lengths, with_decay_bias=with_decay_bias,
+    )
+    r, logits, k, v, a, b = _args(case)
+    # Finite token inputs of the same scale as the teacher reproducer. With
+    # retention=1 and zero initial state, y[t,v] = D * 16 * 12 * (t+1) * v[v].
+    r.fill_(16)
+    logits.fill_(-100)
+    k.fill_(12)
+    v.copy_(torch.linspace(-16, 16, head_size, device=r.device).half())
+    a.zero_()
+    b.zero_()
+    if with_decay_bias:
+        case["decay_bias"].fill_(0.25)
+    pool = case["state_pool"]
+    pool.zero_()
+    default_pool = pool.clone()
+    state = prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor(pool)
+    default_state = prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor(default_pool)
+    metadata = dict(
+        cu_seqlens=case["cu_seqlens"], state_indices=case["state_indices"],
+        max_seqlen=max(lengths), decay_bias=case["decay_bias"], scale=0.75,
+    )
+    default = infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
+        r, logits, k, v, a, b, state=default_state, **metadata,
+    )
+    output = infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
+        r, logits, k, v, a, b, state=state, output_dtype=torch.float32, **metadata,
+    )
+    counts = torch.cat([
+        torch.arange(1, length + 1, device=r.device) for length in lengths
+    ]).view(-1, 1, 1)
+    expected = 0.75 * head_size * 16 * 12 * counts * v.float()
+    assert default.dtype == torch.float16
+    assert not torch.isfinite(default).all()
+    assert output.dtype == torch.float32
+    assert torch.isfinite(output).all()
+    assert output.abs().max() > torch.finfo(torch.float16).max
+    torch.testing.assert_close(output, expected, atol=0.5, rtol=2e-6)
+    torch.testing.assert_close(output.half(), default, atol=0, rtol=0)
+    torch.testing.assert_close(pool, default_pool, atol=0, rtol=0)
+
+    channels = num_heads * head_size
+    zeros = torch.zeros(channels, device=r.device, dtype=torch.float16)
+    ones = torch.ones_like(zeros)
+    readout = flashrwkv2.infer_tmix_readout_forward_varlen(
+        output.flatten(1), r.flatten(1), k.flatten(1), v.flatten(1),
+        zeros, ones, zeros, torch.ones_like(r).flatten(1),
+        torch.eye(channels, device=r.device, dtype=torch.float16),
+        head_size=head_size, batch_size=len(lengths), max_seqlen=max(lengths),
+    )
+    centered = expected - expected.mean(dim=-1, keepdim=True)
+    normalized = centered * torch.rsqrt(
+        centered.square().mean(dim=-1, keepdim=True) + 64e-5
+    )
+    assert readout.dtype == torch.float16
+    assert torch.isfinite(readout).all()
+    torch.testing.assert_close(
+        readout, normalized.flatten(1).half(), atol=0.002, rtol=0.002,
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("head_size", [64, 128, 256])
+@pytest.mark.parametrize("lengths", [(1,), (1, 2, 4)])
+def test_fp32_output_matches_ordinary_token_output(
+    dtype: torch.dtype, head_size: int, lengths: tuple[int, ...],
+) -> None:
+    _require_cuda_extension()
+    case = _make_case(dtype=dtype, head_size=head_size, lengths=lengths)
+    original = case["state_pool"]
+    pools = [original.clone() for _ in range(2)]
+    outputs = []
+    for pool, output_dtype in zip(pools, (None, torch.float32), strict=True):
+        outputs.append(infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
+            *_args(case),
+            state=prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor(pool),
+            cu_seqlens=case["cu_seqlens"], state_indices=case["state_indices"],
+            output_dtype=output_dtype,
+        ))
+    reference, reference_state = rwkv7_decay_logits_reference(
+        *_args(case), state_pool=original,
+        cu_seqlens=case["cu_seqlens"], state_indices=case["state_indices"],
+    )
+    torch.testing.assert_close(outputs[1], reference, atol=1e-6, rtol=2e-5)
+    torch.testing.assert_close(pools[1], reference_state, atol=1e-6, rtol=2e-5)
+    torch.testing.assert_close(outputs[1].to(dtype), outputs[0], atol=0, rtol=0)
+    torch.testing.assert_close(pools[0], pools[1], atol=0, rtol=0)
+
+
+def test_fp32_output_materializes_pending_deltalog(monkeypatch: pytest.MonkeyPatch) -> None:
+    _require_fp32io16_deltalog_extension()
+    monkeypatch.setattr(wkv7_module, "_select_deltalog_merge_interval", lambda *_: 4)
+    case = _make_case(dtype=torch.float16, head_size=64, lengths=(1, 1))
+    state = _prepare_fp32io16_state(case["state_pool"], case["state_indices"])
+    kwargs = dict(cu_seqlens=case["cu_seqlens"], state_indices=case["state_indices"])
+    infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(*_args(case), state=state, **kwargs)
+    assert torch.count_nonzero(state._deltalog_phase_pool).item() > 0
+    reference_state = state.clone().materialize_slots_(case["state_indices"])
+    expected, expected_state = rwkv7_decay_logits_reference(
+        *_args(case), state_pool=reference_state._state_pool, **kwargs,
+    )
+    output = infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
+        *_args(case), state=state, output_dtype=torch.float32, **kwargs,
+    )
+    torch.testing.assert_close(output, expected, atol=1e-6, rtol=2e-5)
+    torch.testing.assert_close(state._state_pool, expected_state, atol=1e-6, rtol=2e-5)
+    assert torch.count_nonzero(state._deltalog_phase_pool).item() == 0
+    assert torch.count_nonzero(state._deltalog_pool).item() == 0
+
+
+@pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float64, torch.int32])
+def test_fp32_output_rejects_unsupported_dtype_before_state_update(output_dtype: torch.dtype) -> None:
+    _require_cuda_extension()
+    case = _make_case(dtype=torch.float16, head_size=64, lengths=(1,))
+    initial = case["state_pool"].clone()
+    state = prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor(case["state_pool"])
+    with pytest.raises(ValueError, match="output_dtype"):
+        infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
+            *_args(case), state=state, output_dtype=output_dtype,
+            cu_seqlens=case["cu_seqlens"], state_indices=case["state_indices"],
+        )
+    # The native boundary must independently enforce the supported output IO.
+    with pytest.raises(RuntimeError, match="dtype mismatch"):
+        flashrwkv2._C.tmix_wkv7_recurrent_fp32_from_decay_logits(
+            case["cu_seqlens"], case["state_indices"], case["state_pool"],
+            *_args(case), torch.empty_like(case["r"], dtype=output_dtype), 1.0,
+        )
+    torch.testing.assert_close(case["state_pool"], initial, atol=0, rtol=0)

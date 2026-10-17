@@ -14,6 +14,7 @@
 //     selector; a canonical-[K,V] B1 tile and group4 t-loop cover remaining
 //     optimized shapes, while the forced-only short-block body is retained as
 //     an unselected source reference;
+//   - optional FP32 output preserves the accumulator before head LN;
 //   - metadata status remains fail-closed for the low-level binding.
 //
 // vllm-rwkv at 6d683f9e49a2997e405c47edc147872c8609513b is a packed-varlen
@@ -234,7 +235,7 @@ __device__ __forceinline__ void fill_invalid_output(
 // state as [slot,head,key,value], whereas the upstream row-local state is
 // addressed as [slot,head,value,key]; the cooperative load/store below is the
 // only layout adaptation.
-template <int HeadSize, typename io_t>
+template <int HeadSize, typename io_t, typename output_t>
 __global__ __launch_bounds__(HeadSize, HeadSize == 64 ? 2 : 1)
 void wkv_fp32_v2_kernel(
     int num_heads,
@@ -250,7 +251,7 @@ void wkv_fp32_v2_kernel(
     const io_t* __restrict__ v_ptr,
     const io_t* __restrict__ a_ptr,
     const io_t* __restrict__ b_ptr,
-    io_t* __restrict__ output_ptr,
+    output_t* __restrict__ output_ptr,
     float scale) {
   const int head_index = static_cast<int>(blockIdx.x);
   const int sequence_index = static_cast<int>(blockIdx.y);
@@ -328,7 +329,7 @@ void wkv_fp32_v2_kernel(
       state[key_index] = updated;
       result += r[key_index] * updated;
     }
-    output_ptr[input_index] = from_float<io_t>(scale * result);
+    output_ptr[input_index] = from_float<output_t>(scale * result);
     __syncthreads();
   }
 
@@ -342,7 +343,7 @@ void wkv_fp32_v2_kernel(
 // owns a value tile: lane groups traverse K while consecutive lanes
 // remain contiguous in V.  Segmented warp reductions reproduce a_state[V] and
 // y[V] without block barriers or transposing the public state pool.
-template <int HeadSize, typename io_t>
+template <int HeadSize, typename io_t, typename output_t>
 __global__ __launch_bounds__(kKvTileThreads, 4)
 void wkv_fp32_v2_kv_tile_kernel(
     int num_heads,
@@ -358,7 +359,7 @@ void wkv_fp32_v2_kv_tile_kernel(
     const io_t* __restrict__ v_ptr,
     const io_t* __restrict__ a_ptr,
     const io_t* __restrict__ b_ptr,
-    io_t* __restrict__ output_ptr,
+    output_t* __restrict__ output_ptr,
     float scale) {
   const int head_index = static_cast<int>(blockIdx.x);
   const int sequence_index = static_cast<int>(blockIdx.y);
@@ -459,7 +460,7 @@ void wkv_fp32_v2_kv_tile_kernel(
     }
     if (lane < kKvValueTile && value_index < HeadSize) {
       output_ptr[token_base + value_index] =
-          from_float<io_t>(scale * result);
+          from_float<output_t>(scale * result);
     }
   }
 }
@@ -468,7 +469,7 @@ void wkv_fp32_v2_kv_tile_kernel(
 // slot-indexed [K,V] state.  Four independent value tiles share one copy of
 // the token vectors, avoiding the one-warp CTA slot limit for short-sequence
 // shapes outside ee3308's rectangular FP16 selector.
-template <int ValueTile>
+template <int ValueTile, typename output_t>
 __global__ __launch_bounds__(kWarpThreads * 4, 2)
 void wkv_fp32_v2_kv_tloop_group4_kernel(
     int num_heads,
@@ -483,7 +484,7 @@ void wkv_fp32_v2_kv_tloop_group4_kernel(
     const c10::Half* __restrict__ v_ptr,
     const c10::Half* __restrict__ a_ptr,
     const c10::Half* __restrict__ b_ptr,
-    c10::Half* __restrict__ output_ptr,
+    output_t* __restrict__ output_ptr,
     float scale) {
   static_assert(ValueTile == 4 || ValueTile == 8);
   constexpr int kHeadSize = 64;
@@ -593,7 +594,7 @@ void wkv_fp32_v2_kv_tloop_group4_kernel(
     }
     if (lane < ValueTile) {
       output_ptr[token_base + value_index] =
-          from_float<c10::Half>(scale * result);
+          from_float<output_t>(scale * result);
     }
   }
 
@@ -609,7 +610,7 @@ void wkv_fp32_v2_kv_tloop_group4_kernel(
 // preserving the reduction tree and FP32 update order.  Eight warps share a
 // coalesced [K,V-tile] load/store so the public layout does not turn every
 // state access into a stride-HeadSize transaction.
-template <int HeadSize, typename io_t>
+template <int HeadSize, typename io_t, typename output_t>
 __global__ __launch_bounds__(kSmallThreads, 2)
 void wkv_fp32_v2_small_warp_kernel(
     int num_heads,
@@ -625,7 +626,7 @@ void wkv_fp32_v2_small_warp_kernel(
     const io_t* __restrict__ v_ptr,
     const io_t* __restrict__ a_ptr,
     const io_t* __restrict__ b_ptr,
-    io_t* __restrict__ output_ptr,
+    output_t* __restrict__ output_ptr,
     float scale) {
   const int value_tile = static_cast<int>(blockIdx.x);
   const int head_index = static_cast<int>(blockIdx.y);
@@ -727,7 +728,7 @@ void wkv_fp32_v2_small_warp_kernel(
     result = warp_sum(result);
     if (lane == 0) {
       output_ptr[token_base + value_index] =
-          from_float<io_t>(scale * result);
+          from_float<output_t>(scale * result);
     }
     __syncthreads();
   }
@@ -757,7 +758,7 @@ void wkv_fp32_v2_small_warp_kernel(
 // without a real selector, packed-varlen correctness and launch-boundary
 // coverage, and benchmark evidence.
 #if 0
-template <int HeadSize, typename io_t>
+template <int HeadSize, typename io_t, typename output_t>
 __global__ __launch_bounds__(kBlockThreads, 4)
 void wkv_fp32_v2_short_block_kernel(
     int num_heads,
@@ -773,7 +774,7 @@ void wkv_fp32_v2_short_block_kernel(
     const io_t* __restrict__ v_ptr,
     const io_t* __restrict__ a_ptr,
     const io_t* __restrict__ b_ptr,
-    io_t* __restrict__ output_ptr,
+    output_t* __restrict__ output_ptr,
     float scale) {
   const int row = static_cast<int>(blockIdx.x);
   const int head_index = static_cast<int>(blockIdx.y);
@@ -837,7 +838,7 @@ void wkv_fp32_v2_short_block_kernel(
     }
     result = block_sum_broadcast(result);
     if (tid == 0) {
-      output_ptr[token_base + row] = from_float<io_t>(scale * result);
+      output_ptr[token_base + row] = from_float<output_t>(scale * result);
     }
     __syncthreads();
   }
@@ -887,7 +888,7 @@ int group4_value_tile_auto(
   return 0;
 }
 
-template <int HeadSize, typename io_t>
+template <int HeadSize, typename io_t, typename output_t>
 void launch_recurrent_fp32(
     int num_sequences,
     int num_heads,
@@ -923,41 +924,41 @@ void launch_recurrent_fp32(
   // selector.  See the #if 0 kernel body above for provenance.
 #if 0
   if (use_short_block_mode) {
-    wkv_fp32_v2_short_block_kernel<HeadSize, io_t>
+    wkv_fp32_v2_short_block_kernel<HeadSize, io_t, output_t>
         <<<dim3(HeadSize, num_heads, num_sequences), dim3(kBlockThreads), 0,
                stream>>>(
             num_heads, output_elements, query_ptr, state_indices_ptr,
             status_ptr, state_ptr, r.data_ptr<io_t>(),
             decay_logits.data_ptr<io_t>(), decay_bias_ptr, k.data_ptr<io_t>(),
             v.data_ptr<io_t>(), a.data_ptr<io_t>(), b.data_ptr<io_t>(),
-            output.data_ptr<io_t>(), scale);
+            output.data_ptr<output_t>(), scale);
   }
 #endif
   if (use_small) {
-    wkv_fp32_v2_small_warp_kernel<HeadSize, io_t>
+    wkv_fp32_v2_small_warp_kernel<HeadSize, io_t, output_t>
         <<<dim3(HeadSize / kSmallValuesPerBlock, num_heads, num_sequences),
                dim3(kSmallThreads), 0, stream>>>(
             num_heads, output_elements, query_ptr, state_indices_ptr,
             status_ptr, state_ptr, r.data_ptr<io_t>(),
             decay_logits.data_ptr<io_t>(), decay_bias_ptr, k.data_ptr<io_t>(),
             v.data_ptr<io_t>(), a.data_ptr<io_t>(), b.data_ptr<io_t>(),
-            output.data_ptr<io_t>(), scale);
+            output.data_ptr<output_t>(), scale);
     return;
   }
   if constexpr (HeadSize == 64) {
     if (num_sequences == 1 && total_tokens == 1 && max_seqlen == 1) {
-      wkv_fp32_v2_kv_tile_kernel<HeadSize, io_t>
+      wkv_fp32_v2_kv_tile_kernel<HeadSize, io_t, output_t>
           <<<dim3(num_heads, num_sequences, HeadSize / kKvValueTile),
              dim3(kKvTileThreads), 0, stream>>>(
               num_heads, output_elements, query_ptr, state_indices_ptr,
               status_ptr, state_ptr, r.data_ptr<io_t>(),
               decay_logits.data_ptr<io_t>(), decay_bias_ptr,
               k.data_ptr<io_t>(), v.data_ptr<io_t>(), a.data_ptr<io_t>(),
-              b.data_ptr<io_t>(), output.data_ptr<io_t>(), scale);
+              b.data_ptr<io_t>(), output.data_ptr<output_t>(), scale);
       return;
     }
     if (group4_value_tile == 4) {
-      wkv_fp32_v2_kv_tloop_group4_kernel<4>
+      wkv_fp32_v2_kv_tloop_group4_kernel<4, output_t>
           <<<dim3(num_heads, num_sequences, HeadSize / (4 * 4)),
              dim3(kWarpThreads * 4), 0, stream>>>(
               num_heads, output_elements, query_ptr, state_indices_ptr,
@@ -969,11 +970,11 @@ void launch_recurrent_fp32(
               reinterpret_cast<const c10::Half*>(v.data_ptr<io_t>()),
               reinterpret_cast<const c10::Half*>(a.data_ptr<io_t>()),
               reinterpret_cast<const c10::Half*>(b.data_ptr<io_t>()),
-              reinterpret_cast<c10::Half*>(output.data_ptr<io_t>()), scale);
+              output.data_ptr<output_t>(), scale);
       return;
     }
     if (group4_value_tile == 8) {
-      wkv_fp32_v2_kv_tloop_group4_kernel<8>
+      wkv_fp32_v2_kv_tloop_group4_kernel<8, output_t>
           <<<dim3(num_heads, num_sequences, HeadSize / (8 * 4)),
              dim3(kWarpThreads * 4), 0, stream>>>(
               num_heads, output_elements, query_ptr, state_indices_ptr,
@@ -985,17 +986,17 @@ void launch_recurrent_fp32(
               reinterpret_cast<const c10::Half*>(v.data_ptr<io_t>()),
               reinterpret_cast<const c10::Half*>(a.data_ptr<io_t>()),
               reinterpret_cast<const c10::Half*>(b.data_ptr<io_t>()),
-              reinterpret_cast<c10::Half*>(output.data_ptr<io_t>()), scale);
+              output.data_ptr<output_t>(), scale);
       return;
     }
   }
-  wkv_fp32_v2_kernel<HeadSize, io_t>
+  wkv_fp32_v2_kernel<HeadSize, io_t, output_t>
       <<<dim3(num_heads, num_sequences), dim3(HeadSize), 0, stream>>>(
           num_heads, output_elements, query_ptr, state_indices_ptr,
           status_ptr, state_ptr, r.data_ptr<io_t>(),
           decay_logits.data_ptr<io_t>(), decay_bias_ptr, k.data_ptr<io_t>(),
           v.data_ptr<io_t>(), a.data_ptr<io_t>(), b.data_ptr<io_t>(),
-          output.data_ptr<io_t>(), scale);
+          output.data_ptr<output_t>(), scale);
 }
 
 }  // namespace
@@ -1043,33 +1044,41 @@ void tmix_wkv7_recurrent_fp32_from_decay_logits_cuda(
           C10_CUDA_KERNEL_LAUNCH_CHECK();
           recurrent_decay_bias = torch::Tensor();
         }
-        switch (state.size(2)) {
-          case 64:
-            launch_recurrent_fp32<64, scalar_t>(
-                num_sequences, num_heads, total_tokens,
-                static_cast<int>(max_seqlen), query_start_loc, state_indices,
-                state, r, decay_raw, recurrent_decay_bias, k, v, a, b,
-                output, metadata_status,
-                static_cast<float>(scale), stream);
-            break;
-          case 128:
-            launch_recurrent_fp32<128, scalar_t>(
-                num_sequences, num_heads, total_tokens,
-                static_cast<int>(max_seqlen), query_start_loc, state_indices,
-                state, r, decay_raw, recurrent_decay_bias, k, v, a, b,
-                output, metadata_status,
-                static_cast<float>(scale), stream);
-            break;
-          case 256:
-            launch_recurrent_fp32<256, scalar_t>(
-                num_sequences, num_heads, total_tokens,
-                static_cast<int>(max_seqlen), query_start_loc, state_indices,
-                state, r, decay_raw, recurrent_decay_bias, k, v, a, b,
-                output, metadata_status,
-                static_cast<float>(scale), stream);
-            break;
-          default:
-            TORCH_CHECK(false, "unsupported recurrent head size");
+        const auto launch = [&](auto output_value) {
+          using output_t = decltype(output_value);
+          switch (state.size(2)) {
+            case 64:
+              launch_recurrent_fp32<64, scalar_t, output_t>(
+                  num_sequences, num_heads, total_tokens,
+                  static_cast<int>(max_seqlen), query_start_loc, state_indices,
+                  state, r, decay_raw, recurrent_decay_bias, k, v, a, b,
+                  output, metadata_status,
+                  static_cast<float>(scale), stream);
+              break;
+            case 128:
+              launch_recurrent_fp32<128, scalar_t, output_t>(
+                  num_sequences, num_heads, total_tokens,
+                  static_cast<int>(max_seqlen), query_start_loc, state_indices,
+                  state, r, decay_raw, recurrent_decay_bias, k, v, a, b,
+                  output, metadata_status,
+                  static_cast<float>(scale), stream);
+              break;
+            case 256:
+              launch_recurrent_fp32<256, scalar_t, output_t>(
+                  num_sequences, num_heads, total_tokens,
+                  static_cast<int>(max_seqlen), query_start_loc, state_indices,
+                  state, r, decay_raw, recurrent_decay_bias, k, v, a, b,
+                  output, metadata_status,
+                  static_cast<float>(scale), stream);
+              break;
+            default:
+              TORCH_CHECK(false, "unsupported recurrent head size");
+          }
+        };
+        if (output.scalar_type() == at::ScalarType::Float) {
+          launch(float{});
+        } else {
+          launch(scalar_t{});
         }
       });
   C10_CUDA_KERNEL_LAUNCH_CHECK();

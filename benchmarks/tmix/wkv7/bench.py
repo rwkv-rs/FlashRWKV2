@@ -358,6 +358,7 @@ def _timed_public_launch(
     operator: str,
     max_seqlen: int,
     scale: float = 1.0,
+    output_dtype: torch.dtype | None = None,
 ) -> None:
     cu_seqlens = inputs["cu_seqlens"]
     state_indices = inputs["state_indices"]
@@ -374,6 +375,7 @@ def _timed_public_launch(
             decay_bias=decay_bias,
             validated_metadata=ticket,
             max_seqlen=max_seqlen,
+            output_dtype=output_dtype,
         )
     else:
         flashrwkv2.infer_tmix_wkv7_recurrent_fp16_forward_varlen(
@@ -395,6 +397,7 @@ def _measure(
     workload: Workload,
     ticket: object,
     operator: str,
+    output_dtype: torch.dtype | None = None,
 ) -> dict[str, object]:
     reset_state = inputs["state_pool"]
     if not isinstance(reset_state, torch.Tensor):
@@ -430,6 +433,7 @@ def _measure(
             ticket=ticket,
             operator=operator,
             max_seqlen=max(workload.lengths),
+            output_dtype=output_dtype,
         )
 
     timing = measure_cuda(run, before_batch=reset)
@@ -443,11 +447,12 @@ def _selected_fp32_family(
     workload: Workload,
     dtype: torch.dtype,
     operator_shape: OperatorShape,
+    output_dtype: torch.dtype | None = None,
 ) -> str:
     """Report the measured family selected for canonical [K,V] state."""
 
     uniform_t = workload.uniform_t
-    if dtype == torch.float16 and uniform_t == 1:
+    if output_dtype != torch.float32 and dtype == torch.float16 and uniform_t == 1:
         merge_interval = wkv7_module._select_deltalog_merge_interval(
             operator_shape.channels,
             workload.batch_size,
@@ -711,6 +716,7 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=("bfloat16", "float16"),
         default=["bfloat16"],
     )
+    parser.add_argument("--output-dtype", choices=("input", "float32"), default="input")
     parser.add_argument("--stress", action="store_true")
     parser.add_argument("--decay-bias", action="store_true")
     parser.add_argument("--seed", type=int, default=20260804)
@@ -724,6 +730,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
+    if args.output_dtype == "float32" and args.operator != "fp32io16":
+        raise ValueError("float32 output requires the fp32io16 operator")
+    output_dtype = torch.float32 if args.output_dtype == "float32" else None
     if not torch.cuda.is_available():
         raise RuntimeError("the recurrent benchmark requires a CUDA device")
     root = _repo_root()
@@ -735,9 +744,7 @@ def main(argv: list[str] | None = None) -> int:
     family = SOURCE_FAMILY
     spec = KERNEL_SPECS[args.operator]
     git = _git_metadata(root)
-    extension = getattr(flashrwkv2, "_C", None)
-    if extension is None:
-        raise RuntimeError("flashrwkv2._C is not loaded; build the CUDA extension first")
+    extension = flashrwkv2._extension()
     extension_path = Path(getattr(extension, "__file__", ""))
     payload: dict[str, object] = {
         "schema_version": 1,
@@ -760,6 +767,7 @@ def main(argv: list[str] | None = None) -> int:
         "configuration": {
             "operator_shapes": args.shapes,
             "dtype": args.dtype,
+            "output_dtype": args.output_dtype,
             "state_dtype": "float32" if args.operator == "fp32io16" else "float16",
             "operator": args.operator,
             "stress": args.stress,
@@ -795,7 +803,7 @@ def main(argv: list[str] | None = None) -> int:
                     "steady_state": "state pool is reset before each timing batch",
                     "selected_kernel_family": (
                         _selected_fp32_family(
-                            workload, dtype, operator_shape
+                            workload, dtype, operator_shape, output_dtype
                         )
                         if args.operator == "fp32io16"
                         else _selected_fp16_family(workload, operator_shape)
@@ -841,6 +849,7 @@ def main(argv: list[str] | None = None) -> int:
                         workload=workload,
                         ticket=ticket,
                         operator=args.operator,
+                        output_dtype=output_dtype,
                     )
                     print(
                         "RESULT "
@@ -862,7 +871,8 @@ def main(argv: list[str] | None = None) -> int:
                 results.append(row)
 
     if (
-        os.environ.get("FLASHRWKV_BENCHMARK_STATUS") == "candidate"
+        output_dtype is None
+        and os.environ.get("FLASHRWKV_BENCHMARK_STATUS") == "candidate"
         and (args.operator == "fp16" or "float16" in args.dtype)
         and hasattr(
             extension,

@@ -787,6 +787,7 @@ def _run_fp32io16(
     decay_bias: torch.Tensor | None,
     max_seqlen: int | None,
     validated_metadata: object | None,
+    output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     packed = _validate_packed_inputs(r, decay_logits, k, v, a, b)
     _validate_state(state)
@@ -802,7 +803,7 @@ def _run_fp32io16(
             max_seqlen=max_seqlen,
         )
     )
-    output = torch.empty_like(packed[3])
+    output = torch.empty_like(packed[3], dtype=output_dtype)
     _extension().tmix_wkv7_recurrent_fp32_from_decay_logits(
         cu_seqlens,
         state_indices,
@@ -869,8 +870,14 @@ def infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
     decay_bias: torch.Tensor | None = None,
     max_seqlen: int | None = None,
     validated_metadata: object | None = None,
+    output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    """Run the provider-selected FP32IO16 WKV7 implementation."""
+    """Run FP32-state WKV7 with optional FP32 output before head LN.
+
+    ``output_dtype=None`` preserves the token dtype and provider selection.
+    ``torch.float32`` keeps the FP32 readout without narrowing to FP16/BF16;
+    pending DeltaLog state is materialized before the ordinary provider runs.
+    """
 
     if (
         not isinstance(state, _TmixWkv7RecurrentState)
@@ -883,11 +890,14 @@ def infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
             "prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor"
         )
     packed = _validate_packed_inputs(r, decay_logits, k, v, a, b)
+    if output_dtype is not None and output_dtype not in {r.dtype, torch.float32}:
+        raise ValueError("output_dtype must be None, the token dtype, or torch.float32")
     _check_metadata_inputs(cu_seqlens, state_indices)
     launch_max_seqlen = _dispatch_max_seqlen(max_seqlen, validated_metadata)
     launch_sequences = state_indices.numel()
     use_deltalog = (
-        state._merge_interval != 0
+        output_dtype != torch.float32
+        and state._merge_interval != 0
         and r.dtype == torch.float16
         and r.shape[0] == launch_sequences
         and 0 < launch_sequences <= state._sequence_capacity
@@ -928,6 +938,7 @@ def infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
         decay_bias=decay_bias,
         max_seqlen=max_seqlen,
         validated_metadata=ordinary_metadata,
+        output_dtype=output_dtype,
     )
 
 

@@ -13,7 +13,7 @@
 | `infer_tmix_postnorm_tokenshift_forward_varlen` | `x, res, weight, bias, x_r, x_w, x_k, x_v, x_a, x_g, *, shift_state_pool, cu_seqlens, state_indices, max_seqlen=None, eps=1e-5, validated_metadata=None` | `(res_out, r, w, k, v, a, g)`；原位更新 shift state |
 | `infer_tmix_wkv_prepare_forward_varlen` | `x_r, x_w, x_k, x_v, x_a, x_g, receptance_weight, key_weight, value_weight, w1, a1, g1, v1, w2, a2, g2, v2, v0, k_k, a0, k_a, *, v_first=None, w1_runtime=None, a1_runtime=None, g1_runtime=None, v1_runtime=None, w2_runtime=None, a2_runtime=None, g2_runtime=None, v2_runtime=None, receptance_lora_a=None, receptance_lora_b=None, receptance_lora_scale=1.0, key_lora_a=None, key_lora_b=None, key_lora_scale=1.0, value_lora_a=None, value_lora_b=None, value_lora_scale=1.0, head_size=64, batch_size=1, max_seqlen=None` | 一次 API 完成 R/K/V、WAG/WAGV、VRes 与 KK/A，返回 `(receptance, decay_delta, key, value, recurrent_a, recurrent_b, gate, v_first)` |
 | `infer_tmix_readout_forward_varlen` | `wkv_output, receptance, key, value, r_k, ln_weight, ln_bias, gate, output_weight, *, output_lora_a=None, output_lora_b=None, output_lora_scale=1.0, head_size=64, batch_size=1, max_seqlen=None` | 完成 head LN、RKV residual、gate 和 output projection |
-| `infer_tmix_wkv7_recurrent_fp32io16_forward_varlen` | `r, decay_logits, k, v, a, b, *, state, cu_seqlens, state_indices, scale=1.0, decay_bias=None, max_seqlen=None, validated_metadata=None` | WKV 输出；原位更新统一 FP32IO16 state handle，并在内部选择普通 FP32IO16 或 DeltaLog |
+| `infer_tmix_wkv7_recurrent_fp32io16_forward_varlen` | `r, decay_logits, k, v, a, b, *, state, cu_seqlens, state_indices, scale=1.0, decay_bias=None, max_seqlen=None, validated_metadata=None, output_dtype=None` | WKV 输出（默认与 token 同 dtype，可选 FP32）；原位更新统一 FP32IO16 state handle，并在内部选择普通 FP32IO16 或 DeltaLog |
 | `infer_tmix_wkv7_recurrent_fp16_forward_varlen` | `r, decay_logits, k, v, a, b, *, state, cu_seqlens, state_indices, scale=1.0, decay_bias=None, max_seqlen=None, validated_metadata=None` | WKV 输出；原位更新统一 FP16 state handle，并在内部选择普通 FP16 或 DeltaLog |
 | `infer_tmix_wkv7_chunk_bf16_forward_varlen` | `r, decay_logits, k, v, a, b, *, state_pool, cu_seqlens, state_indices, chunk_size=16, max_seqlen=None, scale=1.0, decay_bias=None, validated_metadata=None` | chunk WKV 输出；原位更新 state |
 | `infer_cmix_forward_varlen` | `x, res, weight, bias, x_k, key_weight, value_weight, *, shift_state_pool, cu_seqlens, state_indices, max_seqlen=None, eps=1e-5, validated_metadata=None, deterministic=False` | `(res_out, cmix_out)`；原位更新 shift state |
@@ -22,6 +22,42 @@
 | `infer_head_linear_last_forward_varlen` | `x, weight, *, tokens_count` | 最后 `tokens_count` 个 token 的 logits |
 | `infer_sampling_temperature_topk_topp_forward_varlen` | `logits, states, slot_indices, *, temperature=1.0, top_k=-1, top_p=1.0, sample_capacity=None, num_active_samples=None` | sampled token ids；原位更新 RNG state |
 | `infer_sampling_six_parameter_forward_varlen` | `logits, penalties, states, slot_indices, *, presence_penalty=0.0, frequency_penalty=0.0, penalty_decay=0.996, temperature=1.0, top_k=-1, top_p=1.0, sample_capacity=None, num_active_samples=None` | sampled token ids；原位更新 penalty/RNG state |
+
+FP32-state WKV 的 `output_dtype=None` 保留现有 token dtype、默认调度与调用方式；
+`output_dtype=torch.float32` 在 FP32 累加后直接写 FP32 输出，避免 head LN 之前
+缩窄到 FP16 导致溢出。也可显式指定 token 自身的 dtype；其余 dtype 会被拒绝。
+此选项不改变六路 token 输入、decay bias 或 state 的 dtype，不做 clamp 或
+`nan_to_num`。FP32 输出沿用普通 provider 的 shape selector、递推和归约；
+对于已有 pending DeltaLog 的 handle，先 materialize 本次 slots，再运行普通
+provider。默认调用仍可使用 DeltaLog。
+
+`infer_tmix_readout_forward_varlen` 自动接受 FP16 或 FP32 `wkv_output`，其余
+输入与权重仍为 FP16。head LN 直接读取 FP32 WKV，LN、RKV residual 与 gate
+计算完成后才写 FP16 prelinear，output projection 和返回值仍为 FP16。
+FP32 WKV 的显存为每元素 4 字节；默认 FP16 为每元素 2 字节。
+
+HF 模型 TMix 调用点的最小接法如下；`state` 与 `ticket` 继续使用现有对象，
+readout 前不将 `wkv` 转为 FP16。该选项是 FlashRWKV2 算子参数，HF 配置项由
+HF 项目的独立 session 接入。
+
+```python
+import torch
+import flashrwkv2
+
+wkv = flashrwkv2.infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
+    r, decay_logits, k, v, a, b,
+    state=state, cu_seqlens=cu_seqlens, state_indices=state_indices,
+    decay_bias=decay_bias, max_seqlen=max_seqlen,
+    validated_metadata=ticket,
+    output_dtype=torch.float32,
+)
+output = flashrwkv2.infer_tmix_readout_forward_varlen(
+    wkv.flatten(1), r.flatten(1), k.flatten(1), v.flatten(1),
+    r_k, ln_weight, ln_bias, gate, output_weight,
+    head_size=r.shape[-1], batch_size=state_indices.numel(),
+    max_seqlen=max_seqlen,
+)
+```
 
 `prepare_tmix_wkv7_recurrent_fp16_state(state_pool_size, channels, *,
 sequence_capacity, head_size=64, device=None)` 与

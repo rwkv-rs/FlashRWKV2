@@ -57,7 +57,10 @@ torch::Tensor tmix_readout_prelinear_internal(
     int64_t head_size,
     int64_t batch_size,
     int64_t max_seqlen) {
-  check_half(x, x, "x");
+  check_cuda_contiguous(x, "x");
+  TORCH_CHECK(x.scalar_type() == torch::kFloat16 ||
+                  x.scalar_type() == torch::kFloat32,
+              "x must be float16 or float32");
   TORCH_CHECK(head_size == 64 || head_size == 128 || head_size == 256,
               "head_size must be one of 64, 128, or 256");
   TORCH_CHECK(x.dim() == 2 && x.size(0) > 0 && x.size(1) > 0 &&
@@ -84,7 +87,7 @@ torch::Tensor tmix_readout_prelinear_internal(
     TORCH_CHECK(item.first->dim() == 1 && item.first->size(0) == channels,
                 item.second, " must have shape [C]");
   }
-  auto output = torch::empty_like(x);
+  auto output = torch::empty_like(x, x.options().dtype(torch::kFloat16));
   tmix_lnx_rkvres_xg_forward_varlen_cuda(
       static_cast<int>(batch_size), static_cast<int>(max_seqlen),
       static_cast<int>(total_tokens), static_cast<int>(channels), heads,

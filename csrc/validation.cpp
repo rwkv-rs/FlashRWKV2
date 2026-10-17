@@ -35,7 +35,8 @@ RecurrentDimensions check_recurrent_layout(
     const torch::Tensor& a,
     const torch::Tensor& b,
     const torch::Tensor& output,
-    double scale) {
+    double scale,
+    bool allow_fp32_output) {
   check_cuda_contiguous(query_start_loc, "query_start_loc");
   check_cuda_contiguous(state_indices, "state_indices");
   check_cuda_contiguous(state, "state");
@@ -107,7 +108,8 @@ RecurrentDimensions check_recurrent_layout(
           r.scalar_type() == v.scalar_type() &&
           r.scalar_type() == a.scalar_type() &&
           r.scalar_type() == b.scalar_type() &&
-          r.scalar_type() == output.scalar_type(),
+          (r.scalar_type() == output.scalar_type() ||
+           (allow_fp32_output && output.scalar_type() == torch::kFloat32)),
       "r,decay_logits,k,v,a,b,output dtype mismatch");
 
   for (const auto& item : {
