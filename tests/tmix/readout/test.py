@@ -87,13 +87,10 @@ def test_readout_inference_matches_reference(head_size: int, wkv_dtype: torch.dt
         + vectors[2].float().view(1, heads, head_size)
         + residual * value
     ) * packed[4].float().view(rows, heads, head_size)
-    # The native readout island stores its prelinear result in FP16 before the
-    # output projection consumes it; preserve that public numerical boundary.
-    expected = (
-        gated.reshape(rows, channels).to(torch.float16).float()
-        @ output_weight.float().t()
-    )
-    torch.testing.assert_close(output.float(), expected, atol=0.08, rtol=0.05)
+    # Preserve both FP16 boundaries: the prelinear result and the projection.
+    # FP16 GEMM can use reduced-precision reductions on batched shapes.
+    expected = gated.reshape(rows, channels).to(torch.float16) @ output_weight.t()
+    torch.testing.assert_close(output.float(), expected.float(), atol=0.08, rtol=0.05)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
