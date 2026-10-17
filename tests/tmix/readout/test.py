@@ -54,20 +54,9 @@ def test_readout_inference_matches_reference(head_size: int, wkv_dtype: torch.dt
         torch.randn(channels, device=device, dtype=torch.float16) for _ in range(3)
     ]
     output_weight = torch.randn(channels, channels, device=device, dtype=torch.float16)
-    output = infer_tmix_readout_forward_varlen(
-        packed[0],
-        packed[1],
-        packed[2],
-        packed[3],
-        vectors[0],
-        vectors[1],
-        vectors[2],
-        packed[4],
-        output_weight,
-        head_size=head_size,
-        batch_size=1,
-        max_seqlen=rows,
-    )
+    inputs = (*packed[:4], *vectors, packed[4])
+    options = dict(head_size=head_size, batch_size=1, max_seqlen=rows)
+    output = infer_tmix_readout_forward_varlen(*inputs, output_weight, **options)
     assert output.dtype == torch.float16
     assert torch.isfinite(output).all()
     heads = channels // head_size
@@ -87,10 +76,25 @@ def test_readout_inference_matches_reference(head_size: int, wkv_dtype: torch.dt
         + vectors[2].float().view(1, heads, head_size)
         + residual * value
     ) * packed[4].float().view(rows, heads, head_size)
-    # Preserve both FP16 boundaries: the prelinear result and the projection.
-    # FP16 GEMM can use reduced-precision reductions on batched shapes.
-    expected = gated.reshape(rows, channels).to(torch.float16) @ output_weight.t()
-    torch.testing.assert_close(output.float(), expected.float(), atol=0.08, rtol=0.05)
+    # Identity projection exposes the FP16 prelinear boundary through the
+    # public API, so ln/res/gate correctness is checked before dense GEMM.
+    prelinear = infer_tmix_readout_forward_varlen(
+        *inputs, torch.eye(channels, device=device, dtype=torch.float16), **options,
+    )
+    expected_prelinear = gated.reshape(rows, channels).to(torch.float16)
+    torch.testing.assert_close(
+        prelinear.float(), expected_prelinear.float(), atol=0.002, rtol=0.002,
+    )
+    expected = expected_prelinear.float() @ output_weight.float().t()
+    # FP16 rounding and reduced-precision GEMM reductions are discontinuous
+    # around cancellation. Bound end-to-end RMS and maximum error by the
+    # output scale, instead of dividing by individual near-zero elements.
+    error = output.float() - expected
+    reference_rms = expected.square().mean().sqrt()
+    eps = torch.finfo(torch.float16).eps
+    assert float(error.square().mean().sqrt() / reference_rms) <= eps
+    assert float(error.abs().max() / reference_rms) <= 8 * eps
+
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
