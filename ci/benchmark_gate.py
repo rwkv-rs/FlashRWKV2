@@ -213,6 +213,21 @@ for _channels in (768, 1024, 2048, 2560, 4096, 5120):
                 ),
             )
 
+BENCHMARKS["head/linear"] += (
+    BenchmarkCase(
+        "native_cublaslt_multisize",
+        "benchmarks/head/linear/bench.py",
+        (
+            "--compare-torch",
+            "--torch-blas",
+            "cublaslt",
+            "--sweep",
+            "--timing-mode",
+            "graph",
+        ),
+    ),
+)
+
 BENCHMARKS["head/l2wrap_ce"] += (
     BenchmarkCase(
         "nora_model_width_chunked_backward",

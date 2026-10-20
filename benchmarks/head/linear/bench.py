@@ -87,9 +87,10 @@ def benchmark(args):
         # Require FP32 accumulation on the native side, matching the declared
         # contract rather than allowing BF16 partial-reduction truncation.
         previous_reduction = (
-            torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction
+            torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction,
+            torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction_split_k,
         )
-        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = (False, False)
         try:
 
             def native(values=x):
@@ -143,6 +144,7 @@ def benchmark(args):
                 "input_dtype": str(x.dtype).removeprefix("torch."),
                 "output_dtype": str(reference.dtype).removeprefix("torch."),
                 "allow_bf16_reduced_precision_reduction": False,
+                "allow_bf16_reduced_precision_reduction_split_k": False,
                 "batch_invariance": checks,
                 "tilelang_max_abs_difference": float((sample - reference).abs().max()),
                 "timing": measure_cuda(native, timing_mode=args.timing_mode),
@@ -196,6 +198,12 @@ def main():
         help="compare native BF16-to-FP32 mm latency and batch/chunk bitwise invariance",
     )
     parser.add_argument(
+        "--torch-blas",
+        choices=("default", "cublaslt"),
+        default="default",
+        help="select the native comparison configuration before CUDA initialization",
+    )
+    parser.add_argument(
         "--tune",
         action="store_true",
         help="verify and measure output tiles before timing",
@@ -206,6 +214,12 @@ def main():
         help="emit JSONL for six model widths and M=1/27/256",
     )
     args = parser.parse_args()
+    if args.torch_blas == "cublaslt":
+        if not args.compare_torch:
+            parser.error("--torch-blas cublaslt requires --compare-torch")
+        os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
+        os.environ["CUBLASLT_WORKSPACE_SIZE"] = "1"
+        torch.backends.cuda.preferred_blas_library("cublaslt")
     cases = [(args.tokens, args.channels)]
     if args.sweep:
         cases = [

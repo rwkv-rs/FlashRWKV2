@@ -134,16 +134,18 @@ Head CE 基准的 `--backward`、`--train-base`、`--chunk-rows` 明确反向范
 并报告单次调用的 peak allocated memory。
 
 Head 线性基准的 `--compare-torch` 用相同 BF16 输入，对照输出 FP32 的原生
-`torch.mm`。对照时关闭 BF16 reduced-precision reduction，记录原生调用在整批、
+`torch.mm`。对照时关闭 BF16 reduced-precision reduction 与 split-K，记录原生调用在整批、
 单行和七行分块之间的 FP32/BF16 逐位一致性及独立计时，以验证 custom linear
 是否有必要。原生库满足一致性和性能要求时，应优先减少自定义实现。
 样本包含 BF16 有效位和不同指数；单行输入还会扩展到 17 行，核对不同矩阵行数下
 同一行的结果。
 
-原生对照需分别记录默认 BLAS 和 cuBLASLt 的结果。后者在进程启动前设置
-`TORCH_BLAS_PREFER_CUBLASLT=1`、`CUBLAS_WORKSPACE_CONFIG=:16:8` 和
+原生对照分别记录默认 BLAS 和 cuBLASLt 的结果。`--compare-torch --torch-blas cublaslt`
+在首次 CUDA 调用前选择 cuBLASLt，并设置 `CUBLAS_WORKSPACE_CONFIG=:16:8` 和
 `CUBLASLT_WORKSPACE_SIZE=1`；artifact 记录实际 preferred BLAS 与 workspace 设置。
 该配置参考 vLLM 的 batch-invariant 初始化，仍须验证本项目 BF16/FP32 输出契约。
+CI 的 `tuned_multisize` 与 `native_cublaslt_multisize` workload 分别执行两种对照；
+cuBLASLt 对照复用相同样本和尺寸，无需再次搜索 TileLang 配置。
 
 CI 基准结果同时保留每个 workload 的完整 JSON records 和延迟 profiles。JSONL
 尺寸 sweep 的全部记录、调优配置、原生库对照与显存数据均进入上传的基准 artifact。
