@@ -26,13 +26,13 @@ def main() -> None:
 
     device = torch.device("cuda")
     rows = args.batch * args.seqlen
-    x = torch.zeros(rows, args.channels, device=device, dtype=torch.float16)
+    x = torch.zeros(rows, args.channels, device=device, dtype=torch.bfloat16)
     res = torch.zeros_like(x)
-    weight = torch.ones(args.channels, device=device, dtype=torch.float16)
+    weight = torch.ones(args.channels, device=device, dtype=torch.bfloat16)
     bias = torch.zeros_like(weight)
     parameters = [torch.zeros_like(weight) for _ in range(6)]
     shift_state = torch.zeros(
-        args.batch, args.channels, device=device, dtype=torch.float16
+        args.batch, args.channels, device=device, dtype=torch.bfloat16
     )
     cu_seqlens = torch.arange(
         0, rows + 1, args.seqlen, device=device, dtype=torch.int32

@@ -1,6 +1,7 @@
 # FlashRWKV2
 
-FlashRWKV2 is a high-performance CUDA operator library for RWKV-7. Its public
+FlashRWKV2 is a TileLang operator library for RWKV-7 with a shared BF16
+training and inference forward, FP32 accumulation, and FP32 recurrent state. Its public
 inference API exposes the highest semantic fusion islands used by the model;
 kernel composition and shape-dependent dispatch remain internal. Complete
 models, schedulers, and training frameworks remain the responsibility of
@@ -15,11 +16,12 @@ downstream projects.
   and Ninja
 - `uv`, using the repository-local `./.venv`
 
-The runtime supports PyTorch 2.11 through 2.13. Importing the package does not
-compile CUDA code. The first CUDA operator call builds one private ordinary
-ATen/pybind extension from the packaged `csrc/sm80` sources for the exact
-Compute Capability of all visible GPUs, then reuses PyTorch's extension cache.
-All visible GPUs must have the same Compute Capability.
+The runtime supports PyTorch 2.11 through 2.13 and pins TileLang 0.1.15.
+Importing the package does not compile kernels. TileLang specializes model
+operators for the active GPU and caches compiled kernels. Packed metadata
+validation and sampling use a small ATen/pybind extension, compiled from the
+packaged native sources for the Compute Capability of the visible GPUs.
+All GPUs visible to that extension must have the same Compute Capability.
 
 ## Installation
 
@@ -31,8 +33,7 @@ fallback. Building the wheel does not import Torch or run NVCC:
 python -m pip install --pre FlashRWKV2
 ```
 
-To prewarm the runtime cache explicitly, use the same build path as the first
-operator call:
+To prewarm the metadata and sampling extension cache:
 
 ```bash
 python -m flashrwkv2.compile
@@ -62,41 +63,28 @@ for the complete public operator surface and tensor contracts.
 ./.venv/bin/python -m pytest -q
 ```
 
-CUDA tests build and load `flashrwkv2._C` lazily and require the toolchain above.
+CUDA tests compile TileLang kernels and the metadata/sampling extension lazily.
+The full block suite checks outputs, FP32 state, and selected logprobs bitwise
+across training/inference, prefill/decode, and batch composition.
 
 ## Benchmarks
 
-Operator benchmarks live in [`benchmarks/`](benchmarks/). For example, run the
-WKV7 recurrent correctness benchmark with:
+Operator benchmarks live in [`benchmarks/`](benchmarks/). The WKV matrix covers
+batch size, sequence length, and head dimensions:
 
 ```bash
-./.venv/bin/python -m benchmarks.tmix.wkv7.bench \
-  --shapes h32d64 \
-  --dtype bfloat16 \
-  --correctness-only \
-  --output /tmp/flashrwkv2-wkv7-correctness.json
+PYTHONPATH=benchmarks ./.venv/bin/python benchmarks/tmix/wkv7/bench.py \
+  --shapes h32d64 h64d64 h16d128 h8d256 \
+  --cases 1x1 16x1 1x16 1x128 \
+  --output artifacts/wkv7-recurrent-bf16.json
 ```
 
-These benchmarks measure individual operators. They do not report or infer
-model-level latency.
-
-The release-specific WKV7 measurements, evidence identities, acceptance
-boundaries, and non-target advisory regressions are recorded in the
-[FlashRWKV2 0.1.0a9 WKV7 performance report](docs/performance/wkv7-0.1.0a9.md).
-
-For Albatross-compatible TMix low-rank inference, `varlen` means that the
-operator consumes packed token rows; it does not mean that one fused kernel is
-used for every row count.  The public composite callers automatically use the
-canonical fused rank-in window at `M<=7`, the fused rank-out/value-residual
-window at `M<=4`, and the canonical large-row linear dispatcher otherwise.
-Callers may provide both the original checkpoint layout and a runtime layout.
-Both layouts must be prepared outside the timed forward region and retained for
-the lifetime of the inference weights; FlashRWKV2 never transposes or copies a
-missing layout during dispatch.
-
-TMix inference benchmarks are owned by the public `wkv_prepare` and `readout`
-modules. Native-private Linear, activation, VRes, gate and sparse helpers do
-not have standalone public benchmark entry points.
+Tuning candidates are admitted only after exact-output checks. Performance
+acceptance requires correctness evidence and measurements on both RTX 4090
+(SM89) and PRO6000 (SM120). Operator timing does not establish model latency.
+The historical [0.1.0a9 performance report](docs/performance/wkv7-0.1.0a9.md)
+describes that release's implementation; current results must identify the
+revision, hardware, shapes, and numerical contract.
 
 ## License
 

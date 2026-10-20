@@ -178,7 +178,7 @@ jobs:
           .venv/bin/python ci/select_targets.py --self-test
           .venv/bin/python ci/quality_gate.py self-test
           .venv/bin/python ci/benchmark_gate.py self-test
-          CUDA_VISIBLE_DEVICES="" .venv/bin/python -m pytest -q tests/test_runtime.py
+          CUDA_VISIBLE_DEVICES="" .venv/bin/python -m pytest -q tests -m 'not cuda'
 
   untrusted:
     name: Reject untrusted GPU revision
@@ -222,7 +222,7 @@ jobs:
           TORCH_VERSION: ${{ matrix.torch }}
         run: |
           uv venv .venv --python 3.12 --clear
-          uv pip install --python .venv/bin/python "torch==$TORCH_VERSION" pytest numpy ninja
+          uv pip install --python .venv/bin/python "torch==$TORCH_VERSION" tilelang==0.1.15 pytest numpy ninja
           uv pip install --python .venv/bin/python --no-deps artifacts/package/dist/*.whl
       - name: Compile once and verify cache hit
         env:

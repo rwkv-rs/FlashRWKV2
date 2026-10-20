@@ -1,154 +1,122 @@
-# FlashRWKV2 0.1.0a15 operator contract
+# FlashRWKV2 TileLang operator contract
 
-推理公共接口只包含模型调用者需要的最高融合岛。内部 launcher 不属于 Python 或 native 公共契约，也不会从根包导出。
+模型前向统一使用 BF16 激活和权重、FP32 累加与归约。WKV 状态固定为连续
+FP32 `[slots,H,D,D]`，TokenShift 状态为 BF16 `[slots,C]`。Head 输出 logits、
+`head_logprobs` 与 loss 为 FP32。公共名称保留模块所有者；内部 primitive 不从根包导出。
+
+## Numerical contract
+
+训练、prefill 和 decode 使用同一份 TileLang 前向实现。投影按递增 K 顺序执行
+BF16 MMA、FP32 累加，不使用 split-K；每行 LN、head LN 和词表归约使用固定顺序。
+`res + x` 在 LN 前先舍入为 BF16，投影、gate、TokenShift 和 WKV 输出也在相同
+位置舍入为 BF16。WKV 的 FP32 状态在 token 之间不缩窄。
+
+WKV 输入是 raw decay logits。保留率为
+`exp(-0.6065306597126334 * sigmoid(raw_decay))`。若提供 `decay_bias`，先以 FP32
+相加、舍入为 BF16，再计算保留率；这与 WKV Prepare 训练入口加 `w0` 的边界相同。
+状态布局为 `[K,V]`，递推为：
+
+```text
+sa[v] = sum_k a[k] * state[k,v]
+state[k,v] = retention[k] * state[k,v] + b[k] * sa[v] + k[k] * v[v]
+y[v] = scale * sum_k r[k] * state[k,v]
+```
+
+`head_size` 支持 64、128、256。前向一致性按位比较输出、state 和所选 token 的
+logprob；梯度使用独立 FP32 参考与相对误差验证。WKV 反向从保存的 chunk 起始状态
+重放前向，并在短片段内逆序求 VJP。只有需要梯度时才保存 checkpoint。
 
 ## Inference
 
-下表是 `transformers-rwkv` 需要适配的完整推理契约。省略的类型均为
-`torch.Tensor`；`ticket` 表示 `prepare_tmix_wkv7_recurrent_metadata` 的返回值。
+TMix 公共阶段固定为 `tokenshift -> wkv_prepare -> wkv7 -> readout`。
 
-| API | 参数 | 返回值 |
-|---|---|---|
-| `infer_embedding_ln0_forward_varlen` | `embedding, weight, bias, *, eps=1e-5` | embedding + LN0 结果 |
-| `infer_tmix_postnorm_tokenshift_forward_varlen` | `x, res, weight, bias, x_r, x_w, x_k, x_v, x_a, x_g, *, shift_state_pool, cu_seqlens, state_indices, max_seqlen=None, eps=1e-5, validated_metadata=None` | `(res_out, r, w, k, v, a, g)`；原位更新 shift state |
-| `infer_tmix_wkv_prepare_forward_varlen` | `x_r, x_w, x_k, x_v, x_a, x_g, receptance_weight, key_weight, value_weight, w1, a1, g1, v1, w2, a2, g2, v2, v0, k_k, a0, k_a, *, v_first=None, w1_runtime=None, a1_runtime=None, g1_runtime=None, v1_runtime=None, w2_runtime=None, a2_runtime=None, g2_runtime=None, v2_runtime=None, receptance_lora_a=None, receptance_lora_b=None, receptance_lora_scale=1.0, key_lora_a=None, key_lora_b=None, key_lora_scale=1.0, value_lora_a=None, value_lora_b=None, value_lora_scale=1.0, head_size=64, batch_size=1, max_seqlen=None` | 一次 API 完成 R/K/V、WAG/WAGV、VRes 与 KK/A，返回 `(receptance, decay_delta, key, value, recurrent_a, recurrent_b, gate, v_first)` |
-| `infer_tmix_readout_forward_varlen` | `wkv_output, receptance, key, value, r_k, ln_weight, ln_bias, gate, output_weight, *, output_lora_a=None, output_lora_b=None, output_lora_scale=1.0, head_size=64, batch_size=1, max_seqlen=None` | 完成 head LN、RKV residual、gate 和 output projection |
-| `infer_tmix_wkv7_recurrent_fp32io16_forward_varlen` | `r, decay_logits, k, v, a, b, *, state, cu_seqlens, state_indices, scale=1.0, decay_bias=None, max_seqlen=None, validated_metadata=None, output_dtype=None` | WKV 输出（默认与 token 同 dtype，可选 FP32）；原位更新统一 FP32IO16 state handle，并在内部选择普通 FP32IO16 或 DeltaLog |
-| `infer_tmix_wkv7_recurrent_fp16_forward_varlen` | `r, decay_logits, k, v, a, b, *, state, cu_seqlens, state_indices, scale=1.0, decay_bias=None, max_seqlen=None, validated_metadata=None` | WKV 输出；原位更新统一 FP16 state handle，并在内部选择普通 FP16 或 DeltaLog |
-| `infer_tmix_wkv7_chunk_bf16_forward_varlen` | `r, decay_logits, k, v, a, b, *, state_pool, cu_seqlens, state_indices, chunk_size=16, max_seqlen=None, scale=1.0, decay_bias=None, validated_metadata=None` | chunk WKV 输出；原位更新 state |
-| `infer_cmix_forward_varlen` | `x, res, weight, bias, x_k, key_weight, value_weight, *, shift_state_pool, cu_seqlens, state_indices, max_seqlen=None, eps=1e-5, validated_metadata=None, deterministic=False` | `(res_out, cmix_out)`；原位更新 shift state |
-| `infer_post_norm_output_forward_varlen` | `x, res, weight, bias, *, eps=1e-5` | 最终 `LN(x + res)` |
-| `infer_head_linear_all_forward_varlen` | `x, weight` | 所有 packed token 的 logits |
-| `infer_head_linear_last_forward_varlen` | `x, weight, *, tokens_count` | 最后 `tokens_count` 个 token 的 logits |
-| `infer_sampling_temperature_topk_topp_forward_varlen` | `logits, states, slot_indices, *, temperature=1.0, top_k=-1, top_p=1.0, sample_capacity=None, num_active_samples=None` | sampled token ids；原位更新 RNG state |
-| `infer_sampling_six_parameter_forward_varlen` | `logits, penalties, states, slot_indices, *, presence_penalty=0.0, frequency_penalty=0.0, penalty_decay=0.996, temperature=1.0, top_k=-1, top_p=1.0, sample_capacity=None, num_active_samples=None` | sampled token ids；原位更新 penalty/RNG state |
+| API | 输入与返回值 |
+|---|---|
+| `infer_embedding_ln0_forward_varlen(embedding, weight, bias, *, eps=1e-5)` | BF16 embedding 和 LN 仿射参数，返回 BF16 LN0 |
+| `infer_tmix_postnorm_tokenshift_forward_varlen` | res/LN、六路 mix，返回 `(res_out, r, w, k, v, a, g)`，原位更新 shift pool |
+| `infer_tmix_wkv_prepare_forward_varlen` | R/K/V、低秩 W/A/G/V、VRes 与 KK/A，返回 `(r, decay_logits, key, value, recurrent_a, recurrent_b, gate, v_first)` |
+| `infer_tmix_wkv7_recurrent_fp32io16_forward_varlen` | BF16 `[N,H,D]` 六路输入、FP32 state handle、packed metadata；返回 BF16 WKV 并原位更新状态 |
+| `infer_tmix_readout_forward_varlen` | head LN、RKV residual、gate 和 output projection，返回 BF16；WKV 输入也可为 FP32 |
+| `infer_cmix_forward_varlen` | res/LN、TokenShift、key projection、ReLU²、value projection；返回 `(res_out, cmix_out)`，原位更新 shift pool |
+| `infer_post_norm_output_forward_varlen(x, res, weight, bias, *, eps=1e-5)` | 对 BF16 residual sum 作 FP32 LN，返回 BF16 |
+| `infer_head_linear_all_forward_varlen(x, weight)` | `[N,C]` BF16 hidden 与 `[V,C]` BF16 weight，返回 FP32 `[N,V]` |
+| `infer_head_linear_last_forward_varlen(x, weight, *, tokens_count)` | 调用方已选出的末尾 hidden rows，返回对应 FP32 logits |
+| `head_logprobs(logits, targets)` | 连续 FP32 `[...,V]` logits 和同前缀形状的 INT64 targets，返回 FP32 所选 token logprobs |
+| `infer_sampling_temperature_topk_topp_forward_varlen` | FP32 logits、RNG pool、slot indices，返回 token ids 并更新 RNG |
+| `infer_sampling_six_parameter_forward_varlen` | 同上，另含 presence/frequency penalties 与 penalty decay |
 
-FP32-state WKV 的 `output_dtype=None` 保留现有 token dtype、默认调度与调用方式；
-`output_dtype=torch.float32` 在 FP32 累加后直接写 FP32 输出，避免 head LN 之前
-缩窄到 FP16 导致溢出。也可显式指定 token 自身的 dtype；其余 dtype 会被拒绝。
-此选项不改变六路 token 输入、decay bias 或 state 的 dtype，不做 clamp 或
-`nan_to_num`。FP32 输出沿用普通 provider 的 shape selector、递推和归约；
-对于已有 pending DeltaLog 的 handle，先 materialize 本次 slots，再运行普通
-provider。默认调用仍可使用 DeltaLog。
-
-`infer_tmix_readout_forward_varlen` 自动接受 FP16 或 FP32 `wkv_output`，其余
-输入与权重仍为 FP16。head LN 直接读取 FP32 WKV，LN、RKV residual 与 gate
-计算完成后才写 FP16 prelinear，output projection 和返回值仍为 FP16。
-FP32 WKV 的显存为每元素 4 字节；默认 FP16 为每元素 2 字节。
-
-HF 模型 TMix 调用点的最小接法如下；`state` 与 `ticket` 继续使用现有对象，
-readout 前不将 `wkv` 转为 FP16。该选项是 FlashRWKV2 算子参数，HF 配置项由
-HF 项目的独立 session 接入。
+WKV 推理参数为：
 
 ```python
-import torch
-import flashrwkv2
-
-wkv = flashrwkv2.infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
+output = flashrwkv2.infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
     r, decay_logits, k, v, a, b,
-    state=state, cu_seqlens=cu_seqlens, state_indices=state_indices,
-    decay_bias=decay_bias, max_seqlen=max_seqlen,
+    state=state,
+    cu_seqlens=cu_seqlens,
+    state_indices=state_indices,
+    scale=1.0,
+    decay_bias=None,
+    max_seqlen=None,
     validated_metadata=ticket,
-    output_dtype=torch.float32,
-)
-output = flashrwkv2.infer_tmix_readout_forward_varlen(
-    wkv.flatten(1), r.flatten(1), k.flatten(1), v.flatten(1),
-    r_k, ln_weight, ln_bias, gate, output_weight,
-    head_size=r.shape[-1], batch_size=state_indices.numel(),
-    max_seqlen=max_seqlen,
 )
 ```
 
-`prepare_tmix_wkv7_recurrent_fp16_state(state_pool_size, channels, *,
-sequence_capacity, head_size=64, device=None)` 与
+原始低秩 checkpoint 权重按 `[out,in]` 传入推理 prepare；可选 `*_runtime`
+权重是它们的转置布局。两者通过 stride 进入相同投影，不在每次调用时复制权重。
+CMix 推理的 value weight 保持 `[F,C]` runtime 布局；训练入口为 `[C,F]`。
+
+## State and packed metadata
+
 `prepare_tmix_wkv7_recurrent_fp32io16_state(state_pool_size, channels, *,
-sequence_capacity, head_size=64, device=None)` 分别一次性分配完整的统一 FP16 与
-FP32IO16 state package，并返回不透明 handle。FP16 handle 持有零初始化的 FP16
-基础 state 与 INT32 elapsed state；FP32IO16 handle 持有零初始化的 FP32 基础
-state。两者在需要时同时分配与 state 同 dtype 的私有 DeltaLog phase/log
-workspace。调用方不再预先分配或传入基础 state pool。整池 checkpoint 仍可使用
-`clone()`、`copy_()` 和
-`zero_()`；server 调度应使用 `clone_slots(state_indices)`、
-`copy_slots_(source, source_indices, destination_indices)` 与
-`reset_slots_(state_indices)`，这些操作只访问指定 slot，但始终覆盖 base state、
-elapsed、phase 与 logs 的完整逻辑状态包。`copy_slots_` 具有同时复制语义，支持
-同一 handle 内源/目标重叠的 prefix-cache COW。`materialize_slots_(state_indices)`
-把指定 slot 的 pending logs 合入 base state 并清空其 phase/log，不改变 elapsed；
-统一入口从 DeltaLog 回退普通 kernel 前会自动完成同一操作。
+sequence_capacity, head_size=64, device=None)` 分配零初始化 FP32 pool。
+`prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor(state)` 绑定已有连续 CUDA
+FP32 tensor。每次调用返回时状态完整写回。
 
-`prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor(state)` 为普通模型 cache
-绑定调用方已有的连续 CUDA FP32 `[slots,H,D,D]` tensor。返回的 handle 直接持有并
-原位更新该 tensor，不复制基础 state，也不要求调用方提供 `sequence_capacity`。
-caller-backed handle 固定使用完整 materialized FP32IO16 state，不分配 DeltaLog
-phase/log workspace；因此每次推理返回时，调用方 tensor 都是完整的当前 state。
-该入口用于维持调用方已有 tensor 的公开 cache 契约，不用于 server state-pool
-显存预算；调用方必须在 handle 存活期间保持 tensor storage 地址不变。
+handle 提供 `clone()`、`copy_()`、`zero_()`、`clone_slots(indices)`、
+`copy_slots_(source, source_indices, destination_indices)` 和 `reset_slots_(indices)`。
+slot copy 具有同时复制语义，支持同池重叠 COW；目标 slots 必须唯一。
+`materialize_slots_` 保留 lifecycle 调用入口，FP32 状态本身已物化。
+`memory_layout` 报告实际 bytes per slot 和 total bytes。
 
-handle 的 `memory_layout` 是唯一显存统计入口，返回实际分配的
-`base_bytes_per_slot`、`private_bytes_per_slot`、`bytes_per_slot`、
-`fixed_workspace_nbytes` 与 `total_nbytes`。state preparation 同时完成内部 policy
-选择、完整 state package 分配和显存统计，不存在独立的预算查询/外部分配步骤。
-下游不得读取、移动或单独管理基础 pool、DeltaLog policy、`M`、phase 或 logs。
+静态 `prepare_tmix_wkv7_recurrent_metadata(cu_seqlens, state_indices, *,
+state_pool_size, total_tokens, max_seqlen=None)` 验证非空序列、边界、slot 范围和唯一性，
+保存 snapshot，并校验后续调用的 identity、version、shape 和 CUDA stream。
+`cu_seqlens` 与 `state_indices` 为连续 CUDA INT32。
 
-策略保留 Albatross `3465da5070beceb4bab9e07b03abee1642a0bdf8` 的普通
-`WKV_DELTALOG_TUNED_M` 精确表作为候选表。FP32IO16 在 SM120、FP16 token IO、
-`D=64`、固定容量 `T=1` 且 `(C, sequence_capacity)` 精确命中时使用对应 `M`。
-这里的 `sequence_capacity` 是 state handle 支持的单次 launch 上限；实际 T1
-launch 可以包含不超过该上限的任意正数个 sequence，并通过 `state_indices`
-访问 state pool 中任意 slot。DeltaLog status workspace 按上限预分配，launch
-只使用与本次 sequence 数匹配的连续前缀。
-FlashRWKV2 的普通 FP16-state launcher 在 `(768,64)`、`(768,128)`、`(1024,64)`、
-`(2048,32)`、`(2048,64)`、`(2560,32)` 与 `(4096,32)` 上更快，因此这些候选点
-自动回退普通 FP16；其余表内 FP16 点使用 DeltaLog。FP32 state 的 BF16 IO、
-`T>1`、其他 device/head size 或表外 shape 也自动调用对应普通 launcher。策略
-不插值，不接受外部 `M` override，也不包含依赖模型级 CUDA Graph 调度的
-APW-only 表。策略与 workspace 在 state preparation 阶段确定；统一入口不会在
-热路径查询主机侧 CUDA 数据。native 校验异常继续令整套 state fail-closed。
+CUDA Graph 使用 `token_capacity`、`sequence_capacity`、`max_seqlen_capacity` 以及
+两个 CUDA INT32 scalar `num_active_tokens`、`num_active_sequences`。同一 graph
+内所有 stateful 算子共享 ticket；每次 replay 验证有效前缀。零 active warmup 不
+修改 state，非法 metadata 也不修改 state。inactive 输出为 NaN，不应被下游消费。
 
-`prepare_tmix_wkv7_recurrent_fp16_state`、
-`prepare_tmix_wkv7_recurrent_fp32io16_state`、
-`prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor`、
-`prepare_tmix_wkv7_recurrent_metadata` 和 `setup_sampling_states` 是上述推理入口
-需要的状态 preparation API。
+## Training
 
-训练接口包括 16 个完整语义入口：`pretrain_tmix_wkv_prepare_bf16`、
-`pretrain_head_linear_bf16`、`pretrain_cmix_bf16`、
-`statetune_cmix_bf16`、`pretrain_tmix_wkv7_recurrent_bf16`、
-`statetune_tmix_wkv7_recurrent_fp32io16`、`rl_infctx_tmix_wkv7_chunk_fp32io16`、
-`rl_infctx_tmix_wkv7_chunk_fp32io16_factor_recompute`、`pretrain_tmix_a_gate_bf16`、
-`pretrain_tmix_kk_pre_bf16`、`pretrain_tmix_readout_bf16`、
-`pretrain_tmix_tokenshift_bf16`、`statetune_tmix_tokenshift_bf16`、
-`pretrain_tmix_vres_gate_bf16`、`pretrain_l2wrap_ce_bf16` 和
-`pretrain_head_l2wrap_ce_bf16`。根包总计导出 34 个唯一名称：13 个推理入口、
-16 个训练入口和上述 5 个状态 preparation 入口。
+| API | 说明 |
+|---|---|
+| `pretrain_tmix_tokenshift_bf16` / `statetune_tmix_tokenshift_bf16` | 六路 TokenShift；stateful 形式返回混合输出和 final shift |
+| `pretrain_tmix_wkv_prepare_bf16` | 训练权重布局与 `w0` bias，输出共享 BF16 prepare 结果 |
+| `pretrain_tmix_wkv7_recurrent_bf16` | `[B,T,C]`、零初始状态，返回同形状 BF16 输出 |
+| `statetune_tmix_wkv7_recurrent_fp32io16` | 指定 segment 和初始 FP32 state，返回 `(output, final_state)` |
+| `rl_infctx_tmix_wkv7_recurrent_bf16` | packed 六路输入、`state_pool`、`cu_seqlens`、可选 `state_indices`，返回 `(output, final_pool)`；输入和 state 可求梯度 |
+| `pretrain_tmix_readout_bf16` | head LN、RKV residual、gate，可选 output projection |
+| `pretrain_cmix_bf16` / `statetune_cmix_bf16` | ChannelMix 与可微初始/最终 shift state |
+| `pretrain_tmix_a_gate_bf16` / `pretrain_tmix_kk_pre_bf16` / `pretrain_tmix_vres_gate_bf16` | prepare 组成部分，复用相同前向 |
+| `pretrain_head_linear_bf16` | BF16 hidden/weight，返回 FP32 logits |
+| `pretrain_l2wrap_ce_bf16` | FP32 CE，梯度包含 train_temp L2Wrap 项 |
+| `pretrain_head_l2wrap_ce_bf16` | `chunk_rows` 限制词表投影工作集，反向重算当前 chunk |
 
-TMix 的 `B=1,T=1,C=4096` 与 CMix 的 `T=1,C=4096` 使用 Albatross 派生的单次 Res+LN+TokenShift fused launch；其他 packed varlen 形状在同一公共入口内部顺序启动 PostNorm 与 TokenShift。CMix 的 dense/sparse 选择也完全由 `infer_cmix_forward_varlen` 内部完成。
+投影支持 LoRA/NoRA：A `[R,K]`、B `[O,R]`，参数可为 BF16/FP32。
+NoRA 为 `A / (norm(A, dim=0) + 1e-6)`，FP32 归一化与反向，BF16 投影；
+每次 forward 从当前参数计算。冻结 base weight 时省去 dW，但保留输入梯度。
+CMix 使用 `key_*`、`value_*`，prepare 使用 `receptance_*`、`key_*`、`value_*`，
+readout 使用 `output_*`，head 使用 `lora_a/lora_b/lora_scale/use_nora`。
 
-## Downstream handoff
+## Tuning and acceptance
 
-`transformers-rwkv` 必须精确依赖 `FlashRWKV2==0.1.0a15`，只检查和调用上述公共
-接口。server 侧通过统一 handle 的 slot lifecycle 与 memory layout 完成 cache
-调度；模型侧不得为 FP16 或 FP32IO16 选择普通/DeltaLog、传入 `M`、管理
-phase/logs，或调用
-standalone LN、Res、TokenShift、CMix ReLU²、FFN-down、sparse 子步骤、WKV
-elapsed-state 更新及通用 Linear helper。
+内部 `tune_linear`、`tune_norm`、`tune_tokenshift`、`tune_readout` 与 WKV tuner
+按设备及实际 shape 选择配置。先与固定数值基准逐位比较，再用 CUDA Graph 计时；
+候选只能改变输出 tiling、pipeline 或每 CTA 的独立行数。验收覆盖 RTX 4090
+SM89 与 PRO6000 SM120 的 decode、小 batch、prefill 和训练形状。
 
-## NoRA training
-
-训练投影接受原始 A `[R,K]`、B `[O,R]`、scaling 和 `use_nora`。
-NoRA 定义为 `A / (norm(A, dim=0) + 1e-6)`；范数与归一化反向使用 FP32，
-投影 GEMM 使用 BF16，适配器参数支持 BF16/FP32。scaling 直接使用调用方的 PEFT 值。
-单个无 bias、dropout=0 的适配器可通过 CMix、WKV Prepare、Readout、Head 训练入口接入；
-`use_nora="init"` 由 PEFT 初始化后按普通 LoRA 传入。
-
-CMix 的 `key_lora_*`、`value_lora_*` 分别作用于 key/value projection，
-对应的 `key_use_nora`、`value_use_nora` 控制归一化。
-Readout 的 `output_weight` 可选，传入时同时完成 output projection；
-其适配器使用 `output_lora_*` 和 `output_use_nora`。
-Head logits 和分块 Head CE 使用 `lora_a/lora_b/lora_scale/use_nora`。
-所有入口根据 autograd 的梯度需求跳过冻结基座的完整 dW，保留穿过基座的输入梯度。
-
-WKV Prepare 返回 `(r, decay_logits, key, value, recurrent_a, recurrent_b, gate, v_first)`；
-`decay_logits` 是训练 WKV 的输入，保持现有 WKV 数值契约。
-NoRA 的归一化结果属于本次 forward/backward，不跨 optimizer step 缓存。
-吸收使用 `W.float() + scale * B.float() @ normalized_A.float()`，最后转换为目标权重 dtype。
+`tests/tmix/wkv7/test_block.py` 覆盖完整 block 到 selected logprobs 的训练/推理、
+prefill/decode、batch 和 optimizer 更新后一致性。`tests/tmix/wkv7/test.py` 覆盖
+state lifecycle 与 CUDA Graph。设备实测通过前，离线 lowering 不能作为数值或性能
+验收结果。下游模型与 serving 集成应在各自仓库单独接入这一契约。

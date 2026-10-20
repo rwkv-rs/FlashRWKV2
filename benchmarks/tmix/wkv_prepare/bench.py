@@ -8,114 +8,182 @@ import json
 import torch
 from _timing import measure_cuda
 
+from flashrwkv2._internal.linear import _NoRA, linear, tune_linear
 from flashrwkv2.tmix.wkv_prepare import (
     infer_tmix_wkv_prepare_forward_varlen,
     pretrain_tmix_wkv_prepare_bf16,
 )
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--tokens", type=int, default=1)
-    parser.add_argument("--channels", type=int, default=4096)
-    parser.add_argument("--rank", type=int, default=64)
-    parser.add_argument("--adapter-rank", type=int, default=0)
-    args = parser.parse_args()
-    options = {"device": torch.device("cuda"), "dtype": torch.float16}
-    shifted = [torch.randn(args.tokens, args.channels, **options) for _ in range(6)]
-    dense = [
-        torch.randn(args.channels, args.channels, **options) * 0.01 for _ in range(3)
-    ]
-    rank_in = [
-        torch.randn(args.rank, args.channels, **options) * 0.01 for _ in range(4)
-    ]
-    rank_out = [
-        torch.randn(args.channels, args.rank, **options) * 0.01 for _ in range(4)
-    ]
-    runtime_in = [weight.t().contiguous() for weight in rank_in]
-    runtime_out = [weight.t().contiguous() for weight in rank_out]
-    vectors = [torch.zeros(args.channels, **options) for _ in range(4)]
+def benchmark(args):
+    operator = args.operator or ("pretrain" if args.adapter_rank else "infer")
+    backward = args.backward or (args.operator is None and bool(args.adapter_rank))
+    if operator == "infer" and backward:
+        raise ValueError("--backward requires the pretrain operator")
+    torch.manual_seed(127)
+    channels, rank = args.channels, args.rank
+    full_training = backward and not args.adapter_rank
 
-    def run() -> tuple[torch.Tensor, ...]:
-        return infer_tmix_wkv_prepare_forward_varlen(
-            *shifted,
-            *dense,
-            *rank_in,
-            *rank_out,
-            *vectors,
-            w1_runtime=runtime_in[0],
-            a1_runtime=runtime_in[1],
-            g1_runtime=runtime_in[2],
-            v1_runtime=runtime_in[3],
-            w2_runtime=runtime_out[0],
-            a2_runtime=runtime_out[1],
-            g2_runtime=runtime_out[2],
-            v2_runtime=runtime_out[3],
-            head_size=64,
-            batch_size=1,
-            max_seqlen=args.tokens,
-        )
+    def random(*shape, grad=False):
+        return (
+            torch.randn(shape, device="cuda", dtype=torch.bfloat16) * 0.03
+        ).requires_grad_(grad)
 
+    shape = (
+        (1, args.tokens, channels)
+        if operator == "pretrain"
+        else (args.tokens, channels)
+    )
+    shifted = [random(*shape, grad=backward) for _ in range(6)]
+    dense = [random(channels, channels, grad=full_training) for _ in range(3)]
+    rank_in = [random(rank, channels) for _ in range(4)]
+    rank_out = [random(channels, rank) for _ in range(4)]
+    runtime_in = [
+        weight.t().contiguous().requires_grad_(full_training) for weight in rank_in
+    ]
+    runtime_out = [
+        weight.t().contiguous().requires_grad_(full_training) for weight in rank_out
+    ]
+    vectors = [random(channels) for _ in range(4)]
+    vectors[1].fill_(1.0)
+    for vector in vectors:
+        vector.requires_grad_(full_training)
+    v0, kk, a0, ka = vectors
+    w0 = random(channels, grad=full_training)
+    first = random(*shape, grad=backward) if args.later_layer else None
+    adapters, adapter_options = [], {}
     if args.adapter_rank:
-        shifted = [x.to(torch.bfloat16).unsqueeze(0).requires_grad_() for x in shifted]
-        dense = [w.to(torch.bfloat16) for w in dense]
-        w1, a1, g1 = [w.to(torch.bfloat16) for w in runtime_in[:3]]
-        w2, a2, g2 = [w.to(torch.bfloat16) for w in runtime_out[:3]]
-        w0, a0, kk, ka = [v.to(torch.bfloat16) for v in vectors]
-        kk.fill_(1.0)
         adapters = [
-            (torch.randn(*shape, device="cuda") * 0.01).requires_grad_()
-            for shape in (
-                (args.adapter_rank, args.channels),
-                (args.channels, args.adapter_rank),
-            )
+            (torch.randn(size, device="cuda") * 0.01).requires_grad_(backward)
+            for size in ((args.adapter_rank, channels), (channels, args.adapter_rank))
             * 3
         ]
+        for index, name in enumerate(("receptance", "key", "value")):
+            adapter_options[f"{name}_lora_a"] = adapters[index * 2]
+            adapter_options[f"{name}_lora_b"] = adapters[index * 2 + 1]
+            adapter_options[f"{name}_use_nora"] = True
+    tuning = {}
+    if args.tune:
+        source = shifted[0].detach().reshape(args.tokens, channels)
+        tuning["dense"] = tune_linear(source, dense[0])
+        first_weight = runtime_in[0].t() if operator == "pretrain" else rank_in[0]
+        second_weight = runtime_out[0].t() if operator == "pretrain" else rank_out[0]
+        tuning["lowrank_in"] = tune_linear(source, first_weight)
+        reduced = linear(source, first_weight)
+        tuning["lowrank_out"] = tune_linear(reduced, second_weight)
+        if adapters:
+            normalized = _NoRA.apply(adapters[0].detach())
+            tuning["adapter_a"] = tune_linear(source, normalized)
+            reduced = linear(source, normalized)
+            tuning["adapter_b"] = tune_linear(
+                reduced, adapters[1].detach().bfloat16(), torch.float32
+            )
+    variables = (
+        *shifted,
+        *dense,
+        *runtime_in[:3],
+        *runtime_out[:3],
+        w0,
+        kk,
+        a0,
+        ka,
+        *adapters,
+    )
+    if first is not None:
+        variables += (first, v0, runtime_in[3], runtime_out[3])
+    gradient_inputs = tuple(t for t in variables if t.requires_grad)
+    upstream = (
+        [torch.randn(shape, device="cuda", dtype=torch.bfloat16) for _ in range(8)]
+        if backward
+        else None
+    )
 
-        def run():
+    def run():
+        if operator == "infer":
+            outputs = infer_tmix_wkv_prepare_forward_varlen(
+                *shifted,
+                *dense,
+                *rank_in,
+                *rank_out,
+                *vectors,
+                v_first=first,
+                head_size=args.head_size,
+                **adapter_options,
+            )
+        else:
             outputs = pretrain_tmix_wkv_prepare_bf16(
                 *shifted,
                 *dense,
                 w0,
-                w1,
-                w2,
+                runtime_in[0],
+                runtime_out[0],
                 a0,
-                a1,
-                a2,
-                g1,
-                g2,
+                runtime_in[1],
+                runtime_out[1],
+                runtime_in[2],
+                runtime_out[2],
                 kk,
                 ka,
-                receptance_lora_a=adapters[0],
-                receptance_lora_b=adapters[1],
-                key_lora_a=adapters[2],
-                key_lora_b=adapters[3],
-                value_lora_a=adapters[4],
-                value_lora_b=adapters[5],
-                receptance_use_nora=True,
-                key_use_nora=True,
-                value_use_nora=True,
+                v_first=first,
+                v0=v0,
+                v1=runtime_in[3],
+                v2=runtime_out[3],
+                head_size=args.head_size,
+                **adapter_options,
             )
-            torch.autograd.grad(
-                sum(x.float().sum() for x in outputs), (*shifted, *adapters)
-            )
-            return outputs
+            if backward:
+                torch.autograd.grad(outputs, gradient_inputs, upstream)
+        return outputs
 
-    timing = measure_cuda(run)
-    print(
-        json.dumps(
-            {
-                "operator": "pretrain_tmix_wkv_prepare_bf16"
-                if args.adapter_rank
-                else "infer_tmix_wkv_prepare_forward_varlen",
-                "profile": (
-                    f"tokens={args.tokens}/channels={args.channels}/rank={args.rank}/adapter_rank={args.adapter_rank}"
-                ),
-                "steady_state": "stateless inputs and weights are reused",
-                **timing,
-            }
-        )
+    return {
+        "operator": "pretrain_tmix_wkv_prepare_bf16"
+        if operator == "pretrain"
+        else "infer_tmix_wkv_prepare_forward_varlen",
+        "profile": f"tokens={args.tokens}/channels={channels}/rank={rank}/adapter_rank={args.adapter_rank}",
+        "tokens": args.tokens,
+        "channels": channels,
+        "rank": rank,
+        "head_size": args.head_size,
+        "forward_backward": backward,
+        "later_layer": args.later_layer,
+        "input_dtype": "bfloat16",
+        "accumulation_dtype": "float32",
+        "tuning": tuning,
+        "steady_state": "stateless inputs and weights are reused",
+        **measure_cuda(run),
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--tokens", type=int, default=1)
+    parser.add_argument("--channels", type=int, default=4096)
+    parser.add_argument("--rank", type=int, default=64)
+    parser.add_argument("--head-size", type=int, choices=(64, 128, 256), default=64)
+    parser.add_argument("--adapter-rank", type=int, default=0)
+    parser.add_argument("--operator", choices=("infer", "pretrain"))
+    parser.add_argument("--backward", action="store_true")
+    parser.add_argument("--later-layer", action="store_true")
+    parser.add_argument("--tune", action="store_true")
+    parser.add_argument(
+        "--sweep",
+        action="store_true",
+        help="emit JSONL for model widths, M=1/27/256 and rank=32/64/128",
     )
+    args = parser.parse_args()
+    cases = [(args.tokens, args.channels, args.rank)]
+    if args.sweep:
+        cases = [
+            (rows, channels, rank)
+            for channels in (768, 1024, 2048, 2560, 4096, 5120)
+            for rows in (1, 27, 256)
+            for rank in (32, 64, 128)
+        ]
+    for tokens, channels, rank in cases:
+        case = argparse.Namespace(
+            **{**vars(args), "tokens": tokens, "channels": channels, "rank": rank}
+        )
+        print(json.dumps(benchmark(case)))
 
 
 if __name__ == "__main__":

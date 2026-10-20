@@ -82,3 +82,34 @@ def test_chunked_head_nora_gradients():
     for actual, reference in zip(actual_grads, expected_grads, strict=True):
         assert_relative_rmse(actual, reference)
     assert weight.grad is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.cuda
+@pytest.mark.parametrize("chunk_rows", (1, 7, 1024))
+@pytest.mark.parametrize("parameter", ("weight", "adapter"))
+def test_head_l2wrap_accumulates_parameter_gradients_in_fp32(chunk_rows, parameter):
+    """1024 identical rows expose BF16 accumulation saturation after 256 chunks."""
+    rows, vocab = 1024, 65536
+    hidden = torch.ones(1, rows, 1, device="cuda", dtype=torch.bfloat16)
+    weight = torch.zeros(vocab, 1, device="cuda", dtype=torch.bfloat16)
+    targets = torch.zeros(rows, device="cuda", dtype=torch.int64)
+    options = {}
+    if parameter == "weight":
+        trainable = weight.requires_grad_()
+    else:
+        trainable = torch.zeros_like(weight, requires_grad=True)
+        options = {
+            "lora_a": torch.ones(1, 1, device="cuda", dtype=torch.bfloat16),
+            "lora_b": trainable,
+        }
+    loss = pretrain_head_l2wrap_ce_bf16(
+        hidden, weight, targets, chunk_rows=chunk_rows, **options,
+    )
+    actual = torch.autograd.grad(loss, trainable)[0]
+    expected = torch.full_like(actual, 1.0 / vocab)
+    expected[0] = 1.0 / vocab - 1.0
+    assert torch.equal(actual, expected)
+    torch.testing.assert_close(
+        loss, torch.tensor(float(vocab), device="cuda").log(), atol=2e-6, rtol=2e-6,
+    )

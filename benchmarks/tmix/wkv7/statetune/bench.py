@@ -26,7 +26,7 @@ def main() -> None:
     state = torch.randn(1, args.heads, 64, 64, device=device, dtype=torch.float32)
     values = [
         torch.randn(
-            args.tokens, args.heads, 64, device=device, dtype=torch.float16
+            args.tokens, args.heads, 64, device=device, dtype=torch.bfloat16
         )
         for _ in range(6)
     ]

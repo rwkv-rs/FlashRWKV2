@@ -16,24 +16,23 @@ from flashrwkv2.post_norm import infer_post_norm_output_forward_varlen
 def test_post_norm_output(channels: int) -> None:
     torch.manual_seed(53)
     device = torch.device("cuda")
-    x = torch.randn(5, channels, device=device, dtype=torch.float16)
+    x = torch.randn(5, channels, device=device, dtype=torch.bfloat16)
     res = torch.randn_like(x)
-    weight = torch.randn(channels, device=device, dtype=torch.float16)
-    bias = torch.randn(channels, device=device, dtype=torch.float16)
+    weight = torch.randn(channels, device=device, dtype=torch.bfloat16)
+    bias = torch.randn(channels, device=device, dtype=torch.bfloat16)
     expected_sum = (x + res).float()
     last = infer_post_norm_output_forward_varlen(x, res, weight, bias)
+    assert last.dtype == torch.bfloat16
     assert torch.allclose(
         last.float(),
-        F.layer_norm(
-            expected_sum, (channels,), weight.float(), bias.float(), 1.0e-5
-        ),
+        F.layer_norm(expected_sum, (channels,), weight.float(), bias.float(), 1.0e-5),
         atol=0.04,
         rtol=0.04,
     )
 
 
-def test_post_norm_rejects_cpu_before_native_launch() -> None:
-    x = torch.zeros(2, 8, dtype=torch.float16)
-    affine = torch.zeros(8, dtype=torch.float16)
+def test_post_norm_rejects_cpu_before_launch() -> None:
+    x = torch.zeros(2, 8, dtype=torch.bfloat16)
+    affine = torch.zeros(8, dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="CUDA"):
         infer_post_norm_output_forward_varlen(x, x, affine, affine)

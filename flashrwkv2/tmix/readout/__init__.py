@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import torch
 
-from ..wkv7 import _extension
-
 
 def infer_tmix_readout_forward_varlen(
     wkv_output: torch.Tensor,
@@ -24,71 +22,23 @@ def infer_tmix_readout_forward_varlen(
     head_size: int = 64,
     batch_size: int = 1,
     max_seqlen: int | None = None,
+    output_use_nora: bool = False,
 ) -> torch.Tensor:
-    """Run head LN, RKV residual, gate and FP16 output projection.
+    """BF16 head LN, RKV res, gate and output projection with FP32 accumulators."""
+    from ..._internal.linear import adapter_linear
+    from .tilelang import readout
 
-    ``wkv_output`` may be FP16 or FP32; all other tensors remain FP16.
-    FP32 WKV values are normalized before the prelinear result is cast to FP16.
-    """
-
-    if head_size not in {64, 128, 256}:
-        raise ValueError("head_size must be one of 64, 128, or 256")
-    for name, tensor in (
-        ("wkv_output", wkv_output),
-        ("receptance", receptance),
-        ("key", key),
-        ("value", value),
-        ("gate", gate),
-    ):
-        if not isinstance(tensor, torch.Tensor):
-            raise TypeError(f"{name} must be a torch.Tensor")
-        if (
-            (tensor.dtype != torch.float16 and (
-                name != "wkv_output" or tensor.dtype != torch.float32
-            ))
-            or not tensor.is_cuda or not tensor.is_contiguous()
-        ):
-            dtype_name = "float16 or float32" if name == "wkv_output" else "float16"
-            raise ValueError(f"{name} must be contiguous CUDA {dtype_name}")
-        if tensor.device != wkv_output.device or tensor.shape != wkv_output.shape:
-            raise ValueError(f"{name} must match wkv_output's packed shape and device")
-    if wkv_output.ndim != 2 or wkv_output.shape[0] <= 0 or wkv_output.shape[1] % head_size:
-        raise ValueError("wkv_output must have packed shape [total_tokens,H*head_size]")
-    channels = wkv_output.shape[1]
-    for name, tensor in (("r_k", r_k), ("ln_weight", ln_weight), ("ln_bias", ln_bias)):
-        if tensor.dtype != torch.float16 or not tensor.is_cuda or not tensor.is_contiguous():
-            raise ValueError(f"{name} must be contiguous CUDA float16")
-        if tensor.device != wkv_output.device or tensor.shape != (channels,):
-            raise ValueError(f"{name} must have shape [C] on wkv_output's device")
-    if output_weight.dtype != torch.float16 or not output_weight.is_cuda or not output_weight.is_contiguous():
-        raise ValueError("output_weight must be contiguous CUDA float16")
-    if output_weight.device != wkv_output.device or output_weight.shape != (channels, channels):
-        raise ValueError("output_weight must have shape [C,C]")
-    if (output_lora_a is None) != (output_lora_b is None):
-        raise ValueError("output_lora_a and output_lora_b must be provided together")
-    if max_seqlen is None:
-        max_seqlen = wkv_output.shape[0]
-    return _extension().tmix_readout_forward_varlen(
-        wkv_output,
-        receptance,
-        key,
-        value,
-        r_k,
-        ln_weight,
-        ln_bias,
-        gate,
-        output_weight,
-        output_lora_a,
-        output_lora_b,
-        float(output_lora_scale),
-        int(head_size),
-        int(batch_size),
-        int(max_seqlen),
+    if wkv_output.ndim != 2:
+        raise ValueError("wkv_output must have packed shape [total_tokens,C]")
+    prelinear = readout(
+        wkv_output, receptance, key, value, r_k, ln_weight, ln_bias, gate, head_size,
+    )
+    return adapter_linear(
+        prelinear, output_weight, output_lora_a, output_lora_b,
+        output_lora_scale, output_use_nora,
     )
 
 
-__all__ = ["infer_tmix_readout_forward_varlen"]
-
 from .pretrain import pretrain_tmix_readout_bf16
 
-__all__.append("pretrain_tmix_readout_bf16")
+__all__ = ["infer_tmix_readout_forward_varlen", "pretrain_tmix_readout_bf16"]

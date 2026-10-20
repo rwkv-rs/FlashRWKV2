@@ -34,6 +34,7 @@ PUBLIC_MODULES = (
 )
 PUBLIC_PREFIXES = (
     "get_",
+    "head_",
     "infer_",
     "prepare_",
     "pretrain_",
@@ -54,7 +55,8 @@ def test_cpu_import_does_not_compile_or_create_cache(tmp_path) -> None:
             (
                 "import flashrwkv2,sys; "
                 "assert flashrwkv2._C is None; "
-                "assert 'flashrwkv2.compile' not in sys.modules"
+                "assert 'flashrwkv2.compile' not in sys.modules; "
+                "assert 'tilelang' not in sys.modules"
             ),
         ],
         check=True,
@@ -243,6 +245,16 @@ def test_cache_key_changes_with_every_compatibility_input() -> None:
         assert key(changed) != expected
 
 
+def test_source_digest_tracks_shared_native_headers(tmp_path) -> None:
+    from flashrwkv2.compile import _source_digest
+
+    header = tmp_path / "validation.h"
+    header.write_text("void validate_metadata();\n")
+    original = _source_digest(tmp_path)
+    header.write_text("void validate_metadata(int capacity);\n")
+    assert _source_digest(tmp_path) != original
+
+
 def test_root_exports_module_operators_by_identity() -> None:
     import flashrwkv2
 
@@ -260,95 +272,12 @@ def test_root_exports_module_operators_by_identity() -> None:
         assert getattr(flashrwkv2, name) is operator
 
 
-def test_deltalog_policy_matches_pinned_albatross_exact_table() -> None:
-    module = importlib.import_module("flashrwkv2.tmix.wkv7")
-    expected = {
-        (768, 16): 2,
-        (768, 32): 3,
-        (768, 64): 3,
-        (768, 128): 3,
-        (768, 256): 3,
-        (768, 512): 3,
-        (1024, 16): 2,
-        (1024, 32): 3,
-        (1024, 64): 3,
-        (1024, 256): 3,
-        (1024, 512): 3,
-        (2048, 8): 2,
-        (2048, 16): 3,
-        (2048, 32): 3,
-        (2048, 64): 3,
-        (2048, 256): 3,
-        (2048, 512): 4,
-        (2560, 8): 2,
-        (2560, 16): 3,
-        (2560, 32): 3,
-        (2560, 64): 3,
-        (2560, 256): 3,
-        (2560, 512): 4,
-        (4096, 8): 2,
-        (4096, 16): 3,
-        (4096, 32): 3,
-        (4096, 64): 3,
-        (4096, 128): 3,
-        (4096, 256): 3,
-        (4096, 512): 4,
-    }
-    assert module._DELTALOG_POLICY_SOURCE_REVISION == (
-        "3465da5070beceb4bab9e07b03abee1642a0bdf8"
-    )
-    assert module._DELTALOG_TUNED_M == expected
-    fp16_unprofitable = {
-        (768, 64),
-        (768, 128),
-        (1024, 64),
-        (2048, 32),
-        (2048, 64),
-        (2560, 32),
-        (4096, 32),
-    }
-    assert module._DELTALOG_FP16_UNPROFITABLE_SHAPES == fp16_unprofitable
-    for (channels, batch_size), merge_interval in expected.items():
-        assert (
-            module._select_deltalog_merge_interval(
-                channels, batch_size, 64, (12, 0), "fp32io16"
-            )
-            == merge_interval
-        )
-        expected_fp16 = (
-            0 if (channels, batch_size) in fp16_unprofitable else merge_interval
-        )
-        assert (
-            module._select_deltalog_merge_interval(
-                channels, batch_size, 64, (12, 0), "fp16"
-            )
-            == expected_fp16
-        )
-    assert (
-        module._select_deltalog_merge_interval(
-            4096, 320, 64, (12, 0), "fp32io16"
-        )
-        == 0
-    )
-    assert (
-        module._select_deltalog_merge_interval(
-            4096, 64, 128, (12, 0), "fp32io16"
-        )
-        == 0
-    )
-    assert (
-        module._select_deltalog_merge_interval(
-            4096, 64, 64, (9, 0), "fp32io16"
-        )
-        == 0
-    )
 
 
 def test_wkv7_state_preparation_owns_memory_accounting() -> None:
     module = importlib.import_module("flashrwkv2.tmix.wkv7")
     assert not hasattr(module, "get_tmix_wkv7_recurrent_state_memory_layout")
     for name in (
-        "prepare_tmix_wkv7_recurrent_fp16_state",
         "prepare_tmix_wkv7_recurrent_fp32io16_state",
     ):
         assert tuple(inspect.signature(getattr(module, name)).parameters) == (

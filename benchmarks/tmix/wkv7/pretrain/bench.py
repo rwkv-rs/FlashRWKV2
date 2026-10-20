@@ -8,13 +8,6 @@ import torch
 from _timing import measure_cuda
 
 from flashrwkv2 import pretrain_tmix_wkv7_recurrent_bf16
-from flashrwkv2.tmix.wkv7 import _extension
-
-SOURCE_REVISION = "952102498e9ed367ea0a59ee64106916d474d30f"
-NATIVE_SYMBOLS = (
-    "pretrain_tmix_wkv7_recurrent_forward",
-    "pretrain_tmix_wkv7_recurrent_backward",
-)
 
 
 def run() -> dict[str, object]:
@@ -36,12 +29,7 @@ def run() -> dict[str, object]:
     timing = measure_cuda(step)
     device = torch.cuda.current_device()
     return {
-        "source_revision": SOURCE_REVISION,
         "operator": "pretrain_tmix_wkv7_recurrent_bf16",
-        "native_symbols": NATIVE_SYMBOLS,
-        "native_symbols_loaded": all(
-            hasattr(_extension(), symbol) for symbol in NATIVE_SYMBOLS
-        ),
         "gpu": torch.cuda.get_device_name(device),
         "compute_capability": list(torch.cuda.get_device_capability(device)),
         "cuda": torch.version.cuda,

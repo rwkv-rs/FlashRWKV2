@@ -17,9 +17,9 @@ def main() -> None:
     parser.add_argument("--channels", type=int, default=4096)
     args = parser.parse_args()
     device = torch.device("cuda")
-    x = torch.randn(args.tokens, args.channels, device=device, dtype=torch.float16)
+    x = torch.randn(args.tokens, args.channels, device=device, dtype=torch.bfloat16)
     res = torch.randn_like(x)
-    weight = torch.ones(args.channels, device=device, dtype=torch.float16)
+    weight = torch.ones(args.channels, device=device, dtype=torch.bfloat16)
     bias = torch.zeros_like(weight)
     timing = measure_cuda(
         lambda: infer_post_norm_output_forward_varlen(x, res, weight, bias)

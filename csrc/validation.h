@@ -5,8 +5,6 @@
 
 #include <torch/extension.h>
 
-#include <optional>
-
 namespace flashrwkv2::validation {
 
 enum RecurrentMetadataError : int {
@@ -16,12 +14,6 @@ enum RecurrentMetadataError : int {
   kDuplicateStateSlot = 1 << 3,
   kInvalidActiveCount = 1 << 4,
   kSequenceTooLong = 1 << 5,
-};
-
-struct RecurrentDimensions {
-  int64_t num_sequences;
-  int64_t num_heads;
-  int64_t head_size;
 };
 
 struct PreparedRecurrentMetadata {
@@ -36,24 +28,6 @@ void check_same_device(
     const torch::Tensor& reference,
     const torch::Tensor& tensor,
     const char* name);
-RecurrentDimensions check_recurrent_layout(
-    const torch::Tensor& query_start_loc,
-    const torch::Tensor& state_indices,
-    const torch::Tensor& state,
-    const torch::Tensor& r,
-    const torch::Tensor& decay_logits,
-    const torch::Tensor& k,
-    const torch::Tensor& v,
-    const torch::Tensor& a,
-    const torch::Tensor& b,
-    const torch::Tensor& output,
-    double scale,
-    bool allow_fp32_output = false);
-torch::Tensor build_recurrent_token_predecessor_cuda(
-    const torch::Tensor& query_start_loc,
-    const torch::Tensor& state_indices,
-    const torch::Tensor& status,
-    int64_t total_tokens);
 PreparedRecurrentMetadata prepare_recurrent_metadata_cuda(
     torch::Tensor query_start_loc,
     torch::Tensor state_indices,

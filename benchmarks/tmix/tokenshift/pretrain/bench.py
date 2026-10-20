@@ -16,9 +16,10 @@ from flashrwkv2.tmix.tokenshift import (
 
 def torch_stateful(x, initial_shift, params):
     previous = torch.cat((initial_shift[:, None, :], x[:, :-1, :]), dim=1)
-    return tuple(x + (previous - x) * parameter for parameter in params) + (
-        x[:, -1, :].contiguous(),
-    )
+    return tuple(
+        (x.float() + (previous.float() - x.float()) * parameter.float()).bfloat16()
+        for parameter in params
+    ) + (x[:, -1, :].contiguous(),)
 
 
 def main() -> None:

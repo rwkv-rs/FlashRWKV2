@@ -14,14 +14,13 @@ from pathlib import Path
 import torch
 from _timing import measure_cuda
 
-from flashrwkv2.tmix.wkv7 import _extension
+from flashrwkv2.loss.l2wrap_ce import pretrain_l2wrap_ce_bf16
+from flashrwkv2.loss.l2wrap_ce.tilelang import L2Wrap
 
 SOURCE_REVISION = "952102498e9ed367ea0a59ee64106916d474d30f"
 SOURCE_PATHS = (
-    "csrc/sm80/loss/l2wrap_ce/pretrain_bf16_forward.cpp",
-    "csrc/sm80/loss/l2wrap_ce/pretrain_bf16_forward.cu",
-    "csrc/sm80/loss/l2wrap_ce/pretrain_bf16_backward.cpp",
-    "csrc/sm80/loss/l2wrap_ce/pretrain_bf16_backward.cu",
+    "flashrwkv2/loss/l2wrap_ce/tilelang.py",
+    "flashrwkv2/_internal/logprob.py",
 )
 
 
@@ -68,9 +67,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--rows", type=int, default=8)
     parser.add_argument("--vocab", type=int, default=128)
-    parser.add_argument(
-        "--output", type=str, default="/tmp/flashrwkv2-l2wrap-ce.json"
-    )
+    parser.add_argument("--output", type=str, default="/tmp/flashrwkv2-l2wrap-ce.json")
     args = parser.parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
@@ -79,24 +76,19 @@ def main() -> None:
 
     device = torch.device("cuda")
     torch.manual_seed(17)
-    logits = torch.randn(
-        args.rows, args.vocab, device=device, dtype=torch.bfloat16
-    ).mul_(0.2)
-    targets = torch.randint(
-        args.vocab, (args.rows,), device=device, dtype=torch.int64
+    logits = (
+        torch.randn(args.rows, args.vocab, device=device, dtype=torch.float32)
+        .mul_(0.2)
+        .requires_grad_()
     )
+    targets = torch.randint(args.vocab, (args.rows,), device=device, dtype=torch.int64)
 
-    extension = _extension()
+    pretrain_l2wrap_ce_bf16(logits, targets)
     grad_loss = torch.ones((), device=device, dtype=torch.float32)
 
     def launch() -> None:
-        loss, lse, max_vals, argmax = extension.pretrain_l2wrap_ce_forward(
-            logits, targets
-        )
-        extension.pretrain_l2wrap_ce_backward(
-            grad_loss, logits, targets, lse, max_vals, argmax
-        )
-        del loss
+        loss = L2Wrap.apply(logits, targets)
+        torch.autograd.grad(loss, logits, grad_loss)
 
     timing = measure_cuda(launch)
 
@@ -106,8 +98,8 @@ def main() -> None:
         "rows": args.rows,
         "vocab": args.vocab,
         "profile": f"rows={args.rows}/vocab={args.vocab}",
-        "timing_boundary": "native_forward_backward",
-        "steady_state": "native intermediates are recreated for each launch",
+        "timing_boundary": "tilelang_forward_backward",
+        "steady_state": "FP32 forward intermediates are recreated for each launch",
         **timing,
         "source_repository": "https://github.com/BlinkDL/RWKV-LM",
         "source_revision": SOURCE_REVISION,

@@ -16,13 +16,11 @@ def _case(
     torch.manual_seed(20260805 + head_size)
     device = torch.device("cuda")
     batch, heads, total_tokens = 2, 1, 5
-    state = torch.randn(
-        batch, heads, head_size, head_size, device=device
-    ).mul_(0.01)
+    state = torch.randn(batch, heads, head_size, head_size, device=device).mul_(0.01)
     values = [
-        torch.randn(
-            total_tokens, heads, head_size, device=device, dtype=dtype
-        ).mul_(0.01)
+        torch.randn(total_tokens, heads, head_size, device=device, dtype=dtype).mul_(
+            0.01
+        )
         for _ in range(6)
     ]
     if requires_grad:
@@ -48,26 +46,16 @@ def _reference(
     device = state.device
     retention = lambda logits: torch.exp2(
         torch.tensor(-0.8750387749145276, device=device)
-        / (
-            1.0
-            + torch.exp2(
-                torch.tensor(-1.4426950408889634, device=device) * logits
-            )
-        )
+        / (1.0 + torch.exp2(torch.tensor(-1.4426950408889634, device=device) * logits))
     )
     states: list[torch.Tensor] = []
     rows: list[torch.Tensor] = []
-    boundaries: list[torch.Tensor] = []
-    state_dot_a: list[torch.Tensor] = []
     for sequence_index in range(batch):
         current = state[sequence_index, 0].float()
         for chunk_index in range(
             int(sequence[sequence_index]), int(sequence[sequence_index + 1])
         ):
-            boundaries.append(current.clone())
-            for token_index in range(
-                int(starts[chunk_index]), int(ends[chunk_index])
-            ):
+            for token_index in range(int(starts[chunk_index]), int(ends[chunk_index])):
                 rr = r[token_index, 0].float()
                 decay = retention(decay_logits[token_index, 0].float())
                 kk = k[token_index, 0].float()
@@ -75,19 +63,18 @@ def _reference(
                 aa = a[token_index, 0].float()
                 bb = b[token_index, 0].float()
                 dot = (aa[:, None] * current).sum(dim=0)
-                state_dot_a.append(dot)
                 current = (
                     decay[:, None] * current
                     + bb[:, None] * dot[None, :]
                     + kk[:, None] * vv[None, :]
                 )
-                rows.append((float(scale) * (rr[:, None] * current).sum(dim=0)).to(v.dtype))
+                rows.append(
+                    (float(scale) * (rr[:, None] * current).sum(dim=0)).to(v.dtype)
+                )
         states.append(current)
     return (
         torch.stack(rows).view(r.shape[0], heads, head_size),
         torch.stack(states).view(batch, heads, head_size, head_size),
-        torch.stack(boundaries).view(len(boundaries), heads, head_size, head_size),
-        torch.stack(state_dot_a).view(r.shape[0], heads, head_size),
     )
 
 
@@ -97,13 +84,10 @@ def _reference(
     "dtype,head_size",
     [
         pytest.param(
-            torch.float16,
+            torch.bfloat16,
             64,
             marks=(pytest.mark.memcheck, pytest.mark.racecheck),
         ),
-        (torch.float16, 128),
-        (torch.float16, 256),
-        (torch.bfloat16, 64),
         (torch.bfloat16, 128),
         (torch.bfloat16, 256),
     ],
@@ -125,7 +109,7 @@ def test_statetune_matches_train_temp_recurrence_and_initial_gradient(
         for value in case
     )
     expected = _reference(reference_case, 0.75)
-    tolerance = 8e-3 if dtype == torch.bfloat16 else 3e-4
+    tolerance = 8e-3
     for actual_value, expected_value in zip(actual, expected, strict=True):
         assert torch.allclose(
             actual_value, expected_value, atol=tolerance, rtol=tolerance
@@ -148,10 +132,31 @@ def test_statetune_matches_train_temp_recurrence_and_initial_gradient(
         assert torch.allclose(
             actual_gradient,
             expected_gradient,
-            atol=8e-3 if dtype == torch.bfloat16 else 3e-4,
-            rtol=1e-2 if dtype == torch.bfloat16 else 3e-3,
+            atol=8e-3,
+            rtol=1e-2,
         )
         assert torch.isfinite(actual_gradient).all()
 
     # StateTune must not mutate the caller-owned initial state during forward.
     assert torch.equal(state.detach(), initial_state)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.cuda
+@pytest.mark.parametrize(
+    "sequence,starts,ends,message",
+    [
+        ([0, 2, 4], [0, 1, 3], [1, 3, 5], "sequence_chunk_offsets"),
+        ([0, 2, 1], [0, 1, 3], [1, 3, 5], "sequence_chunk_offsets"),
+        ([0, 2, 3], [0, 2, 3], [1, 3, 5], "contiguous partition"),
+        ([0, 2, 3], [0, 1, 3], [2, 3, 5], "contiguous partition"),
+    ],
+)
+def test_statetune_rejects_invalid_chunk_metadata(sequence, starts, ends, message):
+    state, _, _, _, *values = _case(torch.bfloat16, 64)
+    metadata = [
+        torch.tensor(value, device="cuda", dtype=torch.int32)
+        for value in (sequence, starts, ends)
+    ]
+    with pytest.raises(ValueError, match=message):
+        statetune_tmix_wkv7_recurrent_fp32io16(state, *metadata, *values)

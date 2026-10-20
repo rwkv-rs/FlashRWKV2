@@ -22,6 +22,7 @@ from .cmix import infer_cmix_forward_varlen, pretrain_cmix_bf16, statetune_cmix_
 from .embedding import infer_embedding_ln0_forward_varlen
 from .head.l2wrap_ce import pretrain_head_l2wrap_ce_bf16
 from .head.linear import (
+    head_logprobs,
     pretrain_head_linear_bf16,
     infer_head_linear_all_forward_varlen,
     infer_head_linear_last_forward_varlen,
@@ -46,21 +47,18 @@ from .tmix.tokenshift import (
 )
 from .tmix.vres_gate import pretrain_tmix_vres_gate_bf16
 from .tmix.wkv7 import (
-    infer_tmix_wkv7_chunk_bf16_forward_varlen,
-    infer_tmix_wkv7_recurrent_fp16_forward_varlen,
     infer_tmix_wkv7_recurrent_fp32io16_forward_varlen,
-    prepare_tmix_wkv7_recurrent_fp16_state,
     prepare_tmix_wkv7_recurrent_fp32io16_state,
     prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor,
     prepare_tmix_wkv7_recurrent_metadata,
     pretrain_tmix_wkv7_recurrent_bf16,
-    rl_infctx_tmix_wkv7_chunk_fp32io16,
-    rl_infctx_tmix_wkv7_chunk_fp32io16_factor_recompute,
+    rl_infctx_tmix_wkv7_recurrent_bf16,
 )
 from .tmix.wkv7.statetune import statetune_tmix_wkv7_recurrent_fp32io16
 from .tmix.wkv_prepare import infer_tmix_wkv_prepare_forward_varlen, pretrain_tmix_wkv_prepare_bf16
 
 __all__ = [
+    "head_logprobs",
     "pretrain_tmix_wkv_prepare_bf16",
     "pretrain_head_linear_bf16",
     "infer_cmix_forward_varlen",
@@ -72,11 +70,8 @@ __all__ = [
     "infer_sampling_temperature_topk_topp_forward_varlen",
     "infer_tmix_postnorm_tokenshift_forward_varlen",
     "infer_tmix_readout_forward_varlen",
-    "infer_tmix_wkv7_chunk_bf16_forward_varlen",
-    "infer_tmix_wkv7_recurrent_fp16_forward_varlen",
     "infer_tmix_wkv7_recurrent_fp32io16_forward_varlen",
     "infer_tmix_wkv_prepare_forward_varlen",
-    "prepare_tmix_wkv7_recurrent_fp16_state",
     "prepare_tmix_wkv7_recurrent_fp32io16_state",
     "prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor",
     "prepare_tmix_wkv7_recurrent_metadata",
@@ -89,8 +84,7 @@ __all__ = [
     "pretrain_tmix_tokenshift_bf16",
     "pretrain_tmix_vres_gate_bf16",
     "pretrain_tmix_wkv7_recurrent_bf16",
-    "rl_infctx_tmix_wkv7_chunk_fp32io16",
-    "rl_infctx_tmix_wkv7_chunk_fp32io16_factor_recompute",
+    "rl_infctx_tmix_wkv7_recurrent_bf16",
     "setup_sampling_states",
     "statetune_cmix_bf16",
     "statetune_tmix_tokenshift_bf16",

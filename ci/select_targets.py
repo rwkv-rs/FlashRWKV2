@@ -60,13 +60,19 @@ BENCHMARK_SHARED_FILES = {
     "ci/benchmark_gate.py",
 }
 SHARED_PRIMITIVE_CALLERS = {
-    "csrc/sm80/internal/linear/": (
+    "flashrwkv2/_internal/linear.py": (
         "cmix",
         "head/linear",
         "head/l2wrap_ce",
         "tmix/readout",
         "tmix/wkv_prepare",
     ),
+    "flashrwkv2/_internal/elementwise.py": (
+        "cmix", "tmix/a_gate", "tmix/kk_pre", "tmix/vres_gate", "tmix/wkv_prepare",
+    ),
+    "flashrwkv2/_internal/state.py": ("cmix", "tmix/tokenshift", "tmix/wkv7"),
+    "flashrwkv2/_internal/logprob.py": ("head/linear", "head/l2wrap_ce", "loss/l2wrap_ce"),
+    "flashrwkv2/_internal/tuning.py": tuple(module for module in MODULES if module != "sampling"),
 }
 DOC_PREFIXES = ("docs/",)
 DOC_FILES = {
@@ -135,21 +141,17 @@ def validate_layout(root: Path = ROOT) -> None:
             if not candidate.is_file():
                 missing.append(str(candidate.relative_to(root)))
         source_root = root / "csrc/sm80" / module
-        if not source_root.is_dir() or not any(
+        if module == "sampling" and (not source_root.is_dir() or not any(
             path.suffix in {".cpp", ".cu"}
             for path in source_root.rglob("*")
             if path.is_file()
-        ):
+        )):
             source_mismatches.append(f"{module}/sm80")
 
     for candidate in (
-        root / "flashrwkv2/tmix/wkv7/rl_infctx.py",
+        root / "flashrwkv2/tmix/wkv7/tilelang.py",
         root / "tests/tmix/wkv7/rl_infctx/test.py",
         root / "benchmarks/tmix/wkv7/rl_infctx/bench.py",
-        root / "csrc/sm80/tmix/wkv7/rl_infctx_chunk_fp32io16_forward.cpp",
-        root / "csrc/sm80/tmix/wkv7/rl_infctx_chunk_fp32io16_forward.cu",
-        root / "csrc/sm80/tmix/wkv7/rl_infctx_chunk_fp32io16_backward.cpp",
-        root / "csrc/sm80/tmix/wkv7/rl_infctx_chunk_fp32io16_backward.cu",
     ):
         if not candidate.is_file():
             missing.append(str(candidate.relative_to(root)))
@@ -285,6 +287,8 @@ def classify(
             if owner in {"flashrwkv2", "benchmarks", "csrc"}:
                 run_benchmark = True
             if owner == "csrc" and suffix in {".cpp", ".cu", ".cuh", ".h", ".hpp"}:
+                run_sanitizer = True
+            if owner == "flashrwkv2" and suffix == ".py":
                 run_sanitizer = True
             reasons.append(f"{owner}:{module}")
             continue
@@ -488,7 +492,7 @@ def _self_test() -> None:
         and not test.run_benchmark
     )
     assert test.affected_cuda_modules == ("tmix/wkv_prepare",)
-    native = classify(["csrc/sm80/tmix/wkv7/infer_recurrent_fp16_forward_varlen.cu"])
+    native = classify(["flashrwkv2/tmix/wkv7/tilelang.py"])
     assert (
         native.affected_modules == ("tmix/wkv7",)
         and native.run_sanitizer
@@ -499,11 +503,11 @@ def _self_test() -> None:
     benchmark = classify(["benchmarks/cmix/bench.py"])
     assert benchmark.affected_modules == ("cmix",) and benchmark.run_benchmark
     rl_infctx = classify(
-        ["csrc/sm80/tmix/wkv7/rl_infctx_chunk_fp32io16_forward.cu"]
+        ["benchmarks/tmix/wkv7/rl_infctx/bench.py"]
     )
     assert rl_infctx.affected_modules == ("tmix/wkv7/rl_infctx",)
     assert rl_infctx.affected_cuda_modules == ("tmix/wkv7/rl_infctx",)
-    assert rl_infctx.run_benchmark and rl_infctx.run_sanitizer
+    assert rl_infctx.run_benchmark
     shared = classify(["setup.py"])
     assert shared.run_all and shared.affected_modules == tuple(sorted(TARGETS))
     assert shared.affected_cuda_modules == tuple(sorted(TARGETS))
@@ -518,9 +522,9 @@ def _self_test() -> None:
     benchmark_shared = classify(["benchmarks/_timing.py"])
     assert benchmark_shared.run_benchmark and not benchmark_shared.run_sanitizer
     assert benchmark_shared.affected_cuda_modules
-    primitive = classify(["csrc/sm80/internal/linear/backend.cuh"])
+    primitive = classify(["flashrwkv2/_internal/linear.py"])
     assert primitive.affected_modules == tuple(
-        sorted(SHARED_PRIMITIVE_CALLERS["csrc/sm80/internal/linear/"])
+        sorted(SHARED_PRIMITIVE_CALLERS["flashrwkv2/_internal/linear.py"])
     )
     assert primitive.affected_cuda_modules == primitive.affected_modules
     assert primitive.run_sanitizer and not primitive.run_all

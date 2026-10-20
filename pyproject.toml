@@ -8,11 +8,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "FlashRWKV2"
 version = "0.1.0a15"
-description = "High-performance CUDA operator library for RWKV-7"
+description = "TileLang RWKV-7 operators with shared BF16 training and inference"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
   "torch>=2.11,<2.14",
+  "tilelang==0.1.15",
 ]
 license = "MIT"
 
@@ -35,7 +36,7 @@ pythonpath = [".", "tests"]
 norecursedirs = ["tests_old", "benchmarks_old"]
 python_files = ["test.py", "test_*.py"]
 markers = [
-  "cuda: requires the FlashRWKV2 runtime-built CUDA extension",
+  "cuda: requires a CUDA GPU for TileLang or native operators",
   "cuda_graph: captures and replays a real CUDA Graph",
   "resource: validates compiled CUDA binary resource usage",
   "memcheck: minimal Compute Sanitizer memcheck coverage",

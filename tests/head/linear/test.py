@@ -6,9 +6,47 @@ import pytest
 import torch
 
 from flashrwkv2.head.linear import (
+    head_logprobs,
     infer_head_linear_all_forward_varlen,
     infer_head_linear_last_forward_varlen,
+    pretrain_head_linear_bf16,
 )
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("vocab", (17, 1025, 65536))
+def test_selected_logprobs_fixed_reduction_and_vjp(vocab):
+    torch.manual_seed(124)
+    logits = torch.randn(7, vocab, device="cuda", dtype=torch.float32, requires_grad=True)
+    targets = torch.tensor([0, 3, 5, vocab - 1, 1, 3, 0], device="cuda")
+    output = head_logprobs(logits, targets)
+    reference = logits.log_softmax(-1).gather(-1, targets[:, None]).squeeze(-1)
+    torch.testing.assert_close(output, reference, atol=4e-6, rtol=2e-6)
+    separate = torch.cat([
+        head_logprobs(logits[row:row + 1], targets[row:row + 1]) for row in range(7)
+    ])
+    assert torch.equal(output, separate)
+    dy = torch.randn_like(output)
+    actual_grad = torch.autograd.grad(output, logits, dy, retain_graph=True)[0]
+    expected_grad = torch.autograd.grad(reference, logits, dy)[0]
+    torch.testing.assert_close(actual_grad, expected_grad, atol=2e-6, rtol=1e-5)
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("offset", (0.0, 1e8))
+def test_selected_logprobs_masked_vocabulary_and_large_offset(offset):
+    logits = torch.full((2, 2048), offset, device="cuda", requires_grad=True)
+    with torch.no_grad():
+        logits[:, 1024:] = -torch.inf
+    targets = torch.tensor([0, 1013], device="cuda")
+    actual = head_logprobs(logits, targets)
+    expected = logits.log_softmax(-1).gather(1, targets[:, None]).squeeze(1)
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
+    gradients = torch.autograd.grad(actual.sum(), logits, retain_graph=True)[0]
+    references = torch.autograd.grad(expected.sum(), logits)[0]
+    torch.testing.assert_close(gradients, references, atol=1e-7, rtol=1e-5)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -18,15 +56,19 @@ from flashrwkv2.head.linear import (
 def test_head_all_and_last_linear(rows: int, channels: int, vocab: int) -> None:
     torch.manual_seed(59)
     device = torch.device("cuda")
-    x = torch.randn(rows, channels, device=device, dtype=torch.float16)
-    weight = torch.randn(vocab, channels, device=device, dtype=torch.float16)
+    x = torch.randn(rows, channels, device=device, dtype=torch.bfloat16)
+    weight = torch.randn(vocab, channels, device=device, dtype=torch.bfloat16)
     all_logits = infer_head_linear_all_forward_varlen(x, weight)
+    assert all_logits.dtype == torch.float32
+    training_logits = pretrain_head_linear_bf16(x.requires_grad_(), weight)
+    assert torch.equal(training_logits, all_logits)
     assert torch.allclose(
         all_logits.float(), x.float() @ weight.float().t(), atol=0.04, rtol=0.04
     )
     last_logits = infer_head_linear_last_forward_varlen(
         x, weight, tokens_count=max(rows, 2)
     )
+    assert torch.equal(last_logits, all_logits)
     assert torch.allclose(
         last_logits.float(), x.float() @ weight.float().t(), atol=0.04, rtol=0.04
     )
@@ -35,8 +77,8 @@ def test_head_all_and_last_linear(rows: int, channels: int, vocab: int) -> None:
 
 
 def test_head_linear_rejects_cpu_before_native_launch() -> None:
-    x = torch.zeros(2, 8, dtype=torch.float16)
-    weight = torch.zeros(11, 8, dtype=torch.float16)
+    x = torch.zeros(2, 8, dtype=torch.bfloat16)
+    weight = torch.zeros(11, 8, dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="CUDA"):
         infer_head_linear_all_forward_varlen(x, weight)
 
@@ -47,8 +89,7 @@ def test_head_linear_rejects_cpu_before_native_launch() -> None:
     ("use_nora", "adapter_dtype"), [(True, torch.float32), (False, torch.bfloat16)]
 )
 def test_head_adapter_training_and_merge(use_nora, adapter_dtype):
-    from flashrwkv2 import pretrain_head_linear_bf16
-    from utils import nora_linear_reference, assert_relative_rmse
+    from utils import assert_relative_rmse
 
     torch.manual_seed(71)
     x = torch.randn(5, 64, device="cuda", dtype=torch.bfloat16).requires_grad_()
@@ -63,7 +104,22 @@ def test_head_adapter_training_and_merge(use_nora, adapter_dtype):
     output = pretrain_head_linear_bf16(
         x, weight, lora_a=a, lora_b=b, lora_scale=0.7, use_nora=use_nora
     )
-    expected = nora_linear_reference(refs[0], weight, refs[1], refs[2], 0.7, use_nora)
+    with torch.no_grad():
+        inference = infer_head_linear_all_forward_varlen(
+            x, weight, lora_a=a, lora_b=b, lora_scale=0.7, use_nora=use_nora
+        )
+    assert torch.equal(output, inference)
+    normalized = refs[1].float()
+    if use_nora:
+        normalized = normalized / (normalized.norm(dim=0, keepdim=True) + 1.0e-6)
+    features = (refs[0].float() @ normalized.to(torch.bfloat16).float().t()).to(
+        torch.bfloat16
+    )
+    expected = refs[0].float() @ weight.float().t()
+    expected = expected + 0.7 * (
+        features.float() @ refs[2].to(torch.bfloat16).float().t()
+    )
+    assert output.dtype == torch.float32
     upstream = torch.randn_like(output)
     actual_grads = torch.autograd.grad(output, (x, a, b), upstream)
     expected_grads = torch.autograd.grad(expected, refs, upstream)
@@ -76,6 +132,12 @@ def test_head_adapter_training_and_merge(use_nora, adapter_dtype):
     updated = pretrain_head_linear_bf16(
         x, weight, lora_a=a, lora_b=b, lora_scale=0.7, use_nora=use_nora
     )
+    with torch.no_grad():
+        inference = infer_head_linear_last_forward_varlen(
+            x, weight, tokens_count=1,
+            lora_a=a, lora_b=b, lora_scale=0.7, use_nora=use_nora,
+        )
+    assert torch.equal(updated, inference)
     normalized = a.float()
     if use_nora:
         normalized = normalized / (normalized.norm(dim=0, keepdim=True) + 1.0e-6)

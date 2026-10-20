@@ -1,121 +1,326 @@
 # SPDX-License-Identifier: MIT
-
-from __future__ import annotations
-
-import math
+"""ChannelMix with one BF16 forward for training and packed inference."""
 
 import torch
 
-from ..tmix.wkv7 import (
-    _check_metadata_inputs,
-    _extension,
-    _validate_launch_max_seqlen,
-    prepare_tmix_wkv7_recurrent_metadata,
-)
+
+def _check_projection(
+    x, key_weight, value_weight, key_a, key_b, value_a, value_b, key_scale, value_scale
+):
+    from .._internal.linear import check_adapter_scale
+
+    if x.ndim != 2 or x.numel() == 0:
+        raise ValueError("CMix projection input must have nonempty shape [rows,C]")
+    channels = x.shape[1]
+    if (
+        key_weight.ndim != 2
+        or key_weight.shape[1] != channels
+        or key_weight.shape[0] == 0
+        or value_weight.shape != (channels, key_weight.shape[0])
+    ):
+        raise ValueError(
+            "CMix projection requires key_weight [F,C] and value_weight [C,F]"
+        )
+    if any(
+        t.dtype != torch.bfloat16 or not t.is_cuda or t.device != x.device
+        for t in (x, key_weight, value_weight)
+    ):
+        raise ValueError(
+            "CMix projection inputs and weights must share a CUDA bfloat16 device"
+        )
+    for name, weight, a, b, scale in (
+        ("key", key_weight, key_a, key_b, key_scale),
+        ("value", value_weight, value_a, value_b, value_scale),
+    ):
+        if (a is None) != (b is None):
+            raise ValueError(f"CMix {name} adapter A and B must be provided together")
+        if a is not None and (
+            a.ndim != 2
+            or a.shape[0] == 0
+            or a.shape[1] != weight.shape[1]
+            or b.shape != (weight.shape[0], a.shape[0])
+            or any(
+                t.dtype not in (torch.bfloat16, torch.float32) or t.device != x.device
+                for t in (a, b)
+            )
+        ):
+            raise ValueError(
+                f"CMix {name} adapter requires CUDA BF16/FP32 A [rank,in] and B [out,rank]"
+            )
+        if a is not None:
+            check_adapter_scale(scale)
+
+
+def _project(
+    mixed,
+    key_weight,
+    value_weight,
+    key_lora_a=None,
+    key_lora_b=None,
+    value_lora_a=None,
+    value_lora_b=None,
+    key_lora_scale=1.0,
+    value_lora_scale=1.0,
+    key_use_nora=False,
+    value_use_nora=False,
+):
+    from .._internal.elementwise import activation
+    from .._internal.linear import adapter_linear
+
+    _check_projection(
+        mixed,
+        key_weight,
+        value_weight,
+        key_lora_a,
+        key_lora_b,
+        value_lora_a,
+        value_lora_b,
+        key_lora_scale,
+        value_lora_scale,
+    )
+    features = adapter_linear(
+        mixed,
+        key_weight,
+        key_lora_a,
+        key_lora_b,
+        key_lora_scale,
+        key_use_nora,
+    )
+    return adapter_linear(
+        activation(features, "relu2"),
+        value_weight,
+        value_lora_a,
+        value_lora_b,
+        value_lora_scale,
+        value_use_nora,
+    )
+
+
+def _cmix(
+    x,
+    initial_shift,
+    cu_seqlens,
+    x_k,
+    key_weight,
+    value_weight,
+    key_lora_a=None,
+    key_lora_b=None,
+    value_lora_a=None,
+    value_lora_b=None,
+    key_lora_scale=1.0,
+    value_lora_scale=1.0,
+    key_use_nora=False,
+    value_use_nora=False,
+    *,
+    status=None,
+):
+    from ..tmix.tokenshift.tilelang import tokenshift
+
+    mixed, final_shift = tokenshift(
+        x,
+        (x_k,),
+        cu_seqlens,
+        initial_shift,
+        _status=status,
+    )
+    output = _project(
+        mixed[0],
+        key_weight,
+        value_weight,
+        key_lora_a,
+        key_lora_b,
+        value_lora_a,
+        value_lora_b,
+        key_lora_scale,
+        value_lora_scale,
+        key_use_nora,
+        value_use_nora,
+    )
+    return output, final_shift
 
 
 def infer_cmix_forward_varlen(
-    x: torch.Tensor,
-    res: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor,
-    x_k: torch.Tensor,
-    key_weight: torch.Tensor,
-    value_weight: torch.Tensor,
+    x,
+    res,
+    weight,
+    bias,
+    x_k,
+    key_weight,
+    value_weight,
     *,
-    shift_state_pool: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    state_indices: torch.Tensor,
-    max_seqlen: int | None = None,
-    eps: float = 1.0e-5,
-    validated_metadata: object | None = None,
-    deterministic: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run the complete packed ChannelMix inference island."""
+    shift_state_pool,
+    cu_seqlens,
+    state_indices,
+    max_seqlen=None,
+    eps=1.0e-5,
+    validated_metadata=None,
+    deterministic=False,
+    key_lora_a=None,
+    key_lora_b=None,
+    value_lora_a=None,
+    value_lora_b=None,
+    key_lora_scale=1.0,
+    value_lora_scale=1.0,
+    key_use_nora=False,
+    value_use_nora=False,
+):
+    """Apply res/LN, TokenShift, ReLU² and projection to packed rows.
 
-    tensors = (x, res, weight, bias, x_k, key_weight, value_weight)
-    names = ("x", "res", "weight", "bias", "x_k", "key_weight", "value_weight")
-    for name, tensor in zip(names, tensors, strict=True):
-        if not isinstance(tensor, torch.Tensor):
-            raise TypeError(f"{name} must be a torch.Tensor")
-        if tensor.dtype != torch.float16:
-            raise TypeError(f"{name} must have dtype torch.float16")
-        if not tensor.is_cuda or not tensor.is_contiguous():
-            raise ValueError(f"{name} must be CUDA and contiguous")
-        if tensor.device != x.device:
-            raise ValueError(f"{name} must share x's device")
-    if x.ndim != 2 or x.shape[0] <= 0 or x.shape[1] <= 0 or x.shape[1] % 2:
-        raise ValueError("x must have packed shape [total_tokens,C] with even C")
-    if res.shape != x.shape:
-        raise ValueError("res must have the same shape as x")
-    if any(tensor.shape != (x.shape[1],) for tensor in (weight, bias, x_k)):
-        raise ValueError("weight, bias, and x_k must have shape [C]")
-    if key_weight.ndim != 2 or key_weight.shape[1] != x.shape[1]:
-        raise ValueError("key_weight must have shape [F,C]")
-    if value_weight.shape != (key_weight.shape[0], x.shape[1]):
-        raise ValueError("value_weight must have runtime shape [F,C]")
-    if not isinstance(shift_state_pool, torch.Tensor):
-        raise TypeError("shift_state_pool must be a torch.Tensor")
+    The inference value weight retains its runtime [F,C] layout. A transpose
+    view feeds the same projection as the training [C,F] weight.
+    """
+    from .._internal.state import gather_state, scatter_state
+    from ..post_norm.tilelang import norm
+    from ..tmix.tokenshift.tilelang import fused_post_norm_tokenshift
+    from ..tmix.wkv7 import (
+        _validate_launch_max_seqlen,
+        prepare_tmix_wkv7_recurrent_metadata,
+    )
+
+    _check_projection(
+        x,
+        key_weight,
+        value_weight.t(),
+        key_lora_a,
+        key_lora_b,
+        value_lora_a,
+        value_lora_b,
+        key_lora_scale,
+        value_lora_scale,
+    )
     if (
-        shift_state_pool.dtype != torch.float16
+        shift_state_pool.dtype != torch.bfloat16
         or not shift_state_pool.is_cuda
         or not shift_state_pool.is_contiguous()
         or shift_state_pool.ndim != 2
-        or shift_state_pool.shape[1] != x.shape[1]
+        or shift_state_pool.shape[1] != x.shape[-1]
         or shift_state_pool.device != x.device
     ):
-        raise ValueError("shift_state_pool must be contiguous CUDA float16 [slots,C]")
-    if (
-        not isinstance(eps, (float, int))
-        or isinstance(eps, bool)
-        or not math.isfinite(float(eps))
-    ):
-        raise ValueError("eps must be finite")
-    if float(eps) <= 0.0:
-        raise ValueError("eps must be positive")
-    if not isinstance(deterministic, bool):
-        raise TypeError("deterministic must be a bool")
-    _check_metadata_inputs(cu_seqlens, state_indices)
-    if state_indices.ndim != 1 or state_indices.numel() == 0:
-        raise ValueError("state_indices must have shape [B]")
-    launch_max_seqlen = _validate_launch_max_seqlen(max_seqlen)
-    ticket = (
-        validated_metadata
-        if validated_metadata is not None
-        else prepare_tmix_wkv7_recurrent_metadata(
+        raise ValueError("shift_state_pool must be contiguous CUDA bfloat16 [slots,C]")
+    ticket = validated_metadata
+    if ticket is None:
+        ticket = prepare_tmix_wkv7_recurrent_metadata(
             cu_seqlens,
             state_indices,
             total_tokens=x.shape[0],
             state_pool_size=shift_state_pool.shape[0],
             max_seqlen=max_seqlen,
         )
+    ticket._check_compatible(
+        cu_seqlens,
+        state_indices,
+        x.shape[0],
+        shift_state_pool.shape[0],
+        _validate_launch_max_seqlen(max_seqlen),
     )
-    return tuple(
-        _extension().cmix_forward_varlen(
+    cu_seqlens = ticket._query_start_loc_snapshot()
+    state_indices = ticket._state_indices_snapshot()
+    status = ticket._status()
+    if ticket._max_seqlen() == 1 and x.shape[0] == state_indices.numel():
+        residual, mixed = fused_post_norm_tokenshift(
             x,
             res,
-            shift_state_pool,
             weight,
             bias,
-            x_k,
-            key_weight,
-            value_weight,
-            cu_seqlens,
+            (x_k,),
+            shift_state_pool,
             state_indices,
-            launch_max_seqlen,
-            float(eps),
-            ticket,
-            deterministic,
+            status,
+            eps,
         )
+        return residual, _project(
+            mixed[0],
+            key_weight,
+            value_weight.t(),
+            key_lora_a,
+            key_lora_b,
+            value_lora_a,
+            value_lora_b,
+            key_lora_scale,
+            value_lora_scale,
+            key_use_nora,
+            value_use_nora,
+        )
+    normalized, residual = norm(x, weight, bias, eps, res, return_res=True)
+    initial = gather_state(shift_state_pool, state_indices, status)
+    output, final = _cmix(
+        normalized,
+        initial,
+        cu_seqlens,
+        x_k,
+        key_weight,
+        value_weight.t(),
+        key_lora_a,
+        key_lora_b,
+        value_lora_a,
+        value_lora_b,
+        key_lora_scale,
+        value_lora_scale,
+        key_use_nora,
+        value_use_nora,
+        status=status,
     )
+    scatter_state(shift_state_pool, final, state_indices, status)
+    return residual, output
 
 
-class _Cmix(torch.autograd.Function):
-    @staticmethod
-    def forward(
-        ctx,
+def pretrain_cmix_bf16(
+    x,
+    x_k,
+    key_weight,
+    value_weight,
+    *,
+    key_lora_a=None,
+    key_lora_b=None,
+    value_lora_a=None,
+    value_lora_b=None,
+    key_lora_scale=1.0,
+    value_lora_scale=1.0,
+    key_use_nora=False,
+    value_use_nora=False,
+):
+    return statetune_cmix_bf16(
         x,
+        None,
+        x_k,
+        key_weight,
+        value_weight,
+        key_lora_a=key_lora_a,
+        key_lora_b=key_lora_b,
+        value_lora_a=value_lora_a,
+        value_lora_b=value_lora_b,
+        key_lora_scale=key_lora_scale,
+        value_lora_scale=value_lora_scale,
+        key_use_nora=key_use_nora,
+        value_use_nora=value_use_nora,
+    )[0]
+
+
+def statetune_cmix_bf16(
+    x,
+    initial_shift,
+    x_k,
+    key_weight,
+    value_weight,
+    *,
+    key_lora_a=None,
+    key_lora_b=None,
+    value_lora_a=None,
+    value_lora_b=None,
+    key_lora_scale=1.0,
+    value_lora_scale=1.0,
+    key_use_nora=False,
+    value_use_nora=False,
+):
+    """Use differentiable initial/final TokenShift state for chunked training."""
+    if x.ndim != 3 or x.numel() == 0:
+        raise ValueError("CMix training input must have non-empty shape [B,T,C]")
+    batch, tokens, channels = x.shape
+    cu = torch.arange(batch + 1, device=x.device, dtype=torch.int32) * tokens
+    output, final = _cmix(
+        x.reshape(-1, channels),
         initial_shift,
+        cu,
         x_k,
         key_weight,
         value_weight,
@@ -127,202 +332,8 @@ class _Cmix(torch.autograd.Function):
         value_lora_scale,
         key_use_nora,
         value_use_nora,
-    ):
-        ctx.stateful = initial_shift is not None
-        ctx.options = (key_lora_scale, value_lora_scale, key_use_nora, value_use_nora)
-        adapters = (key_lora_a, key_lora_b, value_lora_a, value_lora_b)
-        if ctx.stateful:
-            output, next_shift, mixed, activation, *adapter_state = (
-                _extension().statetune_cmix_forward(
-                    x,
-                    initial_shift,
-                    x_k,
-                    key_weight,
-                    value_weight,
-                    *adapters,
-                    *ctx.options,
-                )
-            )
-        else:
-            output, mixed, activation, *adapter_state = (
-                _extension().pretrain_cmix_forward(
-                    x, x_k, key_weight, value_weight, *adapters, *ctx.options
-                )
-            )
-        ctx.save_for_backward(
-            x,
-            initial_shift,
-            x_k,
-            key_weight,
-            value_weight,
-            *adapters,
-            mixed,
-            activation,
-            *adapter_state,
-        )
-        return (output, next_shift) if ctx.stateful else output
-
-    @staticmethod
-    def backward(ctx, grad_output, grad_next_shift=None):
-        x, initial, x_k, key, value, *saved = ctx.saved_tensors
-        adapters, mixed, activation, adapter_state = (
-            saved[:4],
-            saved[4],
-            saved[5],
-            saved[6:],
-        )
-        if grad_output is None:
-            grad_output = torch.zeros_like(x)
-        args = (x, x_k, key, value, mixed, activation)
-        tail = (*adapters, *ctx.options, adapter_state, list(ctx.needs_input_grad[:9]))
-        if ctx.stateful:
-            if grad_next_shift is None:
-                grad_next_shift = torch.zeros_like(initial)
-            gradients = _extension().statetune_cmix_backward(
-                grad_output.contiguous(),
-                grad_next_shift.contiguous(),
-                x,
-                initial,
-                x_k,
-                key,
-                value,
-                mixed,
-                activation,
-                *tail,
-            )
-        else:
-            gradients = list(
-                _extension().pretrain_cmix_backward(
-                    grad_output.contiguous(), *args, *tail
-                )
-            )
-            gradients.insert(1, None)
-        return (
-            tuple(
-                gradient if needed else None
-                for gradient, needed in zip(
-                    gradients, ctx.needs_input_grad[:9], strict=True
-                )
-            )
-            + (None,) * 4
-        )
-
-
-def pretrain_cmix_bf16(
-    x: torch.Tensor,
-    x_k: torch.Tensor,
-    key_weight: torch.Tensor,
-    value_weight: torch.Tensor,
-    *,
-    key_lora_a: torch.Tensor | None = None,
-    key_lora_b: torch.Tensor | None = None,
-    value_lora_a: torch.Tensor | None = None,
-    value_lora_b: torch.Tensor | None = None,
-    key_lora_scale: float = 1.0,
-    value_lora_scale: float = 1.0,
-    key_use_nora: bool = False,
-    value_use_nora: bool = False,
-) -> torch.Tensor:
-    """Train-temp BF16 CMix forward/backward family."""
-
-    tensors = (x, x_k, key_weight, value_weight)
-    for name, tensor in zip(
-        ("x", "x_k", "key_weight", "value_weight"), tensors, strict=True
-    ):
-        if (
-            not isinstance(tensor, torch.Tensor)
-            or tensor.dtype != torch.bfloat16
-            or not tensor.is_cuda
-            or not tensor.is_contiguous()
-        ):
-            raise ValueError(f"{name} must be contiguous CUDA bfloat16")
-        if tensor.device != x.device:
-            raise ValueError(f"{name} must share x's device")
-    if x.ndim != 3 or x.numel() == 0 or x_k.shape != (x.shape[-1],):
-        raise ValueError("invalid CMix input shapes")
-    if x.shape[-1] % 2:
-        raise ValueError("x channel dimension C must be divisible by 2")
-    if key_weight.shape != (4 * x.shape[-1], x.shape[-1]) or value_weight.shape != (
-        x.shape[-1],
-        4 * x.shape[-1],
-    ):
-        raise ValueError("CMix weights must have shapes [4C,C] and [C,4C]")
-    return _Cmix.apply(
-        x,
-        None,
-        x_k,
-        key_weight,
-        value_weight,
-        key_lora_a,
-        key_lora_b,
-        value_lora_a,
-        value_lora_b,
-        float(key_lora_scale),
-        float(value_lora_scale),
-        key_use_nora,
-        value_use_nora,
     )
+    return output.view_as(x), final
 
 
-def statetune_cmix_bf16(
-    x: torch.Tensor,
-    initial_shift: torch.Tensor,
-    x_k: torch.Tensor,
-    key_weight: torch.Tensor,
-    value_weight: torch.Tensor,
-    *,
-    key_lora_a: torch.Tensor | None = None,
-    key_lora_b: torch.Tensor | None = None,
-    value_lora_a: torch.Tensor | None = None,
-    value_lora_b: torch.Tensor | None = None,
-    key_lora_scale: float = 1.0,
-    value_lora_scale: float = 1.0,
-    key_use_nora: bool = False,
-    value_use_nora: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """BF16 ChannelMix with differentiable chunk-boundary shift state."""
-
-    tensors = (x, initial_shift, x_k, key_weight, value_weight)
-    names = ("x", "initial_shift", "x_k", "key_weight", "value_weight")
-    for name, tensor in zip(names, tensors, strict=True):
-        if not isinstance(tensor, torch.Tensor):
-            raise TypeError(f"{name} must be a torch.Tensor")
-        if tensor.dtype != torch.bfloat16:
-            raise TypeError(f"{name} must have dtype torch.bfloat16")
-        if not tensor.is_cuda or not tensor.is_contiguous():
-            raise ValueError(f"{name} must be contiguous CUDA bfloat16")
-        if tensor.data_ptr() % 4:
-            raise ValueError(f"{name} must be 4-byte aligned for BF16 vec2 access")
-        if tensor.device != x.device:
-            raise ValueError(f"{name} must share x's device")
-    if x.ndim != 3 or any(size <= 0 for size in x.shape):
-        raise ValueError("x must have non-empty shape [B,T,C]")
-    b, _, c = x.shape
-    if c % 2:
-        raise ValueError("x channel dimension C must be divisible by 2")
-    if initial_shift.shape != (b, c):
-        raise ValueError("initial_shift must have shape [B,C]")
-    if x_k.shape != (c,):
-        raise ValueError("x_k must have shape [C]")
-    if key_weight.shape != (4 * c, c):
-        raise ValueError("key_weight must have shape [4C,C]")
-    if value_weight.shape != (c, 4 * c):
-        raise ValueError("value_weight must have shape [C,4C]")
-    return _Cmix.apply(
-        *tensors,
-        key_lora_a,
-        key_lora_b,
-        value_lora_a,
-        value_lora_b,
-        float(key_lora_scale),
-        float(value_lora_scale),
-        key_use_nora,
-        value_use_nora,
-    )
-
-
-__all__ = [
-    "infer_cmix_forward_varlen",
-    "pretrain_cmix_bf16",
-    "statetune_cmix_bf16",
-]
+__all__ = ["infer_cmix_forward_varlen", "pretrain_cmix_bf16", "statetune_cmix_bf16"]

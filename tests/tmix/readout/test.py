@@ -37,27 +37,27 @@ def test_readout_public_contract() -> None:
 @pytest.mark.cuda
 @pytest.mark.memcheck
 @pytest.mark.parametrize("head_size", [64, 128, 256])
-@pytest.mark.parametrize("wkv_dtype", [torch.float16, torch.float32])
+@pytest.mark.parametrize("wkv_dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("rows", [2, 64])
 def test_readout_inference_matches_reference(head_size: int, wkv_dtype: torch.dtype, rows: int) -> None:
     torch.manual_seed(20260816 + head_size)
     channels = 4096
     device = torch.device("cuda")
     packed = [
-        torch.randn(rows, channels, device=device, dtype=torch.float16)
+        torch.randn(rows, channels, device=device, dtype=torch.bfloat16)
         for _ in range(5)
     ]
     packed[0] = packed[0].to(wkv_dtype)
     if wkv_dtype == torch.float32:
         packed[0].mul_(100_000)
     vectors = [
-        torch.randn(channels, device=device, dtype=torch.float16) for _ in range(3)
+        torch.randn(channels, device=device, dtype=torch.bfloat16) for _ in range(3)
     ]
-    output_weight = torch.randn(channels, channels, device=device, dtype=torch.float16)
+    output_weight = torch.randn(channels, channels, device=device, dtype=torch.bfloat16)
     inputs = (*packed[:4], *vectors, packed[4])
     options = dict(head_size=head_size, batch_size=1, max_seqlen=rows)
     output = infer_tmix_readout_forward_varlen(*inputs, output_weight, **options)
-    assert output.dtype == torch.float16
+    assert output.dtype == torch.bfloat16
     assert torch.isfinite(output).all()
     heads = channels // head_size
     wkv = packed[0].float().view(rows, heads, head_size)
@@ -76,22 +76,22 @@ def test_readout_inference_matches_reference(head_size: int, wkv_dtype: torch.dt
         + vectors[2].float().view(1, heads, head_size)
         + residual * value
     ) * packed[4].float().view(rows, heads, head_size)
-    # Identity projection exposes the FP16 prelinear boundary through the
+    # Identity projection exposes the BF16 prelinear boundary through the
     # public API, so ln/res/gate correctness is checked before dense GEMM.
     prelinear = infer_tmix_readout_forward_varlen(
-        *inputs, torch.eye(channels, device=device, dtype=torch.float16), **options,
+        *inputs, torch.eye(channels, device=device, dtype=torch.bfloat16), **options,
     )
-    expected_prelinear = gated.reshape(rows, channels).to(torch.float16)
+    expected_prelinear = gated.reshape(rows, channels).to(torch.bfloat16)
     torch.testing.assert_close(
-        prelinear.float(), expected_prelinear.float(), atol=0.002, rtol=0.002,
+        prelinear.float(), expected_prelinear.float(), atol=0.008, rtol=0.008,
     )
     expected = expected_prelinear.float() @ output_weight.float().t()
-    # FP16 rounding and reduced-precision GEMM reductions are discontinuous
+    # BF16 rounding and reduced-precision GEMM reductions are discontinuous
     # around cancellation. Bound end-to-end RMS and maximum error by the
     # output scale, instead of dividing by individual near-zero elements.
     error = output.float() - expected
     reference_rms = expected.square().mean().sqrt()
-    eps = torch.finfo(torch.float16).eps
+    eps = torch.finfo(torch.bfloat16).eps
     assert float(error.square().mean().sqrt() / reference_rms) <= eps
     assert float(error.abs().max() / reference_rms) <= 8 * eps
 
@@ -192,6 +192,13 @@ def test_readout_nora_projection_gradients():
         output_lora_b=b,
         output_use_nora=True,
     )
+    with torch.no_grad():
+        inferred = infer_tmix_readout_forward_varlen(
+            *(t.view(-1, c) for t in tokens), res_scale.view(c), ln_weight, ln_bias,
+            gate.view(-1, c), weight, output_lora_a=a, output_lora_b=b,
+            output_use_nora=True,
+        )
+    assert torch.equal(output.view(-1, c), inferred)
     prelinear = pretrain_tmix_readout_bf16(*refs[:8])
     expected = nora_linear_reference(prelinear, weight, *refs[8:])
     upstream = torch.randn_like(output)
@@ -203,13 +210,9 @@ def test_readout_nora_projection_gradients():
 
 
 def test_large_wkv_fp32_head_ln_reference_on_cpu() -> None:
-    # Establish that the intermediate exceeds FP16 range while head LN and
-    # its FP16 output remain well-defined, using an independent FP64 oracle.
     wkv = torch.linspace(-200_000, 200_000, 64, dtype=torch.float32).repeat(3, 2, 1)
-    assert torch.isfinite(wkv).all()
-    assert not torch.isfinite(wkv.half()).all()
     centered = wkv - wkv.mean(dim=-1, keepdim=True)
     normalized = centered * torch.rsqrt(centered.square().mean(dim=-1, keepdim=True) + 64e-5)
     expected = torch.nn.functional.layer_norm(wkv.double(), (64,), eps=64e-5)
-    assert torch.isfinite(normalized.half()).all()
+    assert torch.isfinite(normalized.bfloat16()).all()
     torch.testing.assert_close(normalized.double(), expected, atol=2e-7, rtol=2e-7)

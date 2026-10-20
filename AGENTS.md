@@ -26,7 +26,8 @@ param_size: 参数规模, 仅有 0.1b, 0.4b, 1.5b(often used in RL), 2.9b, 7.2b(
 
 ## 目录规范
 
-一个模块要在 Python 源码、测试、基准和 C++/CUDA 源码中使用同一套模块路径。
+一个模块在 Python 源码、测试和基准中使用同一套模块路径。TileLang kernel 保存在
+对应 Python 模块；仍使用 C++/CUDA 的模块在 native 源码中保持同一模块路径。
 下面的写法使用三种占位符：`<...>` 表示实际名称，`[...]` 表示可选部分，
 `{a|b}` 表示只能从列出的选项中选择一个。
 
@@ -58,7 +59,7 @@ C++/CUDA：  ./csrc/sm80/<module_name>[/<sub_module_name>]/
 flashrwkv2/tmix/wkv7/__init__.py
 tests/tmix/wkv7/test.py
 benchmarks/tmix/wkv7/bench.py
-csrc/sm80/tmix/wkv7/infer_recurrent_fp16_forward_varlen.cu
+flashrwkv2/tmix/wkv7/tilelang.py
 ```
 
 算子模块的规范名称还包括：顶层 `post_norm` 公开最终 Res 后 LN，并向融合岛
@@ -72,9 +73,9 @@ WAG/WAGV、VRes 与 KK/A 准备，`readout` 完成 head LN、RKV residual、gate
 和 output projection。不得以 `linear`、`activation` 等实现手段建立公共模块；
 `lnx_rkvres_xg` 只允许作为 Readout 内部 kernel 的来源名称。
 源码、native symbol、Python API、参数、错误信息、测试和文档中的 LN 与 Res
-统一写作 `ln` 和 `res`。SM120 权威 `T=1,C=4096` 路径使用真正 fused
-PostNorm+TokenShift kernel；其他 packed varlen 形状由同一公共接口依次启动
-独立 PostNorm 与 TokenShift kernel。
+统一写作 `ln` 和 `res`。SM120 `T=1,C=4096` 路径使用 fused PostNorm+TokenShift kernel；其他 packed
+varlen 形状由同一公共接口组合共享的 PostNorm 与 TokenShift primitive。所有路径
+必须保持相同的 BF16 舍入边界和 FP32 归约顺序。
 
 根包采用扁平导出，因此公共 Python API、公开 native symbol 和注册函数必须在
 名称中保留模块所有者，不能只写算法名。例如 `tmix/wkv7` 的公共名称使用
@@ -92,26 +93,19 @@ shape dispatch、调优策略和融合语义必须保留在 TMix、CMix、Head �
 调用。所有真实 `.cpp/.cu`（包括两类 internal）仍须在 `docs/dev/csrc` 中镜像。
 空目录不构成模块、构建入口或镜像契约。
 
-### Kernel 实现的阶段顺序与复用
+### TileLang 数值与复用契约
 
-Kernel 通常按照训练阶段的完成顺序设计：`pretrain` 和 `infer` 最早完成，
-`rl_infctx`、`statetune` 等阶段稍后完成。因此，后完成阶段如果可以直接复用
-早期阶段的实现，应保留自己的阶段文件名，但将文件做成指向早期真实文件的
-软链接，而不是复制代码或抽取到 `csrc/common/`。
+模型算子使用 `flashrwkv2/<module_name>[/<sub_module_name>]/tilelang.py`，公共
+Python、测试和 benchmark 的模块所有权保持一致。`flashrwkv2/_internal` 仅放
+多个真实模块复用的投影、归约、状态和调优 primitive。原生源码保留 metadata
+validation 与 sampling；实际 `.cpp/.cu` 仍须在 `docs/dev/csrc` 镜像。
 
-例如，下面的链接保留了 `statetune` 的构建入口，同时只维护一份实现：
+训练、prefill、decode 使用同一 BF16 forward，FP32 累加与 WKV state。Head
+logits、所选 logprobs 与 loss 为 FP32。调优必须先逐位验证输出及 state，才计时；
+不得改变每个输出的 K 归约顺序、舍入边界或使用 split-K。仅 CPU lowering 不能
+作为正确性或性能验收证据，最终验收覆盖 SM89 RTX4090 与 SM120 PRO6000。
 
-```text
-csrc/sm80/tmix/wkv7/pretrain_recurrent_fp16_forward.cu
-csrc/sm80/tmix/wkv7/statetune_recurrent_fp16_forward.cu
-    -> pretrain_recurrent_fp16_forward.cu
-```
-
-软链接目标应指向已经较早完成且行为一致的实现；如果后续阶段出现独有行为，
-就解除软链接并创建独立的真实源文件。对于 kernel 实现，不要为了抽取共同部分
-新增 `csrc/common/` 共享层；阶段之间的复用关系应通过目录中的软链接表达。
-
-新增文件时，必须询问用户。
+新增文件时，若当前任务没有明确授权，必须询问用户。
 
 `setup.py` 与 `pyproject.toml` 定义构建和打包契约。不要提交 `build/`、
 `artifacts/`、缓存目录或 `.egg-info` 等生成文件。

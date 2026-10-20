@@ -25,8 +25,6 @@ _NVCC_FLAGS = (
     "--expt-extended-lambda",
     "-lineinfo",
     "-Xptxas=-v",
-    "-D_N_=64",
-    "-D_CHUNK_LEN_=16",
     "-std=c++17",
 )
 _SOURCE_SUFFIXES = {".cpp", ".cu", ".cuh", ".h", ".hpp"}
@@ -62,18 +60,11 @@ def source_root() -> Path:
 
 
 def _source_files(root: Path) -> list[Path]:
-    files = [
-        root / "bindings.cpp",
-        root / "registration.cpp",
-        root / "validation.cpp",
-        root / "validation" / "recurrent_metadata.cu",
-    ]
-    files.extend(
+    return sorted(
         path
-        for path in (root / "sm80").rglob("*")
+        for path in root.rglob("*")
         if path.is_file() and path.suffix in _SOURCE_SUFFIXES
     )
-    return sorted(files)
 
 
 def _compile_sources(root: Path) -> list[str]:

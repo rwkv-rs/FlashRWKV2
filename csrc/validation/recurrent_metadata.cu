@@ -144,45 +144,6 @@ __global__ void validate_recurrent_metadata_kernel(
   }
 }
 
-__device__ __forceinline__ int find_sequence(
-    int token,
-    int num_sequences,
-    const int* __restrict__ query_start_loc) {
-  int low = 0;
-  int high = num_sequences;
-  while (low + 1 < high) {
-    const int middle = (low + high) >> 1;
-    if (query_start_loc[middle] <= token) {
-      low = middle;
-    } else {
-      high = middle;
-    }
-  }
-  return low;
-}
-
-__global__ void build_token_predecessor_kernel(
-    const int* __restrict__ query_start_loc,
-    const int* __restrict__ state_indices,
-    const int* __restrict__ status,
-    int token_capacity,
-    int* __restrict__ token_predecessor) {
-  const int token = static_cast<int>(
-      static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x);
-  if (token >= token_capacity) {
-    return;
-  }
-  constexpr int kInactiveSentinel = std::numeric_limits<int>::min();
-  if (status[0] != 0 || token >= status[1] || status[2] == 0) {
-    token_predecessor[token] = kInactiveSentinel;
-    return;
-  }
-  const int sequence = find_sequence(token, status[2], query_start_loc);
-  token_predecessor[token] = token == query_start_loc[sequence]
-      ? -state_indices[sequence] - 1
-      : token - 1;
-}
-
 void check_graph_scalar(
     const torch::Tensor& tensor,
     const torch::Tensor& reference,
@@ -249,22 +210,6 @@ PreparedRecurrentMetadata launch_recurrent_metadata_validation(
 }
 
 }  // namespace
-
-torch::Tensor build_recurrent_token_predecessor_cuda(
-    const torch::Tensor& query_start_loc,
-    const torch::Tensor& state_indices,
-    const torch::Tensor& status,
-    int64_t total_tokens) {
-  const c10::cuda::CUDAGuard device_guard(query_start_loc.device());
-  auto token_predecessor = torch::empty({total_tokens}, query_start_loc.options());
-  constexpr int threads = 256;
-  const int blocks = static_cast<int>((total_tokens + threads - 1) / threads);
-  build_token_predecessor_kernel<<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
-      query_start_loc.data_ptr<int>(), state_indices.data_ptr<int>(), status.data_ptr<int>(),
-      static_cast<int>(total_tokens), token_predecessor.data_ptr<int>());
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-  return token_predecessor;
-}
 
 PreparedRecurrentMetadata prepare_recurrent_metadata_cuda(
     torch::Tensor query_start_loc,

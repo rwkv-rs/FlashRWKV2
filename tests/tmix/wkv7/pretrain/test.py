@@ -2,24 +2,15 @@
 
 from __future__ import annotations
 
-import inspect
-
 import pytest
 import torch
-from utils import require_cuda_backend
 
 from flashrwkv2.tmix.wkv7 import pretrain_tmix_wkv7_recurrent_bf16
 
 W_SCALE = -0.6065306597
-
-
-def _require_cuda() -> None:
-    require_cuda_backend(
-        "_C",
-        8,
-        "pretrain_tmix_wkv7_recurrent_forward",
-        "pretrain_tmix_wkv7_recurrent_backward",
-    )
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA is required"
+)
 
 
 def _case(
@@ -59,16 +50,8 @@ def _reference(values: tuple[torch.Tensor, ...], head_size: int = 64) -> torch.T
             + b4[:, token].unsqueeze(-1) * state_dot_a.unsqueeze(-2)
             + k4[:, token].unsqueeze(-1) * v4[:, token].unsqueeze(-2)
         )
-        outputs.append(
-            torch.einsum("bhkv,bhk->bhv", state, r4[:, token])
-        )
+        outputs.append(torch.einsum("bhkv,bhk->bhv", state, r4[:, token]))
     return torch.stack(outputs, dim=1).reshape(batch, tokens, channels)
-
-
-def test_public_contract_matches_clampw_v3() -> None:
-    signature = inspect.signature(pretrain_tmix_wkv7_recurrent_bf16)
-    assert tuple(signature.parameters) == ("r", "w", "k", "v", "a", "b", "head_size")
-    assert signature.parameters["head_size"].default == 64
 
 
 @pytest.mark.parametrize(
@@ -80,14 +63,13 @@ def test_public_contract_matches_clampw_v3() -> None:
             1,
             marks=(pytest.mark.memcheck, pytest.mark.racecheck),
         ),
-        (2, 32, 2),
+        (1, 1, 1),
+        (2, 17, 2),
+        (2, 33, 2),
     ],
 )
 @pytest.mark.cuda
-def test_forward_matches_clampw_recurrence(
-    batch: int, tokens: int, heads: int
-) -> None:
-    _require_cuda()
+def test_forward_matches_clampw_recurrence(batch: int, tokens: int, heads: int) -> None:
     values = _case(batch, tokens, heads)
     actual = pretrain_tmix_wkv7_recurrent_bf16(*values)
     expected = _reference(values)
@@ -100,8 +82,7 @@ def test_forward_matches_clampw_recurrence(
 
 @pytest.mark.cuda
 def test_backward_matches_clampw_recurrence() -> None:
-    _require_cuda()
-    values = _case(1, 16, 1, requires_grad=True)
+    values = _case(1, 17, 1, requires_grad=True)
     actual = pretrain_tmix_wkv7_recurrent_bf16(*values)
     grad_output = torch.randn_like(actual)
     actual.backward(grad_output)
@@ -113,20 +94,15 @@ def test_backward_matches_clampw_recurrence() -> None:
     expected = _reference(reference_values)
     expected.backward(grad_output.float())
     expected_gradients = [value.grad.detach().float() for value in reference_values]
-    for actual_gradient, expected_gradient in zip(
-        actual_gradients, expected_gradients
-    ):
+    for actual_gradient, expected_gradient in zip(actual_gradients, expected_gradients):
         assert torch.isfinite(actual_gradient).all()
-        assert torch.allclose(
-            actual_gradient, expected_gradient, atol=0.03, rtol=0.05
-        )
+        assert torch.allclose(actual_gradient, expected_gradient, atol=0.03, rtol=0.05)
 
 
 @pytest.mark.parametrize("head_size", (128, 256))
 @pytest.mark.cuda
 def test_generalized_forward_backward_matches_recurrence(head_size: int) -> None:
-    _require_cuda()
-    values = _case(1, 16, 1, requires_grad=True, head_size=head_size)
+    values = _case(1, 17, 1, requires_grad=True, head_size=head_size)
     actual = pretrain_tmix_wkv7_recurrent_bf16(*values, head_size=head_size)
     expected_values = tuple(value.detach().clone().requires_grad_() for value in values)
     expected = _reference(expected_values, head_size)
@@ -136,19 +112,17 @@ def test_generalized_forward_backward_matches_recurrence(head_size: int) -> None
     assert torch.allclose(actual.float(), expected, atol=0.03, rtol=0.03)
     for value, reference in zip(values, expected_values, strict=True):
         assert torch.isfinite(value.grad).all()
-        assert torch.allclose(value.grad.float(), reference.grad.float(), atol=0.05, rtol=0.08)
+        assert torch.allclose(
+            value.grad.float(), reference.grad.float(), atol=0.05, rtol=0.08
+        )
 
 
 @pytest.mark.cuda
 def test_invalid_input_contract_is_rejected() -> None:
-    _require_cuda()
     valid = list(_case(1, 16, 1))
 
     with pytest.raises(TypeError, match="bfloat16"):
         pretrain_tmix_wkv7_recurrent_bf16(valid[0].float(), *valid[1:])
-    with pytest.raises(ValueError, match="T must be divisible"):
-        short = [tensor[:, :15].contiguous() for tensor in valid]
-        pretrain_tmix_wkv7_recurrent_bf16(*short)
     with pytest.raises(ValueError, match="C must be divisible"):
         narrow = [tensor[:, :, :63].contiguous() for tensor in valid]
         pretrain_tmix_wkv7_recurrent_bf16(*narrow)

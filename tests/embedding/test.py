@@ -24,18 +24,31 @@ from flashrwkv2.embedding import infer_embedding_ln0_forward_varlen
 def test_embedding_ln0_packed(channels: int) -> None:
     torch.manual_seed(57)
     device = torch.device("cuda")
-    embedding = torch.randn(5, channels, device=device, dtype=torch.bfloat16)
-    weight = torch.randn(channels, device=device, dtype=torch.bfloat16)
-    bias = torch.randn(channels, device=device, dtype=torch.bfloat16)
+    embedding = torch.randn(
+        5, channels, device=device, dtype=torch.bfloat16
+    ).requires_grad_()
+    weight = torch.randn(channels, device=device, dtype=torch.bfloat16).requires_grad_()
+    bias = torch.randn(channels, device=device, dtype=torch.bfloat16).requires_grad_()
     output = infer_embedding_ln0_forward_varlen(embedding, weight, bias)
+    refs = [
+        value.detach().clone().requires_grad_() for value in (embedding, weight, bias)
+    ]
     expected = F.layer_norm(
-        embedding.float(), (channels,), weight.float(), bias.float(), 1.0e-5
-    ).half()
-    assert output.dtype == torch.float16
+        refs[0].float(), (channels,), refs[1].float(), refs[2].float(), 1.0e-5
+    ).bfloat16()
+    assert output.dtype == torch.bfloat16
     assert torch.allclose(output.float(), expected.float(), atol=0.05, rtol=0.05)
+    upstream = torch.randn_like(output)
+    gradients = torch.autograd.grad(output, (embedding, weight, bias), upstream)
+    reference_gradients = torch.autograd.grad(expected, refs, upstream)
+    for actual, reference in zip(gradients, reference_gradients, strict=True):
+        torch.testing.assert_close(actual, reference, atol=0.05, rtol=0.05)
+    with torch.no_grad():
+        inference = infer_embedding_ln0_forward_varlen(embedding, weight, bias)
+    assert torch.equal(output, inference)
 
 
-def test_embedding_rejects_cpu_before_native_launch() -> None:
+def test_embedding_rejects_cpu_before_launch() -> None:
     embedding = torch.zeros(2, 8, dtype=torch.bfloat16)
     affine = torch.zeros(8, dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="CUDA"):

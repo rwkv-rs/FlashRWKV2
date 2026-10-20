@@ -160,7 +160,7 @@ def test_statetune_tokenshift_rejects_misaligned_vec2_input() -> None:
     initial = torch.zeros(1, 8, device=device, dtype=torch.bfloat16)
     params = [torch.zeros(8, device=device, dtype=torch.bfloat16) for _ in range(6)]
     assert x.is_contiguous() and x.data_ptr() % 4 == 2
-    with pytest.raises(ValueError, match="x must be 4-byte aligned"):
+    with pytest.raises(ValueError, match="4-byte aligned"):
         statetune_tmix_tokenshift_bf16(x, initial, *params)
 
 
@@ -171,9 +171,9 @@ def test_statetune_tokenshift_rejects_invalid_cuda_contracts() -> None:
     x = torch.zeros(1, 2, 8, device=device, dtype=torch.bfloat16)
     initial = torch.zeros(1, 8, device=device, dtype=torch.bfloat16)
     params = [torch.zeros(8, device=device, dtype=torch.bfloat16) for _ in range(6)]
-    with pytest.raises(TypeError, match="x must have dtype"):
+    with pytest.raises(ValueError, match="bfloat16"):
         statetune_tmix_tokenshift_bf16(x.float(), initial, *params)
-    with pytest.raises(TypeError, match="initial_shift must have dtype"):
+    with pytest.raises(ValueError, match="bfloat16"):
         statetune_tmix_tokenshift_bf16(x, initial.half(), *params)
     with pytest.raises(ValueError, match="x must be contiguous"):
         statetune_tmix_tokenshift_bf16(x.transpose(1, 2), initial, *params)
@@ -181,18 +181,18 @@ def test_statetune_tokenshift_rejects_invalid_cuda_contracts() -> None:
         statetune_tmix_tokenshift_bf16(x[:, :0], initial, *params)
     with pytest.raises(ValueError, match="initial_shift must have shape"):
         statetune_tmix_tokenshift_bf16(x, initial[:, :-2].contiguous(), *params)
-    with pytest.raises(ValueError, match="x_r must have shape"):
+    with pytest.raises(ValueError, match="parameters must have shape"):
         statetune_tmix_tokenshift_bf16(x, initial, params[0][:-2].contiguous(), *params[1:])
 
     odd_x = torch.zeros(1, 2, 7, device=device, dtype=torch.bfloat16)
     odd_initial = torch.zeros(1, 7, device=device, dtype=torch.bfloat16)
     odd_params = [torch.zeros(7, device=device, dtype=torch.bfloat16) for _ in range(6)]
-    with pytest.raises(ValueError, match="divisible by 2"):
-        statetune_tmix_tokenshift_bf16(odd_x, odd_initial, *odd_params)
+    odd_output = statetune_tmix_tokenshift_bf16(odd_x, odd_initial, *odd_params)
+    assert all(torch.count_nonzero(tensor) == 0 for tensor in odd_output)
 
     if torch.cuda.device_count() > 1:
         foreign = params[0].to("cuda:1")
-        with pytest.raises(ValueError, match="x_r must share x's device"):
+        with pytest.raises(ValueError, match="share x's device"):
             statetune_tmix_tokenshift_bf16(x, initial, foreign, *params[1:])
 
 
@@ -201,17 +201,17 @@ def test_statetune_tokenshift_rejects_invalid_cuda_contracts() -> None:
 @pytest.mark.memcheck
 @pytest.mark.racecheck
 @pytest.mark.parametrize("use_ticket", [False, True])
-def test_infer_tmix_postnorm_tokenshift_matches_albatross_t1_path(use_ticket: bool) -> None:
+def test_infer_tmix_postnorm_tokenshift_matches_shared_t1_path(use_ticket: bool) -> None:
     torch.manual_seed(19)
     device = torch.device("cuda")
     c = 4096
     eps = 1.0e-5
-    x = (torch.randn(1, c, device=device) * 0.03).to(torch.float16)
-    res = (torch.randn(1, c, device=device) * 0.02).to(torch.float16)
-    weight = (torch.randn(c, device=device) * 0.1 + 1.0).to(torch.float16)
-    bias = (torch.randn(c, device=device) * 0.01).to(torch.float16)
-    params = [(torch.randn(c, device=device) * 0.1).to(torch.float16) for _ in range(6)]
-    initial = torch.randn(5, c, device=device, dtype=torch.float16)
+    x = (torch.randn(1, c, device=device) * 0.03).to(torch.bfloat16)
+    res = (torch.randn(1, c, device=device) * 0.02).to(torch.bfloat16)
+    weight = (torch.randn(c, device=device) * 0.1 + 1.0).to(torch.bfloat16)
+    bias = (torch.randn(c, device=device) * 0.01).to(torch.bfloat16)
+    params = [(torch.randn(c, device=device) * 0.1).to(torch.bfloat16) for _ in range(6)]
+    initial = torch.randn(5, c, device=device, dtype=torch.bfloat16)
     shift_state = initial.clone()
     cu_seqlens = torch.tensor([0, 1], device=device, dtype=torch.int32)
     state_indices = torch.tensor([3], device=device, dtype=torch.int32)
@@ -237,22 +237,22 @@ def test_infer_tmix_postnorm_tokenshift_matches_albatross_t1_path(use_ticket: bo
         )
 
     assert "aten::max" not in recorder.operations
-    summed = x.float() + res.float()
+    summed = (x + res).float()
     mean = summed.mean(dim=-1, keepdim=True)
     rstd = torch.rsqrt((summed - mean).square().mean(dim=-1, keepdim=True) + eps)
     normalized = ((summed - mean) * rstd * weight.float() + bias.float()).to(
-        torch.float16
+        torch.bfloat16
     )
     previous = initial[3]
     expected = [
         (
             normalized.float()
             + (previous.float() - normalized.float()) * parameter.float()
-        ).to(torch.float16)
+        ).to(torch.bfloat16)
         for parameter in params
     ]
 
-    assert torch.allclose(outputs[0], summed.to(torch.float16), atol=0.01, rtol=0.01)
+    assert torch.allclose(outputs[0], summed.to(torch.bfloat16), atol=0.01, rtol=0.01)
     for output, expected_output in zip(outputs[1:], expected, strict=True):
         assert torch.allclose(output, expected_output, atol=0.01, rtol=0.01)
     expected_state = initial.clone()
@@ -271,21 +271,21 @@ def test_infer_tmix_t1_varlen_preserves_fragmented_slots(
     device = torch.device("cuda")
     channels = 4096
     x = torch.randn(
-        batch_size, channels, device=device, dtype=torch.float16
+        batch_size, channels, device=device, dtype=torch.bfloat16
     ).mul_(0.02)
     res = torch.randn_like(x).mul_(0.02)
     weight = torch.randn(
-        channels, device=device, dtype=torch.float16
+        channels, device=device, dtype=torch.bfloat16
     ).mul_(0.05).add_(1)
     bias = torch.randn(
-        channels, device=device, dtype=torch.float16
+        channels, device=device, dtype=torch.bfloat16
     ).mul_(0.01)
     params = [
-        torch.randn(channels, device=device, dtype=torch.float16).mul_(0.1)
+        torch.randn(channels, device=device, dtype=torch.bfloat16).mul_(0.1)
         for _ in range(6)
     ]
     initial = torch.randn(
-        batch_size + 3, channels, device=device, dtype=torch.float16
+        batch_size + 3, channels, device=device, dtype=torch.bfloat16
     ).mul_(0.02)
     state = initial.clone()
     cu = torch.arange(batch_size + 1, device=device, dtype=torch.int32)
@@ -311,14 +311,14 @@ def test_infer_tmix_t1_varlen_preserves_fragmented_slots(
         validated_metadata=ticket,
     )
 
-    summed = x.float() + res.float()
+    summed = (x + res).float()
     centered = summed - summed.mean(dim=-1, keepdim=True)
     normalized = (
         centered
         * torch.rsqrt(centered.square().mean(dim=-1, keepdim=True) + 1.0e-5)
         * weight.float()
         + bias.float()
-    ).to(torch.float16)
+    ).to(torch.bfloat16)
     previous = initial.index_select(0, slots.to(torch.int64))
     expected = [
         normalized.float()
@@ -343,15 +343,15 @@ def test_infer_tokenshift_generic_packed_ragged_matches_reference() -> None:
     torch.manual_seed(20260822)
     device = torch.device("cuda")
     rows, channels = 4, 4096
-    x = torch.randn(rows, channels, device=device, dtype=torch.float16) * 0.02
+    x = torch.randn(rows, channels, device=device, dtype=torch.bfloat16) * 0.02
     res = torch.randn_like(x) * 0.02
-    weight = torch.randn(channels, device=device, dtype=torch.float16) * 0.05 + 1
-    bias = torch.randn(channels, device=device, dtype=torch.float16) * 0.01
+    weight = torch.randn(channels, device=device, dtype=torch.bfloat16) * 0.05 + 1
+    bias = torch.randn(channels, device=device, dtype=torch.bfloat16) * 0.01
     params = [
-        torch.randn(channels, device=device, dtype=torch.float16) * 0.1
+        torch.randn(channels, device=device, dtype=torch.bfloat16) * 0.1
         for _ in range(6)
     ]
-    initial = torch.randn(5, channels, device=device, dtype=torch.float16) * 0.02
+    initial = torch.randn(5, channels, device=device, dtype=torch.bfloat16) * 0.02
     state = initial.clone()
     cu = torch.tensor([0, 1, 4], device=device, dtype=torch.int32)
     slots = torch.tensor([3, 1], device=device, dtype=torch.int32)
@@ -369,14 +369,14 @@ def test_infer_tokenshift_generic_packed_ragged_matches_reference() -> None:
         state_indices=slots,
         validated_metadata=ticket,
     )
-    summed = x.float() + res.float()
+    summed = (x + res).float()
     centered = summed - summed.mean(dim=-1, keepdim=True)
     normalized = (
         centered
         * torch.rsqrt(centered.square().mean(dim=-1, keepdim=True) + 1.0e-5)
         * weight.float()
         + bias.float()
-    ).to(torch.float16)
+    ).to(torch.bfloat16)
     previous = torch.empty_like(normalized)
     previous[0] = initial[3]
     previous[1] = initial[1]
@@ -404,15 +404,15 @@ def test_infer_tokenshift_postnorm_tokenshift_cuda_graph_zero_active_has_no_stat
     torch.manual_seed(20260809)
     device = torch.device("cuda")
     channels, num_slots = 4096, 4
-    x = torch.randn(1, channels, device=device, dtype=torch.float16)
+    x = torch.randn(1, channels, device=device, dtype=torch.bfloat16)
     res = torch.randn_like(x)
-    weight = torch.randn(channels, device=device, dtype=torch.float16)
-    bias = torch.randn(channels, device=device, dtype=torch.float16)
+    weight = torch.randn(channels, device=device, dtype=torch.bfloat16)
+    bias = torch.randn(channels, device=device, dtype=torch.bfloat16)
     params = [
-        torch.randn(channels, device=device, dtype=torch.float16)
+        torch.randn(channels, device=device, dtype=torch.bfloat16)
         for _ in range(6)
     ]
-    initial = torch.randn(num_slots, channels, device=device, dtype=torch.float16)
+    initial = torch.randn(num_slots, channels, device=device, dtype=torch.bfloat16)
     shift_state = initial.clone()
     cu_seqlens = torch.tensor([0, 1], device=device, dtype=torch.int32)
     state_indices = torch.tensor([3], device=device, dtype=torch.int32)

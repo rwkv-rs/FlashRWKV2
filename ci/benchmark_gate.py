@@ -89,75 +89,16 @@ BENCHMARKS = {
         BenchmarkCase("infer", "benchmarks/tmix/wkv_prepare/bench.py"),
     ),
     "tmix/wkv7": (
-        BenchmarkCase(
-            "infer_recurrent_fp32io16",
-            "benchmarks/tmix/wkv7/bench.py",
-            ("--shapes", "h32d64", "--dtype", "bfloat16", "--seed", "20260804"),
-            "--output",
-        ),
-        BenchmarkCase(
-            "infer_recurrent_fp32io16_selectors",
-            "benchmarks/tmix/wkv7/bench.py",
-            (
-                "--operator",
-                "fp32io16",
-                "--shapes",
-                "h32d64",
-                "--cases",
-                "1x5",
-                "1x6",
-                "2x6",
-                "1x10",
-                "--dtype",
-                "float16",
-                "--decay-bias",
-                "--seed",
-                "20260825",
-            ),
-            "--output",
-        ),
-        BenchmarkCase(
-            "infer_recurrent_fp16",
-            "benchmarks/tmix/wkv7/bench.py",
-            (
-                "--operator",
-                "fp16",
-                "--shapes",
-                "h64d64",
-                "--cases",
-                "256x1",
-                "320x1",
-                "20x2",
-                "--dtype",
-                "float16",
-                "--decay-bias",
-                "--seed",
-                "20260825",
-            ),
-            "--output",
-        ),
-        BenchmarkCase("infer_chunk_bf16", "benchmarks/tmix/wkv7/chunk/bench.py"),
-        BenchmarkCase(
-            "pretrain_forward_backward", "benchmarks/tmix/wkv7/pretrain/bench.py"
-        ),
+        BenchmarkCase("infer_recurrent_fp32io16", "benchmarks/tmix/wkv7/bench.py",
+                      ("--shapes", "h32d64", "--seed", "20260804"), "--output"),
+        BenchmarkCase("infer_recurrent_multisize", "benchmarks/tmix/wkv7/bench.py",
+                      ("--shapes", "h64d64", "h16d128", "h8d256", "--cases", "1x1", "16x1", "1x16", "1x128", "--decay-bias"), "--output"),
+        BenchmarkCase("pretrain_forward_backward", "benchmarks/tmix/wkv7/pretrain/bench.py"),
         BenchmarkCase("statetune", "benchmarks/tmix/wkv7/statetune/bench.py"),
     ),
     "tmix/wkv7/rl_infctx": (
-        BenchmarkCase(
-            "forward_materialized",
-            "benchmarks/tmix/wkv7/rl_infctx/bench.py",
-            ("--stage", "forward", "--strategy", "materialized"),
-        ),
-        BenchmarkCase(
-            "forward_recompute",
-            "benchmarks/tmix/wkv7/rl_infctx/bench.py",
-            ("--stage", "forward", "--strategy", "recompute"),
-        ),
-        BenchmarkCase(
-            "backward_replay",
-            "benchmarks/tmix/wkv7/rl_infctx/bench.py",
-            ("--stage", "backward_replay"),
-        ),
+        BenchmarkCase("forward", "benchmarks/tmix/wkv7/rl_infctx/bench.py"),
+        BenchmarkCase("forward_backward", "benchmarks/tmix/wkv7/rl_infctx/bench.py", ("--backward",)),
     ),
 }
 
@@ -838,16 +779,13 @@ def _self_test() -> None:
     }
     assert {case.workload for case in BENCHMARKS["tmix/wkv7"]} == {
         "infer_recurrent_fp32io16",
-        "infer_recurrent_fp32io16_selectors",
-        "infer_recurrent_fp16",
-        "infer_chunk_bf16",
+        "infer_recurrent_multisize",
         "pretrain_forward_backward",
         "statetune",
     }
     assert {case.workload for case in BENCHMARKS["tmix/wkv7/rl_infctx"]} == {
-        "forward_materialized",
-        "forward_recompute",
-        "backward_replay",
+        "forward",
+        "forward_backward",
     }
 
 
