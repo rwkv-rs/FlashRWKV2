@@ -116,6 +116,26 @@ readout 使用 `output_*`，head 使用 `lora_a/lora_b/lora_scale/use_nora`。
 候选只能改变输出 tiling、pipeline 或每 CTA 的独立行数。验收覆盖 RTX 4090
 SM89 与 PRO6000 SM120 的 decode、小 batch、prefill 和训练形状。
 
+调优同时核对 FP32 累加或统计量及实际生产输出；LN 是否保存统计量、是否写回
+res 等变体都必须保持相同结果。线性层的 bias presence/dtype 属于调优 key。
+编译不受工具链支持的线性候选会在结果中记录 `compile_error`；运行失败直接报错。
+调优需在 CUDA Graph capture 前完成，并使用有效、非空的 active workload。
+
+PostNorm、TMix 各推理阶段、CMix 和 Head 线性基准可用
+`--implementation tilelang|cuda-baseline` 标记
+通过 `PYTHONPATH` 选中的包。两次运行复用同一基准脚本、seed、逻辑输入及尺寸，
+结果记录实际输入、输出和上游梯度 dtype。WKV 基线使用 owning FP32IO16 handle，
+保留原 CUDA selector 的生产路径；metadata preparation、state reset 和 materialize
+位于计时外。`--timing-mode eager` 测完整 Python dispatch 与末尾同步的 wall time，
+`--timing-mode graph` 用 CUDA events 测包含整批调用的 graph replay；两种结果分别比较。
+Head CE 基准的 `--backward`、`--train-base`、`--chunk-rows` 明确反向范围及工作集，
+并报告单次调用的 peak allocated memory。
+
+Head 线性基准的 `--compare-torch` 用相同 BF16 输入，对照输出 FP32 的原生
+`torch.mm`。对照时关闭 BF16 reduced-precision reduction，记录原生调用在整批、
+单行和七行分块之间的 FP32/BF16 逐位一致性及独立计时，以验证 custom linear
+是否有必要。原生库满足一致性和性能要求时，应优先减少自定义实现。
+
 `tests/tmix/wkv7/test_block.py` 覆盖完整 block 到 selected logprobs 的训练/推理、
 prefill/decode、batch 和 optimizer 更新后一致性。`tests/tmix/wkv7/test.py` 覆盖
 state lifecycle 与 CUDA Graph。设备实测通过前，离线 lowering 不能作为数值或性能

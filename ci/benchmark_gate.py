@@ -48,8 +48,20 @@ BENCHMARKS = {
     "embedding": (BenchmarkCase("infer", "benchmarks/embedding/bench.py"),),
     "head/l2wrap_ce": (
         BenchmarkCase("pretrain", "benchmarks/head/l2wrap_ce/bench.py"),
+        BenchmarkCase(
+            "pretrain_forward_backward_frozen_base",
+            "benchmarks/head/l2wrap_ce/bench.py",
+            ("--backward",),
+        ),
+        BenchmarkCase(
+            "pretrain_forward_backward_trainable_base",
+            "benchmarks/head/l2wrap_ce/bench.py",
+            ("--backward", "--train-base"),
+        ),
     ),
-    "head/linear": (BenchmarkCase("infer", "benchmarks/head/linear/bench.py"),),
+    "head/linear": (
+        BenchmarkCase("infer", "benchmarks/head/linear/bench.py", ("--compare-torch",)),
+    ),
     "loss/l2wrap_ce": (
         BenchmarkCase(
             "pretrain_forward_backward", "benchmarks/loss/l2wrap_ce/bench.py"
@@ -106,7 +118,7 @@ BENCHMARKS = {
 for _owner, _arguments in {
     "cmix": ("--operator", "pretrain", "--backward", "--adapter-rank", "256"),
     "head/linear": ("--tokens", "4", "--adapter-rank", "256"),
-    "head/l2wrap_ce": ("--adapter-rank", "256"),
+    "head/l2wrap_ce": ("--adapter-rank", "256", "--backward"),
     "tmix/readout": (
         "--operator",
         "pretrain",

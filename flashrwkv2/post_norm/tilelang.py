@@ -262,25 +262,37 @@ def tune_norm(x, weight, bias, eps=1e-5, res=None):
     flat = x.view(-1, x.shape[-1])
     other = flat if res is None else res.view_as(flat)
     summed = torch.empty_like(flat) if res is not None else flat
-
-    def check(group):
-        return _forward(flat.shape[-1], eps, res is not None, rows_per_block=group)(
-            flat, other, weight, bias, summed
-        )
-
-    reference = check(1)
-    for row in sorted({0, flat.shape[0] // 2, flat.shape[0] - 1}):
-        single = _forward(flat.shape[-1], eps, res is not None)(
-            flat[row:row + 1], other[row:row + 1], weight, bias, summed[row:row + 1]
-        )
-        if not all(torch.equal(full[row:row + 1], one) for full, one in zip(reference, single)):
-            raise RuntimeError("canonical norm failed batch invariance")
     buffer = flat.new_empty((0, flat.shape[-1]))
 
-    def run(group):
+    def run(group, values=flat, residual=other):
         return _forward(flat.shape[-1], eps, res is not None, False, False, group)(
-            flat, other, weight, bias, buffer
+            values, residual, weight, bias, buffer
         )[0]
+
+    def check(group, values=flat, residual=other):
+        total = torch.empty_like(values) if res is not None else values
+        training = _forward(flat.shape[-1], eps, res is not None, rows_per_block=group)(
+            values, residual, weight, bias, total
+        )
+        outputs = (*training, run(group, values, residual))
+        if res is not None:
+            stored = torch.empty_like(values)
+            production = _forward(flat.shape[-1], eps, True, False, True, group)(
+                values, residual, weight, bias, stored
+            )[0]
+            outputs += (production, stored)
+        return outputs
+
+    training = _forward(flat.shape[-1], eps, res is not None)(flat, other, weight, bias, summed)
+    # Keep FP32 statistics in the check and compare both production stores
+    # directly with the canonical training result.
+    reference = (*training, training[0])
+    if res is not None:
+        reference += (training[0], summed.clone())
+    for row in sorted({0, flat.shape[0] // 2, flat.shape[0] - 1}):
+        single = check(1, flat[row:row + 1], other[row:row + 1])
+        if not all(torch.equal(full[row:row + 1], one) for full, one in zip(reference, single, strict=True)):
+            raise RuntimeError("canonical norm failed batch invariance")
 
     best, measurements = select_config((1, 2, 4), run, check=check, reference=reference)
     _ROW_CONFIGS[_config_key(flat, res is not None)] = best

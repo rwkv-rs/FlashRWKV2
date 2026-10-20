@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import argparse
 import json
+from pathlib import Path
 
 import torch
 from _timing import measure_cuda
 
-from flashrwkv2._internal.linear import _NoRA, linear, tune_linear
+import flashrwkv2
 from flashrwkv2.tmix.wkv_prepare import (
     infer_tmix_wkv_prepare_forward_varlen,
     pretrain_tmix_wkv_prepare_bf16,
@@ -16,17 +17,26 @@ from flashrwkv2.tmix.wkv_prepare import (
 
 
 def benchmark(args):
+    tilelang = args.implementation == "tilelang"
+    package_path = Path(flashrwkv2.__file__).resolve()
+    if (package_path.parent / "_internal" / "linear.py").is_file() != tilelang:
+        raise ValueError("--implementation must match the imported flashrwkv2 package")
+    if args.tune and not tilelang:
+        raise ValueError("--tune requires the TileLang implementation")
     operator = args.operator or ("pretrain" if args.adapter_rank else "infer")
     backward = args.backward or (args.operator is None and bool(args.adapter_rank))
     if operator == "infer" and backward:
         raise ValueError("--backward requires the pretrain operator")
-    torch.manual_seed(127)
+    if not tilelang and operator == "infer" and args.adapter_rank:
+        raise ValueError("CUDA baseline inference has no NoRA parameters")
+    torch.manual_seed(args.seed)
     channels, rank = args.channels, args.rank
     full_training = backward and not args.adapter_rank
+    dtype = torch.bfloat16 if tilelang or operator == "pretrain" else torch.float16
 
     def random(*shape, grad=False):
         return (
-            torch.randn(shape, device="cuda", dtype=torch.bfloat16) * 0.03
+            (torch.randn(shape, device="cuda") * 0.03).bfloat16().half().to(dtype)
         ).requires_grad_(grad)
 
     shape = (
@@ -64,6 +74,8 @@ def benchmark(args):
             adapter_options[f"{name}_use_nora"] = True
     tuning = {}
     if args.tune:
+        from flashrwkv2._internal.linear import _NoRA, linear, tune_linear
+
         source = shifted[0].detach().reshape(args.tokens, channels)
         tuning["dense"] = tune_linear(source, dense[0])
         first_weight = runtime_in[0].t() if operator == "pretrain" else rank_in[0]
@@ -135,6 +147,9 @@ def benchmark(args):
                 torch.autograd.grad(outputs, gradient_inputs, upstream)
         return outputs
 
+    sample = run()
+    output_dtypes = [str(value.dtype).removeprefix("torch.") for value in sample]
+    del sample
     return {
         "operator": "pretrain_tmix_wkv_prepare_bf16"
         if operator == "pretrain"
@@ -146,11 +161,16 @@ def benchmark(args):
         "head_size": args.head_size,
         "forward_backward": backward,
         "later_layer": args.later_layer,
-        "input_dtype": "bfloat16",
+        "implementation": args.implementation,
+        "package_path": str(package_path),
+        "seed": args.seed,
+        "input_dtype": str(dtype).removeprefix("torch."),
+        "output_dtypes": output_dtypes,
+        "logical_inputs": "FP32 normal samples scaled by 0.03 and rounded through BF16 and FP16",
         "accumulation_dtype": "float32",
         "tuning": tuning,
         "steady_state": "stateless inputs and weights are reused",
-        **measure_cuda(run),
+        **measure_cuda(run, timing_mode=args.timing_mode),
     }
 
 
@@ -165,6 +185,11 @@ def main():
     parser.add_argument("--backward", action="store_true")
     parser.add_argument("--later-layer", action="store_true")
     parser.add_argument("--tune", action="store_true")
+    parser.add_argument("--seed", type=int, default=127)
+    parser.add_argument(
+        "--implementation", choices=("tilelang", "cuda-baseline"), default="tilelang"
+    )
+    parser.add_argument("--timing-mode", choices=("eager", "graph"), default="eager")
     parser.add_argument(
         "--sweep",
         action="store_true",

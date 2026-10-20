@@ -349,23 +349,54 @@ def tokenshift(
 
 
 @torch.no_grad()
-def tune_tokenshift(x, mixes, cu_seqlens, initial_shift=None):
-    """Choose channel blocking after exact output and state comparison."""
+def tune_tokenshift(x, mixes, cu_seqlens, initial_shift=None, *, _status=None):
+    """Check functional/status variants and time the requested production path.
+
+    Tuning requires valid, nonempty active metadata before Graph capture.
+    A live status is read once; inactive metadata tails are excluded from the
+    functional reference, and only defined active status outputs are compared.
+    """
     from ..._internal.tuning import select_config
 
     mixes = _pack_mixes(x, mixes)
     batch, channels = cu_seqlens.numel() - 1, x.shape[-1]
     if initial_shift is None:
         initial_shift = x.new_zeros((batch, channels))
-    tokenshift(x, mixes, cu_seqlens, initial_shift)
+    if _status is None:
+        active_rows, active_batch = x.shape[0], batch
+        status = cu_seqlens.new_tensor([0, active_rows, active_batch])
+        valid = True
+    else:
+        status = _status
+        error, active_rows, active_batch = status.tolist()
+        valid = error == 0
+    if not valid or not 0 < active_rows <= x.shape[0] or not 0 < active_batch <= batch:
+        raise ValueError("TokenShift tuning requires valid nonempty active tokens and sequences")
+    tokenshift(x, mixes, cu_seqlens, initial_shift, _status=status)
     options = (channels, mixes.shape[0], batch, str(cu_seqlens.dtype).split(".")[-1])
+    functional_cu = cu_seqlens
+    if active_batch < batch:
+        functional_cu = cu_seqlens.clone()
+        functional_cu[active_batch + 1:] = active_rows
 
-    def run(block):
+    def functional(block):
         return _forward(*options, block)(
-            x, mixes, cu_seqlens, initial_shift, cu_seqlens[:0]
+            x[:active_rows], mixes, functional_cu, initial_shift, cu_seqlens[:0]
         )
 
-    best, measurements = select_config((256, 128, 512), run)
+    def production(block):
+        return _forward(*options, block, True)(
+            x, mixes, cu_seqlens, initial_shift, status
+        )
+
+    def check(block):
+        output, final = production(block)
+        return (*functional(block), output[:, :active_rows], final[:active_batch])
+
+    canonical = functional(256)
+    reference = (*canonical, canonical[0], canonical[1][:active_batch])
+    run = functional if _status is None else production
+    best, measurements = select_config((256, 128, 512), run, check=check, reference=reference)
     _BLOCK_CONFIGS[_config_key(x, mixes, batch)] = best
     return measurements
 

@@ -43,6 +43,106 @@ def reference(x, mixes, offsets, initial):
     return outputs + (torch.stack(final),)
 
 
+@pytest.mark.parametrize("live", (False, True))
+@pytest.mark.parametrize("fault", ("functional_output", "functional_final", "status_output", "status_final"))
+def test_tokenshift_tuning_checks_both_variants_with_active_metadata(monkeypatch, live, fault):
+    from flashrwkv2._internal import tuning
+    from flashrwkv2.tmix.tokenshift import tilelang as implementation
+
+    x = torch.ones(5, 64, dtype=torch.bfloat16)
+    mixes = torch.ones(6, 64, dtype=torch.bfloat16)
+    initial = torch.ones(4, 64, dtype=torch.bfloat16)
+    cu = torch.tensor([0, 1, 3, -999, 999] if live else [0, 1, 3, 4, 5], dtype=torch.int32)
+    status = torch.tensor([0, 3, 2], dtype=torch.int32) if live else None
+    launches = []
+
+    def forward(channels, count, batch, index_dtype, block=256, use_status=False):
+        def kernel(values, mixes, offsets, initial_shift, active):
+            launches.append(use_status)
+            if not use_status:
+                assert offsets.tolist() == ([0, 1, 3, 3, 3] if live else [0, 1, 3, 4, 5])
+                assert values.shape[0] == (3 if live else 5)
+            output = torch.ones(count, *values.shape, dtype=values.dtype)
+            final = torch.ones_like(initial_shift)
+            if block == 128 and use_status == fault.startswith("status"):
+                (output if fault.endswith("output") else final).add_(1)
+            return output, final
+        return kernel
+
+    def select_config(candidates, run, *, check, reference):
+        assert len(reference) == 4
+        eligible = []
+        for config in candidates:
+            actual = check(config)
+            if all(torch.equal(a, b) for a, b in zip(actual, reference, strict=True)):
+                eligible.append(config)
+        assert eligible == [256, 512]
+        run(256)
+        assert launches[-1] == live
+        return 256, []
+
+    monkeypatch.setattr(implementation, "tokenshift", lambda *args, **kwargs: None)
+    monkeypatch.setattr(implementation, "_forward", forward)
+    monkeypatch.setattr(implementation, "_BLOCK_CONFIGS", {})
+    monkeypatch.setattr(tuning, "select_config", select_config)
+    implementation.tune_tokenshift(x, mixes, cu, initial, _status=status)
+    assert implementation._BLOCK_CONFIGS[implementation._config_key(x, mixes, 4)] == 256
+
+
+@pytest.mark.parametrize("status", ((1, 3, 2), (0, 0, 0), (0, 6, 2), (0, 3, 5)))
+def test_tokenshift_tuning_requires_valid_nonempty_active_sample(status):
+    from flashrwkv2.tmix.tokenshift.tilelang import tune_tokenshift
+
+    with pytest.raises(ValueError, match="valid nonempty active"):
+        tune_tokenshift(
+            torch.ones(5, 64, dtype=torch.bfloat16),
+            torch.ones(6, 64, dtype=torch.bfloat16),
+            torch.tensor([0, 1, 3, -999, 999], dtype=torch.int32),
+            torch.ones(4, 64, dtype=torch.bfloat16),
+            _status=torch.tensor(status, dtype=torch.int32),
+        )
+
+
+def test_fused_tuning_rejects_changed_pool_and_preserves_caller_state(monkeypatch):
+    from flashrwkv2._internal import tuning
+    from flashrwkv2.tmix.tokenshift import tilelang as implementation
+
+    x = torch.ones(3, 64, dtype=torch.bfloat16)
+    mixes = torch.ones(6, 64, dtype=torch.bfloat16)
+    pool = torch.zeros(5, 64, dtype=torch.bfloat16)
+    indices = torch.tensor([3, 1, 2], dtype=torch.int32)
+    status = torch.tensor([0, 3, 3], dtype=torch.int32)
+
+    def forward(channels, count, eps, rows_per_block=1):
+        def kernel(x, res, weight, bias, mixes, scratch, indices, status):
+            scratch[indices.long()] = 2 if rows_per_block == 2 else 1
+            return torch.ones_like(x), torch.ones(count, *x.shape, dtype=x.dtype)
+        return kernel
+
+    def select_config(candidates, run, *, check):
+        expected = check(1)
+        assert len(expected) == 3
+        expected_pool = pool.clone()
+        expected_pool[indices.long()] = 1
+        assert torch.equal(expected[2], expected_pool)
+        eligible = []
+        for config in candidates:
+            actual = check(config)
+            if all(torch.equal(a, b) for a, b in zip(actual, expected, strict=True)):
+                eligible.append(config)
+        assert eligible == [1, 4]
+        assert torch.equal(run(1)[0], expected[0])
+        return 1, []
+
+    monkeypatch.setattr(implementation, "fused_post_norm_tokenshift", lambda *args, **kwargs: None)
+    monkeypatch.setattr(implementation, "_fused_forward", forward)
+    monkeypatch.setattr(implementation, "_FUSED_CONFIGS", {})
+    monkeypatch.setattr(tuning, "select_config", select_config)
+    implementation.tune_fused_tokenshift(x, x, x[0], x[0], mixes, pool, indices, status)
+    assert torch.count_nonzero(pool) == 0
+    assert implementation._FUSED_CONFIGS[implementation._config_key(x, mixes, x.shape[0])] == 1
+
+
 @pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("channels", (7, 128, 1024, 4096, 7168))

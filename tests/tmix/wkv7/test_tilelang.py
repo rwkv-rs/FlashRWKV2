@@ -183,6 +183,26 @@ def test_recurrent_final_state_only_and_empty_sequences():
     assert torch.equal(gradient, ds)
 
 
+@pytest.mark.memcheck
+@pytest.mark.racecheck
+def test_recurrent_checkpoint_backward_sanitizer():
+    lengths = (17,)
+    values, state, cu, bias = _case(64, lengths, requires_grad=True)
+    reference_inputs = [
+        value.detach().clone().requires_grad_() for value in (*values, state, bias)
+    ]
+    actual = tmix_wkv7_recurrent(*values, state, cu, decay_bias=bias)
+    expected = _reference(
+        reference_inputs[:6], reference_inputs[6], lengths, reference_inputs[7], 1.0
+    )
+    cotangents = tuple(torch.ones_like(value) for value in actual)
+    gradients = torch.autograd.grad(actual, (*values, state, bias), cotangents)
+    references = torch.autograd.grad(expected, reference_inputs, cotangents)
+    for actual_grad, reference_grad in zip(gradients, references, strict=True):
+        assert torch.isfinite(actual_grad).all()
+        torch.testing.assert_close(actual_grad, reference_grad, atol=2e-5, rtol=2e-2)
+
+
 def test_recurrent_status_masks_inactive_capacity_and_invalid_metadata():
     values, state, _, bias = _case(64, (3, 1, 1))
     # Only the first sequence is active; inactive CU entries are deliberately

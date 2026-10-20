@@ -15,9 +15,56 @@ def test_norm_lowering(arch, channels):
         for args in ((channels, 1e-5, True), (channels, 1e-5, True, False, False)):
             tilelang.lower(_forward.get_tir(*args), target=target)
         tilelang.lower(_backward.get_tir(channels, True), target=target)
-        tilelang.lower(_forward.get_tir(channels, 1e-5, True, True, True, 4), target=target)
+        for save_stats, store_res in ((True, True), (False, False), (False, True)):
+            tilelang.lower(_forward.get_tir(channels, 1e-5, True, save_stats, store_res, 4), target=target)
         for needed in (False, True):
             tilelang.lower(_backward.get_tir(channels, True, 32, needed, needed), target=target)
+
+
+@pytest.mark.parametrize("fault", ("stats", "production", "res_output", "res_store"))
+def test_norm_tuning_rejects_changed_statistics_production_or_res(monkeypatch, fault):
+    from flashrwkv2._internal import tuning
+    from flashrwkv2.post_norm import tilelang as implementation
+
+    x = torch.ones(3, 64, dtype=torch.bfloat16)
+    weight, bias, res = x[0], x[0], x.clone()
+
+    def forward(channels, eps, has_res, save_stats=True, store_res=True, rows_per_block=1):
+        def kernel(values, residual, weight, bias, total):
+            output = torch.ones_like(values)
+            mean = torch.ones(values.shape[0] if save_stats else 0)
+            rstd = torch.ones_like(mean)
+            if store_res:
+                total.copy_(values + residual)
+            if rows_per_block == 2:
+                if fault == "stats" and save_stats:
+                    mean.add_(1e-5)  # Invisible after a BF16 cast.
+                if fault == "production" and not save_stats and not store_res:
+                    output.add_(1)
+                if fault == "res_output" and not save_stats and store_res:
+                    output.add_(1)
+                if fault == "res_store" and not save_stats and store_res:
+                    total.add_(1)
+            return output, mean, rstd
+        return kernel
+
+    def select_config(candidates, run, *, check, reference):
+        assert len(reference) == 6 and reference[1].dtype == torch.float32
+        eligible = []
+        for config in candidates:
+            actual = check(config)
+            if all(torch.equal(a, b) for a, b in zip(actual, reference, strict=True)):
+                eligible.append(config)
+        assert eligible == [1, 4]
+        assert torch.equal(run(1), reference[0])
+        return 1, []
+
+    monkeypatch.setattr(implementation, "norm", lambda *args, **kwargs: None)
+    monkeypatch.setattr(implementation, "_forward", forward)
+    monkeypatch.setattr(implementation, "_ROW_CONFIGS", {})
+    monkeypatch.setattr(tuning, "select_config", select_config)
+    implementation.tune_norm(x, weight, bias, res=res)
+    assert implementation._ROW_CONFIGS[implementation._config_key(x, True)] == 1
 
 
 @pytest.mark.cuda

@@ -15,9 +15,49 @@ def test_readout_lowering(arch, head_size):
             for save in (False, True):
                 tilelang.lower(_forward.get_tir(4096, head_size, 64e-5, dtype, save), target=target)
             tilelang.lower(_backward.get_tir(4096, head_size, dtype), target=target)
-            tilelang.lower(_forward.get_tir(4096, head_size, 64e-5, dtype, True, 16), target=target)
+            for save in (False, True):
+                tilelang.lower(_forward.get_tir(4096, head_size, 64e-5, dtype, save, 16), target=target)
             for needed in (False, True):
                 tilelang.lower(_backward.get_tir(4096, head_size, dtype, 32, (needed,) * 3), target=target)
+
+
+@pytest.mark.parametrize("fault", ("stats", "production"))
+def test_readout_tuning_rejects_changed_statistics_or_production(monkeypatch, fault):
+    from flashrwkv2._internal import tuning
+    from flashrwkv2.tmix.readout import tilelang as implementation
+
+    x = torch.ones(3, 64, dtype=torch.bfloat16)
+    vector = x[0]
+
+    def forward(channels, head_size, eps, x_dtype, save_stats=True, rows_per_block=1):
+        def kernel(*inputs):
+            output = torch.ones_like(inputs[0])
+            stats = torch.ones(inputs[0].shape[0] if save_stats else 0, 1, 3)
+            if rows_per_block == 2:
+                if fault == "stats" and save_stats:
+                    stats.add_(1e-5)  # Invisible after a BF16 cast.
+                if fault == "production" and not save_stats:
+                    output.add_(1)
+            return output, stats
+        return kernel
+
+    def select_config(candidates, run, *, check, reference):
+        assert len(reference) == 3 and reference[1].dtype == torch.float32
+        eligible = []
+        for config in candidates:
+            actual = check(config)
+            if all(torch.equal(a, b) for a, b in zip(actual, reference, strict=True)):
+                eligible.append(config)
+        assert eligible == [1, 4, 8, 16]
+        assert torch.equal(run(1), reference[0])
+        return 1, []
+
+    monkeypatch.setattr(implementation, "readout", lambda *args, **kwargs: None)
+    monkeypatch.setattr(implementation, "_forward", forward)
+    monkeypatch.setattr(implementation, "_ROW_CONFIGS", {})
+    monkeypatch.setattr(tuning, "select_config", select_config)
+    implementation.tune_readout(x, x, x, x, vector, vector, vector, x)
+    assert implementation._ROW_CONFIGS[implementation._config_key(x, 64)] == 1
 
 
 def reference(inputs, head_size):

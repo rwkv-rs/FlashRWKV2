@@ -271,6 +271,9 @@ def _backward_kernel(
                         replay_state[key, value] = Boundaries[
                             checkpoint, h, key, tile * columns + value
                         ]
+                    # Give shared history one writer per element; replay_state
+                    # is replicated to preserve the forward reduction order.
+                    for key, value in T.Parallel(dim, columns):
                         history[0, key, value] = replay_state[key, value]
                     # Replay from the saved boundary with the shared FMA order.
                     for local in T.serial(count):

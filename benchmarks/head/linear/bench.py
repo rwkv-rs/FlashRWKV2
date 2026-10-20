@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import argparse
 import json
+from pathlib import Path
 
 import torch
 from _timing import measure_cuda
 
-from flashrwkv2._internal.linear import _NoRA, linear, tune_linear
+import flashrwkv2
 from flashrwkv2.head.linear import (
     infer_head_linear_all_forward_varlen,
     pretrain_head_linear_bf16,
@@ -16,26 +17,48 @@ from flashrwkv2.head.linear import (
 
 
 def benchmark(args):
+    tilelang = args.implementation == "tilelang"
+    source_uses_tilelang = (
+        Path(flashrwkv2.__file__).parent / "_internal" / "linear.py"
+    ).is_file()
+    if tilelang != source_uses_tilelang:
+        raise ValueError("--implementation must match the imported flashrwkv2 package")
+    if args.tune and not tilelang:
+        raise ValueError("--tune requires the TileLang implementation")
+    torch.manual_seed(args.seed)
     backward = args.backward or bool(args.adapter_rank)
-    x = torch.randn(
-        args.tokens, args.channels, device="cuda", dtype=torch.bfloat16
-    ).requires_grad_(backward)
-    weight = torch.randn(
-        args.vocab, args.channels, device="cuda", dtype=torch.bfloat16
-    ).requires_grad_(backward and not args.adapter_rank)
+    if args.compare_torch and (not tilelang or backward):
+        raise ValueError(
+            "--compare-torch requires TileLang base inference without adapters"
+        )
+    dtype = torch.bfloat16 if tilelang or backward else torch.float16
+
+    def values(shape, dtype, denominator):
+        # Dyadic values are exactly representable in both BF16 and FP16.
+        return (
+            torch.randint(-64, 65, shape, device="cuda", dtype=torch.int32).float()
+            / denominator
+        ).to(dtype)
+
+    x = values((args.tokens, args.channels), dtype, 64).requires_grad_(backward)
+    weight = values((args.vocab, args.channels), dtype, 1024).requires_grad_(
+        backward and not args.adapter_rank
+    )
     adapters = {}
     inputs = (x, weight)
     if args.adapter_rank:
-        a = (
-            torch.randn(args.adapter_rank, args.channels, device="cuda") * 0.01
+        a = values(
+            (args.adapter_rank, args.channels), torch.float32, 4096
         ).requires_grad_()
-        b = (
-            torch.randn(args.vocab, args.adapter_rank, device="cuda") * 0.01
+        b = values(
+            (args.vocab, args.adapter_rank), torch.float32, 4096
         ).requires_grad_()
         adapters = {"lora_a": a, "lora_b": b, "use_nora": True}
         inputs = (x, a, b)
     tuning = {}
     if args.tune:
+        from flashrwkv2._internal.linear import _NoRA, linear, tune_linear
+
         tuning["base"] = tune_linear(x, weight, torch.float32)
         if adapters:
             normalized = _NoRA.apply(a.detach())
@@ -44,12 +67,11 @@ def benchmark(args):
             tuning["adapter_b"] = tune_linear(
                 features, b.detach().bfloat16(), torch.float32
             )
-    # The common head emits FP32 logits, including the externally supplied VJP.
-    grad = (
-        torch.randn(args.tokens, args.vocab, device="cuda", dtype=torch.float32)
-        if backward
-        else None
+    # Record the production precision of each backend; the input values match.
+    output_dtype = (
+        torch.float32 if tilelang else torch.bfloat16 if backward else torch.float16
     )
+    grad = values((args.tokens, args.vocab), output_dtype, 64) if backward else None
 
     def run():
         if backward:
@@ -59,6 +81,61 @@ def benchmark(args):
             output = infer_head_linear_all_forward_varlen(x, weight)
         return output
 
+    sample = run()
+    output_dtype = sample.dtype
+    torch_comparison = None
+    if args.compare_torch:
+        # Require FP32 accumulation on the native side, matching the declared
+        # contract rather than allowing BF16 partial-reduction truncation.
+        previous_reduction = (
+            torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction
+        )
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+        try:
+
+            def native(values=x):
+                return torch.mm(values, weight.t(), out_dtype=torch.float32)
+
+            reference = native()
+            checks = []
+            for row in sorted({0, x.shape[0] // 2, x.shape[0] - 1}):
+                actual = native(x[row : row + 1])
+                expected = reference[row : row + 1]
+                checks.append(
+                    {
+                        "mode": f"row={row}",
+                        "fp32_bitwise_equal": torch.equal(actual, expected),
+                        "bf16_bitwise_equal": torch.equal(
+                            actual.bfloat16(), expected.bfloat16()
+                        ),
+                        "max_abs_error": float((actual - expected).abs().max()),
+                    }
+                )
+            chunked = torch.cat([native(chunk) for chunk in x.split(7)])
+            checks.append(
+                {
+                    "mode": "chunks=7",
+                    "fp32_bitwise_equal": torch.equal(chunked, reference),
+                    "bf16_bitwise_equal": torch.equal(
+                        chunked.bfloat16(), reference.bfloat16()
+                    ),
+                    "max_abs_error": float((chunked - reference).abs().max()),
+                }
+            )
+            torch_comparison = {
+                "operator": "torch.mm",
+                "input_dtype": str(x.dtype).removeprefix("torch."),
+                "output_dtype": str(reference.dtype).removeprefix("torch."),
+                "allow_bf16_reduced_precision_reduction": False,
+                "batch_invariance": checks,
+                "tilelang_max_abs_difference": float((sample - reference).abs().max()),
+                "timing": measure_cuda(native, timing_mode=args.timing_mode),
+            }
+        finally:
+            torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = (
+                previous_reduction
+            )
+    del sample
     return {
         "operator": "pretrain_head_linear_bf16"
         if backward
@@ -67,13 +144,19 @@ def benchmark(args):
         "tokens": args.tokens,
         "channels": args.channels,
         "vocab": args.vocab,
-        "input_dtype": "bfloat16",
-        "output_dtype": "float32",
+        "implementation": args.implementation,
+        "package_path": str(Path(flashrwkv2.__file__).resolve()),
+        "seed": args.seed,
+        "input_distribution": "randint[-64,64] / 64; weights / 1024; adapters / 4096",
+        "input_dtype": str(dtype).removeprefix("torch."),
+        "output_dtype": str(output_dtype).removeprefix("torch."),
+        "upstream_dtype": str(grad.dtype).removeprefix("torch.") if backward else None,
         "accumulation_dtype": "float32",
         "forward_backward": backward,
         "tuning": tuning,
+        "torch_comparison": torch_comparison,
         "steady_state": "stateless inputs are reused",
-        **measure_cuda(run),
+        **measure_cuda(run, timing_mode=args.timing_mode),
     }
 
 
@@ -86,6 +169,16 @@ def main():
         "--adapter-rank", type=int, default=0, help="enable NoRA forward+backward"
     )
     parser.add_argument("--backward", action="store_true")
+    parser.add_argument("--seed", type=int, default=20260804)
+    parser.add_argument(
+        "--implementation", choices=("tilelang", "cuda-baseline"), default="tilelang"
+    )
+    parser.add_argument("--timing-mode", choices=("eager", "graph"), default="eager")
+    parser.add_argument(
+        "--compare-torch",
+        action="store_true",
+        help="compare native BF16-to-FP32 mm latency and batch/chunk bitwise invariance",
+    )
     parser.add_argument(
         "--tune",
         action="store_true",

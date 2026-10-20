@@ -74,14 +74,21 @@ batch size, sequence length, and head dimensions:
 
 ```bash
 PYTHONPATH=benchmarks ./.venv/bin/python benchmarks/tmix/wkv7/bench.py \
-  --shapes h32d64 h64d64 h16d128 h8d256 \
-  --cases 1x1 16x1 1x16 1x128 \
+  --shapes h12d64 h16d64 h32d64 h40d64 h64d64 h80d64 h16d128 h8d256 \
+  --cases 1x1 16x1 1x16 64x16 1x128 --tune --timing-mode graph \
   --output artifacts/wkv7-recurrent-bf16.json
 ```
 
 Tuning candidates are admitted only after exact-output checks. Performance
 acceptance requires correctness evidence and measurements on both RTX 4090
 (SM89) and PRO6000 (SM120). Operator timing does not establish model latency.
+PostNorm, TMix inference stages, CMix and Head linear benchmarks support
+`--implementation cuda-baseline`
+when `PYTHONPATH` selects the original CUDA package. Run the same benchmark
+script and seed for both revisions; emitted JSON records their actual precision.
+`--timing-mode eager` measures dispatch wall time and `graph` measures a captured
+batch with CUDA events. Compare the two timing modes separately. PostNorm,
+TokenShift and Readout benchmarks also expose `--tune`.
 The historical [0.1.0a9 performance report](docs/performance/wkv7-0.1.0a9.md)
 describes that release's implementation; current results must identify the
 revision, hardware, shapes, and numerical contract.

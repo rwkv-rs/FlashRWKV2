@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import argparse
 import json
+from pathlib import Path
 
 import torch
 from _timing import measure_cuda
 
-from flashrwkv2._internal.linear import _NoRA, linear, tune_linear
+import flashrwkv2
 from flashrwkv2.cmix import (
     infer_cmix_forward_varlen,
     pretrain_cmix_bf16,
@@ -31,18 +32,42 @@ def _torch_linear(x, weight, a=None, b=None):
 
 
 def benchmark(args):
+    package_path = Path(flashrwkv2.__file__).resolve()
+    is_tilelang = (package_path.parent / "_internal" / "linear.py").is_file()
+    if is_tilelang != (args.implementation == "tilelang"):
+        raise ValueError(
+            "--implementation does not match the package selected by PYTHONPATH"
+        )
     if args.operator == "infer" and args.backward:
         raise ValueError("the inference benchmark does not support --backward")
     if args.operator == "torch" and args.tune:
         raise ValueError("--tune applies to TileLang operators")
+    if args.implementation == "cuda-baseline":
+        if args.tune or args.operator == "torch":
+            raise ValueError("the CUDA baseline uses its own operators without tuning")
+        if args.operator == "infer" and args.adapter_rank:
+            raise ValueError(
+                "the CUDA baseline inference API has no adapter parameters"
+            )
     channels = args.channels
     features = 4 * channels if args.features is None else args.features
+    if (
+        args.implementation == "cuda-baseline"
+        and args.operator != "infer"
+        and features != 4 * channels
+    ):
+        raise ValueError("CUDA baseline training requires features=4*channels")
     rows = args.batch * args.seqlen
-    torch.manual_seed(113)
+    torch.manual_seed(args.seed)
+    dtype = (
+        torch.float16
+        if args.implementation == "cuda-baseline" and args.operator == "infer"
+        else torch.bfloat16
+    )
 
     def random(*shape):
         return (
-            torch.randn(shape, device="cuda", dtype=torch.bfloat16) * 0.02
+            (torch.randn(shape, device="cuda") * 0.02).bfloat16().half().to(dtype)
         ).requires_grad_(args.backward)
 
     x, initial, mix = (
@@ -75,8 +100,8 @@ def benchmark(args):
     if args.operator == "infer":
         x = x.reshape(rows, channels)
         value = value.t().contiguous()
-        res = torch.zeros_like(x)
-        weight = torch.ones(channels, device="cuda", dtype=torch.bfloat16)
+        res = random(rows, channels)
+        weight = torch.ones(channels, device="cuda", dtype=dtype)
         bias = torch.zeros_like(weight)
         state = initial.clone()
         cu = (
@@ -92,23 +117,98 @@ def benchmark(args):
         )
     tuning = {}
     if args.tune:
-        source = x.detach().reshape(rows, channels)
-        tuning["key"] = tune_linear(source, key)
-        hidden = linear(source, key).float().relu().square().bfloat16()
-        tuning["value"] = tune_linear(
-            hidden, value.t() if args.operator == "infer" else value
+        from flashrwkv2._internal.elementwise import activation
+        from flashrwkv2._internal.linear import (
+            _NoRA,
+            adapter_linear,
+            linear,
+            tune_linear,
         )
-        if adapters:
-            for name, adapter_source, a, b in (
-                ("key", source, *adapters[:2]),
-                ("value", hidden, *adapters[2:]),
-            ):
-                normalized = _NoRA.apply(a.detach())
-                tuning[f"{name}_adapter_a"] = tune_linear(adapter_source, normalized)
-                projected = linear(adapter_source, normalized)
-                tuning[f"{name}_adapter_b"] = tune_linear(
-                    projected, b.detach().bfloat16(), torch.float32
+        from flashrwkv2.post_norm.tilelang import norm, tune_norm
+        from flashrwkv2.tmix.tokenshift.tilelang import (
+            fused_post_norm_tokenshift,
+            tokenshift,
+            tune_fused_tokenshift,
+            tune_tokenshift,
+        )
+
+        with torch.no_grad():
+            source = x.detach().reshape(rows, channels)
+            if args.operator == "infer" and args.seqlen == 1:
+                tuning["fused_tokenshift"] = tune_fused_tokenshift(
+                    source,
+                    res,
+                    weight,
+                    bias,
+                    (mix,),
+                    state,
+                    ticket._state_indices_snapshot(),
+                    ticket._status(),
                 )
+                _, mixed = fused_post_norm_tokenshift(
+                    source,
+                    res,
+                    weight,
+                    bias,
+                    (mix,),
+                    state.clone(),
+                    ticket._state_indices_snapshot(),
+                    ticket._status(),
+                )
+                source = mixed[0]
+            else:
+                status = None
+                initial_shift = initial if args.operator != "pretrain" else None
+                tune_cu = (
+                    torch.arange(args.batch + 1, device="cuda", dtype=torch.int32)
+                    * args.seqlen
+                )
+                if args.operator == "infer":
+                    tuning["norm"] = tune_norm(source, weight, bias, res=res)
+                    source = norm(source, weight, bias, res=res)
+                    tune_cu, status = (
+                        ticket._query_start_loc_snapshot(),
+                        ticket._status(),
+                    )
+                tuning["tokenshift"] = tune_tokenshift(
+                    source,
+                    (mix,),
+                    tune_cu,
+                    initial_shift,
+                    _status=status,
+                )
+                mixed, _ = tokenshift(
+                    source, (mix,), tune_cu, initial_shift, _status=status
+                )
+                source = mixed[0]
+            tuning["key"] = tune_linear(source, key)
+            projected = (
+                adapter_linear(
+                    source,
+                    key,
+                    *adapters[:2],
+                    use_nora=True,
+                )
+                if adapters
+                else linear(source, key)
+            )
+            hidden = activation(projected, "relu2")
+            tuning["value"] = tune_linear(
+                hidden, value.t() if args.operator == "infer" else value
+            )
+            if adapters:
+                for name, adapter_source, a, b in (
+                    ("key", source, *adapters[:2]),
+                    ("value", hidden, *adapters[2:]),
+                ):
+                    normalized = _NoRA.apply(a.detach())
+                    tuning[f"{name}_adapter_a"] = tune_linear(
+                        adapter_source, normalized
+                    )
+                    features_a = linear(adapter_source, normalized)
+                    tuning[f"{name}_adapter_b"] = tune_linear(
+                        features_a, b.detach().bfloat16(), torch.float32
+                    )
 
     variables = (x, mix, key, value, *adapters)
     if args.operator in ("stateful", "torch"):
@@ -128,6 +228,7 @@ def benchmark(args):
                 shift_state_pool=state,
                 cu_seqlens=cu,
                 state_indices=slots,
+                max_seqlen=args.seqlen,
                 validated_metadata=ticket,
                 **adapter_options,
             )
@@ -155,22 +256,43 @@ def benchmark(args):
             torch.autograd.grad(sum(t.float().sum() for t in output), gradient_inputs)
         return output
 
+    sample = run()
+    output_dtypes = [str(value.dtype).removeprefix("torch.") for value in sample]
+    del sample
     timing = measure_cuda(
         run,
         before_batch=(lambda: state.copy_(initial))
         if args.operator == "infer"
         else None,
+        timing_mode=args.timing_mode,
     )
     return {
         "operator": args.operator,
+        "implementation": args.implementation,
+        "package_path": str(package_path),
+        "seed": args.seed,
         "forward_backward": args.backward,
         "batch": args.batch,
         "seqlen": args.seqlen,
         "channels": channels,
         "features": features,
         "adapter_rank": args.adapter_rank,
-        "input_dtype": "bfloat16",
+        "input_dtype": str(x.dtype).removeprefix("torch."),
+        "output_dtypes": output_dtypes,
+        "key_weight_dtype": str(key.dtype).removeprefix("torch."),
+        "value_weight_dtype": str(value.dtype).removeprefix("torch."),
+        "shift_state_dtype": str(initial.dtype).removeprefix("torch."),
         "accumulation_dtype": "float32",
+        "logical_inputs": "FP32 normal samples scaled by 0.02, rounded through BF16 and FP16; identical values in both formats",
+        "metadata": {
+            "total_tokens": rows,
+            "sequences": args.batch,
+            "state_pool_size": args.batch,
+            "max_seqlen": args.seqlen,
+            "preparation": "outside timing",
+        }
+        if args.operator == "infer"
+        else None,
         "tuning": tuning,
         "profile": f"operator={args.operator}/backward={args.backward}/batch={args.batch}/seqlen={args.seqlen}/channels={channels}/features={features}/adapter_rank={args.adapter_rank}",
         "steady_state": "shift state is reset before each timing batch"
@@ -198,6 +320,14 @@ def main():
     parser.add_argument("--backward", action="store_true")
     parser.add_argument("--adapter-rank", type=int, default=0)
     parser.add_argument("--tune", action="store_true")
+    parser.add_argument(
+        "--implementation",
+        choices=("tilelang", "cuda-baseline"),
+        default="tilelang",
+        help="select TileLang or the saved CUDA baseline package through PYTHONPATH",
+    )
+    parser.add_argument("--timing-mode", choices=("eager", "graph"), default="eager")
+    parser.add_argument("--seed", type=int, default=113)
     parser.add_argument(
         "--sweep",
         action="store_true",

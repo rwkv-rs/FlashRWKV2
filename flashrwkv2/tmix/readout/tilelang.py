@@ -258,17 +258,22 @@ def tune_readout(x, r, k, v, r_k, weight, bias, gate, head_size=64, eps=64e-5):
     )
     dtype = str(x.dtype).split(".")[-1]
 
-    def check(group):
-        return _forward(c, head_size, eps, dtype, rows_per_block=group)(*args)
+    def run(group, inputs=args):
+        return _forward(c, head_size, eps, dtype, False, group)(*inputs)[0]
 
-    reference = check(1)
+    def check(group, inputs=args):
+        training = _forward(c, head_size, eps, dtype, rows_per_block=group)(*inputs)
+        return (*training, run(group, inputs))
+
+    training = _forward(c, head_size, eps, dtype)(*args)
+    # FP32 LN/RKV statistics remain part of candidate acceptance; the actual
+    # no-statistics production output must also equal the training result.
+    reference = (*training, training[0])
     for row in sorted({0, args[0].shape[0] // 2, args[0].shape[0] - 1}):
         single_args = tuple(t[row:row + 1] if t.ndim == 2 else t for t in args)
-        single = _forward(c, head_size, eps, dtype)(*single_args)
-        if not all(torch.equal(full[row:row + 1], one) for full, one in zip(reference, single)):
+        single = check(1, single_args)
+        if not all(torch.equal(full[row:row + 1], one) for full, one in zip(reference, single, strict=True)):
             raise RuntimeError("canonical readout failed batch invariance")
-    def run(group):
-        return _forward(c, head_size, eps, dtype, False, group)(*args)[0]
 
     best, measurements = select_config((1, 2, 4, 8, 16), run, check=check, reference=reference)
     _ROW_CONFIGS[_config_key(args[0], head_size)] = best

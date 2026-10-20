@@ -27,6 +27,7 @@ def _matmul_program(
     config,
     weight_strides=None,
     input_major=False,
+    no_set_max_nreg=False,
 ):
     import tilelang.language as T
 
@@ -48,8 +49,12 @@ def _matmul_program(
         Y: T.Tensor((rows, outputs), output_dtype),
     ):
         with T.Kernel(
-            T.ceildiv(outputs, block_n), T.ceildiv(rows, block_m), threads=128
+            T.ceildiv(outputs, block_n),
+            T.ceildiv(rows, block_m),
+            threads=min(128, block_n * 4),
         ) as (bn, bm):
+            if no_set_max_nreg:
+                T.no_set_max_nreg()
             xs = T.alloc_shared((block_m, block_k), T.bfloat16)
             ws = T.alloc_shared(
                 (block_k, block_n) if input_major else (block_n, block_k), T.bfloat16
@@ -105,6 +110,8 @@ def _compiled(
             config,
             weight_strides,
             input_major,
+            # SM12x supports TMA but not CTA register reconfiguration.
+            no_set_max_nreg=arch // 10 == 12,
         ),
         out_idx=[3],
         target={"kind": "cuda", "arch": f"sm_{arch}"},
@@ -116,7 +123,7 @@ def _dtype_name(dtype):
     return "bfloat16" if dtype == torch.bfloat16 else "float32"
 
 
-def _key(x, weight, output_dtype):
+def _key(x, weight, output_dtype, bias=None):
     return (
         torch.cuda.get_device_name(x.device),
         x.shape[0],
@@ -124,12 +131,23 @@ def _key(x, weight, output_dtype):
         x.shape[1],
         weight.stride(),
         output_dtype,
+        None if bias is None else bias.dtype,
     )
 
 
+def _aligned(tensor):
+    # Contiguous views can still start at an unaligned storage offset. Both
+    # TMA and the vectorized cp.async copies require 16-byte global alignment.
+    return tensor if tensor.data_ptr() % 16 == 0 else tensor.clone()
+
+
 def _forward(x, weight, bias, output_dtype, config=None):
+    x, weight = _aligned(x), _aligned(weight)
+    bias = None if bias is None else _aligned(bias)
     if config is None:
-        config = _TUNED_CONFIGS.get(_key(x, weight, output_dtype), _DEFAULT_CONFIG)
+        config = _TUNED_CONFIGS.get(
+            _key(x, weight, output_dtype, bias), _DEFAULT_CONFIG
+        )
     major, minor = torch.cuda.get_device_capability(x.device)
     input_major = weight.stride(0) == 1
     physical_weight = weight.t() if input_major else weight
@@ -428,42 +446,83 @@ def adapter_linear(
 
 
 @torch.no_grad()
-def tune_linear(x, weight, output_dtype=None):
+def tune_linear(x, weight, output_dtype=None, *, bias=None):
     """Measure output tiles without changing the canonical MMA reduction.
 
     This explicit warmup uses the actual device and shape. Each candidate must
-    equal the canonical kernel in FP32, including independent one-row replays,
-    before its latency can select it. Results apply to this process and device
-    model; callers can record the returned measurements with their benchmark.
+    equal the canonical kernel in FP32 and the production output dtype, including
+    independent one-row FP32 replays, before its latency can select it. Results
+    apply to this process, device model, and bias dtype; callers can record the
+    returned measurements with their benchmark.
     """
     from .tuning import select_config
 
     output_dtype = torch.bfloat16 if output_dtype is None else output_dtype
-    linear(x, weight, output_dtype=output_dtype)
-    x = x.reshape(-1, x.shape[-1]).contiguous()
-    reference = _forward(x, weight, None, torch.float32, _DEFAULT_CONFIG)
+    linear(x, weight, bias, output_dtype)
+    x = _aligned(x.reshape(-1, x.shape[-1]).contiguous())
+    weight = _aligned(weight)
+    bias = None if bias is None else _aligned(bias.contiguous())
+    check_dtypes = tuple(dict.fromkeys((torch.float32, output_dtype)))
+    reference = tuple(
+        _forward(x, weight, bias, dtype, _DEFAULT_CONFIG) for dtype in check_dtypes
+    )
     probes = sorted({0, x.shape[0] // 2, x.shape[0] - 1})
     for row in probes:
         single = _forward(
-            x[row : row + 1], weight, None, torch.float32, _DEFAULT_CONFIG
+            x[row : row + 1], weight, bias, torch.float32, _DEFAULT_CONFIG
         )
-        if not torch.equal(reference[row : row + 1], single):
+        if not torch.equal(reference[0][row : row + 1], single):
             raise RuntimeError("canonical linear failed FP32 batch invariance")
     block_rows = (16,) if x.shape[0] < 16 else (16, 32, 64, 128)
+    block_cols = (
+        (8, 16, 32, 64, 128)
+        if x.shape[0] < 16 and weight.shape[0] <= 128
+        else (32, 64, 128)
+    )
     candidates = (
         (block_m, block_n, stages)
         for block_m in block_rows
-        for block_n in (32, 64, 128)
+        for block_n in block_cols
         for stages in (2, 3)
     )
+    major, minor = torch.cuda.get_device_capability(x.device)
+    input_major = weight.stride(0) == 1
+    weight_strides = (weight.t() if input_major else weight).stride()
+    eligible, rejected = [], []
+    for config in candidates:
+        try:
+            for dtype in check_dtypes:
+                _compiled(
+                    weight.shape[0],
+                    x.shape[1],
+                    _dtype_name(dtype),
+                    _dtype_name(bias.dtype) if bias is not None else "bfloat16",
+                    bias is not None,
+                    config,
+                    weight_strides,
+                    input_major,
+                    major * 10 + minor,
+                )
+        except RuntimeError as error:
+            # Only compilation is recoverable here. Launch and correctness
+            # failures below must still stop tuning.
+            rejected.append({"config": config, "compile_error": str(error)})
+        else:
+            eligible.append(config)
     best_config, measurements = select_config(
-        candidates,
-        lambda config: _forward(x, weight, None, output_dtype, config),
-        check=lambda config: _forward(x, weight, None, torch.float32, config),
+        eligible,
+        lambda config: _forward(x, weight, bias, output_dtype, config),
+        check=lambda config: tuple(
+            _forward(x, weight, bias, dtype, config) for dtype in check_dtypes
+        ),
         reference=reference,
     )
     best_ms = next(
         item["milliseconds"] for item in measurements if item["config"] == best_config
     )
-    _TUNED_CONFIGS[_key(x, weight, output_dtype)] = best_config
-    return {"config": best_config, "milliseconds": best_ms, "candidates": measurements}
+    _TUNED_CONFIGS[_key(x, weight, output_dtype, bias)] = best_config
+    return {
+        "config": best_config,
+        "milliseconds": best_ms,
+        "candidates": measurements + rejected,
+    }

@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import argparse
 import json
+from pathlib import Path
 
 import torch
 from _timing import measure_cuda
 
+import flashrwkv2
 from flashrwkv2.tmix.readout import (
     infer_tmix_readout_forward_varlen,
     pretrain_tmix_readout_bf16,
@@ -21,17 +23,40 @@ def main() -> None:
     parser.add_argument("--operator", choices=("infer", "pretrain"), default="infer")
     parser.add_argument("--backward", action="store_true")
     parser.add_argument("--adapter-rank", type=int, default=0)
+    parser.add_argument("--tune", action="store_true")
+    parser.add_argument("--timing-mode", choices=("eager", "graph"), default="eager")
+    parser.add_argument("--seed", type=int, default=20260804)
+    parser.add_argument(
+        "--implementation", choices=("tilelang", "cuda-baseline"), default="tilelang"
+    )
     args = parser.parse_args()
+    tilelang = args.implementation == "tilelang"
+    package_path = Path(flashrwkv2.__file__).resolve()
+    if (package_path.parent / "_internal" / "linear.py").is_file() != tilelang:
+        raise ValueError("--implementation must match the imported flashrwkv2 package")
+    if args.tune and not tilelang:
+        raise ValueError("--tune requires the TileLang implementation")
+    torch.manual_seed(args.seed)
     if args.adapter_rank and args.operator != "pretrain":
         raise ValueError("adapter-rank requires the pretrain operator")
     if args.operator == "infer" and args.backward:
         raise ValueError("the inference readout does not support backward")
 
     if args.operator == "infer":
-        options = {"device": torch.device("cuda"), "dtype": torch.bfloat16}
-        packed = [torch.randn(args.tokens, args.channels, **options) for _ in range(5)]
-        affine = [torch.randn(args.channels, **options) for _ in range(3)]
-        output_weight = torch.randn(args.channels, args.channels, **options) * 0.01
+        dtype = torch.bfloat16 if tilelang else torch.float16
+
+        def values(*shape, scale=1.0):
+            return (
+                (torch.randn(shape, device="cuda") * scale).bfloat16().half().to(dtype)
+            )
+
+        packed = [values(args.tokens, args.channels) for _ in range(5)]
+        if not tilelang:
+            packed[0] = packed[0].float()
+        affine = [values(args.channels) for _ in range(3)]
+        output_weight = values(args.channels, args.channels, scale=0.01)
+        tune_inputs = (*packed[:4], *affine, packed[4])
+        projection = {"output_weight": output_weight}
 
         def run() -> torch.Tensor:
             return infer_tmix_readout_forward_varlen(
@@ -84,6 +109,7 @@ def main() -> None:
             requires_grad=args.backward,
         )
         inputs = (*tokens, residual_scale, *affine, gate)
+        tune_inputs = inputs
         grad_output = torch.randn_like(tokens[0])
 
         projection = {}
@@ -115,13 +141,39 @@ def main() -> None:
                 torch.autograd.grad(output, grad_inputs, grad_output)
             return output
 
-    timing = measure_cuda(run)
+    tuning = {}
+    if args.tune:
+        from flashrwkv2._internal.linear import _NoRA, linear, tune_linear
+        from flashrwkv2.tmix.readout.tilelang import readout, tune_readout
+
+        tuning["readout"] = tune_readout(*tune_inputs)
+        if projection:
+            with torch.no_grad():
+                hidden = readout(*tune_inputs)
+                tuning["projection"] = tune_linear(hidden, output_weight)
+                if args.adapter_rank:
+                    normalized = _NoRA.apply(a.detach())
+                    tuning["adapter_a"] = tune_linear(hidden, normalized)
+                    features = linear(hidden, normalized)
+                    tuning["adapter_b"] = tune_linear(
+                        features, b.detach().bfloat16(), torch.float32
+                    )
+    sample = run()
+    output_dtype = str(sample.dtype).removeprefix("torch.")
+    del sample
+    timing = measure_cuda(run, timing_mode=args.timing_mode)
     print(
         json.dumps(
             {
                 "operator": args.operator,
                 "forward_backward": args.backward,
-                "wkv_dtype": "bfloat16",
+                "implementation": args.implementation,
+                "package_path": str(package_path),
+                "wkv_dtype": str(tune_inputs[0].dtype).removeprefix("torch."),
+                "input_dtype": str(tune_inputs[1].dtype).removeprefix("torch."),
+                "output_dtype": output_dtype,
+                "seed": args.seed,
+                "tuning": tuning,
                 "profile": (
                     f"operator={args.operator}/backward={args.backward}/"
                     f"tokens={args.tokens}/channels={args.channels}/adapter_rank={args.adapter_rank}"
