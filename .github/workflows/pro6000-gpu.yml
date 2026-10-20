@@ -277,11 +277,11 @@ jobs:
       - name: Compute Sanitizer racecheck
         if: matrix.torch == '2.13.0'
         run: compute-sanitizer --error-exitcode=1 --tool racecheck .venv/bin/python -m pytest -q tests -m racecheck
-      - name: NoRA rank-256 training benchmarks
+      - name: Multi-size tuning, native linear comparisons and NoRA training benchmarks
         if: matrix.torch == '2.13.0'
         run: |
           .venv/bin/python ci/benchmark_gate.py run-suite \
-            --modules '["cmix","tmix/wkv_prepare","tmix/readout","head/linear","head/l2wrap_ce"]' \
+            --modules '["cmix","post_norm","tmix/tokenshift","tmix/wkv_prepare","tmix/wkv7","tmix/wkv7/rl_infctx","tmix/readout","head/linear","head/l2wrap_ce"]' \
             --python .venv/bin/python --revision '${{ github.sha }}' --status candidate \
             --output artifacts/nora-benchmarks --summary artifacts/nora-benchmark-summary.json \
             --require-complete

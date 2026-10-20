@@ -240,8 +240,10 @@ def test_recurrent_status_masks_inactive_capacity_and_invalid_metadata():
 
 
 @pytest.mark.memcheck
-def test_recurrent_indexed_pool_matches_functional_forward():
-    values, state, cu, bias = _case(64, (3, 1, 1))
+@pytest.mark.parametrize("dim", [64, 128, 256])
+@pytest.mark.parametrize("block_values", [32, 64])
+def test_recurrent_indexed_pool_matches_functional_forward(dim, block_values):
+    values, state, cu, bias = _case(dim, (3, 1, 1))
     pool = torch.cat((state, state[:2]), dim=0)
     original = pool.clone()
     bias = bias.to(torch.bfloat16)
@@ -262,12 +264,43 @@ def test_recurrent_indexed_pool_matches_functional_forward():
         indices,
         status,
         decay_bias=bias,
-        block_values=32,
+        block_values=block_values,
     )
     assert torch.equal(actual[:3], expected[0])
     assert torch.isnan(actual[3:]).all()
     assert torch.equal(pool[3:4], expected[1])
     assert torch.equal(pool[[0, 1, 2, 4]], original[[0, 1, 2, 4]])
+
+
+@pytest.mark.parametrize("dim", [64, 128, 256])
+@pytest.mark.parametrize("indexed", [False, True])
+def test_recurrent_tuning_preserves_both_forwards_and_caller_state(monkeypatch, dim, indexed):
+    from flashrwkv2.tmix.wkv7 import tilelang as implementation
+
+    values, state, cu, bias = _case(dim, (1, 3))
+    original = state.clone()
+    monkeypatch.setattr(implementation, "_TUNED_CONFIGS", {})
+    expected = tmix_wkv7_recurrent(*values, state, cu, decay_bias=bias, block_values=64)
+    selected = implementation.tune_tmix_wkv7_recurrent(
+        *values, state, cu, decay_bias=bias, indexed=indexed,
+    )
+    assert selected["indexed"] == indexed
+    assert all(candidate["bitwise_equal"] for candidate in selected["candidates"])
+    assert torch.equal(state, original)
+    key = implementation._config_key(values[0], state.shape[0], bias, indexed=indexed)
+    other_key = implementation._config_key(values[0], state.shape[0], bias, indexed=not indexed)
+    assert implementation._TUNED_CONFIGS[key] == selected["block_values"]
+    assert other_key not in implementation._TUNED_CONFIGS
+    functional = tmix_wkv7_recurrent(*values, state, cu, decay_bias=bias)
+    pool = state.clone()
+    output = _infer_recurrent(
+        *values, pool, cu,
+        torch.arange(state.shape[0], dtype=torch.int32, device="cuda"),
+        torch.tensor([0, values[0].shape[0], state.shape[0]], dtype=torch.int32, device="cuda"),
+        decay_bias=bias,
+    )
+    for actual, reference in zip((*functional, output, pool), (*expected, *expected), strict=True):
+        assert torch.equal(actual, reference)
 
 
 @pytest.mark.cuda_graph

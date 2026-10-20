@@ -468,7 +468,7 @@ class _Recurrent(torch.autograd.Function):
         )
         gradients = torch.zeros((6, *r.shape), dtype=torch.float32, device=r.device)
         ds0 = torch.empty_like(ds)
-        n, heads, dim = r.shape
+        _, heads, dim = r.shape
         _backward_kernel(
             heads,
             dim,
@@ -560,12 +560,13 @@ def _bias_tensor(r, decay_bias):
     return decay_bias.reshape(r.shape[1:])
 
 
-def _config_key(r, batch, bias):
+def _config_key(r, batch, bias, *, indexed=False):
     return (
         torch.cuda.get_device_name(r.device),
         tuple(r.shape),
         batch,
         None if bias is None else bias.dtype,
+        indexed,
     )
 
 
@@ -610,8 +611,8 @@ def _infer_recurrent(
         batch,
     )
     if block_values is None:
-        block_values = _TUNED_CONFIGS.get(_config_key(r, batch, decay_bias), 64)
-    n, heads, dim = r.shape
+        block_values = _TUNED_CONFIGS.get(_config_key(r, batch, decay_bias, indexed=True), 64)
+    _, heads, dim = r.shape
     bias = _bias_tensor(r, decay_bias)
     output = torch.empty_like(v)
     empty = torch.empty((0, heads, dim, dim), dtype=torch.float32, device=r.device)
@@ -714,16 +715,19 @@ def tune_tmix_wkv7_recurrent(
     *,
     scale=1.0,
     decay_bias=None,
+    indexed=False,
 ):
-    """Tune value-column parallelism after exact BF16 output/FP32 state checks.
+    """Check both forward variants and time the requested production mode.
 
-    This explicit warmup measures CUDA Graph replay and caches the selected
-    configuration for the current process, device model and packed shape.
-    It does not mutate the initial state.
+    Every candidate must preserve functional/indexed BF16 outputs and FP32
+    final states. ``indexed=True`` measures in-place inference on a private
+    pool with identity slots and valid status. Otherwise it measures the
+    functional forward. The two modes retain separate configuration caches;
+    neither mode mutates the caller's initial state.
     """
     from ..._internal.tuning import select_config
 
-    def run(columns):
+    def functional(columns):
         return tmix_wkv7_recurrent(
             r,
             decay_logits,
@@ -738,9 +742,29 @@ def tune_tmix_wkv7_recurrent(
             block_values=columns,
         )
 
-    best, measurements = select_config((64, 32), run)
-    _TUNED_CONFIGS[_config_key(r, initial_state.shape[0], decay_bias)] = best
-    return {"block_values": best, "candidates": measurements}
+    canonical = functional(64)
+    batch = initial_state.shape[0]
+    scratch = initial_state.clone()
+    indices = torch.arange(batch, dtype=torch.int32, device=r.device)
+    status = torch.tensor([0, r.shape[0], batch], dtype=torch.int32, device=r.device)
+
+    def inference(columns):
+        return _infer_recurrent(
+            r, decay_logits, k, v, a, b, scratch, cu_seqlens, indices, status,
+            scale=scale, decay_bias=decay_bias, block_values=columns,
+        )
+
+    def check(columns):
+        scratch.copy_(initial_state)
+        output, final = functional(columns)
+        inferred = inference(columns)
+        return output, final, inferred, scratch.clone()
+
+    reference = (*canonical, *canonical)
+    run = inference if indexed else functional
+    best, measurements = select_config((64, 32), run, check=check, reference=reference)
+    _TUNED_CONFIGS[_config_key(r, batch, decay_bias, indexed=indexed)] = best
+    return {"block_values": best, "indexed": indexed, "candidates": measurements}
 
 
 __all__ = ["tmix_wkv7_recurrent", "tune_tmix_wkv7_recurrent"]

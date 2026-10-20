@@ -101,16 +101,50 @@ BENCHMARKS = {
         BenchmarkCase("infer", "benchmarks/tmix/wkv_prepare/bench.py"),
     ),
     "tmix/wkv7": (
-        BenchmarkCase("infer_recurrent_fp32io16", "benchmarks/tmix/wkv7/bench.py",
-                      ("--shapes", "h32d64", "--seed", "20260804"), "--output"),
-        BenchmarkCase("infer_recurrent_multisize", "benchmarks/tmix/wkv7/bench.py",
-                      ("--shapes", "h64d64", "h16d128", "h8d256", "--cases", "1x1", "16x1", "1x16", "1x128", "--decay-bias"), "--output"),
-        BenchmarkCase("pretrain_forward_backward", "benchmarks/tmix/wkv7/pretrain/bench.py"),
+        BenchmarkCase(
+            "infer_recurrent_fp32io16",
+            "benchmarks/tmix/wkv7/bench.py",
+            ("--shapes", "h32d64", "--seed", "20260804"),
+            "--output",
+        ),
+        BenchmarkCase(
+            "infer_recurrent_multisize",
+            "benchmarks/tmix/wkv7/bench.py",
+            (
+                "--shapes",
+                "h12d64",
+                "h16d64",
+                "h32d64",
+                "h40d64",
+                "h64d64",
+                "h80d64",
+                "h16d128",
+                "h8d256",
+                "--cases",
+                "1x1",
+                "16x1",
+                "1x16",
+                "64x16",
+                "1x128",
+                "--decay-bias",
+                "--tune",
+                "--timing-mode",
+                "graph",
+            ),
+            "--output",
+        ),
+        BenchmarkCase(
+            "pretrain_forward_backward", "benchmarks/tmix/wkv7/pretrain/bench.py"
+        ),
         BenchmarkCase("statetune", "benchmarks/tmix/wkv7/statetune/bench.py"),
     ),
     "tmix/wkv7/rl_infctx": (
         BenchmarkCase("forward", "benchmarks/tmix/wkv7/rl_infctx/bench.py"),
-        BenchmarkCase("forward_backward", "benchmarks/tmix/wkv7/rl_infctx/bench.py", ("--backward",)),
+        BenchmarkCase(
+            "forward_backward",
+            "benchmarks/tmix/wkv7/rl_infctx/bench.py",
+            ("--backward",),
+        ),
     ),
 }
 
@@ -141,6 +175,59 @@ BENCHMARKS["cmix"] += (
         "nora_torch_forward_backward",
         "benchmarks/cmix/bench.py",
         ("--operator", "torch", "--backward", "--adapter-rank", "256"),
+    ),
+)
+
+for _owner, _arguments in {
+    "cmix": ("--operator", "infer"),
+    "tmix/wkv_prepare": ("--operator", "infer", "--later-layer"),
+    "head/linear": ("--compare-torch",),
+}.items():
+    BENCHMARKS[_owner] += (
+        BenchmarkCase(
+            "tuned_multisize",
+            f"benchmarks/{_owner}/bench.py",
+            (*_arguments, "--sweep", "--tune", "--timing-mode", "graph"),
+        ),
+    )
+
+for _channels in (768, 1024, 2048, 2560, 4096, 5120):
+    for _rows in (1, 27, 256):
+        for _owner, _arguments in {
+            "post_norm": ("--tokens", str(_rows)),
+            "tmix/readout": ("--tokens", str(_rows)),
+            "tmix/tokenshift": ("--batch", "1", "--seqlen", str(_rows)),
+        }.items():
+            BENCHMARKS[_owner] += (
+                BenchmarkCase(
+                    f"tuned_c{_channels}_t{_rows}",
+                    f"benchmarks/{_owner}/bench.py",
+                    (
+                        *_arguments,
+                        "--channels",
+                        str(_channels),
+                        "--tune",
+                        "--timing-mode",
+                        "graph",
+                    ),
+                ),
+            )
+
+BENCHMARKS["head/l2wrap_ce"] += (
+    BenchmarkCase(
+        "nora_model_width_chunked_backward",
+        "benchmarks/head/l2wrap_ce/bench.py",
+        (
+            "--channels",
+            "4096",
+            "--tokens",
+            "16",
+            "--chunk-rows",
+            "4",
+            "--adapter-rank",
+            "256",
+            "--backward",
+        ),
     ),
 )
 
@@ -228,22 +315,25 @@ def _physical_gpu() -> str:
     return os.environ.get("FLASHRWKV_PHYSICAL_GPU", "0")
 
 
-def _last_json(stdout: str) -> dict[str, Any]:
+def _json_payloads(stdout: str) -> list[dict[str, Any]]:
     try:
         payload = json.loads(stdout)
     except json.JSONDecodeError:
         pass
     else:
         if isinstance(payload, dict):
-            return payload
-    for line in reversed(stdout.splitlines()):
+            return [payload]
+    payloads = []
+    for line in stdout.splitlines():
         try:
             payload = json.loads(line)
         except json.JSONDecodeError:
             continue
         if isinstance(payload, dict):
-            return payload
-    raise RuntimeError("benchmark did not emit a JSON object")
+            payloads.append(payload)
+    if not payloads:
+        raise RuntimeError("benchmark did not emit a JSON object")
+    return payloads
 
 
 def _contract_hash(module: str) -> str:
@@ -383,7 +473,7 @@ def _run_case(
     *,
     python: str,
     status: str,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     script = ROOT / case.path
     command = [_python_executable(python), str(script), *case.arguments]
     output_path: Path | None = None
@@ -403,24 +493,27 @@ def _run_case(
         capture_output=True,
         text=True,
     )
-    payload = (
-        json.loads(output_path.read_text(encoding="utf-8"))
+    payloads = (
+        [json.loads(output_path.read_text(encoding="utf-8"))]
         if output_path is not None
-        else _last_json(result.stdout)
+        else _json_payloads(result.stdout)
     )
     if output_path is not None:
         output_path.unlink(missing_ok=True)
-    profiles = _profiles(payload, module)
+    profiles, experiments = [], []
+    for payload in payloads:
+        profiles.extend(_profiles(payload, module))
+        current_experiments = payload.get("experiments", [])
+        if not isinstance(current_experiments, list):
+            raise TypeError("benchmark experiments must be a list")
+        experiments.extend(
+            {"workload": case.workload, **experiment}
+            for experiment in current_experiments
+            if isinstance(experiment, dict)
+        )
     for profile in profiles:
         profile["profile"] = f"{case.workload}/{profile['profile']}"
-    experiments = payload.get("experiments", [])
-    if not isinstance(experiments, list):
-        raise TypeError("benchmark experiments must be a list")
-    return profiles, [
-        {"workload": case.workload, **experiment}
-        for experiment in experiments
-        if isinstance(experiment, dict)
-    ]
+    return profiles, experiments, payloads
 
 
 def run_module(
@@ -433,12 +526,14 @@ def run_module(
 ) -> dict[str, Any]:
     profiles = []
     experiments = []
+    workloads = []
     for case in BENCHMARKS[module]:
-        case_profiles, case_experiments = _run_case(
+        case_profiles, case_experiments, case_records = _run_case(
             module, case, python=python, status=status
         )
         profiles.extend(case_profiles)
         experiments.extend(case_experiments)
+        workloads.append({"workload": case.workload, "records": case_records})
     return {
         "schema_version": SCHEMA_VERSION,
         "status": status,
@@ -449,6 +544,7 @@ def run_module(
         "environment": environment,
         "profiles": profiles,
         "experiments": experiments,
+        "workloads": workloads,
     }
 
 
@@ -718,8 +814,16 @@ def _parse_modules(value: str) -> list[str]:
 
 
 def _self_test() -> None:
-    assert _last_json('{\n  "status": "pretty"\n}') == {"status": "pretty"}
-    assert _last_json('diagnostic\n{"status":"compact"}\n') == {"status": "compact"}
+    from unittest.mock import patch
+
+    assert _json_payloads('{\n  "status": "pretty"\n}') == [{"status": "pretty"}]
+    assert _json_payloads('diagnostic\n{"status":"compact"}\n') == [
+        {"status": "compact"}
+    ]
+    assert _json_payloads('diagnostic\n{"row":1}\n{"row":2}\n') == [
+        {"row": 1},
+        {"row": 2},
+    ]
     request = urllib.request.Request("https://api.github.com/artifact")
     request.add_unredirected_header("Authorization", "Bearer test-token")
     redirected = urllib.request.HTTPRedirectHandler().redirect_request(
@@ -742,6 +846,35 @@ def _self_test() -> None:
         "driver": "driver",
         "wheel_sha256": "wheel",
     }
+    records = [
+        {
+            "profile": f"rows={rows}",
+            "raw_batch_mean_us": [1.0, 2.0],
+            "mean_us": 1.5,
+            "tuning": {"config": [16, 64, 2]},
+            "torch_comparison": {"fp32_bitwise_equal": False},
+            "memory": {"peak_allocated_bytes": 512},
+        }
+        for rows in (1, 27)
+    ]
+    stdout = "compiler diagnostic\n" + "\n".join(
+        json.dumps(record) for record in records
+    )
+    with patch.object(
+        subprocess, "run", return_value=subprocess.CompletedProcess([], 0, stdout, "")
+    ):
+        collected = run_module(
+            "head/linear",
+            python=sys.executable,
+            revision="test",
+            status="candidate",
+            environment=environment,
+        )
+    assert len(collected["profiles"]) == 2 * len(BENCHMARKS["head/linear"])
+    for workload, case in zip(
+        collected["workloads"], BENCHMARKS["head/linear"], strict=True
+    ):
+        assert workload == {"workload": case.workload, "records": records}
 
     def payload(value: float) -> dict[str, Any]:
         return {
@@ -783,11 +916,16 @@ def _self_test() -> None:
         "statetune_forward_backward",
         "nora_forward_backward",
         "nora_torch_forward_backward",
+        "tuned_multisize",
     }
     assert {case.workload for case in BENCHMARKS["tmix/tokenshift"]} == {
         "infer",
         "pretrain_forward_backward",
         "statetune_forward_backward",
+    } | {
+        f"tuned_c{channels}_t{rows}"
+        for channels in (768, 1024, 2048, 2560, 4096, 5120)
+        for rows in (1, 27, 256)
     }
     assert {case.workload for case in BENCHMARKS["tmix/wkv7"]} == {
         "infer_recurrent_fp32io16",

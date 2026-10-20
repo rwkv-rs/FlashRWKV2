@@ -120,6 +120,8 @@ SM89 与 PRO6000 SM120 的 decode、小 batch、prefill 和训练形状。
 res 等变体都必须保持相同结果。线性层的 bias presence/dtype 属于调优 key。
 编译不受工具链支持的线性候选会在结果中记录 `compile_error`；运行失败直接报错。
 调优需在 CUDA Graph capture 前完成，并使用有效、非空的 active workload。
+WKV 的 functional 与 indexed pool 模式分别缓存配置；候选同时校验两种模式的
+输出和 FP32 最终状态，按实际调用模式计时。
 
 PostNorm、TMix 各推理阶段、CMix 和 Head 线性基准可用
 `--implementation tilelang|cuda-baseline` 标记
@@ -138,7 +140,43 @@ Head 线性基准的 `--compare-torch` 用相同 BF16 输入，对照输出 FP32
 样本包含 BF16 有效位和不同指数；单行输入还会扩展到 17 行，核对不同矩阵行数下
 同一行的结果。
 
+原生对照需分别记录默认 BLAS 和 cuBLASLt 的结果。后者在进程启动前设置
+`TORCH_BLAS_PREFER_CUBLASLT=1`、`CUBLAS_WORKSPACE_CONFIG=:16:8` 和
+`CUBLASLT_WORKSPACE_SIZE=1`；artifact 记录实际 preferred BLAS 与 workspace 设置。
+该配置参考 vLLM 的 batch-invariant 初始化，仍须验证本项目 BF16/FP32 输出契约。
+
+CI 基准结果同时保留每个 workload 的完整 JSON records 和延迟 profiles。JSONL
+尺寸 sweep 的全部记录、调优配置、原生库对照与显存数据均进入上传的基准 artifact。
+
 `tests/tmix/wkv7/test_block.py` 覆盖完整 block 到 selected logprobs 的训练/推理、
 prefill/decode、batch 和 optimizer 更新后一致性。`tests/tmix/wkv7/test.py` 覆盖
 state lifecycle 与 CUDA Graph。设备实测通过前，离线 lowering 不能作为数值或性能
 验收结果。下游模型与 serving 集成应在各自仓库单独接入这一契约。
+
+## 上游实现与实现边界
+
+2026-10-20 核对 vLLM
+[`005cef040a28`](https://github.com/vllm-project/vllm/tree/005cef040a283aac2b156eccb12a2ab5d10f3157)：
+
+- 普通非量化线性层默认调用 `torch.nn.functional.linear`；开启 batch invariance
+  后改用独立 Triton GEMM。其配置按架构和 `(N,K)` 选择，再按 M 分桶，保持同一
+  shape 的 `BLOCK_K` 不随 batch 改变。见
+  [linear](https://github.com/vllm-project/vllm/blob/005cef040a283aac2b156eccb12a2ab5d10f3157/vllm/model_executor/layers/linear.py) 与
+  [batch-invariant configs](https://github.com/vllm-project/vllm/blob/005cef040a283aac2b156eccb12a2ab5d10f3157/vllm/model_executor/determinism/batch_invariant_configs.py)。
+- Qwen3.5 的 GDN prefill 组合 FLA/Triton、FlashInfer 和可选的 SM100 CuTe DSL；
+  SM120 通过 FlashInfer 的对应实现支持。decode 另有面向 SM80+ 的 fused CUDA。
+  见 [Qwen GDN](https://github.com/vllm-project/vllm/blob/005cef040a283aac2b156eccb12a2ab5d10f3157/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py)。
+- Kimi-K3 的 KDA prefill 使用 FlashKDA CUDA/CUTLASS 或 Triton；decode 有
+  fused CUDA 及 Triton。低延迟 BF16 GEMM 另按设备、shape 和 M 保存实测配置，
+  部分路径在 batch-invariant 模式下禁用。见
+  [KDA](https://github.com/vllm-project/vllm/blob/005cef040a283aac2b156eccb12a2ab5d10f3157/vllm/models/kimi_k3/nvidia/kda.py) 与
+  [low-latency GEMM](https://github.com/vllm-project/vllm/blob/005cef040a283aac2b156eccb12a2ab5d10f3157/vllm/models/kimi_k3/nvidia/low_latency_gemm.py)。
+  可选 `decode_backend=latency_specialized` 进一步使用 CuTe DSL executor，入口
+  限定 SM100/103、TP8/16 等部署条件，见
+  [specialized decode](https://github.com/vllm-project/vllm/blob/005cef040a283aac2b156eccb12a2ab5d10f3157/vllm/models/kimi_k3/nvidia/specialized_decode/runtime/__init__.py)。
+
+本项目的实现选择以数值契约、实测性能及维护成本决定。普通 GEMM 优先验证原生
+BLAS；自定义实现须由 batch/prefill/decode 一致性或实际融合收益支持。DSL 不消除
+shape 调优；仅保留有测量依据的执行配置。SM100 与 SM120 分别验证，不按 Blackwell
+名称推定指令和资源限制相同。KDA/GDN 与 RWKV7 的递推公式不同，复用应核对数学
+和接口契约。

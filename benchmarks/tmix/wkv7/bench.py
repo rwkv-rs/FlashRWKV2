@@ -134,7 +134,13 @@ def main():
             if args.tune:
                 from flashrwkv2.tmix.wkv7.tilelang import tune_tmix_wkv7_recurrent
 
-                tuning = tune_tmix_wkv7_recurrent(*values, initial, cu, decay_bias=bias)
+                tuning = tune_tmix_wkv7_recurrent(
+                    *values,
+                    initial,
+                    cu,
+                    decay_bias=bias,
+                    indexed=True,
+                )
 
             run = partial(
                 infer_tmix_wkv7_recurrent_fp32io16_forward_varlen,

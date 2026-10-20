@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 import torch
@@ -134,6 +135,11 @@ def benchmark(args):
             )
             torch_comparison = {
                 "operator": "torch.mm",
+                "preferred_blas_library": str(
+                    torch.backends.cuda.preferred_blas_library()
+                ),
+                "CUBLAS_WORKSPACE_CONFIG": os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
+                "CUBLASLT_WORKSPACE_SIZE": os.environ.get("CUBLASLT_WORKSPACE_SIZE"),
                 "input_dtype": str(x.dtype).removeprefix("torch."),
                 "output_dtype": str(reference.dtype).removeprefix("torch."),
                 "allow_bf16_reduced_precision_reduction": False,
