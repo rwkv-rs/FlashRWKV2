@@ -135,6 +135,8 @@ Head 线性基准的 `--compare-torch` 用相同 BF16 输入，对照输出 FP32
 `torch.mm`。对照时关闭 BF16 reduced-precision reduction，记录原生调用在整批、
 单行和七行分块之间的 FP32/BF16 逐位一致性及独立计时，以验证 custom linear
 是否有必要。原生库满足一致性和性能要求时，应优先减少自定义实现。
+样本包含 BF16 有效位和不同指数；单行输入还会扩展到 17 行，核对不同矩阵行数下
+同一行的结果。
 
 `tests/tmix/wkv7/test_block.py` 覆盖完整 block 到 selected logprobs 的训练/推理、
 prefill/decode、batch 和 optimizer 更新后一致性。`tests/tmix/wkv7/test.py` 覆盖

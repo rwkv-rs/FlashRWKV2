@@ -33,25 +33,23 @@ def benchmark(args):
         )
     dtype = torch.bfloat16 if tilelang or backward else torch.float16
 
-    def values(shape, dtype, denominator):
-        # Dyadic values are exactly representable in both BF16 and FP16.
-        return (
-            torch.randint(-64, 65, shape, device="cuda", dtype=torch.int32).float()
-            / denominator
-        ).to(dtype)
+    def values(shape, dtype, scale):
+        # BF16 significands and varied exponents exercise FP32 rounding while
+        # both input formats receive identical logical values.
+        return (torch.randn(shape, device="cuda") * scale).bfloat16().half().to(dtype)
 
-    x = values((args.tokens, args.channels), dtype, 64).requires_grad_(backward)
-    weight = values((args.vocab, args.channels), dtype, 1024).requires_grad_(
+    x = values((args.tokens, args.channels), dtype, 1.0).requires_grad_(backward)
+    weight = values((args.vocab, args.channels), dtype, 0.03).requires_grad_(
         backward and not args.adapter_rank
     )
     adapters = {}
     inputs = (x, weight)
     if args.adapter_rank:
-        a = values(
-            (args.adapter_rank, args.channels), torch.float32, 4096
+        a = (
+            torch.randn(args.adapter_rank, args.channels, device="cuda") * 0.01
         ).requires_grad_()
-        b = values(
-            (args.vocab, args.adapter_rank), torch.float32, 4096
+        b = (
+            torch.randn(args.vocab, args.adapter_rank, device="cuda") * 0.01
         ).requires_grad_()
         adapters = {"lora_a": a, "lora_b": b, "use_nora": True}
         inputs = (x, a, b)
@@ -71,7 +69,7 @@ def benchmark(args):
     output_dtype = (
         torch.float32 if tilelang else torch.bfloat16 if backward else torch.float16
     )
-    grad = values((args.tokens, args.vocab), output_dtype, 64) if backward else None
+    grad = values((args.tokens, args.vocab), output_dtype, 1.0) if backward else None
 
     def run():
         if backward:
@@ -122,6 +120,18 @@ def benchmark(args):
                     "max_abs_error": float((chunked - reference).abs().max()),
                 }
             )
+            # M=1 cannot exercise a different GEMM shape by slicing itself.
+            repeated = native(x[:1].expand(17, -1).contiguous())[:1]
+            checks.append(
+                {
+                    "mode": "repeat_first_row=17",
+                    "fp32_bitwise_equal": torch.equal(repeated, reference[:1]),
+                    "bf16_bitwise_equal": torch.equal(
+                        repeated.bfloat16(), reference[:1].bfloat16()
+                    ),
+                    "max_abs_error": float((repeated - reference[:1]).abs().max()),
+                }
+            )
             torch_comparison = {
                 "operator": "torch.mm",
                 "input_dtype": str(x.dtype).removeprefix("torch."),
@@ -147,7 +157,7 @@ def benchmark(args):
         "implementation": args.implementation,
         "package_path": str(Path(flashrwkv2.__file__).resolve()),
         "seed": args.seed,
-        "input_distribution": "randint[-64,64] / 64; weights / 1024; adapters / 4096",
+        "input_distribution": "FP32 normal samples rounded through BF16 and FP16; weight scale=0.03, FP32 adapter scale=0.01",
         "input_dtype": str(dtype).removeprefix("torch."),
         "output_dtype": str(output_dtype).removeprefix("torch."),
         "upstream_dtype": str(grad.dtype).removeprefix("torch.") if backward else None,
