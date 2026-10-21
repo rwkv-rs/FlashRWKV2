@@ -423,5 +423,3 @@ def tune_fused_tokenshift(x, res, weight, bias, mixes, pool, indices, status, ep
     best, measurements = select_config((1, 2, 4), run, check=check)
     _FUSED_CONFIGS[_config_key(x, mixes, x.shape[0])] = best
     return measurements
-
-
