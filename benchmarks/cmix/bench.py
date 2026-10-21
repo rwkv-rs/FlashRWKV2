@@ -259,6 +259,11 @@ def benchmark(args):
     sample = run()
     output_dtypes = [str(value.dtype).removeprefix("torch.") for value in sample]
     del sample
+    if args.tune and not args.backward:
+        tuning["key"] = tune_linear(source, key, benchmark=run)
+        tuning["value"] = tune_linear(
+            hidden, value.t() if args.operator == "infer" else value, benchmark=run
+        )
     timing = measure_cuda(
         run,
         before_batch=(lambda: state.copy_(initial))

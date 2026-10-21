@@ -135,6 +135,8 @@ res 等变体都必须保持相同结果。线性层的 bias presence/dtype 属�
 `tune_linear` 可通过 `benchmark` 回调测量实际前向阶段，结果用 `timing_scope`
 区分整个阶段与单个投影。Prepare 基准先调优各投影，再按完整前向重选 R/K/V 的
 共同配置，保持三份 dense weights 的实际工作集；反向基准仍独立测量投影。
+CMix 前向基准同样按完整阶段重选 key/value 投影，以保留两份权重及 ReLU²
+中间结果共同产生的缓存行为。
 调优需在 CUDA Graph capture 前完成，并使用有效、非空的 active workload。
 WKV 的 functional 与 indexed pool 模式分别缓存配置；候选同时校验两种模式的
 输出和 FP32 最终状态，按实际调用模式计时。

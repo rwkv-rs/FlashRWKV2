@@ -38,7 +38,11 @@ def select_config(candidates, run, *, check=None, reference=None, warmup=3, repe
         for _ in range(warmup):
             run(config)
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
+        # Metadata tickets keep the stream on which the owner prepared them.
+        capture_stream = torch.cuda.current_stream()
+        if capture_stream == torch.cuda.default_stream():
+            capture_stream = None
+        with torch.cuda.graph(graph, stream=capture_stream):
             for _ in range(repeat):
                 run(config)
         # Instantiate the graph and events before measuring steady device time.
