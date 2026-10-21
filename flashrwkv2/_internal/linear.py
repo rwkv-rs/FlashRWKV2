@@ -16,6 +16,7 @@ from torch.autograd.function import once_differentiable
 _PASS_CONFIG = {"tl.disable_wgmma": True, "tl.enable_fast_math": False}
 _DEFAULT_CONFIG = (16, 64, 2, 32)
 _TUNED_CONFIGS = {}
+_COMPILED_KERNELS = {}
 
 
 def _matmul_program(
@@ -96,8 +97,7 @@ def _matmul_program(
     return matmul
 
 
-@cache
-def _compiled(
+def _compile_spec(
     outputs,
     channels,
     output_dtype,
@@ -108,8 +108,6 @@ def _compiled(
     input_major,
     arch,
 ):
-    import tilelang
-
     pass_configs = _PASS_CONFIG
     if arch // 10 == 12:
         # Keep SM12x copies and MMA consumers in one CTA synchronization domain.
@@ -124,7 +122,7 @@ def _compiled(
             "tl.enable_async_copy": False,
             "tirx.use_async_copy": False,
         }
-    return tilelang.compile(
+    return (
         _matmul_program(
             outputs,
             channels,
@@ -137,10 +135,46 @@ def _compiled(
             # SM12x supports TMA but not CTA register reconfiguration.
             no_set_max_nreg=arch // 10 == 12,
         ),
-        out_idx=[3],
-        target={"kind": "cuda", "arch": f"sm_{arch}"},
-        pass_configs=pass_configs,
+        {
+            "out_idx": [3],
+            "target": {"kind": "cuda", "arch": f"sm_{arch}"},
+            "pass_configs": pass_configs,
+        },
     )
+
+
+def _compiled(*key):
+    import tilelang
+
+    if key not in _COMPILED_KERNELS:
+        program, options = _compile_spec(*key)
+        _COMPILED_KERNELS[key] = tilelang.compile(program, **options)
+    return _COMPILED_KERNELS[key]
+
+
+def _precompile(keys):
+    """Elaborate on the caller thread; compile a bounded batch before timing."""
+    import tilelang
+
+    pending, programs = [], []
+    for key in dict.fromkeys(keys):
+        if key in _COMPILED_KERNELS:
+            continue
+        try:
+            program, options = _compile_spec(*key)
+        except RuntimeError:
+            # The normal compilation path records each rejected candidate.
+            continue
+        pending.append(key)
+        programs.append(program)
+    if programs:
+        kernels = tilelang.par_compile(
+            programs, **options, num_workers=4, ignore_error=True
+        )
+        _COMPILED_KERNELS.update(
+            (key, kernel) for key, kernel in zip(pending, kernels, strict=True)
+            if kernel is not None
+        )
 
 
 def _dtype_name(dtype):
@@ -579,6 +613,18 @@ def tune_linear(x, weight, output_dtype=None, *, bias=None, benchmark=None):
                     ),
                 })
                 continue
+            eligible.append(config)
+        _precompile(
+            (
+                weight.shape[0], x.shape[1], _dtype_name(dtype),
+                _dtype_name(bias.dtype) if bias is not None else "bfloat16",
+                bias is not None, config, weight_strides, input_major,
+                major * 10 + minor,
+            )
+            for config in eligible for dtype in check_dtypes
+        )
+        compiled = []
+        for config in eligible:
             try:
                 for dtype in check_dtypes:
                     _compiled(
@@ -597,9 +643,9 @@ def tune_linear(x, weight, output_dtype=None, *, bias=None, benchmark=None):
                 # failures below must still stop tuning.
                 rejected.append({"config": config, "compile_error": str(error)})
             else:
-                eligible.append(config)
+                compiled.append(config)
         best_config, checked = select_config(
-            eligible,
+            compiled,
             run,
             check=lambda config: tuple(
                 _forward(x, weight, bias, dtype, config) for dtype in check_dtypes

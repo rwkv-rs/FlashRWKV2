@@ -136,6 +136,8 @@ MMA 的 K 序列保持不变。
 res 等变体都必须保持相同结果。线性层的 bias presence/dtype 属于调优 key。
 编译不受工具链支持的线性候选会在结果中记录 `compile_error`；运行失败直接报错。
 候选的 staging buffers 超出设备共享内存上限时，记录 `resource_error` 并在启动前排除。
+投影候选先串行生成 TIR，再用 TileLang 的四个编译线程构建并复用进程内 kernel cache。
+全部构建结束后才逐一检查输出和计时；编译失败仍在对应候选中保留错误信息。
 `tune_linear` 可通过 `benchmark` 回调测量实际前向阶段，结果用 `timing_scope`
 区分整个阶段与单个投影。Prepare 基准先调优各投影，再按完整前向重选 R/K/V 的
 共同配置，保持三份 dense weights 的实际工作集；反向基准仍独立测量投影。

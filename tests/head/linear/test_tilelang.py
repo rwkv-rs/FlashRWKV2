@@ -182,6 +182,7 @@ def test_tilelang_linear_tuning_checks_production_and_skips_compile_failures(
 
     monkeypatch.setattr(implementation, "linear", lambda *args, **kwargs: None)
     monkeypatch.setattr(implementation, "_compiled", compile_kernel)
+    monkeypatch.setattr(implementation, "_precompile", lambda keys: None)
     monkeypatch.setattr(implementation, "_forward", forward)
     monkeypatch.setattr(implementation, "_TUNED_CONFIGS", {})
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (12, 0))
@@ -236,6 +237,45 @@ def test_tilelang_linear_tuning_checks_production_and_skips_compile_failures(
     assert next(
         item for item in result["candidates"] if item["config"] == rejected
     ) == {"config": rejected, "compile_error": "candidate exceeds shared memory"}
+
+
+def test_tilelang_precompile_reuses_successes_and_preserves_compile_errors(monkeypatch):
+    import tilelang
+
+    from flashrwkv2._internal import linear as implementation
+
+    keys = [
+        (outputs, 64, "float32", "bfloat16", False, (16, 32, 2, 32), (64, 1), False, 120)
+        for outputs in (32, 64, 128)
+    ]
+    ready = object()
+    batches = []
+
+    def spec(*key):
+        if key == keys[2]:
+            raise RuntimeError("lowering rejected the candidate")
+        return key[0], {"target": "cuda"}
+
+    def parallel(programs, *, target, num_workers, ignore_error):
+        batches.append(tuple(programs))
+        assert target == "cuda" and num_workers == 4 and ignore_error
+        return [ready, None]
+
+    def failed_compile(*args, **kwargs):
+        raise RuntimeError("nvcc rejected the candidate")
+
+    monkeypatch.setattr(implementation, "_COMPILED_KERNELS", {})
+    monkeypatch.setattr(implementation, "_compile_spec", spec)
+    monkeypatch.setattr(tilelang, "par_compile", parallel)
+    monkeypatch.setattr(tilelang, "compile", failed_compile)
+    implementation._precompile([*keys, keys[0]])
+    assert implementation._compiled(*keys[0]) is ready
+    implementation._precompile([keys[0]])
+    assert batches == [(32, 64)]
+    with pytest.raises(RuntimeError, match="nvcc rejected"):
+        implementation._compiled(*keys[1])
+    with pytest.raises(RuntimeError, match="lowering rejected"):
+        implementation._compiled(*keys[2])
 
 
 @pytest.mark.parametrize("offset", [0, 1, 8])
