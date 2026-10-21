@@ -47,4 +47,4 @@ def run() -> dict[str, object]:
 
 
 if __name__ == "__main__":
-    print(json.dumps(run(), indent=2))
+    print(json.dumps(run()))
