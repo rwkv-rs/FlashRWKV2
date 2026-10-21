@@ -138,6 +138,10 @@ res 等变体都必须保持相同结果。线性层的 bias presence/dtype 属�
 调优需在 CUDA Graph capture 前完成，并使用有效、非空的 active workload。
 WKV 的 functional 与 indexed pool 模式分别缓存配置；候选同时校验两种模式的
 输出和 FP32 最终状态，按实际调用模式计时。
+WKV 候选组合 32/64 个 value columns 与 1/4 个输入 token 的共享内存预取。
+预取只改变输入加载与 decay 计算的排布，逐 token 的 state 更新、K 归约、BF16
+舍入和每 16 token 的 FP32 checkpoint 保持原有顺序。未调优时使用单 token
+预取；单步 decode 的调优也只测单 token 配置。
 
 PostNorm、TMix 各推理阶段、CMix 和 Head 线性基准可用
 `--implementation tilelang|cuda-baseline` 标记

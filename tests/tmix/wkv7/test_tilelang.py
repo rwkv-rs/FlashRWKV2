@@ -67,12 +67,19 @@ def _reference(values, initial, lengths, bias, scale):
 
 @pytest.mark.parametrize("dim", [64, 128, 256])
 @pytest.mark.parametrize("lengths", [(1,), (0, 1, 17, 0, 33)])
-def test_recurrent_forward_reference_and_grad_mode(dim, lengths):
+@pytest.mark.parametrize("prefetch_tokens", [1, 4])
+def test_recurrent_forward_reference_and_grad_mode(dim, lengths, prefetch_tokens):
     values, state, cu, bias = _case(dim, lengths, requires_grad=True)
     original = state.detach().clone()
-    actual = tmix_wkv7_recurrent(*values, state, cu, decay_bias=bias, scale=0.75)
+    actual = tmix_wkv7_recurrent(
+        *values, state, cu, decay_bias=bias, scale=0.75,
+        prefetch_tokens=prefetch_tokens,
+    )
     with torch.no_grad():
-        inference = tmix_wkv7_recurrent(*values, state, cu, decay_bias=bias, scale=0.75)
+        inference = tmix_wkv7_recurrent(
+            *values, state, cu, decay_bias=bias, scale=0.75,
+            prefetch_tokens=prefetch_tokens,
+        )
         expected = _reference(values, state, lengths, bias, 0.75)
     assert torch.equal(state.detach(), original)
     for training, rollout in zip(actual, inference, strict=True):
@@ -82,14 +89,21 @@ def test_recurrent_forward_reference_and_grad_mode(dim, lengths):
 
 
 @pytest.mark.parametrize("dim", [64, 128, 256])
-def test_recurrent_packing_decode_and_column_config_are_bitwise_equal(dim):
-    lengths = (1, 17, 33)
+@pytest.mark.parametrize("lengths", [(1, 17, 33), (0, 2, 3, 4, 5, 15, 16, 17)])
+@pytest.mark.parametrize("prefetch_tokens", [1, 4])
+@pytest.mark.memcheck
+@pytest.mark.racecheck
+def test_recurrent_packing_decode_and_column_config_are_bitwise_equal(
+    dim, lengths, prefetch_tokens,
+):
     values, state, cu, bias = _case(dim, lengths)
     packed, final = tmix_wkv7_recurrent(
-        *values, state, cu, decay_bias=bias, block_values=64
+        *values, state, cu, decay_bias=bias, block_values=64,
+        prefetch_tokens=prefetch_tokens,
     )
     alternate = tmix_wkv7_recurrent(
-        *values, state, cu, decay_bias=bias, block_values=32
+        *values, state, cu, decay_bias=bias, block_values=32,
+        prefetch_tokens=4 if prefetch_tokens == 1 else 1,
     )
     assert torch.equal(packed, alternate[0])
     assert torch.equal(final, alternate[1])
@@ -105,6 +119,7 @@ def test_recurrent_packing_decode_and_column_config_are_bitwise_equal(dim):
                 torch.tensor([0, 1], device="cuda", dtype=torch.int32),
                 decay_bias=bias,
                 block_values=32,
+                prefetch_tokens=1,
             )
             assert torch.equal(y[0], packed[token])
         assert torch.equal(current[0], final[sequence])
@@ -127,13 +142,17 @@ def test_recurrent_bias_matches_materialized_bf16_logits(dim, bias_dtype):
 @pytest.mark.parametrize("dim", [64, 128, 256])
 @pytest.mark.parametrize("logits", [-15.0, -2.0, 15.0])
 @pytest.mark.parametrize("cotangent", ["random", "sparse", "zero"])
-def test_recurrent_independent_vjp(dim, logits, cotangent):
+@pytest.mark.parametrize("prefetch_tokens", [1, 4])
+def test_recurrent_independent_vjp(dim, logits, cotangent, prefetch_tokens):
     lengths = (0, 1, 17, 33)
     values, state, cu, bias = _case(dim, lengths, requires_grad=True, logits=logits)
     reference_inputs = [
         value.detach().clone().requires_grad_() for value in (*values, state, bias)
     ]
-    actual = tmix_wkv7_recurrent(*values, state, cu, decay_bias=bias, scale=0.75)
+    actual = tmix_wkv7_recurrent(
+        *values, state, cu, decay_bias=bias, scale=0.75,
+        prefetch_tokens=prefetch_tokens,
+    )
     expected = _reference(
         reference_inputs[:6], reference_inputs[6], lengths, reference_inputs[7], 0.75
     )
@@ -185,13 +204,16 @@ def test_recurrent_final_state_only_and_empty_sequences():
 
 @pytest.mark.memcheck
 @pytest.mark.racecheck
-def test_recurrent_checkpoint_backward_sanitizer():
+@pytest.mark.parametrize("prefetch_tokens", [1, 4])
+def test_recurrent_checkpoint_backward_sanitizer(prefetch_tokens):
     lengths = (17,)
     values, state, cu, bias = _case(64, lengths, requires_grad=True)
     reference_inputs = [
         value.detach().clone().requires_grad_() for value in (*values, state, bias)
     ]
-    actual = tmix_wkv7_recurrent(*values, state, cu, decay_bias=bias)
+    actual = tmix_wkv7_recurrent(
+        *values, state, cu, decay_bias=bias, prefetch_tokens=prefetch_tokens,
+    )
     expected = _reference(
         reference_inputs[:6], reference_inputs[6], lengths, reference_inputs[7], 1.0
     )
@@ -203,7 +225,8 @@ def test_recurrent_checkpoint_backward_sanitizer():
         torch.testing.assert_close(actual_grad, reference_grad, atol=2e-5, rtol=2e-2)
 
 
-def test_recurrent_status_masks_inactive_capacity_and_invalid_metadata():
+@pytest.mark.parametrize("prefetch_tokens", [1, 4])
+def test_recurrent_status_masks_inactive_capacity_and_invalid_metadata(prefetch_tokens):
     values, state, _, bias = _case(64, (3, 1, 1))
     # Only the first sequence is active; inactive CU entries are deliberately
     # invalid and must never determine a token range.
@@ -215,6 +238,7 @@ def test_recurrent_status_masks_inactive_capacity_and_invalid_metadata():
         cu,
         decay_bias=bias,
         _status=status,
+        prefetch_tokens=prefetch_tokens,
     )
     active = tmix_wkv7_recurrent(
         *[value[:3] for value in values],
@@ -234,15 +258,18 @@ def test_recurrent_status_masks_inactive_capacity_and_invalid_metadata():
         cu,
         decay_bias=bias,
         _status=status,
+        prefetch_tokens=prefetch_tokens,
     )
     assert torch.isnan(invalid_y).all()
     assert torch.equal(invalid_final, state)
 
 
 @pytest.mark.memcheck
+@pytest.mark.racecheck
 @pytest.mark.parametrize("dim", [64, 128, 256])
 @pytest.mark.parametrize("block_values", [32, 64])
-def test_recurrent_indexed_pool_matches_functional_forward(dim, block_values):
+@pytest.mark.parametrize("prefetch_tokens", [1, 4])
+def test_recurrent_indexed_pool_matches_functional_forward(dim, block_values, prefetch_tokens):
     values, state, cu, bias = _case(dim, (3, 1, 1))
     pool = torch.cat((state, state[:2]), dim=0)
     original = pool.clone()
@@ -265,6 +292,7 @@ def test_recurrent_indexed_pool_matches_functional_forward(dim, block_values):
         status,
         decay_bias=bias,
         block_values=block_values,
+        prefetch_tokens=prefetch_tokens,
     )
     assert torch.equal(actual[:3], expected[0])
     assert torch.isnan(actual[3:]).all()
@@ -289,7 +317,9 @@ def test_recurrent_tuning_preserves_both_forwards_and_caller_state(monkeypatch, 
     assert torch.equal(state, original)
     key = implementation._config_key(values[0], state.shape[0], bias, indexed=indexed)
     other_key = implementation._config_key(values[0], state.shape[0], bias, indexed=not indexed)
-    assert implementation._TUNED_CONFIGS[key] == selected["block_values"]
+    assert implementation._TUNED_CONFIGS[key] == (
+        selected["block_values"], selected["prefetch_tokens"],
+    )
     assert other_key not in implementation._TUNED_CONFIGS
     functional = tmix_wkv7_recurrent(*values, state, cu, decay_bias=bias)
     pool = state.clone()

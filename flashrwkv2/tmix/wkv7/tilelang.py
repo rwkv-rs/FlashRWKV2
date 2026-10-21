@@ -28,25 +28,28 @@ _TUNED_CONFIGS = {}
 
 
 @T.macro
-def _dot_keys(state, vector, partial, result):
+def _dot_keys(state, vector, partial, result, offset=0):
     """Fixed key-group FMA scan shared by forward and checkpoint replay."""
     T.clear(partial)
     for step in T.unroll(64):
         for group, value in T.Parallel(partial.shape[0], partial.shape[1]):
             key = step * partial.shape[0] + group
             partial[group, value] = T.fma(
-                state[key, value], vector[key], partial[group, value]
+                state[key, value], vector[key + offset], partial[group, value]
             )
     T.reduce_sum(partial, result, dim=0)
 
 
 @T.macro
-def _update_state(state, decay, k, v, b, state_dot_a):
+def _update_state(state, decay, k, v, b, state_dot_a, offset=0):
     for key, value in T.Parallel(state.shape[0], state.shape[1]):
         state[key, value] = T.fma(
-            k[key],
+            k[key + offset],
             v[value],
-            T.fma(b[key], state_dot_a[value], decay[key] * state[key, value]),
+            T.fma(
+                b[key + offset], state_dot_a[value],
+                decay[key + offset] * state[key, value],
+            ),
         )
 
 
@@ -61,6 +64,7 @@ def _forward_kernel(
     has_status: bool = False,
     indexed: bool = False,
     bias_dtype: str = "float32",
+    prefetch_tokens: int = 1,
 ):
     n, batch = T.dynamic("n, batch")
     state_slots = T.dynamic("state_slots") if indexed else batch
@@ -91,11 +95,14 @@ def _forward_kernel(
             partial = T.alloc_fragment((key_groups, columns), "float32")
             dot = T.alloc_fragment((columns,), "float32")
             out = T.alloc_fragment((columns,), "float32")
-            rv = T.alloc_shared((dim,), "float32")
-            wv = T.alloc_shared((dim,), "float32")
-            kv = T.alloc_shared((dim,), "float32")
-            av = T.alloc_shared((dim,), "float32")
-            bv = T.alloc_shared((dim,), "float32")
+            rv = T.alloc_shared((prefetch_tokens * dim,), "float32")
+            wv = T.alloc_shared((prefetch_tokens * dim,), "float32")
+            kv = T.alloc_shared((prefetch_tokens * dim,), "float32")
+            av = T.alloc_shared((prefetch_tokens * dim,), "float32")
+            bv = T.alloc_shared((prefetch_tokens * dim,), "float32")
+            vs = T.alloc_shared(
+                (prefetch_tokens * columns if prefetch_tokens > 1 else 0,), "float32"
+            )
             vv = T.alloc_fragment((columns,), "float32")
             layout = T.Fragment(
                 (dim, columns),
@@ -134,38 +141,60 @@ def _forward_kernel(
             else:
                 for key, value in T.Parallel(dim, columns):
                     state[key, value] = S0[seq, h, key, tile * columns + value]
-            for token in T.serial(start, end):
-                if save and (token - start) % _CHECKPOINT == 0:
-                    checkpoint = (
-                        start // _CHECKPOINT + seq + (token - start) // _CHECKPOINT
-                    )
-                    for key, value in T.Parallel(dim, columns):
-                        Boundaries[checkpoint, h, key, tile * columns + value] = state[
-                            key, value
-                        ]
-                for key in T.Parallel(dim):
-                    rv[key] = T.cast(R[token, h, key], "float32")
-                    logits = T.cast(W[token, h, key], "float32")
-                    if has_bias:
-                        logits = T.cast(
-                            T.cast(
-                                logits + T.cast(Bias[h, key], "float32"), "bfloat16"
-                            ),
-                            "float32",
+            for chunk in T.serial(T.ceildiv(end - start, prefetch_tokens)):
+                for prefetched, key in T.Parallel(prefetch_tokens, dim):
+                    token = start + chunk * prefetch_tokens + prefetched
+                    if prefetch_tokens == 1 or token < end:
+                        offset = prefetched * dim + key
+                        rv[offset] = T.cast(R[token, h, key], "float32")
+                        logits = T.cast(W[token, h, key], "float32")
+                        if has_bias:
+                            logits = T.cast(
+                                T.cast(
+                                    logits + T.cast(Bias[h, key], "float32"),
+                                    "bfloat16",
+                                ),
+                                "float32",
+                            )
+                        wv[offset] = T.exp2(
+                            _DECAY_EXP2 / (1.0 + T.exp2(-_LOG2E * logits))
                         )
-                    wv[key] = T.exp2(_DECAY_EXP2 / (1.0 + T.exp2(-_LOG2E * logits)))
-                    kv[key] = T.cast(K[token, h, key], "float32")
-                    av[key] = T.cast(A[token, h, key], "float32")
-                    bv[key] = T.cast(B[token, h, key], "float32")
-                for value in T.Parallel(columns):
-                    vv[value] = T.cast(V[token, h, tile * columns + value], "float32")
-                _dot_keys(state, av, partial, dot)
-                _update_state(state, wv, kv, vv, bv, dot)
-                _dot_keys(state, rv, partial, out)
-                for value in T.Parallel(columns):
-                    Y[token, h, tile * columns + value] = T.cast(
-                        out[value] * scale, "bfloat16"
-                    )
+                        kv[offset] = T.cast(K[token, h, key], "float32")
+                        av[offset] = T.cast(A[token, h, key], "float32")
+                        bv[offset] = T.cast(B[token, h, key], "float32")
+                if prefetch_tokens > 1:
+                    for prefetched, value in T.Parallel(prefetch_tokens, columns):
+                        token = start + chunk * prefetch_tokens + prefetched
+                        if token < end:
+                            vs[prefetched * columns + value] = T.cast(
+                                V[token, h, tile * columns + value], "float32"
+                            )
+                for within in T.serial(prefetch_tokens):
+                    token = start + chunk * prefetch_tokens + within
+                    if prefetch_tokens == 1 or token < end:
+                        if save and (token - start) % _CHECKPOINT == 0:
+                            checkpoint = (
+                                start // _CHECKPOINT + seq
+                                + (token - start) // _CHECKPOINT
+                            )
+                            for key, value in T.Parallel(dim, columns):
+                                Boundaries[
+                                    checkpoint, h, key, tile * columns + value
+                                ] = state[key, value]
+                        for value in T.Parallel(columns):
+                            if prefetch_tokens == 1:
+                                vv[value] = T.cast(
+                                    V[token, h, tile * columns + value], "float32"
+                                )
+                            else:
+                                vv[value] = vs[within * columns + value]
+                        _dot_keys(state, av, partial, dot, within * dim)
+                        _update_state(state, wv, kv, vv, bv, dot, within * dim)
+                        _dot_keys(state, rv, partial, out, within * dim)
+                        for value in T.Parallel(columns):
+                            Y[token, h, tile * columns + value] = T.cast(
+                                out[value] * scale, "bfloat16"
+                            )
             if indexed:
                 if active:
                     slot = Indices[seq]
@@ -406,6 +435,7 @@ def _forward(
     scale,
     save,
     block_values,
+    prefetch_tokens,
 ):
     n, heads, dim = r.shape
     batch = initial_state.shape[0]
@@ -426,6 +456,7 @@ def _forward(
         status.numel() != 0,
         False,
         "bfloat16" if bias.dtype == torch.bfloat16 else "float32",
+        prefetch_tokens,
     )(
         r,
         decay_logits,
@@ -447,9 +478,13 @@ def _forward(
 
 class _Recurrent(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, r, w, k, v, a, b, state, cu, bias, status, scale, block_values):
+    def forward(
+        ctx, r, w, k, v, a, b, state, cu, bias, status, scale, block_values,
+        prefetch_tokens,
+    ):
         output, final_state, boundary = _forward(
-            r, w, k, v, a, b, state, cu, bias, status, scale, True, block_values
+            r, w, k, v, a, b, state, cu, bias, status, scale, True, block_values,
+            prefetch_tokens,
         )
         ctx.save_for_backward(r, w, k, v, a, b, cu, bias, status, boundary)
         ctx.state_shape = state.shape
@@ -494,7 +529,7 @@ class _Recurrent(torch.autograd.Function):
         )
         dr, dw, dk, dv, da, db = gradients.to(torch.bfloat16).unbind(0)
         dbias = dw.float().sum(dim=0).to(bias.dtype) if bias.numel() else None
-        return dr, dw, dk, dv, da, db, ds0, None, dbias, None, None, None
+        return dr, dw, dk, dv, da, db, ds0, None, dbias, None, None, None, None
 
 
 def _check_inputs(
@@ -509,6 +544,7 @@ def _check_inputs(
     scale,
     decay_bias,
     block_values,
+    prefetch_tokens,
     batch,
 ):
     if r.ndim != 3 or r.shape[1] < 1 or r.shape[2] not in (64, 128, 256):
@@ -543,6 +579,8 @@ def _check_inputs(
         raise ValueError("scale must be finite")
     if block_values not in (32, 64):
         raise ValueError("block_values must be 32 or 64")
+    if prefetch_tokens not in (1, 4):
+        raise ValueError("prefetch_tokens must be 1 or 4")
     if decay_bias is not None and (
         decay_bias.shape not in (r.shape[1:], (r.shape[1] * r.shape[2],))
         or decay_bias.dtype not in (torch.float32, torch.bfloat16)
@@ -585,6 +623,7 @@ def _infer_recurrent(
     scale=1.0,
     decay_bias=None,
     block_values=None,
+    prefetch_tokens=None,
 ):
     """Launch the common forward directly against an indexed inference pool."""
     if (
@@ -608,10 +647,12 @@ def _infer_recurrent(
         scale,
         decay_bias,
         64 if block_values is None else block_values,
+        1 if prefetch_tokens is None else prefetch_tokens,
         batch,
     )
-    if block_values is None:
-        block_values = _TUNED_CONFIGS.get(_config_key(r, batch, decay_bias, indexed=True), 64)
+    config = _TUNED_CONFIGS.get(_config_key(r, batch, decay_bias, indexed=True), (64, 1))
+    block_values = config[0] if block_values is None else block_values
+    prefetch_tokens = config[1] if prefetch_tokens is None else prefetch_tokens
     _, heads, dim = r.shape
     bias = _bias_tensor(r, decay_bias)
     output = torch.empty_like(v)
@@ -626,6 +667,7 @@ def _infer_recurrent(
         True,
         True,
         "bfloat16" if bias.dtype == torch.bfloat16 else "float32",
+        prefetch_tokens,
     )(
         r,
         decay_logits,
@@ -658,6 +700,7 @@ def tmix_wkv7_recurrent(
     scale: float = 1.0,
     decay_bias: torch.Tensor | None = None,
     block_values: int | None = None,
+    prefetch_tokens: int | None = None,
     _status: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run packed recurrent forward, with the same arithmetic in training.
@@ -671,7 +714,9 @@ def tmix_wkv7_recurrent(
 
     ``block_values`` chooses independent value columns per CTA, leaving the
     key reduction unchanged. ``None`` uses an explicitly tuned configuration,
-    or 64 columns until tuning has run for this device and shape.
+    or 64 columns until tuning has run for this device and shape. Likewise,
+    ``prefetch_tokens`` selects one or four input tokens per shared-memory load;
+    it defaults to one until explicit tuning.
     """
     batch = initial_state.shape[0] if initial_state.ndim else 0
     _check_inputs(
@@ -686,10 +731,12 @@ def tmix_wkv7_recurrent(
         scale,
         decay_bias,
         64 if block_values is None else block_values,
+        1 if prefetch_tokens is None else prefetch_tokens,
         batch,
     )
-    if block_values is None:
-        block_values = _TUNED_CONFIGS.get(_config_key(r, batch, decay_bias), 64)
+    config = _TUNED_CONFIGS.get(_config_key(r, batch, decay_bias), (64, 1))
+    block_values = config[0] if block_values is None else block_values
+    prefetch_tokens = config[1] if prefetch_tokens is None else prefetch_tokens
     bias = _bias_tensor(r, decay_bias)
     status = (
         _status
@@ -698,8 +745,8 @@ def tmix_wkv7_recurrent(
     )
     inputs = (r, decay_logits, k, v, a, b, initial_state, cu_seqlens, bias, status)
     if torch.is_grad_enabled() and any(value.requires_grad for value in inputs):
-        return _Recurrent.apply(*inputs, float(scale), block_values)
-    return _forward(*inputs, float(scale), False, block_values)[:2]
+        return _Recurrent.apply(*inputs, float(scale), block_values, prefetch_tokens)
+    return _forward(*inputs, float(scale), False, block_values, prefetch_tokens)[:2]
 
 
 @torch.no_grad()
@@ -727,7 +774,7 @@ def tune_tmix_wkv7_recurrent(
     """
     from ..._internal.tuning import select_config
 
-    def functional(columns):
+    def functional(config):
         return tmix_wkv7_recurrent(
             r,
             decay_logits,
@@ -739,32 +786,39 @@ def tune_tmix_wkv7_recurrent(
             cu_seqlens,
             scale=scale,
             decay_bias=decay_bias,
-            block_values=columns,
+            block_values=config[0],
+            prefetch_tokens=config[1],
         )
 
-    canonical = functional(64)
+    canonical = functional((64, 1))
     batch = initial_state.shape[0]
     scratch = initial_state.clone()
     indices = torch.arange(batch, dtype=torch.int32, device=r.device)
     status = torch.tensor([0, r.shape[0], batch], dtype=torch.int32, device=r.device)
 
-    def inference(columns):
+    def inference(config):
         return _infer_recurrent(
             r, decay_logits, k, v, a, b, scratch, cu_seqlens, indices, status,
-            scale=scale, decay_bias=decay_bias, block_values=columns,
+            scale=scale, decay_bias=decay_bias,
+            block_values=config[0], prefetch_tokens=config[1],
         )
 
-    def check(columns):
+    def check(config):
         scratch.copy_(initial_state)
-        output, final = functional(columns)
-        inferred = inference(columns)
+        output, final = functional(config)
+        inferred = inference(config)
         return output, final, inferred, scratch.clone()
 
     reference = (*canonical, *canonical)
     run = inference if indexed else functional
-    best, measurements = select_config((64, 32), run, check=check, reference=reference)
+    prefetches = (1, 4) if r.shape[0] > batch else (1,)
+    candidates = tuple((columns, count) for columns in (64, 32) for count in prefetches)
+    best, measurements = select_config(candidates, run, check=check, reference=reference)
     _TUNED_CONFIGS[_config_key(r, batch, decay_bias, indexed=indexed)] = best
-    return {"block_values": best, "indexed": indexed, "candidates": measurements}
+    return {
+        "block_values": best[0], "prefetch_tokens": best[1],
+        "indexed": indexed, "candidates": measurements,
+    }
 
 
 __all__ = ["tmix_wkv7_recurrent", "tune_tmix_wkv7_recurrent"]
