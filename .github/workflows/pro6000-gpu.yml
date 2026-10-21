@@ -278,14 +278,6 @@ jobs:
       - name: Compute Sanitizer racecheck
         if: matrix.torch == '2.13.0'
         run: compute-sanitizer --error-exitcode=1 --tool racecheck .venv/bin/python -m pytest -q tests -m racecheck
-      - name: Multi-size tuning, native linear comparisons and NoRA training benchmarks
-        if: matrix.torch == '2.13.0'
-        run: |
-          .venv/bin/python ci/benchmark_gate.py run-suite \
-            --modules '["head/linear","cmix","post_norm","tmix/tokenshift","tmix/wkv_prepare","tmix/wkv7","tmix/wkv7/rl_infctx","tmix/readout","head/l2wrap_ce"]' \
-            --python .venv/bin/python --revision '${{ github.sha }}' --status candidate \
-            --output artifacts/nora-benchmarks --summary artifacts/nora-benchmark-summary.json \
-            --require-complete
       - name: Compare original CUDA inference on the same inputs
         if: matrix.torch == '2.13.0'
         run: |
@@ -332,6 +324,14 @@ jobs:
             --shapes h12d64 h16d64 h32d64 h40d64 h64d64 h80d64 h16d128 h8d256 \
             --cases 1x1 16x1 1x16 64x16 1x128 --decay-bias --timing-mode graph \
             --output "$comparison_output/tmix-wkv7.json"
+      - name: Multi-size tuning, native linear comparisons and NoRA training benchmarks
+        if: matrix.torch == '2.13.0'
+        run: |
+          .venv/bin/python ci/benchmark_gate.py run-suite \
+            --modules '["head/linear","tmix/wkv7","tmix/wkv7/rl_infctx","cmix","post_norm","tmix/tokenshift","tmix/wkv_prepare","tmix/readout","head/l2wrap_ce"]' \
+            --python .venv/bin/python --revision '${{ github.sha }}' --status candidate \
+            --output artifacts/nora-benchmarks --summary artifacts/nora-benchmark-summary.json \
+            --require-complete
       - name: Record complete CUDA coverage
         if: matrix.torch == '2.13.0'
         env:
@@ -361,6 +361,7 @@ jobs:
           path.write_text(json.dumps(payload, indent=2) + "\n")
           PY
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: flashrwkv2-validation-torch-${{ matrix.torch }}-${{ needs.plan.outputs.source_tree_sha }}
           path: |

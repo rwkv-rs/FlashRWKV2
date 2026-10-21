@@ -528,6 +528,7 @@ def run_module(
     experiments = []
     workloads = []
     for case in BENCHMARKS[module]:
+        print(f"Running benchmark: {module}/{case.workload}", file=sys.stderr, flush=True)
         case_profiles, case_experiments, case_records = _run_case(
             module, case, python=python, status=status
         )
