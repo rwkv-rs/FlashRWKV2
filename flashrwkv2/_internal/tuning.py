@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: MIT
 """Measure explicit kernel candidates only after exact-output validation."""
 
+import math
+from statistics import median
+
 import torch
 
 
@@ -48,6 +51,18 @@ def select_config(candidates, run, *, check=None, reference=None, warmup=3, repe
         graph.replay()
         end.record()
         end.synchronize()
-        record["milliseconds"] = start.elapsed_time(end) / repeat
+        replays = math.ceil(10.0 / start.elapsed_time(end))
+        for _ in range(replays):
+            graph.replay()
+        samples = []
+        for _ in range(3):
+            start.record()
+            for _ in range(replays):
+                graph.replay()
+            end.record()
+            end.synchronize()
+            samples.append(start.elapsed_time(end) / (repeat * replays))
+        record["raw_milliseconds"] = samples
+        record["milliseconds"] = median(samples)
     best = min(eligible, key=lambda item: item[1]["milliseconds"])[0]
     return best, measurements

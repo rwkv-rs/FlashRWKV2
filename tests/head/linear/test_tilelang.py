@@ -71,6 +71,7 @@ def test_tilelang_linear_k1_head_device_compilation_without_gpu(arch):
 
 @pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("bias_dtype", [None, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("operator_benchmark", [False, True])
 @pytest.mark.parametrize(
     "shape", [
         (32, 96, 64), (1, 64, 96), (15, 128, 128),
@@ -78,7 +79,7 @@ def test_tilelang_linear_k1_head_device_compilation_without_gpu(arch):
     ]
 )
 def test_tilelang_linear_tuning_checks_production_and_skips_compile_failures(
-    monkeypatch, output_dtype, bias_dtype, shape
+    monkeypatch, output_dtype, bias_dtype, shape, operator_benchmark
 ):
     from flashrwkv2._internal import linear as implementation
     from flashrwkv2._internal import tuning
@@ -92,6 +93,16 @@ def test_tilelang_linear_tuning_checks_production_and_skips_compile_failures(
     compiled_dtypes = set()
     compiled_configs = set()
     select_calls = 0
+    benchmark_configs = []
+
+    def benchmark():
+        config = implementation._TUNED_CONFIGS[
+            implementation._key(x, weight, output_dtype, bias)
+        ]
+        assert config != rejected
+        if output_dtype == torch.bfloat16:
+            assert config != wrong_bf16
+        benchmark_configs.append(config)
 
     def compile_kernel(
         outputs, channels, dtype, compiled_bias, has_bias, config, *args
@@ -126,12 +137,15 @@ def test_tilelang_linear_tuning_checks_production_and_skips_compile_failures(
             assert {config[3] for config in candidates} == {32}
         else:
             assert len({config[:3] for config in candidates}) == (
-                2 if 16 <= rows <= 128 else 1
+                6 if rows > 128 else 4 if 16 <= rows <= 128 else 2
             )
             assert {config[3] for config in candidates} == (
-                {32} if rows > 128 else
+                {32, 64} if rows > 128 else
                 {32, *(span for span in (64, 128) if channels % span == 0)}
             )
+            if rows > 128:
+                assert all((256, width, 2, 64) in candidates for width in (32, 64, 128))
+                assert all(config[2] == 2 for config in candidates if config[3] == 64)
         select_calls += 1
         assert tuple(value.dtype for value in reference) == (
             (torch.float32, torch.bfloat16)
@@ -164,7 +178,14 @@ def test_tilelang_linear_tuning_checks_production_and_skips_compile_failures(
         lambda device: SimpleNamespace(shared_memory_per_block_optin=101376),
     )
     monkeypatch.setattr(tuning, "select_config", select_config)
-    result = implementation.tune_linear(x, weight, output_dtype, bias=bias)
+    result = implementation.tune_linear(
+        x, weight, output_dtype, bias=bias,
+        benchmark=benchmark if operator_benchmark else None,
+    )
+    assert result["timing_scope"] == (
+        "operator" if operator_benchmark else "projection"
+    )
+    assert bool(benchmark_configs) == operator_benchmark
     assert select_calls == (2 if channels % 64 == 0 else 1)
     assert compiled_dtypes == (
         {"bfloat16", "float32"} if output_dtype == torch.bfloat16 else {"float32"}

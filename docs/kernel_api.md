@@ -115,10 +115,14 @@ readout 使用 `output_*`，head 使用 `lora_a/lora_b/lora_scale/use_nora`。
 按设备及实际 shape 选择配置。先与固定数值基准逐位比较，再用 CUDA Graph 计时；
 候选只能改变输出 tiling、pipeline 或每 CTA 的独立行数。验收覆盖 RTX 4090
 SM89 与 PRO6000 SM120 的 decode、小 batch、prefill 和训练形状。
+调优用首批 device 耗时估算约 10 ms 的重放次数，预热后测量三批并取中位数。
+各候选保留 `raw_milliseconds` 三批单次延迟，正式基准的 10000 次计时保持独立。
 
 投影先以 32 元素的 K 拷贝跨度选择输出 tile，再为获胜 tile 测量 64/128 元素的跨度。
-同时测量 M 取输入行数向上取整到 2 的幂（限于 16–256）的最佳 tile，最多增加
-四个大拷贝候选。较大的跨度必须整除输入宽度。每次拷贝内部仍按连续 32 元素块执行相同的 MMA 序列，
+同时测量 M 取输入行数向上取整到 2 的幂（限于 16–256）的最佳 tile；超过 128 行时，
+保留该 M tile 的 32/64/128 三种列宽。拷贝阶段分别核对两级和三级 pipeline，
+先按设备共享内存上限排除无法启动的候选。较大的跨度必须整除输入宽度。
+每次拷贝内部仍按连续 32 元素块执行相同的 MMA 序列，
 保持 MMA 次数与 FP32 累加顺序。未显式调优时，默认 M tile 按行数从
 16/32/64/128 中选择；只有 CTA 网格可覆盖设备 SM 时才增大 M tile。
 超过 128 行的投影会测量 256 行 tile，较大的 tile 使用最多 256 个线程复用权重，
@@ -128,6 +132,9 @@ MMA 的 K 序列保持不变。
 res 等变体都必须保持相同结果。线性层的 bias presence/dtype 属于调优 key。
 编译不受工具链支持的线性候选会在结果中记录 `compile_error`；运行失败直接报错。
 候选的 staging buffers 超出设备共享内存上限时，记录 `resource_error` 并在启动前排除。
+`tune_linear` 可通过 `benchmark` 回调测量实际前向阶段，结果用 `timing_scope`
+区分整个阶段与单个投影。Prepare 基准先调优各投影，再按完整前向重选 R/K/V 的
+共同配置，保持三份 dense weights 的实际工作集；反向基准仍独立测量投影。
 调优需在 CUDA Graph capture 前完成，并使用有效、非空的 active workload。
 WKV 的 functional 与 indexed pool 模式分别缓存配置；候选同时校验两种模式的
 输出和 FP32 最终状态，按实际调用模式计时。

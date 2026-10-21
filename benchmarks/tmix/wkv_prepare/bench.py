@@ -150,6 +150,9 @@ def benchmark(args):
     sample = run()
     output_dtypes = [str(value.dtype).removeprefix("torch.") for value in sample]
     del sample
+    if args.tune and not backward:
+        # R/K/V together can exceed L2 even when one dense weight fits.
+        tuning["dense"] = tune_linear(source, dense[0], benchmark=run)
     return {
         "operator": "pretrain_tmix_wkv_prepare_bf16"
         if operator == "pretrain"

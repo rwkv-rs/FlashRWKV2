@@ -484,14 +484,15 @@ def adapter_linear(
 
 
 @torch.no_grad()
-def tune_linear(x, weight, output_dtype=None, *, bias=None):
+def tune_linear(x, weight, output_dtype=None, *, bias=None, benchmark=None):
     """Measure output tiles without changing the canonical MMA reduction.
 
     This explicit warmup uses the actual device and shape. Each candidate must
     equal the canonical kernel in FP32 and the production output dtype, including
     independent one-row FP32 replays, before its latency can select it. Results
-    apply to this process, device model, and bias dtype; callers can record the
-    returned measurements with their benchmark.
+    apply to this process, device model, and bias dtype. An optional zero-argument
+    ``benchmark`` measures the owning forward operator with each candidate in
+    its dispatch cache, preserving the operator's working set during tuning.
     """
     from .tuning import select_config
 
@@ -533,26 +534,38 @@ def tune_linear(x, weight, output_dtype=None, *, bias=None):
     ).shared_memory_per_block_optin
     measurements = {}
     best_config = _DEFAULT_CONFIG
+
+    def run(config):
+        if benchmark is None:
+            return _forward(x, weight, bias, output_dtype, config)
+        _TUNED_CONFIGS[_key(x, weight, output_dtype, bias)] = config
+        return benchmark()
+
     for phase in ("tiles", "copies"):
         if phase == "copies":
-            # Check a row tile with little padding as well as the 32-K winner.
+            # Copy spans can change the best column tile and pipeline depth.
             copies = [span for span in (64, 128) if x.shape[1] % span == 0]
             if not copies:
                 break
             tiles = [best_config]
             row_tile = min(256, max(16, 1 << (x.shape[0] - 1).bit_length()))
-            if best_config[0] != row_tile:
-                matched = [
-                    item for item in measurements.values()
-                    if item.get("bitwise_equal") and item["config"][0] == row_tile
-                ]
-                if matched:
-                    tiles.append(
-                        min(matched, key=lambda item: item["milliseconds"])["config"]
-                    )
-            candidates = (
-                candidate for tile in tiles
-                for candidate in (tile, *(tile[:3] + (span,) for span in copies))
+            matched = [
+                item for item in measurements.values()
+                if item.get("bitwise_equal") and item["config"][0] == row_tile
+            ]
+            if x.shape[0] > 128:
+                tiles.extend(item["config"] for item in matched)
+            elif best_config[0] != row_tile and matched:
+                tiles.append(
+                    min(matched, key=lambda item: item["milliseconds"])["config"]
+                )
+            candidates = tuple(
+                dict.fromkeys(
+                    tile[:2] + (stages, span)
+                    for tile in tiles
+                    for stages in (2, 3)
+                    for span in (32, *copies)
+                )
             )
         eligible, rejected = [], []
         for config in candidates:
@@ -589,7 +602,7 @@ def tune_linear(x, weight, output_dtype=None, *, bias=None):
                 eligible.append(config)
         best_config, checked = select_config(
             eligible,
-            lambda config: _forward(x, weight, bias, output_dtype, config),
+            run,
             check=lambda config: tuple(
                 _forward(x, weight, bias, dtype, config) for dtype in check_dtypes
             ),
@@ -601,5 +614,6 @@ def tune_linear(x, weight, output_dtype=None, *, bias=None):
     return {
         "config": best_config,
         "milliseconds": best_ms,
+        "timing_scope": "operator" if benchmark is not None else "projection",
         "candidates": list(measurements.values()),
     }
