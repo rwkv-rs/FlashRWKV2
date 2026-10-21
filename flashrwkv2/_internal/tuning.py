@@ -68,5 +68,6 @@ def select_config(candidates, run, *, check=None, reference=None, warmup=3, repe
             samples.append(start.elapsed_time(end) / (repeat * replays))
         record["raw_milliseconds"] = samples
         record["milliseconds"] = median(samples)
+        record["launches_per_graph"] = repeat
     best = min(eligible, key=lambda item: item[1]["milliseconds"])[0]
     return best, measurements

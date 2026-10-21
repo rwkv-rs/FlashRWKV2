@@ -515,11 +515,8 @@ def tune_linear(x, weight, output_dtype=None, *, bias=None, benchmark=None):
     block_rows = (16,) if x.shape[0] < 16 else (16, 32, 64, 128)
     if x.shape[0] > 128:
         block_rows += (256,)
-    block_cols = (
-        (8, 16, 32, 64, 128)
-        if x.shape[0] < 16 and weight.shape[0] <= 128
-        else (32, 64, 128)
-    )
+    narrow_tiles = x.shape[0] < 16 and weight.shape[0] <= 128
+    block_cols = (8, 16, 32, 64, 128) if narrow_tiles else (32, 64, 128)
     candidates = (
         (block_m, block_n, stages, 32)
         for block_m in block_rows
@@ -544,7 +541,8 @@ def tune_linear(x, weight, output_dtype=None, *, bias=None, benchmark=None):
     for phase in ("tiles", "copies"):
         if phase == "copies":
             # Copy spans can change the best column tile and pipeline depth.
-            copies = [span for span in (64, 128) if x.shape[1] % span == 0]
+            spans = (64, 128, 256, 512, 1024) if narrow_tiles else (64, 128)
+            copies = [span for span in spans if x.shape[1] % span == 0]
             if not copies:
                 break
             tiles = [best_config]
@@ -553,7 +551,7 @@ def tune_linear(x, weight, output_dtype=None, *, bias=None, benchmark=None):
                 item for item in measurements.values()
                 if item.get("bitwise_equal") and item["config"][0] == row_tile
             ]
-            if x.shape[0] > 128:
+            if x.shape[0] > 128 or narrow_tiles:
                 tiles.extend(item["config"] for item in matched)
             elif best_config[0] != row_tile and matched:
                 tiles.append(
@@ -609,6 +607,27 @@ def tune_linear(x, weight, output_dtype=None, *, bias=None, benchmark=None):
             reference=reference,
         )
         measurements.update((item["config"], item) for item in checked + rejected)
+    # Finalists use the formal benchmark's graph length. Short graphs can rank
+    # copy spans differently from a sustained benchmark.
+    finalists = {}
+    for item in measurements.values():
+        if item.get("bitwise_equal"):
+            span = item["config"][3]
+            if (
+                span not in finalists
+                or item["milliseconds"] < finalists[span]["milliseconds"]
+            ):
+                finalists[span] = item
+    best_config, checked = select_config(
+        tuple(item["config"] for item in finalists.values()),
+        run,
+        check=lambda config: tuple(
+            _forward(x, weight, bias, dtype, config) for dtype in check_dtypes
+        ),
+        reference=reference,
+        repeat=1000,
+    )
+    measurements.update((item["config"], item) for item in checked)
     best_ms = measurements[best_config]["milliseconds"]
     _TUNED_CONFIGS[_key(x, weight, output_dtype, bias)] = best_config
     return {

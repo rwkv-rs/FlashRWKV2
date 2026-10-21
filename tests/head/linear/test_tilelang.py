@@ -75,7 +75,8 @@ def test_tilelang_linear_k1_head_device_compilation_without_gpu(arch):
 @pytest.mark.parametrize(
     "shape", [
         (32, 96, 64), (1, 64, 96), (15, 128, 128),
-        (1, 129, 64), (16, 64, 160), (129, 256, 128), (256, 256, 128),
+        (1, 129, 64), (1, 64, 4096), (16, 64, 160),
+        (129, 256, 128), (256, 256, 128),
     ]
 )
 def test_tilelang_linear_tuning_checks_production_and_skips_compile_failures(
@@ -122,7 +123,7 @@ def test_tilelang_linear_tuning_checks_production_and_skips_compile_failures(
         value = 2 if config == wrong_bf16 and dtype == torch.bfloat16 else 1
         return torch.full((x.shape[0], weight.shape[0]), value, dtype=dtype)
 
-    def select_config(candidates, run, *, check, reference):
+    def select_config(candidates, run, *, check, reference, repeat=20):
         nonlocal select_calls
         candidates = tuple(candidates)
         assert rejected not in candidates
@@ -135,17 +136,29 @@ def test_tilelang_linear_tuning_checks_production_and_skips_compile_failures(
                 {8, 16, 32, 64, 128} if narrow_tiles else {32, 64, 128}
             )
             assert {config[3] for config in candidates} == {32}
-        else:
-            assert len({config[:3] for config in candidates}) == (
-                6 if rows > 128 else 4 if 16 <= rows <= 128 else 2
-            )
+        elif repeat == 20:
+            if rows < 16 and outputs <= 128:
+                assert all((16, width, 2, 64) in candidates for width in (8, 16))
+                if channels == 4096:
+                    assert (16, 8, 2, 1024) in candidates
+                    assert (16, 8, 3, 1024) not in candidates
+            else:
+                assert len({config[:3] for config in candidates}) == (
+                    6 if rows > 128 else 4 if rows >= 16 else 2
+                )
+            spans = (64, 128, 256, 512, 1024) if (
+                rows < 16 and outputs <= 128
+            ) else (64, 128)
             assert {config[3] for config in candidates} == (
                 {32, 64} if rows > 128 else
-                {32, *(span for span in (64, 128) if channels % span == 0)}
+                {32, *(span for span in spans if channels % span == 0)}
             )
             if rows > 128:
                 assert all((256, width, 2, 64) in candidates for width in (32, 64, 128))
                 assert all(config[2] == 2 for config in candidates if config[3] == 64)
+        else:
+            assert repeat == 1000
+            assert len(candidates) == len({config[3] for config in candidates})
         select_calls += 1
         assert tuple(value.dtype for value in reference) == (
             (torch.float32, torch.bfloat16)
@@ -186,7 +199,7 @@ def test_tilelang_linear_tuning_checks_production_and_skips_compile_failures(
         "operator" if operator_benchmark else "projection"
     )
     assert bool(benchmark_configs) == operator_benchmark
-    assert select_calls == (2 if channels % 64 == 0 else 1)
+    assert select_calls == (3 if channels % 64 == 0 else 2)
     assert compiled_dtypes == (
         {"bfloat16", "float32"} if output_dtype == torch.bfloat16 else {"float32"}
     )
@@ -422,16 +435,19 @@ def test_tilelang_linear_narrow_tiles_preserve_results(
         (16, 32, 3, 32), (32, 128, 2, 32), (64, 64, 3, 32), (128, 32, 2, 32),
         (256, 64, 2, 32),
         pytest.param((256, 128, 2, 64), marks=(pytest.mark.memcheck, pytest.mark.racecheck)),
+        pytest.param((16, 16, 3, 512), marks=(pytest.mark.memcheck, pytest.mark.racecheck)),
+        pytest.param((16, 8, 2, 1024), marks=(pytest.mark.memcheck, pytest.mark.racecheck)),
     ]
 )
 @pytest.mark.parametrize("input_major", [False, True])
 @pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float32])
 def test_tilelang_linear_tiling_preserves_results(config, input_major, output_dtype):
     torch.manual_seed(77)
-    channels = 160 if config[3] == 32 else 128
-    x = torch.randn(257, channels, device="cuda", dtype=torch.bfloat16)
-    weight = torch.randn(257, channels, device="cuda", dtype=torch.bfloat16)
-    bias = torch.randn(257, device="cuda", dtype=torch.float32)
+    channels = 4096 if config[3] >= 256 else 160 if config[3] == 32 else 128
+    rows, outputs = (17, 64) if config[3] >= 256 else (257, 257)
+    x = torch.randn(rows, channels, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(outputs, channels, device="cuda", dtype=torch.bfloat16)
+    bias = torch.randn(outputs, device="cuda", dtype=torch.float32)
     if input_major:
         weight = weight.t().contiguous().t()
     canonical = _forward(x, weight, bias, output_dtype, (16, 64, 2, 32))
