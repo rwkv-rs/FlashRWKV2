@@ -3,32 +3,37 @@
 
 from collections.abc import Sequence
 
-import torch
 import tilelang
 import tilelang.language as T
+import torch
 
-from ...post_norm.tilelang import _check_inputs as _check_norm, _normalize, _row_layout
+from ...post_norm.tilelang import _check_inputs as _check_norm
+from ...post_norm.tilelang import _normalize, _row_layout
 
 _BLOCK_CONFIGS = {}
 _FUSED_CONFIGS = {}
 
 
 def _config_key(x, mixes, batch):
-    return (x.device.index, x.shape, mixes.shape[0], batch)
+    return (x.device.index, x.shape, len(mixes), batch)
 
 
-def _pack_mixes(x, mixes):
-    if isinstance(mixes, torch.Tensor):
+def _pack_mixes(x, mixes, *, pack=True):
+    if isinstance(mixes, torch.Tensor) and pack:
         return mixes
     mixes = tuple(mixes)
     if not mixes or any(t.shape != (x.shape[-1],) for t in mixes):
         raise ValueError("TokenShift parameters must have shape [C]")
     if any(t.device != x.device or t.dtype != torch.bfloat16 or not t.is_contiguous() for t in mixes):
         raise ValueError("TokenShift parameters must be contiguous bfloat16 and share x's device")
+    if not pack:
+        if x.shape[-1] % 2 == 0 and any(mix.data_ptr() % 4 for mix in mixes):
+            mixes = tuple(torch.stack(mixes).unbind(0))
+        return mixes
     return mixes[0].unsqueeze(0) if len(mixes) == 1 else torch.stack(mixes)
 
 
-@tilelang.jit(pass_configs={"tl.enable_fast_math": False}, out_idx=[8, 9], compile_flags=["--fmad=false"])
+@tilelang.jit(pass_configs={"tl.enable_fast_math": False}, out_idx=[13, 14], compile_flags=["--fmad=false"])
 def _fused_forward(channels: int, count: int, eps: float, rows_per_block: int = 1):
     rows, slots = T.dynamic("rows, slots")
     block, row_threads, layout = _row_layout(channels, rows_per_block)
@@ -39,7 +44,12 @@ def _fused_forward(channels: int, count: int, eps: float, rows_per_block: int = 
         Res: T.Tensor((rows, channels), "bfloat16"),
         Weight: T.Tensor((channels,), "bfloat16"),
         Bias: T.Tensor((channels,), "bfloat16"),
-        Mix: T.Tensor((count, channels), "bfloat16"),
+        Mix0: T.Tensor((channels,), "bfloat16"),
+        Mix1: T.Tensor((channels,), "bfloat16"),
+        Mix2: T.Tensor((channels,), "bfloat16"),
+        Mix3: T.Tensor((channels,), "bfloat16"),
+        Mix4: T.Tensor((channels,), "bfloat16"),
+        Mix5: T.Tensor((channels,), "bfloat16"),
         Pool: T.Tensor((slots, channels), "bfloat16"),
         Indices: T.Tensor((rows,), "int32"),
         Status: T.Tensor((3,), "int32"),
@@ -75,9 +85,20 @@ def _fused_forward(channels: int, count: int, eps: float, rows_per_block: int = 
                     row = tile * rows_per_block + r
                     if row < rows and c < channels and Status[0] == 0 and row < Status[2]:
                         current = T.cast(normalized[r, c], "float32")
+                        factor = T.cast(T.if_then_else(
+                            m == 0, Mix0[c], T.if_then_else(
+                                m == 1, Mix1[c], T.if_then_else(
+                                    m == 2, Mix2[c], T.if_then_else(
+                                        m == 3, Mix3[c], T.if_then_else(
+                                            m == 4, Mix4[c], Mix5[c]
+                                        )
+                                    )
+                                )
+                            )
+                        ), "float32")
                         Y[m, row, c] = current + (
                             T.cast(previous[r, c], "float32") - current
-                        ) * T.cast(Mix[m, c], "float32")
+                        ) * factor
                     elif row < rows and c < channels:
                         Y[m, row, c] = T.float32(float("nan"))
             for r, c in T.Parallel(rows_per_block, block):
@@ -90,12 +111,11 @@ def _fused_forward(channels: int, count: int, eps: float, rows_per_block: int = 
 
 @torch.no_grad()
 def fused_post_norm_tokenshift(x, res, weight, bias, mixes, pool, indices, status, eps=1e-5):
-    """T=1 per sequence: shared LN plus TokenShift and indexed state in one kernel."""
+    """Fuse T=1 LN and indexed TokenShift for TMix's six or CMix's one mix."""
     _check_norm(x, weight, bias, res, eps)
-    mixes = _pack_mixes(x, mixes)
+    mixes = _pack_mixes(x, mixes, pack=False)
     if (
         x.ndim != 2 or indices.shape != (x.shape[0],)
-        or mixes.ndim != 2 or mixes.shape[1] != x.shape[1] or mixes.shape[0] == 0
     ):
         raise ValueError("fused TokenShift expects one packed row per sequence and mixes [K,C]")
     if (
@@ -103,13 +123,13 @@ def fused_post_norm_tokenshift(x, res, weight, bias, mixes, pool, indices, statu
         or pool.device != x.device or not pool.is_contiguous()
     ):
         raise ValueError("shift state must be contiguous CUDA bfloat16 [slots,C]")
-    if mixes.dtype != torch.bfloat16 or mixes.device != x.device or not mixes.is_contiguous():
-        raise ValueError("mixes must be contiguous CUDA bfloat16 on x's device")
-    if x.shape[1] % 2 == 0 and (pool.data_ptr() % 4 or mixes.data_ptr() % 4):
+    if x.shape[1] % 2 == 0 and pool.data_ptr() % 4:
         raise ValueError("fused TokenShift state and parameters must be 4-byte aligned")
     group = _FUSED_CONFIGS.get(_config_key(x, mixes, x.shape[0]), 1)
-    total, output = _fused_forward(x.shape[1], mixes.shape[0], float(eps), group)(
-        x, res, weight, bias, mixes, pool, indices, status
+    # CMix reuses its pointer for the unused TMix parameter arguments.
+    mix_args = mixes + (mixes[-1],) * (6 - len(mixes))
+    total, output = _fused_forward(x.shape[1], len(mixes), float(eps), group)(
+        x, res, weight, bias, *mix_args, pool, indices, status
     )
     return total, tuple(output.unbind(0))
 
@@ -406,13 +426,14 @@ def tune_fused_tokenshift(x, res, weight, bias, mixes, pool, indices, status, ep
     """Tune T=1 row grouping using private state, checking outputs and final slots."""
     from ..._internal.tuning import select_config
 
-    mixes = _pack_mixes(x, mixes)
+    mixes = _pack_mixes(x, mixes, pack=False)
     scratch = pool.clone()
     fused_post_norm_tokenshift(x, res, weight, bias, mixes, scratch, indices, status, eps)
+    mix_args = mixes + (mixes[-1],) * (6 - len(mixes))
 
     def run(group):
-        return _fused_forward(x.shape[1], mixes.shape[0], eps, group)(
-            x, res, weight, bias, mixes, scratch, indices, status
+        return _fused_forward(x.shape[1], len(mixes), eps, group)(
+            x, res, weight, bias, *mix_args, scratch, indices, status
         )
 
     def check(group):

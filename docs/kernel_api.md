@@ -141,6 +141,8 @@ res 等变体都必须保持相同结果。线性层的 bias presence/dtype 属�
 共同配置，保持三份 dense weights 的实际工作集；反向基准仍独立测量投影。
 CMix 前向基准同样按完整阶段重选 key/value 投影，以保留两份权重及 ReLU²
 中间结果共同产生的缓存行为。
+单 token 的 PostNorm+TokenShift 融合路径直接读取独立的 mix 参数，
+避免每次调用都先在 GPU 上打包六路参数；CMix 的单路复用使用同一 kernel。
 调优需在 CUDA Graph capture 前完成，并使用有效、非空的 active workload。
 WKV 的 functional 与 indexed pool 模式分别缓存配置；候选同时校验两种模式的
 输出和 FP32 最终状态，按实际调用模式计时。

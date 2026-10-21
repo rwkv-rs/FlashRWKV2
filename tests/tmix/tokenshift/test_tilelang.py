@@ -114,7 +114,9 @@ def test_fused_tuning_rejects_changed_pool_and_preserves_caller_state(monkeypatc
     status = torch.tensor([0, 3, 3], dtype=torch.int32)
 
     def forward(channels, count, eps, rows_per_block=1):
-        def kernel(x, res, weight, bias, mixes, scratch, indices, status):
+        def kernel(x, res, weight, bias, *parameters_and_state):
+            assert len(parameters_and_state) == 9
+            scratch, indices, status = parameters_and_state[-3:]
             scratch[indices.long()] = 2 if rows_per_block == 2 else 1
             return torch.ones_like(x), torch.ones(count, *x.shape, dtype=x.dtype)
         return kernel
@@ -200,6 +202,8 @@ def test_tokenshift_independent_vjp_with_empty_sequences():
 
 
 @pytest.mark.cuda
+@pytest.mark.memcheck
+@pytest.mark.racecheck
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("channels", (128, 4096, 7168))
 @pytest.mark.parametrize("count", (1, 6))
@@ -218,13 +222,27 @@ def test_fused_t1_matches_training_and_preserves_inactive_slots(channels, count,
     normalized, total = norm(x, weight, bias, res=res, return_res=True)
     expected, final = tokenshift(normalized, mixes, cu, original.index_select(0, indices.long()))
     expected_pool = original.clone().index_copy_(0, indices.long(), final)
+    parameters = tuple(mixes.unbind(0))
+    mix_args = parameters + (parameters[-1],) * (6 - count)
     for group in (1, 2, 4):
         pool = original.clone()
         actual_total, actual = _fused_forward(channels, count, 1e-5, group)(
-            x, res, weight, bias, mixes, pool, indices, status
+            x, res, weight, bias, *mix_args, pool, indices, status
         )
         assert torch.equal(total, actual_total)
         assert torch.equal(torch.stack(expected), actual)
+        assert torch.equal(expected_pool, pool)
+    unaligned = tuple(
+        parameter.new_empty(channels + 1)[1:].copy_(parameter)
+        for parameter in parameters
+    )
+    for supplied in (mixes, tuple(parameter.clone() for parameter in parameters), unaligned):
+        pool = original.clone()
+        actual_total, actual = fused_post_norm_tokenshift(
+            x, res, weight, bias, supplied, pool, indices, status
+        )
+        assert torch.equal(total, actual_total)
+        assert all(torch.equal(a, b) for a, b in zip(actual, expected, strict=True))
         assert torch.equal(expected_pool, pool)
     status.zero_()
     indices.fill_(99)
