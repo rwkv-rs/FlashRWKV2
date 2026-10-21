@@ -45,6 +45,26 @@ def test_tilelang_linear_sm120_device_compilation_without_gpu(input_major, confi
     assert "warpgroup_reg_" not in source
 
 
+@pytest.mark.resource
+@pytest.mark.parametrize("arch", [89, 120])
+def test_tilelang_linear_k1_head_device_compilation_without_gpu(arch):
+    """The chunked HeadCE forward projects [rows,1] into 65536 logits."""
+    from tilelang.contrib.nvcc import get_cuda_version
+    from tilelang.env import CUDA_HOME
+
+    if CUDA_HOME is None or not (Path(CUDA_HOME) / "bin" / "nvcc").is_file():
+        pytest.skip("CUDA Toolkit is required for device compilation")
+    if arch == 120 and get_cuda_version() < (12, 8):
+        pytest.skip("SM120 compilation requires CUDA Toolkit 12.8 or newer")
+    kernel = _compiled(
+        65536, 1, "float32", "bfloat16", False, (16, 64, 2), (1, 1), True, arch,
+    )
+    source = kernel.get_kernel_source()
+    assert "cp_async" not in source
+    assert "tl::mma_sync<" in source
+    assert "tl::DataType::kFloat32, 16, 8, 16" in source
+
+
 @pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("bias_dtype", [None, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("shape", [(32, 96), (1, 64), (15, 128), (1, 129), (16, 64)])

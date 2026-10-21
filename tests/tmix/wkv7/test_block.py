@@ -129,6 +129,10 @@ def infer_layer(
     adapters=None, use_nora=False, ticket=None,
 ):
     channels, heads = x.shape[-1], x.shape[-1] // head_size
+    # Pack sliced batch rows before calling the contiguous varlen interfaces.
+    x, res = x.contiguous(), res.contiguous()
+    if v_first is not None:
+        v_first = v_first.contiguous()
     if ticket is None:
         ticket = fr.prepare_tmix_wkv7_recurrent_metadata(
             cu, slots, total_tokens=x.shape[0], state_pool_size=shifts[0].shape[0],

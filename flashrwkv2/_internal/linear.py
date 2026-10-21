@@ -100,6 +100,17 @@ def _compiled(
 ):
     import tilelang
 
+    pass_configs = _PASS_CONFIG
+    weight_width = outputs if input_major else channels
+    if channels % 2 or weight_width % 2 or weight_strides[0] % 2 or weight_strides[1] != 1:
+        # cp.async requires at least two adjacent BF16 elements. Scalar tails
+        # and odd/noncontiguous strides use synchronous copies in the same
+        # pipeline; disable both automatic injection and pipeline planning.
+        pass_configs = {
+            **_PASS_CONFIG,
+            "tl.enable_async_copy": False,
+            "tirx.use_async_copy": False,
+        }
     return tilelang.compile(
         _matmul_program(
             outputs,
@@ -115,7 +126,7 @@ def _compiled(
         ),
         out_idx=[3],
         target={"kind": "cuda", "arch": f"sm_{arch}"},
-        pass_configs=_PASS_CONFIG,
+        pass_configs=pass_configs,
     )
 
 
