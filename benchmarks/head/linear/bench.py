@@ -198,12 +198,6 @@ def main():
         help="compare native BF16-to-FP32 mm latency and batch/chunk bitwise invariance",
     )
     parser.add_argument(
-        "--torch-blas",
-        choices=("default", "cublaslt"),
-        default="default",
-        help="select the native comparison configuration before CUDA initialization",
-    )
-    parser.add_argument(
         "--tune",
         action="store_true",
         help="verify and measure output tiles before timing",
@@ -214,9 +208,7 @@ def main():
         help="emit JSONL for six model widths and M=1/27/256",
     )
     args = parser.parse_args()
-    if args.torch_blas == "cublaslt":
-        if not args.compare_torch:
-            parser.error("--torch-blas cublaslt requires --compare-torch")
+    if args.compare_torch:
         os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
         os.environ["CUBLASLT_WORKSPACE_SIZE"] = "1"
         torch.backends.cuda.preferred_blas_library("cublaslt")
