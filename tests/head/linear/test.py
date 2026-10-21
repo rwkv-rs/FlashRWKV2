@@ -60,18 +60,24 @@ def test_head_all_and_last_linear(rows: int, channels: int, vocab: int) -> None:
     weight = torch.randn(vocab, channels, device=device, dtype=torch.bfloat16)
     all_logits = infer_head_linear_all_forward_varlen(x, weight)
     assert all_logits.dtype == torch.float32
-    training_logits = pretrain_head_linear_bf16(x.requires_grad_(), weight)
-    assert torch.equal(training_logits, all_logits)
     assert torch.allclose(
         all_logits.float(), x.float() @ weight.float().t(), atol=0.04, rtol=0.04
     )
-    last_logits = infer_head_linear_last_forward_varlen(
-        x, weight, tokens_count=max(rows, 2)
-    )
-    assert torch.equal(last_logits, all_logits)
-    assert torch.allclose(
-        last_logits.float(), x.float() @ weight.float().t(), atol=0.04, rtol=0.04
-    )
+    x.requires_grad_()
+    for repeat in range(4):
+        outputs = (
+            ("training", pretrain_head_linear_bf16(x, weight)),
+            ("all", infer_head_linear_all_forward_varlen(x.detach(), weight)),
+            ("last", infer_head_linear_last_forward_varlen(
+                x.detach(), weight, tokens_count=max(rows, 2)
+            )),
+        )
+        for name, actual in outputs:
+            assert torch.equal(actual, all_logits), (
+                f"{name} repeat {repeat}: "
+                f"{torch.count_nonzero(actual != all_logits).item()} unequal logits; "
+                f"first indices={torch.nonzero(actual != all_logits)[:8].tolist()}"
+            )
     with pytest.raises(ValueError, match="positive"):
         infer_head_linear_last_forward_varlen(x, weight, tokens_count=0)
 

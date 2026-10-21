@@ -211,6 +211,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          fetch-depth: 0
           persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
@@ -285,6 +286,52 @@ jobs:
             --python .venv/bin/python --revision '${{ github.sha }}' --status candidate \
             --output artifacts/nora-benchmarks --summary artifacts/nora-benchmark-summary.json \
             --require-complete
+      - name: Compare original CUDA inference on the same inputs
+        if: matrix.torch == '2.13.0'
+        run: |
+          set -euo pipefail
+          baseline_revision=fd29c063aeecc27ef0142e9bce28331fdc846831
+          baseline_source="$PWD/artifacts/cuda-baseline"
+          comparison_output="$PWD/artifacts/cuda-comparisons"
+          benchmark_python="$PWD/.venv/bin/python"
+          mkdir -p "$baseline_source" "$comparison_output"
+          git archive "$baseline_revision" flashrwkv2 csrc | tar -x -C "$baseline_source"
+          git rev-parse HEAD > "$comparison_output/candidate-revision.txt"
+          git rev-parse "$baseline_revision" > "$comparison_output/baseline-revision.txt"
+          (
+            cd "$baseline_source"
+            "$benchmark_python" -m flashrwkv2.compile > "$comparison_output/compile.json"
+          )
+          export PYTHONPATH="$baseline_source:$PWD/benchmarks"
+          for module in cmix tmix/wkv_prepare head/linear; do
+            comparison_arguments=()
+            if [ "$module" = tmix/wkv_prepare ]; then
+              comparison_arguments=(--later-layer)
+            fi
+            "$benchmark_python" "benchmarks/$module/bench.py" \
+              --implementation cuda-baseline --sweep --timing-mode graph \
+              "${comparison_arguments[@]}" \
+              > "$comparison_output/${module//\//-}.jsonl"
+          done
+          for channels in 768 1024 2048 2560 4096 5120; do
+            for rows in 1 27 256; do
+              for module in post_norm tmix/readout; do
+                "$benchmark_python" "benchmarks/$module/bench.py" \
+                  --implementation cuda-baseline --channels "$channels" \
+                  --tokens "$rows" --timing-mode graph \
+                  >> "$comparison_output/${module//\//-}.jsonl"
+              done
+              "$benchmark_python" benchmarks/tmix/tokenshift/bench.py \
+                --implementation cuda-baseline --channels "$channels" \
+                --batch 1 --seqlen "$rows" --timing-mode graph \
+                >> "$comparison_output/tmix-tokenshift.jsonl"
+            done
+          done
+          "$benchmark_python" benchmarks/tmix/wkv7/bench.py \
+            --implementation cuda-baseline \
+            --shapes h12d64 h16d64 h32d64 h40d64 h64d64 h80d64 h16d128 h8d256 \
+            --cases 1x1 16x1 1x16 64x16 1x128 --decay-bias --timing-mode graph \
+            --output "$comparison_output/tmix-wkv7.json"
       - name: Record complete CUDA coverage
         if: matrix.torch == '2.13.0'
         env:
@@ -321,6 +368,7 @@ jobs:
             artifacts/validation-${{ matrix.torch }}.json
             artifacts/nora-*.json
             artifacts/nora-benchmarks/
+            artifacts/cuda-comparisons/
           if-no-files-found: error
 
   finalize:

@@ -41,7 +41,7 @@ def test_tilelang_linear_sm120_device_compilation_without_gpu(input_major, confi
         120,
     )
     source = kernel.get_kernel_source()
-    assert "tma_load" in source
+    assert "cp_async" in source
     assert "warpgroup_reg_" not in source
 
 

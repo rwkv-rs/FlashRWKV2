@@ -602,6 +602,9 @@ def run_suite(
                 "module": module,
                 "message": f"{type(error).__name__}: {error}",
             }
+            if isinstance(error, subprocess.CalledProcessError):
+                warning["stdout"] = error.stdout
+                warning["stderr"] = error.stderr
             warnings.append(warning)
             payload = {
                 "schema_version": SCHEMA_VERSION,

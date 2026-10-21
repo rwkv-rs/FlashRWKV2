@@ -101,13 +101,16 @@ def _compiled(
     import tilelang
 
     pass_configs = _PASS_CONFIG
+    if arch // 10 == 12:
+        # Keep SM12x copies and MMA consumers in one CTA synchronization domain.
+        pass_configs = {**pass_configs, "tl.disable_warp_specialized": True}
     weight_width = outputs if input_major else channels
     if channels % 2 or weight_width % 2 or weight_strides[0] % 2 or weight_strides[1] != 1:
         # cp.async requires at least two adjacent BF16 elements. Scalar tails
         # and odd/noncontiguous strides use synchronous copies in the same
         # pipeline; disable both automatic injection and pipeline planning.
         pass_configs = {
-            **_PASS_CONFIG,
+            **pass_configs,
             "tl.enable_async_copy": False,
             "tirx.use_async_copy": False,
         }
