@@ -50,6 +50,12 @@ def measure_cuda(
         with torch.cuda.graph(graph, stream=torch.cuda.current_stream()):
             for _ in range(launches_per_batch):
                 call()
+        graph.replay()
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
+        end_event.record()
+        end_event.synchronize()
 
     batch_means_us: list[float] = []
     for _ in range(batches):
@@ -63,8 +69,6 @@ def measure_cuda(
             torch.cuda.synchronize()
             elapsed_us = (perf_counter() - start) * 1.0e6
         else:
-            start_event = torch.cuda.Event(enable_timing=True)
-            end_event = torch.cuda.Event(enable_timing=True)
             start_event.record()
             graph.replay()
             end_event.record()
@@ -74,6 +78,7 @@ def measure_cuda(
     total_launches = batches * launches_per_batch
     return {
         "warmup_launches": warmup,
+        "graph_warmup_launches": launches_per_batch if graph is not None else 0,
         "batches": batches,
         "launches_per_batch": launches_per_batch,
         "total_launches": total_launches,

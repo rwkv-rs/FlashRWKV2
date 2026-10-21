@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -19,15 +20,16 @@ cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is require
 
 
 @pytest.mark.resource
+@pytest.mark.parametrize("arch", [89, 120])
 @pytest.mark.parametrize("input_major", [False, True])
-@pytest.mark.parametrize("config", [(16, 8, 2), (16, 16, 3), (16, 64, 2)])
-def test_tilelang_linear_sm120_device_compilation_without_gpu(input_major, config):
+@pytest.mark.parametrize("config", [(16, 8, 2, 32), (16, 16, 3, 64), (16, 64, 2, 128)])
+def test_tilelang_linear_device_compilation_without_gpu(arch, input_major, config):
     from tilelang.contrib.nvcc import get_cuda_version
     from tilelang.env import CUDA_HOME
 
     if CUDA_HOME is None or not (Path(CUDA_HOME) / "bin" / "nvcc").is_file():
         pytest.skip("CUDA Toolkit is required for device compilation")
-    if get_cuda_version() < (12, 8):
+    if arch == 120 and get_cuda_version() < (12, 8):
         pytest.skip("SM120 compilation requires CUDA Toolkit 12.8 or newer")
     kernel = _compiled(
         128,
@@ -38,7 +40,7 @@ def test_tilelang_linear_sm120_device_compilation_without_gpu(input_major, confi
         config,
         (128, 1),
         input_major,
-        120,
+        arch,
     )
     source = kernel.get_kernel_source()
     assert "cp_async" in source
@@ -57,7 +59,7 @@ def test_tilelang_linear_k1_head_device_compilation_without_gpu(arch):
     if arch == 120 and get_cuda_version() < (12, 8):
         pytest.skip("SM120 compilation requires CUDA Toolkit 12.8 or newer")
     kernel = _compiled(
-        65536, 1, "float32", "bfloat16", False, (16, 64, 2), (1, 1), True, arch,
+        65536, 1, "float32", "bfloat16", False, (16, 64, 2, 32), (1, 1), True, arch,
     )
     source = kernel.get_kernel_source()
     assert "cp_async" not in source
@@ -67,24 +69,32 @@ def test_tilelang_linear_k1_head_device_compilation_without_gpu(arch):
 
 @pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("bias_dtype", [None, torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("shape", [(32, 96), (1, 64), (15, 128), (1, 129), (16, 64)])
+@pytest.mark.parametrize(
+    "shape", [
+        (32, 96, 64), (1, 64, 96), (15, 128, 128),
+        (1, 129, 64), (16, 64, 160), (256, 256, 128),
+    ]
+)
 def test_tilelang_linear_tuning_checks_production_and_skips_compile_failures(
     monkeypatch, output_dtype, bias_dtype, shape
 ):
     from flashrwkv2._internal import linear as implementation
     from flashrwkv2._internal import tuning
 
-    rows, outputs = shape
-    x = torch.ones(rows, 64, dtype=torch.bfloat16)
-    weight = torch.ones(outputs, 64, dtype=torch.bfloat16)
+    rows, outputs, channels = shape
+    x = torch.ones(rows, channels, dtype=torch.bfloat16)
+    weight = torch.ones(outputs, channels, dtype=torch.bfloat16)
     bias = None if bias_dtype is None else torch.ones(outputs, dtype=bias_dtype)
-    rejected = (16, 128, 3)
-    wrong_bf16 = (16, 32, 2)
+    rejected = (16, 128, 3, 32)
+    wrong_bf16 = (16, 32, 2, 32)
     compiled_dtypes = set()
+    compiled_configs = set()
+    select_calls = 0
 
     def compile_kernel(
         outputs, channels, dtype, compiled_bias, has_bias, config, *args
     ):
+        compiled_configs.add(config)
         assert has_bias == (bias is not None)
         assert compiled_bias == (
             "float32" if bias_dtype == torch.float32 else "bfloat16"
@@ -100,13 +110,23 @@ def test_tilelang_linear_tuning_checks_production_and_skips_compile_failures(
         return torch.full((x.shape[0], weight.shape[0]), value, dtype=dtype)
 
     def select_config(candidates, run, *, check, reference):
+        nonlocal select_calls
         candidates = tuple(candidates)
         assert rejected not in candidates
-        narrow_tiles = rows < 16 and outputs <= 128
-        assert len(candidates) == (24 if rows >= 16 else 10 if narrow_tiles else 6) - 1
-        assert {config[1] for config in candidates} == (
-            {8, 16, 32, 64, 128} if narrow_tiles else {32, 64, 128}
-        )
+        if select_calls == 0:
+            narrow_tiles = rows < 16 and outputs <= 128
+            assert len(candidates) == (24 if rows >= 16 else 10 if narrow_tiles else 6) - 1
+            assert {config[1] for config in candidates} == (
+                {8, 16, 32, 64, 128} if narrow_tiles else {32, 64, 128}
+            )
+            assert {config[3] for config in candidates} == {32}
+        else:
+            assert len({config[:3] for config in candidates}) == 1
+            assert {config[3] for config in candidates} == (
+                {32, 64} if rows == 256 else
+                {32, *(span for span in (64, 128) if channels % span == 0)}
+            )
+        select_calls += 1
         assert tuple(value.dtype for value in reference) == (
             (torch.float32, torch.bfloat16)
             if output_dtype == torch.bfloat16
@@ -123,7 +143,7 @@ def test_tilelang_linear_tuning_checks_production_and_skips_compile_failures(
                 run(config)
                 record["milliseconds"] = 1.0
             measurements.append(record)
-        return next(
+        return max(
             item["config"] for item in measurements if item["bitwise_equal"]
         ), measurements
 
@@ -133,12 +153,21 @@ def test_tilelang_linear_tuning_checks_production_and_skips_compile_failures(
     monkeypatch.setattr(implementation, "_TUNED_CONFIGS", {})
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (12, 0))
     monkeypatch.setattr(torch.cuda, "get_device_name", lambda device: "test")
+    monkeypatch.setattr(
+        torch.cuda, "get_device_properties",
+        lambda device: SimpleNamespace(shared_memory_per_block_optin=101376),
+    )
     monkeypatch.setattr(tuning, "select_config", select_config)
     result = implementation.tune_linear(x, weight, output_dtype, bias=bias)
+    assert select_calls == (2 if channels % 64 == 0 else 1)
     assert compiled_dtypes == (
         {"bfloat16", "float32"} if output_dtype == torch.bfloat16 else {"float32"}
     )
     assert result["config"] != rejected
+    if rows == 256:
+        assert (128, 128, 3, 128) not in compiled_configs
+        resource = next(item for item in result["candidates"] if "resource_error" in item)
+        assert resource["config"] == (128, 128, 3, 128)
     if output_dtype == torch.bfloat16:
         assert result["config"] != wrong_bf16
     assert (
@@ -199,7 +228,7 @@ def test_tilelang_linear_aligns_storage_offset_before_launch(
 
     monkeypatch.setattr(implementation, "_compiled", compile_kernel)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (12, 0))
-    actual = implementation._forward(x, weight, bias, torch.float32, (16, 64, 2))
+    actual = implementation._forward(x, weight, bias, torch.float32, (16, 64, 2, 32))
     assert torch.equal(actual, x.float() @ weight.float().t() + bias.float())
 
 
@@ -324,7 +353,19 @@ def test_linear_weight_vjp_fp32_chunk_accumulation(upstream_dtype):
 
 @cuda
 @pytest.mark.cuda
-@pytest.mark.parametrize("config", [(16, 8, 2), (16, 8, 3), (16, 16, 2), (16, 16, 3)])
+@pytest.mark.parametrize(
+    "config",
+    [
+        pytest.param(
+            (*config, copy_k),
+            marks=(pytest.mark.memcheck, pytest.mark.racecheck)
+            if config == (16, 8, 3) and copy_k == 128
+            else (),
+        )
+        for config in ((16, 8, 2), (16, 8, 3), (16, 16, 2), (16, 16, 3))
+        for copy_k in (32, 64, 128)
+    ],
+)
 @pytest.mark.parametrize("rows", [1, 15])
 @pytest.mark.parametrize("input_major", [False, True])
 @pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float32])
@@ -336,7 +377,7 @@ def test_tilelang_linear_narrow_tiles_preserve_results(
     weight = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16)
     if input_major:
         weight = weight.t().contiguous().t()
-    canonical = _forward(x, weight, None, output_dtype, (16, 64, 2))
+    canonical = _forward(x, weight, None, output_dtype, (16, 64, 2, 32))
     assert torch.equal(canonical, _forward(x, weight, None, output_dtype, config))
     for row in sorted({0, rows - 1}):
         single = _forward(x[row : row + 1], weight, None, output_dtype, config)
@@ -346,14 +387,16 @@ def test_tilelang_linear_narrow_tiles_preserve_results(
 @cuda
 @pytest.mark.cuda
 @pytest.mark.parametrize(
-    "config", [(16, 32, 3), (32, 128, 2), (64, 64, 3), (128, 32, 2)]
+    "config", [(16, 32, 3, 32), (32, 128, 2, 32), (64, 64, 3, 32), (128, 32, 2, 32)]
 )
 def test_tilelang_linear_tiling_preserves_fp32_result(config):
     torch.manual_seed(77)
     x = torch.randn(65, 160, device="cuda", dtype=torch.bfloat16)
     weight = torch.randn(257, 160, device="cuda", dtype=torch.bfloat16)
-    canonical = _forward(x, weight, None, torch.float32, (16, 64, 2))
+    canonical = _forward(x, weight, None, torch.float32, (16, 64, 2, 32))
     assert torch.equal(canonical, _forward(x, weight, None, torch.float32, config))
+    for rows in (1, 17, 33, 65):
+        assert torch.equal(canonical[:rows], _forward(x[:rows], weight, None, torch.float32))
 
 
 @cuda

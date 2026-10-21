@@ -36,11 +36,16 @@ def select_config(candidates, run, *, check=None, reference=None, warmup=3, repe
             run(config)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            run(config)
+            for _ in range(repeat):
+                run(config)
+        # Instantiate the graph and events before measuring steady device time.
+        graph.replay()
         start, end = (torch.cuda.Event(enable_timing=True) for _ in range(2))
         start.record()
-        for _ in range(repeat):
-            graph.replay()
+        end.record()
+        end.synchronize()
+        start.record()
+        graph.replay()
         end.record()
         end.synchronize()
         record["milliseconds"] = start.elapsed_time(end) / repeat

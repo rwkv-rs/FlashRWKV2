@@ -3,7 +3,7 @@
 
 Weights use PyTorch's [out_features, in_features] layout. Each output follows
 the same increasing-K sequence of BF16 MMA instructions with FP32 accumulators.
-Tuning changes output tiling and pipelining, never K tiling or split-K.
+Tuning changes output tiling and copy pipelining, never MMA K tiling or split-K.
 """
 
 import math
@@ -14,7 +14,7 @@ import torch
 from torch.autograd.function import once_differentiable
 
 _PASS_CONFIG = {"tl.disable_wgmma": True, "tl.enable_fast_math": False}
-_DEFAULT_CONFIG = (16, 64, 2)
+_DEFAULT_CONFIG = (16, 64, 2, 32)
 _TUNED_CONFIGS = {}
 
 
@@ -32,7 +32,7 @@ def _matmul_program(
     import tilelang.language as T
 
     rows = T.dynamic("rows")
-    block_m, block_n, stages = config
+    block_m, block_n, stages, copy_k = config
     block_k = 32
     weight_shape = (channels, outputs) if input_major else (outputs, channels)
     weight_strides = (weight_shape[1], 1) if weight_strides is None else weight_strides
@@ -55,25 +55,35 @@ def _matmul_program(
         ) as (bn, bm):
             if no_set_max_nreg:
                 T.no_set_max_nreg()
-            xs = T.alloc_shared((block_m, block_k), T.bfloat16)
+            xs = T.alloc_shared((block_m, copy_k), T.bfloat16)
             ws = T.alloc_shared(
-                (block_k, block_n) if input_major else (block_n, block_k), T.bfloat16
+                (copy_k, block_n) if input_major else (block_n, copy_k), T.bfloat16
             )
             acc = T.alloc_fragment((block_m, block_n), T.float32)
             T.clear(acc)
-            for k in T.Pipelined(T.ceildiv(channels, block_k), num_stages=stages):
-                T.copy(X[bm * block_m, k * block_k], xs)
+            for k in T.Pipelined(T.ceildiv(channels, copy_k), num_stages=stages):
+                T.copy(X[bm * block_m, k * copy_k], xs)
                 if input_major:
-                    T.copy(W[k * block_k, bn * block_n], ws)
+                    T.copy(W[k * copy_k, bn * block_n], ws)
                 else:
-                    T.copy(W[bn * block_n, k * block_k], ws)
-                T.gemm(
-                    xs,
-                    ws,
-                    acc,
-                    transpose_B=not input_major,
-                    policy=T.GemmWarpPolicy.FullCol,
-                )
+                    T.copy(W[bn * block_n, k * copy_k], ws)
+                # Each copy contains consecutive canonical 32-K MMA groups.
+                for inner in T.unroll(copy_k // block_k):
+                    if input_major:
+                        T.gemm(
+                            xs[:, inner * block_k : (inner + 1) * block_k],
+                            ws[inner * block_k : (inner + 1) * block_k, :],
+                            acc,
+                            policy=T.GemmWarpPolicy.FullCol,
+                        )
+                    else:
+                        T.gemm(
+                            xs[:, inner * block_k : (inner + 1) * block_k],
+                            ws[:, inner * block_k : (inner + 1) * block_k],
+                            acc,
+                            transpose_B=True,
+                            policy=T.GemmWarpPolicy.FullCol,
+                        )
             for i, j in T.Parallel(block_m, block_n):
                 if bm * block_m + i < rows and bn * block_n + j < outputs:
                     if has_bias:
@@ -159,9 +169,23 @@ def _forward(x, weight, bias, output_dtype, config=None):
     x, weight = _aligned(x), _aligned(weight)
     bias = None if bias is None else _aligned(bias)
     if config is None:
-        config = _TUNED_CONFIGS.get(
-            _key(x, weight, output_dtype, bias), _DEFAULT_CONFIG
-        )
+        config = _TUNED_CONFIGS.get(_key(x, weight, output_dtype, bias))
+        if config is None:
+            block_m = 16
+            if x.shape[0] > 16:
+                max_m = min(128, 1 << (x.shape[0] - 1).bit_length())
+                block_n = _DEFAULT_CONFIG[1]
+                blocks_n = (weight.shape[0] + block_n - 1) // block_n
+                multiprocessors = torch.cuda.get_device_properties(
+                    x.device
+                ).multi_processor_count
+                for candidate in (32, 64, 128):
+                    # Keep a full CTA wave while capping row padding.
+                    blocks = ((x.shape[0] + candidate - 1) // candidate) * blocks_n
+                    if candidate > max_m or blocks < multiprocessors:
+                        break
+                    block_m = candidate
+            config = (block_m, *_DEFAULT_CONFIG[1:])
     major, minor = torch.cuda.get_device_capability(x.device)
     input_major = weight.stride(0) == 1
     physical_weight = weight.t() if input_major else weight
@@ -494,7 +518,7 @@ def tune_linear(x, weight, output_dtype=None, *, bias=None):
         else (32, 64, 128)
     )
     candidates = (
-        (block_m, block_n, stages)
+        (block_m, block_n, stages, 32)
         for block_m in block_rows
         for block_n in block_cols
         for stages in (2, 3)
@@ -502,41 +526,64 @@ def tune_linear(x, weight, output_dtype=None, *, bias=None):
     major, minor = torch.cuda.get_device_capability(x.device)
     input_major = weight.stride(0) == 1
     weight_strides = (weight.t() if input_major else weight).stride()
-    eligible, rejected = [], []
-    for config in candidates:
-        try:
-            for dtype in check_dtypes:
-                _compiled(
-                    weight.shape[0],
-                    x.shape[1],
-                    _dtype_name(dtype),
-                    _dtype_name(bias.dtype) if bias is not None else "bfloat16",
-                    bias is not None,
-                    config,
-                    weight_strides,
-                    input_major,
-                    major * 10 + minor,
-                )
-        except RuntimeError as error:
-            # Only compilation is recoverable here. Launch and correctness
-            # failures below must still stop tuning.
-            rejected.append({"config": config, "compile_error": str(error)})
-        else:
-            eligible.append(config)
-    best_config, measurements = select_config(
-        eligible,
-        lambda config: _forward(x, weight, bias, output_dtype, config),
-        check=lambda config: tuple(
-            _forward(x, weight, bias, dtype, config) for dtype in check_dtypes
-        ),
-        reference=reference,
-    )
-    best_ms = next(
-        item["milliseconds"] for item in measurements if item["config"] == best_config
-    )
+    shared_memory_limit = torch.cuda.get_device_properties(
+        x.device
+    ).shared_memory_per_block_optin
+    measurements = {}
+    best_config = _DEFAULT_CONFIG
+    for phase in ("tiles", "copies"):
+        if phase == "copies":
+            # Retune only the winning tile, and retain the canonical MMA count.
+            copies = [span for span in (64, 128) if x.shape[1] % span == 0]
+            if not copies:
+                break
+            candidates = (best_config, *(best_config[:3] + (span,) for span in copies))
+        eligible, rejected = [], []
+        for config in candidates:
+            block_m, block_n, stages, copy_k = config
+            # Both BF16 staging tiles retain one buffer per pipeline stage.
+            shared_memory = (block_m + block_n) * copy_k * stages * 2
+            if shared_memory > shared_memory_limit:
+                rejected.append({
+                    "config": config,
+                    "resource_error": (
+                        f"shared memory requires {shared_memory} bytes; "
+                        f"device limit is {shared_memory_limit} bytes"
+                    ),
+                })
+                continue
+            try:
+                for dtype in check_dtypes:
+                    _compiled(
+                        weight.shape[0],
+                        x.shape[1],
+                        _dtype_name(dtype),
+                        _dtype_name(bias.dtype) if bias is not None else "bfloat16",
+                        bias is not None,
+                        config,
+                        weight_strides,
+                        input_major,
+                        major * 10 + minor,
+                    )
+            except RuntimeError as error:
+                # Only compilation is recoverable here. Launch and correctness
+                # failures below must still stop tuning.
+                rejected.append({"config": config, "compile_error": str(error)})
+            else:
+                eligible.append(config)
+        best_config, checked = select_config(
+            eligible,
+            lambda config: _forward(x, weight, bias, output_dtype, config),
+            check=lambda config: tuple(
+                _forward(x, weight, bias, dtype, config) for dtype in check_dtypes
+            ),
+            reference=reference,
+        )
+        measurements.update((item["config"], item) for item in checked + rejected)
+    best_ms = measurements[best_config]["milliseconds"]
     _TUNED_CONFIGS[_key(x, weight, output_dtype, bias)] = best_config
     return {
         "config": best_config,
         "milliseconds": best_ms,
-        "candidates": measurements + rejected,
+        "candidates": list(measurements.values()),
     }

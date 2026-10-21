@@ -116,9 +116,15 @@ readout 使用 `output_*`，head 使用 `lora_a/lora_b/lora_scale/use_nora`。
 候选只能改变输出 tiling、pipeline 或每 CTA 的独立行数。验收覆盖 RTX 4090
 SM89 与 PRO6000 SM120 的 decode、小 batch、prefill 和训练形状。
 
+投影先选择输出 tile，再为获胜 tile 测量 32/64/128 元素的 K 拷贝跨度；较大的
+跨度必须整除输入宽度。每次拷贝内部仍按连续 32 元素块执行相同的 MMA 序列，
+保持 MMA 次数与 FP32 累加顺序。未显式调优时，默认 M tile 按行数从
+16/32/64/128 中选择；只有 CTA 网格可覆盖设备 SM 时才增大 M tile。
+
 调优同时核对 FP32 累加或统计量及实际生产输出；LN 是否保存统计量、是否写回
 res 等变体都必须保持相同结果。线性层的 bias presence/dtype 属于调优 key。
 编译不受工具链支持的线性候选会在结果中记录 `compile_error`；运行失败直接报错。
+候选的 staging buffers 超出设备共享内存上限时，记录 `resource_error` 并在启动前排除。
 调优需在 CUDA Graph capture 前完成，并使用有效、非空的 active workload。
 WKV 的 functional 与 indexed pool 模式分别缓存配置；候选同时校验两种模式的
 输出和 FP32 最终状态，按实际调用模式计时。
@@ -130,6 +136,8 @@ PostNorm、TMix 各推理阶段、CMix 和 Head 线性基准可用
 保留原 CUDA selector 的生产路径；metadata preparation、state reset 和 materialize
 位于计时外。`--timing-mode eager` 测完整 Python dispatch 与末尾同步的 wall time，
 `--timing-mode graph` 用 CUDA events 测包含整批调用的 graph replay；两种结果分别比较。
+Graph replay 与 events 在正式计时前初始化，额外的整批 Graph 预热由
+`graph_warmup_launches` 单独记录；默认正式计时仍为 10 批、每批 1000 次调用。
 Head CE 基准的 `--backward`、`--train-base`、`--chunk-rows` 明确反向范围及工作集，
 并报告单次调用的 peak allocated memory。
 
