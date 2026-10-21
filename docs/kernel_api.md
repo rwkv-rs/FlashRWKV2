@@ -145,6 +145,7 @@ CMix 前向基准同样按完整阶段重选 key/value 投影，以保留两份�
 WKV 的 functional 与 indexed pool 模式分别缓存配置；候选同时校验两种模式的
 输出和 FP32 最终状态，按实际调用模式计时。
 WKV 候选组合 32/64 个 value columns 与 1/4 个输入 token 的共享内存预取。
+四 token 预取在 head size 64/128 时展开块内 token 循环；head size 256 保留串行循环。
 预取只改变输入加载与 decay 计算的排布，逐 token 的 state 更新、K 归约、BF16
 舍入和每 16 token 的 FP32 checkpoint 保持原有顺序。未调优时使用单 token
 预取；单步 decode 的调优也只测单 token 配置。

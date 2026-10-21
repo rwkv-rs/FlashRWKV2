@@ -72,6 +72,7 @@ def _forward_kernel(
     key_groups = dim // 64
     checkpoints = n // _CHECKPOINT + batch
     threads = columns * key_groups
+    within_loop = T.unroll if prefetch_tokens > 1 and dim <= 128 else T.serial
 
     @T.prim_func
     def kernel(
@@ -169,7 +170,7 @@ def _forward_kernel(
                             vs[prefetched * columns + value] = T.cast(
                                 V[token, h, tile * columns + value], "float32"
                             )
-                for within in T.serial(prefetch_tokens):
+                for within in within_loop(prefetch_tokens):
                     token = start + chunk * prefetch_tokens + within
                     if prefetch_tokens == 1 or token < end:
                         if save and (token - start) % _CHECKPOINT == 0:
