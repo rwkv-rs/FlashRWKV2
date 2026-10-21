@@ -196,6 +196,8 @@ def main():
         help="emit JSONL for model widths, M=1/27/256 and rank=32/64/128",
     )
     args = parser.parse_args()
+    if args.timing_mode == "graph":
+        torch.cuda.set_stream(torch.cuda.Stream())
     cases = [(args.tokens, args.channels, args.rank)]
     if args.sweep:
         cases = [

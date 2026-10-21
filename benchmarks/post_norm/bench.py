@@ -24,6 +24,8 @@ def main() -> None:
         "--implementation", choices=("tilelang", "cuda-baseline"), default="tilelang"
     )
     args = parser.parse_args()
+    if args.timing_mode == "graph":
+        torch.cuda.set_stream(torch.cuda.Stream())
     tilelang = args.implementation == "tilelang"
     package_path = Path(flashrwkv2.__file__).resolve()
     if (package_path.parent / "_internal" / "linear.py").is_file() != tilelang:

@@ -71,6 +71,8 @@ def main():
         "--output", type=Path, default=Path("artifacts/wkv7-recurrent-bf16.json")
     )
     args = parser.parse_args()
+    if args.timing_mode == "graph":
+        torch.cuda.set_stream(torch.cuda.Stream())
     package_path = Path(flashrwkv2.__file__).resolve()
     is_tilelang = (package_path.parent / "_internal" / "linear.py").is_file()
     if is_tilelang != (args.implementation == "tilelang"):

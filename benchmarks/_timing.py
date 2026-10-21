@@ -27,6 +27,7 @@ def measure_cuda(
     Eager includes Python dispatch, allocation and synchronization. Graph mode
     captures the whole launch batch, so the timed replay has no Python loop
     between its operators. Warmup, capture and ``before_batch`` are untimed.
+    Graph callers prepare inputs and metadata on the current non-default stream.
     """
     if warmup < 0 or batches <= 0 or launches_per_batch <= 0:
         raise ValueError("timing counts must be positive and warmup non-negative")
@@ -46,7 +47,7 @@ def measure_cuda(
             before_batch()
         torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
+        with torch.cuda.graph(graph, stream=torch.cuda.current_stream()):
             for _ in range(launches_per_batch):
                 call()
 

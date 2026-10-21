@@ -31,18 +31,18 @@ def test_embedding_ln0_packed(channels: int) -> None:
     bias = torch.randn(channels, device=device, dtype=torch.bfloat16).requires_grad_()
     output = infer_embedding_ln0_forward_varlen(embedding, weight, bias)
     refs = [
-        value.detach().clone().requires_grad_() for value in (embedding, weight, bias)
+        value.detach().cpu().requires_grad_() for value in (embedding, weight, bias)
     ]
     expected = F.layer_norm(
         refs[0].float(), (channels,), refs[1].float(), refs[2].float(), 1.0e-5
     ).bfloat16()
     assert output.dtype == torch.bfloat16
-    assert torch.allclose(output.float(), expected.float(), atol=0.05, rtol=0.05)
+    assert torch.allclose(output.float().cpu(), expected.float(), atol=0.05, rtol=0.05)
     upstream = torch.randn_like(output)
     gradients = torch.autograd.grad(output, (embedding, weight, bias), upstream)
-    reference_gradients = torch.autograd.grad(expected, refs, upstream)
+    reference_gradients = torch.autograd.grad(expected, refs, upstream.cpu())
     for actual, reference in zip(gradients, reference_gradients, strict=True):
-        torch.testing.assert_close(actual, reference, atol=0.05, rtol=0.05)
+        torch.testing.assert_close(actual.cpu(), reference, atol=0.05, rtol=0.05)
     with torch.no_grad():
         inference = infer_embedding_ln0_forward_varlen(embedding, weight, bias)
     assert torch.equal(output, inference)

@@ -220,6 +220,8 @@ def main():
         os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
         os.environ["CUBLASLT_WORKSPACE_SIZE"] = "1"
         torch.backends.cuda.preferred_blas_library("cublaslt")
+    if args.timing_mode == "graph":
+        torch.cuda.set_stream(torch.cuda.Stream())
     cases = [(args.tokens, args.channels)]
     if args.sweep:
         cases = [

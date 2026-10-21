@@ -334,6 +334,8 @@ def main():
         help="emit JSONL over model widths and decode/prefill batches",
     )
     args = parser.parse_args()
+    if args.timing_mode == "graph":
+        torch.cuda.set_stream(torch.cuda.Stream())
     cases = [(args.batch, args.seqlen, args.channels)]
     if args.sweep:
         cases = [
