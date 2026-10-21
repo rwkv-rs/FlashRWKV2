@@ -295,15 +295,28 @@ jobs:
             "$benchmark_python" -m flashrwkv2.compile > "$comparison_output/compile.json"
           )
           export PYTHONPATH="$baseline_source:$PWD/benchmarks"
-          for module in cmix tmix/wkv_prepare head/linear; do
-            comparison_arguments=()
-            if [ "$module" = tmix/wkv_prepare ]; then
-              comparison_arguments=(--later-layer)
-            fi
+          for module in cmix head/linear; do
             "$benchmark_python" "benchmarks/$module/bench.py" \
               --implementation cuda-baseline --sweep --timing-mode graph \
-              "${comparison_arguments[@]}" \
               > "$comparison_output/${module//\//-}.jsonl"
+          done
+          for channels in 1024 2048 2560 4096 5120; do
+            for rows in 1 27 256; do
+              for rank in 32 64 128; do
+                "$benchmark_python" benchmarks/tmix/wkv_prepare/bench.py \
+                  --implementation cuda-baseline --channels "$channels" \
+                  --tokens "$rows" --rank "$rank" --later-layer --timing-mode graph \
+                  >> "$comparison_output/tmix-wkv_prepare.jsonl"
+              done
+            done
+          done
+          for rows in 27 256; do
+            for rank in 32 64 128; do
+              "$benchmark_python" benchmarks/tmix/wkv_prepare/bench.py \
+                --implementation cuda-baseline --channels 768 \
+                --tokens "$rows" --rank "$rank" --later-layer --timing-mode graph \
+                >> "$comparison_output/tmix-wkv_prepare.jsonl"
+            done
           done
           for channels in 768 1024 2048 2560 4096 5120; do
             for rows in 1 27 256; do
