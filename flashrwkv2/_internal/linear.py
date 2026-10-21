@@ -51,7 +51,7 @@ def _matmul_program(
         with T.Kernel(
             T.ceildiv(outputs, block_n),
             T.ceildiv(rows, block_m),
-            threads=min(128, block_n * 4),
+            threads=min(256, max(128, block_m), block_n * 4),
         ) as (bn, bm):
             if no_set_max_nreg:
                 T.no_set_max_nreg()
@@ -512,6 +512,8 @@ def tune_linear(x, weight, output_dtype=None, *, bias=None):
         if not torch.equal(reference[0][row : row + 1], single):
             raise RuntimeError("canonical linear failed FP32 batch invariance")
     block_rows = (16,) if x.shape[0] < 16 else (16, 32, 64, 128)
+    if x.shape[0] > 128:
+        block_rows += (256,)
     block_cols = (
         (8, 16, 32, 64, 128)
         if x.shape[0] < 16 and weight.shape[0] <= 128
