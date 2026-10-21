@@ -535,11 +535,25 @@ def tune_linear(x, weight, output_dtype=None, *, bias=None):
     best_config = _DEFAULT_CONFIG
     for phase in ("tiles", "copies"):
         if phase == "copies":
-            # Retune only the winning tile, and retain the canonical MMA count.
+            # Check a row tile with little padding as well as the 32-K winner.
             copies = [span for span in (64, 128) if x.shape[1] % span == 0]
             if not copies:
                 break
-            candidates = (best_config, *(best_config[:3] + (span,) for span in copies))
+            tiles = [best_config]
+            row_tile = min(256, max(16, 1 << (x.shape[0] - 1).bit_length()))
+            if best_config[0] != row_tile:
+                matched = [
+                    item for item in measurements.values()
+                    if item.get("bitwise_equal") and item["config"][0] == row_tile
+                ]
+                if matched:
+                    tiles.append(
+                        min(matched, key=lambda item: item["milliseconds"])["config"]
+                    )
+            candidates = (
+                candidate for tile in tiles
+                for candidate in (tile, *(tile[:3] + (span,) for span in copies))
+            )
         eligible, rejected = [], []
         for config in candidates:
             block_m, block_n, stages, copy_k = config

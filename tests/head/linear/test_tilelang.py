@@ -125,7 +125,9 @@ def test_tilelang_linear_tuning_checks_production_and_skips_compile_failures(
             )
             assert {config[3] for config in candidates} == {32}
         else:
-            assert len({config[:3] for config in candidates}) == 1
+            assert len({config[:3] for config in candidates}) == (
+                2 if 16 <= rows <= 128 else 1
+            )
             assert {config[3] for config in candidates} == (
                 {32} if rows > 128 else
                 {32, *(span for span in (64, 128) if channels % span == 0)}
