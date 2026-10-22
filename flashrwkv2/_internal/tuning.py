@@ -24,7 +24,7 @@ def compile_candidates(keys, cache, spec):
         programs.append(program)
     if programs:
         kernels = tilelang.par_compile(
-            programs, **options, num_workers=4, ignore_error=True
+            programs, **options, ignore_error=True
         )
         cache.update(
             (key, kernel)

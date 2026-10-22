@@ -278,9 +278,9 @@ def test_tilelang_precompile_reuses_successes_and_preserves_compile_errors(monke
             raise RuntimeError("lowering rejected the candidate")
         return key[0], {"target": "cuda"}
 
-    def parallel(programs, *, target, num_workers, ignore_error):
+    def parallel(programs, *, target, ignore_error, num_workers=None):
         batches.append(tuple(programs))
-        assert target == "cuda" and num_workers == 4 and ignore_error
+        assert target == "cuda" and num_workers is None and ignore_error
         return [ready, None]
 
     def failed_compile(*args, **kwargs):
