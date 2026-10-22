@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""Head LN, RKV res and output gate with a shared BF16 forward."""
+"""Head ln, RKV res and output gate with a shared BF16 forward."""
 
 import math
 
@@ -215,7 +215,7 @@ def readout(
     head_size: int = 64,
     eps: float = 64e-5,
 ) -> torch.Tensor:
-    """Compute BF16 preprojection readout with FP32 head LN and RKV res."""
+    """Compute BF16 preprojection readout with FP32 head ln and RKV res."""
     if head_size not in (64, 128, 256) or x.ndim < 2 or x.numel() == 0 or x.shape[-1] % head_size:
         raise ValueError("readout expects nonempty [..., C] with head_size 64, 128, or 256")
     rows = (r, k, v, gate)
@@ -266,7 +266,7 @@ def tune_readout(x, r, k, v, r_k, weight, bias, gate, head_size=64, eps=64e-5):
         return (*training, run(group, inputs))
 
     training = _forward(c, head_size, eps, dtype)(*args)
-    # FP32 LN/RKV statistics remain part of candidate acceptance; the actual
+    # FP32 ln/RKV statistics remain part of candidate acceptance; the actual
     # no-statistics production output must also equal the training result.
     reference = (*training, training[0])
     for row in sorted({0, args[0].shape[0] // 2, args[0].shape[0] - 1}):

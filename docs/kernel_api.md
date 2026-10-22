@@ -7,8 +7,8 @@ FP32 `[slots,H,D,D]`，TokenShift 状态为 BF16 `[slots,C]`。Head 输出 logit
 ## Numerical contract
 
 训练、prefill 和 decode 使用同一份 TileLang 前向实现。投影按递增 K 顺序执行
-BF16 MMA、FP32 累加，不使用 split-K；每行 LN、head LN 和词表归约使用固定顺序。
-`res + x` 在 LN 前先舍入为 BF16，投影、gate、TokenShift 和 WKV 输出也在相同
+BF16 MMA、FP32 累加，不使用 split-K；每行 ln、head ln 和词表归约使用固定顺序。
+`res + x` 在 ln 前先舍入为 BF16，投影、gate、TokenShift 和 WKV 输出也在相同
 位置舍入为 BF16。WKV 的 FP32 状态在 token 之间不缩窄。
 
 WKV 输入是 raw decay logits。保留率为
@@ -32,13 +32,13 @@ TMix 公共阶段固定为 `tokenshift -> wkv_prepare -> wkv7 -> readout`。
 
 | API | 输入与返回值 |
 |---|---|
-| `infer_embedding_ln0_forward_varlen(embedding, weight, bias, *, eps=1e-5)` | BF16 embedding 和 LN 仿射参数，返回 BF16 LN0 |
-| `infer_tmix_postnorm_tokenshift_forward_varlen` | res/LN、六路 mix，返回 `(res_out, r, w, k, v, a, g)`，原位更新 shift pool |
+| `infer_embedding_ln0_forward_varlen(embedding, weight, bias, *, eps=1e-5)` | BF16 embedding 和 ln 仿射参数，返回 BF16 ln0 |
+| `infer_tmix_postnorm_tokenshift_forward_varlen` | res/ln、六路 mix，返回 `(res_out, r, w, k, v, a, g)`，原位更新 shift pool |
 | `infer_tmix_wkv_prepare_forward_varlen` | R/K/V、低秩 W/A/G/V、VRes 与 KK/A，返回 `(r, decay_logits, key, value, recurrent_a, recurrent_b, gate, v_first)` |
 | `infer_tmix_wkv7_recurrent_fp32io16_forward_varlen` | BF16 `[N,H,D]` 六路输入、FP32 state handle、packed metadata；返回 BF16 WKV 并原位更新状态 |
-| `infer_tmix_readout_forward_varlen` | head LN、RKV residual、gate 和 output projection，返回 BF16；WKV 输入也可为 FP32 |
-| `infer_cmix_forward_varlen` | res/LN、TokenShift、key projection、ReLU²、value projection；返回 `(res_out, cmix_out)`，原位更新 shift pool |
-| `infer_post_norm_output_forward_varlen(x, res, weight, bias, *, eps=1e-5)` | 对 BF16 residual sum 作 FP32 LN，返回 BF16 |
+| `infer_tmix_readout_forward_varlen` | head ln、RKV residual、gate 和 output projection，返回 BF16；WKV 输入也可为 FP32 |
+| `infer_cmix_forward_varlen` | res/ln、TokenShift、key projection、ReLU²、value projection；返回 `(res_out, cmix_out)`，原位更新 shift pool |
+| `infer_post_norm_output_forward_varlen(x, res, weight, bias, *, eps=1e-5)` | 对 BF16 residual sum 作 FP32 ln，返回 BF16 |
 | `infer_head_linear_all_forward_varlen(x, weight)` | `[N,C]` BF16 hidden 与 `[V,C]` BF16 weight，返回 FP32 `[N,V]` |
 | `infer_head_linear_last_forward_varlen(x, weight, *, tokens_count)` | 调用方已选出的末尾 hidden rows，返回对应 FP32 logits |
 | `head_logprobs(logits, targets)` | 连续 FP32 `[...,V]` logits 和同前缀形状的 INT64 targets，返回 FP32 所选 token logprobs |
@@ -96,7 +96,7 @@ CUDA Graph 使用 `token_capacity`、`sequence_capacity`、`max_seqlen_capacity`
 | `pretrain_tmix_wkv7_recurrent_bf16` | `[B,T,C]`、零初始状态，返回同形状 BF16 输出 |
 | `statetune_tmix_wkv7_recurrent_fp32io16` | 指定 segment 和初始 FP32 state，返回 `(output, final_state)` |
 | `rl_infctx_tmix_wkv7_recurrent_bf16` | packed 六路输入、`state_pool`、`cu_seqlens`、可选 `state_indices`，返回 `(output, final_pool)`；输入和 state 可求梯度 |
-| `pretrain_tmix_readout_bf16` | head LN、RKV residual、gate，可选 output projection |
+| `pretrain_tmix_readout_bf16` | head ln、RKV residual、gate，可选 output projection |
 | `pretrain_cmix_bf16` / `statetune_cmix_bf16` | ChannelMix 与可微初始/最终 shift state |
 | `pretrain_tmix_a_gate_bf16` / `pretrain_tmix_kk_pre_bf16` / `pretrain_tmix_vres_gate_bf16` | prepare 组成部分，复用相同前向 |
 | `pretrain_head_linear_bf16` | BF16 hidden/weight，返回 FP32 logits |
@@ -108,6 +108,12 @@ NoRA 为 `A / (norm(A, dim=0) + 1e-6)`，FP32 归一化与反向，BF16 投影�
 每次 forward 从当前参数计算。冻结 base weight 时省去 dW，但保留输入梯度。
 CMix 使用 `key_*`、`value_*`，prepare 使用 `receptance_*`、`key_*`、`value_*`，
 readout 使用 `output_*`，head 使用 `lora_a/lora_b/lora_scale/use_nora`。
+
+Prepare 分别将 R/K/V、W/A/G/V 的低秩输入投影、低秩输出投影分组执行。
+各组使用独立输入和权重，允许低秩宽度不同；没有 VRes 的首层只执行三路。
+每路仍按原来的连续 32 元素 K 块累加，先舍入到 BF16，再执行原有 bias 与
+tanh/sigmoid，最后再次舍入到 BF16。反向复用相同的激活 VJP、bias 归约和
+线性 VJP；R/K/V 的 LoRA/NoRA 更新仍作用于各自的 BF16 base projection。
 
 ## Tuning and acceptance
 
@@ -132,15 +138,16 @@ SM89 与 PRO6000 SM120 的 decode、小 batch、prefill 和训练形状。
 超过 128 行的投影会测量 256 行 tile，较大的 tile 使用最多 256 个线程复用权重，
 MMA 的 K 序列保持不变。
 
-调优同时核对 FP32 累加或统计量及实际生产输出；LN 是否保存统计量、是否写回
+调优同时核对 FP32 累加或统计量及实际生产输出；ln 是否保存统计量、是否写回
 res 等变体都必须保持相同结果。线性层的 bias presence/dtype 属于调优 key。
 编译不受工具链支持的线性候选会在结果中记录 `compile_error`；运行失败直接报错。
 候选的 staging buffers 超出设备共享内存上限时，记录 `resource_error` 并在启动前排除。
 投影候选先串行生成 TIR，再用 TileLang 的四个编译线程构建并复用进程内 kernel cache。
 全部构建结束后才逐一检查输出和计时；编译失败仍在对应候选中保留错误信息。
 `tune_linear` 可通过 `benchmark` 回调测量实际前向阶段，结果用 `timing_scope`
-区分整个阶段与单个投影。Prepare 基准先调优各投影，再按完整前向重选 R/K/V 的
-共同配置，保持三份 dense weights 的实际工作集；反向基准仍独立测量投影。
+区分整个阶段与单个投影。Prepare 基准先核对并调优三个分组 kernel，再按完整
+前向重选 R/K/V 分组配置，保持三份 dense weights 的实际工作集；反向基准
+仍独立测量分组投影。分组调优同时核对每路 BF16 结果与激活前的 FP32 累加。
 CMix 前向基准同样按完整阶段重选 key/value 投影，以保留两份权重及 ReLU²
 中间结果共同产生的缓存行为。
 单 token 的 PostNorm+TokenShift 融合路径直接读取独立的 mix 参数，

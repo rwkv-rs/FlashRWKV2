@@ -41,7 +41,7 @@ def _fused_forward(channels: int, count: int, eps: float, rows_per_block: int = 
     @T.prim_func
     def kernel(
         X: T.Tensor((rows, channels), "bfloat16"),
-        Res: T.Tensor((rows, channels), "bfloat16"),
+        res: T.Tensor((rows, channels), "bfloat16"),
         Weight: T.Tensor((channels,), "bfloat16"),
         Bias: T.Tensor((channels,), "bfloat16"),
         Mix0: T.Tensor((channels,), "bfloat16"),
@@ -73,7 +73,7 @@ def _fused_forward(channels: int, count: int, eps: float, rows_per_block: int = 
                 values[r, c] = 0
                 if row < rows and c < channels and Status[0] == 0 and row < Status[2]:
                     values[r, c] = T.cast(
-                        T.cast(X[row, c], "float32") + T.cast(Res[row, c], "float32"), "bfloat16",
+                        T.cast(X[row, c], "float32") + T.cast(res[row, c], "float32"), "bfloat16",
                     )
                     Sum[row, c] = values[r, c]
                     previous[r, c] = Pool[Indices[row], c]
@@ -111,7 +111,7 @@ def _fused_forward(channels: int, count: int, eps: float, rows_per_block: int = 
 
 @torch.no_grad()
 def fused_post_norm_tokenshift(x, res, weight, bias, mixes, pool, indices, status, eps=1e-5):
-    """Fuse T=1 LN and indexed TokenShift for TMix's six or CMix's one mix."""
+    """Fuse T=1 ln and indexed TokenShift for TMix's six or CMix's one mix."""
     _check_norm(x, weight, bias, res, eps)
     mixes = _pack_mixes(x, mixes, pack=False)
     if (

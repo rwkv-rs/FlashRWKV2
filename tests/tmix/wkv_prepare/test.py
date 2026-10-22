@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+from pathlib import Path
 
 import pytest
 import torch
@@ -105,6 +106,115 @@ def _runtime_options(rank_in, rank_out):
         for stage, weights in ((1, rank_in), (2, rank_out))
         for name, weight in zip(("w", "a", "g", "v"), weights, strict=True)
     }
+
+
+@pytest.mark.resource
+@pytest.mark.parametrize("arch", (89, 120))
+@pytest.mark.parametrize("input_major", (False, True))
+@pytest.mark.parametrize("config", ((16, 8, 2, 32), (256, 128, 2, 64)))
+def test_grouped_projection_device_compilation_without_gpu(arch, input_major, config):
+    from tilelang.contrib.nvcc import get_cuda_version
+    from tilelang.env import CUDA_HOME
+
+    from flashrwkv2.tmix.wkv_prepare.tilelang import _compiled_group
+
+    if CUDA_HOME is None or not (Path(CUDA_HOME) / "bin" / "nvcc").is_file():
+        pytest.skip("CUDA Toolkit is required for device compilation")
+    if arch == 120 and get_cuda_version() < (12, 8):
+        pytest.skip("SM120 compilation requires CUDA Toolkit 12.8 or newer")
+    channels, outputs = (128, 64, 96, 32), (32, 64, 16, 48)
+    strides = tuple((n if input_major else k, 1) for k, n in zip(channels, outputs))
+    kernel = _compiled_group(
+        channels,
+        outputs,
+        strides,
+        (1, 0, 2, 0),
+        (False, True, True, False),
+        config,
+        input_major,
+        2,
+        arch,
+        4,
+    )
+    source = kernel.get_kernel_source()
+    assert "tl::mma_sync<" in source
+    assert "tl::DataType::kFloat32, 16, 8, 16" in source
+    assert "warpgroup_reg_" not in source
+
+
+@cuda
+@pytest.mark.cuda
+@pytest.mark.memcheck
+@pytest.mark.racecheck
+@pytest.mark.parametrize("rows", (1, 17))
+@pytest.mark.parametrize("count", (3, 4))
+@pytest.mark.parametrize("stage", (1, 2))
+@pytest.mark.parametrize("layout", ("row_major", "column_major", "mixed"))
+def test_grouped_projection_preserves_fp32_bf16_and_vjp(rows, count, stage, layout):
+    from flashrwkv2._internal.elementwise import activation
+    from flashrwkv2._internal.linear import _aligned, _forward, linear
+    from flashrwkv2.tmix.wkv_prepare.tilelang import _grouped_linear, _run_groups
+
+    torch.manual_seed(714)
+    ranks = (3, 8, 9, 5)[:count]
+    channels = (128,) * count if stage == 1 else ranks
+    outputs = ranks if stage == 1 else (128,) * count
+    kinds = ((1, 0, 2, 0) if stage == 1 else (0, 2, 0, 0))[:count]
+
+    def random(shape):
+        return torch.randn(shape, device="cuda", dtype=torch.bfloat16) * 0.03
+
+    xs = tuple(
+        random((1, rows, width) if rows > 1 else (rows, width)).requires_grad_()
+        for width in channels
+    )
+    weights = []
+    for i, (width, inputs) in enumerate(zip(outputs, channels, strict=True)):
+        weight = random((width, inputs))
+        if layout == "column_major" or (layout == "mixed" and i % 2):
+            weight = weight.t().contiguous().t()
+        weights.append(weight.requires_grad_())
+    weights = tuple(weights)
+    biases = tuple(
+        random((width,)).requires_grad_() if stage == 2 and i < 2 else None
+        for i, width in enumerate(outputs)
+    )
+    xrefs = tuple(x.detach().clone().requires_grad_() for x in xs)
+    wrefs = tuple(w.detach().clone().requires_grad_() for w in weights)
+    brefs = tuple(
+        None if b is None else b.detach().clone().requires_grad_() for b in biases
+    )
+    actual = _grouped_linear(xs, weights, kinds, biases)
+    expected = []
+    for x, w, kind, bias in zip(xrefs, wrefs, kinds, brefs, strict=True):
+        projected = linear(x, w)
+        expected.append(
+            activation(projected, {0: "identity", 1: "tanh", 2: "sigmoid"}[kind], bias)
+            if kind or bias is not None
+            else projected
+        )
+    for output, reference in zip(actual, expected, strict=True):
+        assert torch.equal(output.view(torch.int16), reference.view(torch.int16))
+    with torch.no_grad():
+        flat = tuple(
+            _aligned(x.reshape(rows, width))
+            for x, width in zip(xs, channels, strict=True)
+        )
+        aligned = tuple(_aligned(w) for w in weights)
+        _, raw = _run_groups(flat, aligned, kinds, biases, raw_mode=2)
+        position = 0
+        for x, w, width in zip(flat, aligned, outputs, strict=True):
+            reference = _forward(x, w, None, torch.float32, (16, 64, 2, 32))
+            value = raw[position : position + rows * width].view(rows, width)
+            assert torch.equal(value.view(torch.int32), reference.view(torch.int32))
+            position += rows * width
+    variables = (*xs, *weights, *(b for b in biases if b is not None))
+    references = (*xrefs, *wrefs, *(b for b in brefs if b is not None))
+    upstream = tuple(torch.randn_like(output) for output in actual)
+    gradients = torch.autograd.grad(actual, variables, upstream)
+    expected_gradients = torch.autograd.grad(expected, references, upstream)
+    for gradient, reference in zip(gradients, expected_gradients, strict=True):
+        assert torch.equal(gradient.view(torch.int16), reference.view(torch.int16))
 
 
 def test_wkv_prepare_public_contract():

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""Shared BF16 LN forward; every row uses the same FP32 reduction tree."""
+"""Shared BF16 ln forward; every row uses the same FP32 reduction tree."""
 
 import math
 
@@ -52,7 +52,7 @@ def _forward(
     @T.prim_func
     def kernel(
         X: T.Tensor((rows, channels), "bfloat16"),
-        Res: T.Tensor((rows, channels), "bfloat16"),
+        res: T.Tensor((rows, channels), "bfloat16"),
         Weight: T.Tensor((channels,), "bfloat16"),
         Bias: T.Tensor((channels,), "bfloat16"),
         Sum: T.Tensor((rows if store_res else 0, channels), "bfloat16"),
@@ -76,7 +76,7 @@ def _forward(
                 if row < rows and c < channels:
                     if has_res:
                         values[r, c] = T.cast(
-                            T.cast(X[row, c], "float32") + T.cast(Res[row, c], "float32"),
+                            T.cast(X[row, c], "float32") + T.cast(res[row, c], "float32"),
                             "bfloat16",
                         )
                         if store_res:
@@ -231,10 +231,10 @@ def norm(
     *,
     return_res: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """LN over the final dimension, with an optional BF16-rounded res sum.
+    """ln over the final dimension, with an optional BF16-rounded res sum.
 
     Forward is identical with and without autograd. Casts have PyTorch's usual
-    identity gradient; LN statistics and all arithmetic are FP32. ``return_res``
+    identity gradient; ln statistics and all arithmetic are FP32. ``return_res``
     exposes the same rounded sum used to compute the statistics.
     """
     tensors = _check_inputs(x, weight, bias, res, eps)

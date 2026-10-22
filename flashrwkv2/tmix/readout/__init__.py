@@ -24,7 +24,7 @@ def infer_tmix_readout_forward_varlen(
     max_seqlen: int | None = None,
     output_use_nora: bool = False,
 ) -> torch.Tensor:
-    """BF16 head LN, RKV res, gate and output projection with FP32 accumulators."""
+    """BF16 head ln, RKV res, gate and output projection with FP32 accumulators."""
     from ..._internal.linear import adapter_linear
     from .tilelang import readout
 

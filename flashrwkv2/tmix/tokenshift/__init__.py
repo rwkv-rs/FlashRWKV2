@@ -29,7 +29,7 @@ def infer_tmix_postnorm_tokenshift_forward_varlen(
     eps: float = 1.0e-5,
     validated_metadata: object | None = None,
 ) -> tuple[torch.Tensor, ...]:
-    """Packed BF16 res, LN and TokenShift with active-slot state updates."""
+    """Packed BF16 res, ln and TokenShift with active-slot state updates."""
     from ..._internal.state import gather_state, scatter_state
     from ...post_norm.tilelang import norm
     from .tilelang import fused_post_norm_tokenshift, tokenshift

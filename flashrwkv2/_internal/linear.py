@@ -154,27 +154,9 @@ def _compiled(*key):
 
 def _precompile(keys):
     """Elaborate on the caller thread; compile a bounded batch before timing."""
-    import tilelang
+    from .tuning import compile_candidates
 
-    pending, programs = [], []
-    for key in dict.fromkeys(keys):
-        if key in _COMPILED_KERNELS:
-            continue
-        try:
-            program, options = _compile_spec(*key)
-        except RuntimeError:
-            # The normal compilation path records each rejected candidate.
-            continue
-        pending.append(key)
-        programs.append(program)
-    if programs:
-        kernels = tilelang.par_compile(
-            programs, **options, num_workers=4, ignore_error=True
-        )
-        _COMPILED_KERNELS.update(
-            (key, kernel) for key, kernel in zip(pending, kernels, strict=True)
-            if kernel is not None
-        )
+    compile_candidates(keys, _COMPILED_KERNELS, _compile_spec)
 
 
 def _dtype_name(dtype):
@@ -486,7 +468,15 @@ def check_adapter_scale(scale):
 
 
 def adapter_linear(
-    x, weight, a=None, b=None, scale=1.0, use_nora=False, output_dtype=None
+    x,
+    weight,
+    a=None,
+    b=None,
+    scale=1.0,
+    use_nora=False,
+    output_dtype=None,
+    *,
+    base_result=None,
 ):
     """Project through a base weight and differentiable LoRA/NoRA parameters.
 
@@ -497,7 +487,11 @@ def adapter_linear(
     if (a is None) != (b is None):
         raise ValueError("adapter A and B must be provided together")
     if a is None:
-        return linear(x, weight, output_dtype=output_dtype)
+        return (
+            linear(x, weight, output_dtype=output_dtype)
+            if base_result is None
+            else base_result
+        )
     if (
         a.ndim != 2
         or b.ndim != 2
@@ -510,7 +504,11 @@ def adapter_linear(
     ):
         raise ValueError("adapter expects A [rank,in], B [out,rank], CUDA BF16/FP32")
     scale = check_adapter_scale(scale)
-    result = linear(x, weight, output_dtype=output_dtype)
+    result = (
+        linear(x, weight, output_dtype=output_dtype)
+        if base_result is None
+        else base_result
+    )
     normalized = _NoRA.apply(a) if use_nora else a.to(torch.bfloat16)
     features = linear(x, normalized)
     update = linear(features, b.to(torch.bfloat16), output_dtype=torch.float32)

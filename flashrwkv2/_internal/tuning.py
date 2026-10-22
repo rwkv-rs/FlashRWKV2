@@ -7,6 +7,32 @@ from statistics import median
 import torch
 
 
+def compile_candidates(keys, cache, spec):
+    """Compile candidates sharing compiler options after serial TIR elaboration."""
+    import tilelang
+
+    pending, programs = [], []
+    for key in dict.fromkeys(keys):
+        if key in cache:
+            continue
+        try:
+            program, options = spec(*key)
+        except RuntimeError:
+            # The owner records individual errors through its normal launcher.
+            continue
+        pending.append(key)
+        programs.append(program)
+    if programs:
+        kernels = tilelang.par_compile(
+            programs, **options, num_workers=4, ignore_error=True
+        )
+        cache.update(
+            (key, kernel)
+            for key, kernel in zip(pending, kernels, strict=True)
+            if kernel is not None
+        )
+
+
 @torch.no_grad()
 def select_config(candidates, run, *, check=None, reference=None, warmup=3, repeat=20):
     """Return (configuration, measurements), timing CUDA Graph replay.

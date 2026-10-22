@@ -20,7 +20,7 @@ def pretrain_tmix_readout_bf16(
     output_lora_scale=1.0,
     output_use_nora=False,
 ):
-    """Shared BF16 head LN, recurrent res and output gate with autograd."""
+    """Shared BF16 head ln, recurrent res and output gate with autograd."""
     from ..._internal.linear import adapter_linear
     from .tilelang import readout
 

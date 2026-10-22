@@ -77,12 +77,43 @@ def benchmark(args):
         from flashrwkv2._internal.linear import _NoRA, linear, tune_linear
 
         source = shifted[0].detach().reshape(args.tokens, channels)
-        tuning["dense"] = tune_linear(source, dense[0])
-        first_weight = runtime_in[0].t() if operator == "pretrain" else rank_in[0]
-        second_weight = runtime_out[0].t() if operator == "pretrain" else rank_out[0]
-        tuning["lowrank_in"] = tune_linear(source, first_weight)
-        reduced = linear(source, first_weight)
-        tuning["lowrank_out"] = tune_linear(reduced, second_weight)
+        from flashrwkv2.tmix.wkv_prepare.tilelang import (
+            _grouped_linear,
+            _tune_grouped_linear,
+        )
+
+        dense_inputs = tuple(shifted[i].detach() for i in (0, 2, 3))
+        dense_weights = tuple(weight.detach() for weight in dense)
+        tuning["dense"] = _tune_grouped_linear(
+            dense_inputs, dense_weights, (0, 0, 0), (None,) * 3
+        )
+        count = 4 if args.later_layer else 3
+        lowrank_inputs = tuple(shifted[i].detach() for i in (1, 4, 5, 3)[:count])
+        first_weights = tuple(
+            (runtime_in[i].t() if operator == "pretrain" else rank_in[i]).detach()
+            for i in range(count)
+        )
+        second_weights = tuple(
+            (runtime_out[i].t() if operator == "pretrain" else rank_out[i]).detach()
+            for i in range(count)
+        )
+        first_kinds = (1, 0, 2, 0)[:count]
+        second_kinds = (0, 2, 0, 0)[:count]
+        biases = (
+            w0.detach() if operator == "pretrain" else None,
+            a0.detach(),
+            None,
+            None,
+        )[:count]
+        tuning["lowrank_in"] = _tune_grouped_linear(
+            lowrank_inputs, first_weights, first_kinds, (None,) * count
+        )
+        reduced = _grouped_linear(
+            lowrank_inputs, first_weights, first_kinds, (None,) * count
+        )
+        tuning["lowrank_out"] = _tune_grouped_linear(
+            reduced, second_weights, second_kinds, biases
+        )
         if adapters:
             normalized = _NoRA.apply(adapters[0].detach())
             tuning["adapter_a"] = tune_linear(source, normalized)
@@ -152,7 +183,9 @@ def benchmark(args):
     del sample
     if args.tune and not backward:
         # R/K/V together can exceed L2 even when one dense weight fits.
-        tuning["dense"] = tune_linear(source, dense[0], benchmark=run)
+        tuning["dense"] = _tune_grouped_linear(
+            dense_inputs, dense_weights, (0, 0, 0), (None,) * 3, benchmark=run
+        )
     return {
         "operator": "pretrain_tmix_wkv_prepare_bf16"
         if operator == "pretrain"

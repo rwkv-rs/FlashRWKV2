@@ -164,7 +164,7 @@ def infer_cmix_forward_varlen(
     key_use_nora=False,
     value_use_nora=False,
 ):
-    """Apply res/LN, TokenShift, ReLU² and projection to packed rows.
+    """Apply res/ln, TokenShift, ReLU² and projection to packed rows.
 
     The inference value weight retains its runtime [F,C] layout. A transpose
     view feeds the same projection as the training [C,F] weight.
