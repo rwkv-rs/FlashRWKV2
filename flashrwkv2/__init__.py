@@ -91,4 +91,4 @@ __all__ = [
     "statetune_tmix_wkv7_recurrent_fp32io16",
 ]
 
-__version__ = "0.1.0a15"
+__version__ = "0.1.0a16"
