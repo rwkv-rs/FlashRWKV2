@@ -302,11 +302,14 @@ def test_recurrent_indexed_pool_matches_functional_forward(dim, block_values, pr
 
 @pytest.mark.parametrize("dim", [64, 128, 256])
 @pytest.mark.parametrize("indexed", [False, True])
-def test_recurrent_tuning_preserves_both_forwards_and_caller_state(monkeypatch, dim, indexed):
+def test_recurrent_tuning_preserves_both_forwards_and_caller_state(monkeypatch, tmp_path, dim, indexed):
+    from flashrwkv2._internal import tuning
     from flashrwkv2.tmix.wkv7 import tilelang as implementation
 
     values, state, cu, bias = _case(dim, (1, 3))
     original = state.clone()
+    monkeypatch.setattr(tuning, "_profile_root", lambda: tmp_path)
+    tuning._read_profile.cache_clear()
     monkeypatch.setattr(implementation, "_TUNED_CONFIGS", {})
     expected = tmix_wkv7_recurrent(*values, state, cu, decay_bias=bias, block_values=64)
     selected = implementation.tune_tmix_wkv7_recurrent(
@@ -320,7 +323,7 @@ def test_recurrent_tuning_preserves_both_forwards_and_caller_state(monkeypatch, 
     assert implementation._TUNED_CONFIGS[key] == (
         selected["block_values"], selected["prefetch_tokens"],
     )
-    assert other_key not in implementation._TUNED_CONFIGS
+    assert implementation._TUNED_CONFIGS[other_key] == (64, 1)
     functional = tmix_wkv7_recurrent(*values, state, cu, decay_bias=bias)
     pool = state.clone()
     output = _infer_recurrent(
@@ -331,6 +334,7 @@ def test_recurrent_tuning_preserves_both_forwards_and_caller_state(monkeypatch, 
     )
     for actual, reference in zip((*functional, output, pool), (*expected, *expected), strict=True):
         assert torch.equal(actual, reference)
+    tuning._read_profile.cache_clear()
 
 
 @pytest.mark.cuda_graph
