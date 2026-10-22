@@ -54,6 +54,7 @@ def main():
     parser.add_argument("--cases", nargs="+", default=CASES)
     parser.add_argument("--decay-bias", action="store_true")
     parser.add_argument("--tune", action="store_true")
+    parser.add_argument("--state-dtype", choices=("float32", "float16"), default="float32")
     parser.add_argument(
         "--implementation",
         choices=("tilelang", "cuda-baseline"),
@@ -85,6 +86,17 @@ def main():
         parser.error("TileLang token IO is bfloat16")
     if args.implementation == "cuda-baseline" and args.tune:
         parser.error("--tune applies only to TileLang")
+    if not is_tilelang and args.state_dtype != "float32":
+        parser.error("the saved CUDA comparison uses FP32 state")
+    prepare_state = prepare_tmix_wkv7_recurrent_fp32io16_state
+    infer = infer_tmix_wkv7_recurrent_fp32io16_forward_varlen
+    if args.state_dtype == "float16":
+        from flashrwkv2 import (
+            infer_tmix_wkv7_recurrent_fp16_forward_varlen,
+            prepare_tmix_wkv7_recurrent_fp16_state,
+        )
+        prepare_state = prepare_tmix_wkv7_recurrent_fp16_state
+        infer = infer_tmix_wkv7_recurrent_fp16_forward_varlen
     dtype = getattr(torch, args.token_dtype)
     results = []
     for shape in args.shapes:
@@ -104,7 +116,9 @@ def main():
                 for scale in (0.1, 2.0, 0.05, 0.05, 0.05, 0.05)
             )
             initial = torch.randn(batch, heads, dim, dim, device="cuda") * 0.01
-            state = prepare_tmix_wkv7_recurrent_fp32io16_state(
+            if args.state_dtype == "float16":
+                initial = initial.half()
+            state = prepare_state(
                 batch,
                 heads * dim,
                 sequence_capacity=batch,
@@ -145,7 +159,7 @@ def main():
                 )
 
             run = partial(
-                infer_tmix_wkv7_recurrent_fp32io16_forward_varlen,
+                infer,
                 *values,
                 state=state,
                 cu_seqlens=cu,
@@ -162,7 +176,7 @@ def main():
             # DeltaLog and ordinary CUDA providers can differ within the
             # baseline's 4e-3 relative-L2 contract. TileLang must be bitwise equal.
             for row in range(batch):
-                single = prepare_tmix_wkv7_recurrent_fp32io16_state(
+                single = prepare_state(
                     1,
                     heads * dim,
                     sequence_capacity=1,
@@ -181,7 +195,7 @@ def main():
                     state_pool_size=1,
                     max_seqlen=length,
                 )
-                actual = infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
+                actual = infer(
                     *(
                         value[row * length : (row + 1) * length].contiguous()
                         for value in values

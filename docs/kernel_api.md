@@ -36,6 +36,7 @@ TMix 公共阶段固定为 `tokenshift -> wkv_prepare -> wkv7 -> readout`。
 | `infer_tmix_postnorm_tokenshift_forward_varlen` | res/ln、六路 mix，返回 `(res_out, r, w, k, v, a, g)`，原位更新 shift pool |
 | `infer_tmix_wkv_prepare_forward_varlen` | R/K/V、低秩 W/A/G/V、VRes 与 KK/A，返回 `(r, decay_logits, key, value, recurrent_a, recurrent_b, gate, v_first)` |
 | `infer_tmix_wkv7_recurrent_fp32io16_forward_varlen` | BF16 `[N,H,D]` 六路输入、FP32 state handle、packed metadata；返回 BF16 WKV 并原位更新状态 |
+| `infer_tmix_wkv7_recurrent_fp16_forward_varlen` | 可选低精度推理；BF16 六路输入、FP16 state handle、FP32 算术；每 token 后将 state 舍入为 FP16 |
 | `infer_tmix_readout_forward_varlen` | head ln、RKV residual、gate 和 output projection，返回 BF16；WKV 输入也可为 FP32 |
 | `infer_cmix_forward_varlen` | res/ln、TokenShift、key projection、ReLU²、value projection；返回 `(res_out, cmix_out)`，原位更新 shift pool |
 | `infer_post_norm_output_forward_varlen(x, res, weight, bias, *, eps=1e-5)` | 对 BF16 residual sum 作 FP32 ln，返回 BF16 |
@@ -70,6 +71,14 @@ CMix 推理的 value weight 保持 `[F,C]` runtime 布局；训练入口为 `[C,
 sequence_capacity, head_size=64, device=None)` 分配零初始化 FP32 pool。
 `prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor(state)` 绑定已有连续 CUDA
 FP32 tensor。每次调用返回时状态完整写回。
+
+`prepare_tmix_wkv7_recurrent_fp16_state` 和
+`prepare_tmix_wkv7_recurrent_fp16_state_from_tensor` 提供相同的容量参数及 lifecycle，
+但 pool 使用 FP16，显存占用为 FP32 的一半。它们只供
+`infer_tmix_wkv7_recurrent_fp16_forward_varlen` 使用，token 输入和输出仍为 BF16，
+递推算术和归约仍为 FP32；每个 token 更新后将 state 舍入为 FP16。
+该可选路径在不同 batch、prefill 分段、decode 和 CUDA Graph 间保持自身的逐位一致性，
+不承诺与 FP32 训练轨迹逐位一致。训练、RL/Infctx 和 state tuning 继续要求 FP32 state。
 
 handle 提供 `clone()`、`copy_()`、`zero_()`、`clone_slots(indices)`、
 `copy_slots_(source, source_indices, destination_indices)` 和 `reset_slots_(indices)`。
@@ -161,17 +170,20 @@ CMix 前向基准同样按完整阶段重选 key/value 投影，以保留两份�
 单 token 的 PostNorm+TokenShift 融合路径直接读取独立的 mix 参数，
 避免每次调用都先在 GPU 上打包六路参数；CMix 的单路复用使用同一 kernel。
 调优需在 CUDA Graph capture 前完成，并使用有效、非空的 active workload。
-WKV 的 functional 与 indexed pool 模式分别缓存配置；候选同时校验两种模式的
-输出和 FP32 最终状态，按实际调用模式计时。
+WKV 的 functional、indexed pool 模式和 state dtype 分别缓存配置；候选同时校验两种模式的
+输出和所选 dtype 的最终状态，按实际调用模式计时。
 WKV 候选组合 32/64 个 value columns 与 1/4 个输入 token 的共享内存预取。
 四 token 预取在 head size 64/128 时展开块内 token 循环；head size 256 保留串行循环。
 预取只改变输入加载与 decay 计算的排布，逐 token 的 state 更新、K 归约、BF16
 舍入和每 16 token 的 FP32 checkpoint 保持原有顺序。未调优时使用单 token
 预取；单步 decode 的调优也只测单 token 配置。
+FP16 state 只能以 `indexed=True` 调优，逐位校验相同 FP16 舍入规则下的 functional
+参考与 indexed 结果；不以降低训练精度作为调优候选。
 
 PostNorm、TMix 各推理阶段、CMix 和 Head 线性基准可用
 `--implementation tilelang|cuda-baseline` 标记
 通过 `PYTHONPATH` 选中的包。两次运行复用同一基准脚本、seed、逻辑输入及尺寸，
+WKV 的 `--state-dtype float16` 单独测量可选推理模式；默认仍为 `float32`。
 结果记录实际输入、输出和上游梯度 dtype。WKV 基线使用 owning FP32IO16 handle，
 保留原 CUDA selector 的生产路径；metadata preparation、state reset 和 materialize
 位于计时外。`--timing-mode eager` 测完整 Python dispatch 与末尾同步的 wall time，

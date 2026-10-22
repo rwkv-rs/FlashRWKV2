@@ -76,7 +76,7 @@ def test_recurrent_tuning_and_dispatch_keep_mode_caches_separate(monkeypatch):
 
     def forward_kernel(
         heads, dim, scale, has_bias, save, columns, has_status, indexed, bias_dtype,
-        prefetch_tokens,
+        prefetch_tokens, state_dtype,
     ):
         def kernel(*args):
             launches.append((indexed, columns, prefetch_tokens))
@@ -97,7 +97,7 @@ def test_recurrent_tuning_and_dispatch_keep_mode_caches_separate(monkeypatch):
         return selected, []
 
     monkeypatch.setattr(implementation, "_forward_kernel", forward_kernel)
-    monkeypatch.setattr(implementation, "_check_inputs", lambda *args: None)
+    monkeypatch.setattr(implementation, "_check_inputs", lambda *args, **kwargs: None)
     monkeypatch.setattr(implementation, "_TUNED_CONFIGS", {})
     monkeypatch.setattr(torch.cuda, "get_device_name", lambda device: "cpu-test")
     monkeypatch.setattr(tuning, "select_config", select_config)
@@ -117,11 +117,14 @@ def test_recurrent_tuning_and_dispatch_keep_mode_caches_separate(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "mode,prefetch_tokens",
-    [("functional", 1), ("functional", 4), ("indexed", 1), ("indexed", 4), ("backward", 1)],
+    "mode,prefetch_tokens,state_dtype",
+    [(mode, prefetch, dtype)
+     for dtype in ("float32", "float16")
+     for mode, prefetch in (("functional", 1), ("functional", 4), ("indexed", 1), ("indexed", 4))]
+    + [("backward", 1, "float32")],
 )
 @pytest.mark.parametrize("arch", ["sm_89", "sm_120"])
-def test_recurrent_dynamic_shapes_lower_without_gpu(mode, prefetch_tokens, arch):
+def test_recurrent_dynamic_shapes_lower_without_gpu(mode, prefetch_tokens, state_dtype, arch):
     import tilelang
     from tilelang import tvm
 
@@ -139,9 +142,10 @@ def test_recurrent_dynamic_shapes_lower_without_gpu(mode, prefetch_tokens, arch)
             indexed = mode == "indexed"
             function = _forward_kernel.get_tir(
                 2, 64, 0.75, True, not indexed, 32, indexed, indexed, "bfloat16",
-                prefetch_tokens,
+                prefetch_tokens, state_dtype,
             )
         buffers = {buffer.name: buffer for buffer in function.buffer_map.values()}
+        assert buffers["DSN" if mode == "backward" else "S0"].dtype == state_dtype
         tokens = buffers["R"].shape[0]
         batch = buffers["DSN" if mode == "backward" else "Indices" if mode == "indexed" else "S0"].shape[0]
         assert isinstance(tokens, tvm.tirx.Var)

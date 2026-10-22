@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""BF16 WKV7 forward with FP32 state and one recurrent numerical contract."""
+"""BF16 WKV7: default FP32 training parity and optional FP16 inference state."""
 
 from __future__ import annotations
 
@@ -12,23 +12,24 @@ def _extension():
     return flashrwkv2._extension()
 
 
-def _validate_state(state):
+def _validate_state(state, dtypes=(torch.float32,)):
     if (
-        not isinstance(state, torch.Tensor) or state.dtype != torch.float32
+        not isinstance(state, torch.Tensor) or state.dtype not in dtypes
         or not state.is_cuda or not state.is_contiguous()
         or state.ndim != 4 or state.shape[0] <= 0 or state.shape[1] <= 0
         or state.shape[2] not in (64, 128, 256) or state.shape[3] != state.shape[2]
     ):
-        raise ValueError("state must be contiguous CUDA float32 [slots,H,D,D], D=64/128/256")
+        dtype_names = "/".join(str(dtype).removeprefix("torch.") for dtype in dtypes)
+        raise ValueError(f"state must be contiguous CUDA {dtype_names} [slots,H,D,D], D=64/128/256")
 
 
 class _TmixWkv7RecurrentState:
-    """Owned or externally bound FP32 state pool, including prefix-cache COW."""
+    """Owned or externally bound state pool, including prefix-cache COW."""
 
     __slots__ = ("_state_pool",)
 
     def __init__(self, state_pool):
-        _validate_state(state_pool)
+        _validate_state(state_pool, (torch.float32, torch.float16))
         self._state_pool = state_pool
 
     @property
@@ -64,8 +65,9 @@ class _TmixWkv7RecurrentState:
         if (
             source._state_pool.shape[1:] != self._state_pool.shape[1:]
             or source._state_pool.device != self._state_pool.device
+            or source._state_pool.dtype != self._state_pool.dtype
         ):
-            raise ValueError("source and destination state geometry and device must match")
+            raise ValueError("source and destination state geometry, dtype and device must match")
         src, dst = source._indices(source_indices), self._indices(destination_indices)
         if src.numel() != dst.numel():
             raise ValueError("source and destination slot counts must match")
@@ -80,7 +82,7 @@ class _TmixWkv7RecurrentState:
         return self
 
     def materialize_slots_(self, state_indices):
-        """FP32 recurrent state is materialized after every call."""
+        """Recurrent state is materialized after every call."""
         self._indices(state_indices)
         return self
 
@@ -88,8 +90,9 @@ class _TmixWkv7RecurrentState:
         if (
             source._state_pool.shape != self._state_pool.shape
             or source._state_pool.device != self._state_pool.device
+            or source._state_pool.dtype != self._state_pool.dtype
         ):
-            raise ValueError("source and destination state shapes and device must match")
+            raise ValueError("source and destination state shapes, dtype and device must match")
         self._state_pool.copy_(source._state_pool)
         return self
 
@@ -98,8 +101,9 @@ class _TmixWkv7RecurrentState:
         return self
 
 
-def prepare_tmix_wkv7_recurrent_fp32io16_state(
+def _prepare_state(
     state_pool_size, channels, *, sequence_capacity, head_size=64, device=None,
+    dtype,
 ):
     if any(not isinstance(value, int) or isinstance(value, bool) or value <= 0
            for value in (state_pool_size, channels, sequence_capacity, head_size)):
@@ -112,11 +116,36 @@ def prepare_tmix_wkv7_recurrent_fp32io16_state(
         device = torch.device("cuda", device)
     return _TmixWkv7RecurrentState(torch.zeros(
         state_pool_size, channels // head_size, head_size, head_size,
-        device=device, dtype=torch.float32,
+        device=device, dtype=dtype,
     ))
 
 
 def prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor(state):
+    _validate_state(state)
+    return _TmixWkv7RecurrentState(state)
+
+
+def prepare_tmix_wkv7_recurrent_fp32io16_state(
+    state_pool_size, channels, *, sequence_capacity, head_size=64, device=None,
+):
+    return _prepare_state(
+        state_pool_size, channels, sequence_capacity=sequence_capacity,
+        head_size=head_size, device=device, dtype=torch.float32,
+    )
+
+
+def prepare_tmix_wkv7_recurrent_fp16_state(
+    state_pool_size, channels, *, sequence_capacity, head_size=64, device=None,
+):
+    """Allocate optional FP16 inference state; training keeps FP32 state."""
+    return _prepare_state(
+        state_pool_size, channels, sequence_capacity=sequence_capacity,
+        head_size=head_size, device=device, dtype=torch.float16,
+    )
+
+
+def prepare_tmix_wkv7_recurrent_fp16_state_from_tensor(state):
+    _validate_state(state, (torch.float16,))
     return _TmixWkv7RecurrentState(state)
 
 
@@ -229,17 +258,19 @@ def _validate_launch_max_seqlen(max_seqlen):
     return max_seqlen
 
 
-@torch.no_grad()
-def infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
+def _infer_forward_varlen(
     r, decay_logits, k, v, a, b, *,
     state, cu_seqlens, state_indices, scale=1.0, decay_bias=None,
     max_seqlen=None, validated_metadata=None,
+    state_dtype,
 ):
-    """Update selected FP32 state slots with the common BF16 recurrent forward."""
+    """Launch indexed recurrence with the requested state storage precision."""
     from .tilelang import _infer_recurrent
 
     if not isinstance(state, _TmixWkv7RecurrentState):
         raise TypeError("state must be a prepared WKV7 recurrent state handle")
+    if state._state_pool.dtype != state_dtype:
+        raise ValueError(f"state must be {state_dtype}")
     ticket = validated_metadata
     if ticket is None:
         ticket = prepare_tmix_wkv7_recurrent_metadata(
@@ -256,6 +287,39 @@ def infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
     return _infer_recurrent(
         r, decay_logits, k, v, a, b, state._state_pool, cu_seqlens,
         state_indices, status, scale=scale, decay_bias=decay_bias,
+    )
+
+
+@torch.no_grad()
+def infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
+    r, decay_logits, k, v, a, b, *,
+    state, cu_seqlens, state_indices, scale=1.0, decay_bias=None,
+    max_seqlen=None, validated_metadata=None,
+):
+    """Match training with BF16 token IO, FP32 recurrence and FP32 state."""
+    return _infer_forward_varlen(
+        r, decay_logits, k, v, a, b, state=state, cu_seqlens=cu_seqlens,
+        state_indices=state_indices, scale=scale, decay_bias=decay_bias,
+        max_seqlen=max_seqlen, validated_metadata=validated_metadata,
+        state_dtype=torch.float32,
+    )
+
+
+@torch.no_grad()
+def infer_tmix_wkv7_recurrent_fp16_forward_varlen(
+    r, decay_logits, k, v, a, b, *,
+    state, cu_seqlens, state_indices, scale=1.0, decay_bias=None,
+    max_seqlen=None, validated_metadata=None,
+):
+    """Optional inference: BF16 token IO, FP32 arithmetic, FP16 state per token.
+
+    This mode does not promise bitwise equality with the FP32 training state.
+    """
+    return _infer_forward_varlen(
+        r, decay_logits, k, v, a, b, state=state, cu_seqlens=cu_seqlens,
+        state_indices=state_indices, scale=scale, decay_bias=decay_bias,
+        max_seqlen=max_seqlen, validated_metadata=validated_metadata,
+        state_dtype=torch.float16,
     )
 
 
@@ -308,9 +372,12 @@ def rl_infctx_tmix_wkv7_recurrent_bf16(
 from .pretrain import pretrain_tmix_wkv7_recurrent_bf16
 
 __all__ = [
+    "infer_tmix_wkv7_recurrent_fp16_forward_varlen",
     "infer_tmix_wkv7_recurrent_fp32io16_forward_varlen",
     "prepare_tmix_wkv7_recurrent_fp32io16_state",
     "prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor",
+    "prepare_tmix_wkv7_recurrent_fp16_state",
+    "prepare_tmix_wkv7_recurrent_fp16_state_from_tensor",
     "prepare_tmix_wkv7_recurrent_metadata",
     "pretrain_tmix_wkv7_recurrent_bf16",
     "rl_infctx_tmix_wkv7_recurrent_bf16",

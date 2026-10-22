@@ -15,6 +15,66 @@ pytestmark = [
 ]
 
 
+@pytest.mark.parametrize("dim", [64, 128, 256])
+@pytest.mark.parametrize("has_bias", [False, True])
+@pytest.mark.memcheck
+@pytest.mark.racecheck
+def test_optional_fp16_state_preserves_inference_packing_and_training_precision(dim, has_bias):
+    from flashrwkv2 import (
+        infer_tmix_wkv7_recurrent_fp16_forward_varlen,
+        prepare_tmix_wkv7_recurrent_fp16_state_from_tensor,
+    )
+    from flashrwkv2.tmix.wkv7.tilelang import (
+        _bias_tensor, _forward, tune_tmix_wkv7_recurrent,
+    )
+
+    lengths = (1, 17, 33)
+    values, initial, cu, bias = _case(dim, lengths)
+    initial = initial.half()
+    bias = bias if has_bias else None
+    with pytest.raises(ValueError, match="FP32"):
+        tmix_wkv7_recurrent(*values, initial, cu, decay_bias=bias)
+    reference = _forward(
+        *values, initial, cu, _bias_tensor(values[0], bias),
+        torch.empty(0, dtype=torch.int32, device="cuda"), .75, False, 64, 1,
+    )[:2]
+    independent = _reference(values, initial, lengths, bias, .75, state_dtype=torch.float16)
+    for actual, expected in zip(reference, independent, strict=True):
+        torch.testing.assert_close(actual, expected, atol=2e-4, rtol=8e-3)
+
+    tuned = tune_tmix_wkv7_recurrent(
+        *values, initial, cu, scale=.75, decay_bias=bias, indexed=True,
+    )
+    assert all(item.get("bitwise_equal", False) for item in tuned["candidates"] if "milliseconds" in item)
+    slots = torch.tensor([3, 1, 0], dtype=torch.int32, device="cuda")
+    pool = initial.new_zeros(5, *initial.shape[1:])
+    pool.index_copy_(0, slots.long(), initial)
+    original = pool.clone()
+    handle = prepare_tmix_wkv7_recurrent_fp16_state_from_tensor(pool)
+    actual = infer_tmix_wkv7_recurrent_fp16_forward_varlen(
+        *values, state=handle, cu_seqlens=cu, state_indices=slots,
+        scale=.75, decay_bias=bias,
+    )
+    assert torch.equal(actual.view(torch.int16), reference[0].view(torch.int16))
+    assert torch.equal(pool[slots.long()].view(torch.int16), reference[1].view(torch.int16))
+    assert torch.equal(pool[[2, 4]], original[[2, 4]])
+    assert pool.dtype == torch.float16 and actual.dtype == torch.bfloat16
+
+    pool.copy_(original)
+    offset = 0
+    one = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
+    for sequence, length in enumerate(lengths):
+        slot = slots[sequence:sequence + 1]
+        for token in range(offset, offset + length):
+            y = infer_tmix_wkv7_recurrent_fp16_forward_varlen(
+                *(value[token:token + 1] for value in values), state=handle,
+                cu_seqlens=one, state_indices=slot, scale=.75, decay_bias=bias,
+            )
+            assert torch.equal(y[0].view(torch.int16), reference[0][token].view(torch.int16))
+        assert torch.equal(pool[slot.long()].view(torch.int16), reference[1][sequence:sequence + 1].view(torch.int16))
+        offset += length
+
+
 def _case(dim, lengths, *, requires_grad=False, logits=-2.0):
     generator = torch.Generator(device="cuda").manual_seed(1729 + dim)
     n, heads = sum(lengths), 2
@@ -37,7 +97,7 @@ def _case(dim, lengths, *, requires_grad=False, logits=-2.0):
     return values, state, cu, bias
 
 
-def _reference(values, initial, lengths, bias, scale):
+def _reference(values, initial, lengths, bias, scale, *, state_dtype=None):
     """Independent FP32 PyTorch graph, including the declared BF16 boundary."""
     r, logits, k, v, a, b = (value.float() for value in values)
     if bias is not None:
@@ -48,7 +108,7 @@ def _reference(values, initial, lengths, bias, scale):
     outputs, final_states = [], []
     offset = 0
     for sequence, length in enumerate(lengths):
-        state = initial[sequence]
+        state = initial[sequence].float()
         for token in range(offset, offset + length):
             sa = torch.einsum("hkv,hk->hv", state, a[token])
             state = (
@@ -56,10 +116,12 @@ def _reference(values, initial, lengths, bias, scale):
                 + b[token, :, :, None] * sa[:, None, :]
                 + k[token, :, :, None] * v[token, :, None, :]
             )
+            if state_dtype is not None:
+                state = state.to(state_dtype).float()
             outputs.append(
                 (torch.einsum("hkv,hk->hv", state, r[token]) * scale).to(torch.bfloat16)
             )
-        final_states.append(state)
+        final_states.append(state.to(state_dtype) if state_dtype is not None else state)
         offset += length
     output = torch.stack(outputs) if outputs else torch.empty_like(values[0])
     return output, torch.stack(final_states)

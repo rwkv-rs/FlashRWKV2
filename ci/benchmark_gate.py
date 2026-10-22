@@ -268,6 +268,16 @@ BENCHMARKS["head/l2wrap_ce"] += (
 )
 
 
+# Optional inference precision is measured separately from FP32 training parity.
+for _case in tuple(BENCHMARKS["tmix/wkv7"]):
+    if _case.workload in ("infer_recurrent_multisize", "infer_recurrent_model_decode"):
+        BENCHMARKS["tmix/wkv7"] += (
+            BenchmarkCase(
+                _case.workload + "_fp16_state", _case.path,
+                (*_case.arguments, "--state-dtype", "float16"), _case.output_argument,
+            ),
+        )
+
 # Publish real serving shapes first so downstream validation can run in parallel.
 for _owner, _cases in BENCHMARKS.items():
     BENCHMARKS[_owner] = tuple(sorted(
@@ -979,6 +989,8 @@ def _self_test() -> None:
         "infer_recurrent_fp32io16",
         "infer_recurrent_multisize",
         "infer_recurrent_model_decode",
+        "infer_recurrent_multisize_fp16_state",
+        "infer_recurrent_model_decode_fp16_state",
         "pretrain_forward_backward",
         "statetune",
     }

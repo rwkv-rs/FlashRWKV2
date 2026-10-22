@@ -2,6 +2,9 @@
 
 """Shared RWKV-7 recurrence: BF16 token IO and FP32 state/accumulation.
 
+An explicit inference-only mode stores FP16 state after every token; it does
+not change training or claim equality with the default FP32-state trajectory.
+
 State is stored as [sequence, head, key, value].  Every value column follows
 the same key reduction and update order, independently of sequence packing,
 the number of columns assigned to a block, or whether backward is requested.
@@ -41,7 +44,7 @@ def _dot_keys(state, vector, partial, result, offset=0):
 
 
 @T.macro
-def _update_state(state, decay, k, v, b, state_dot_a, offset=0):
+def _update_state(state, decay, k, v, b, state_dot_a, offset=0, state_dtype="float32"):
     for key, value in T.Parallel(state.shape[0], state.shape[1]):
         state[key, value] = T.fma(
             k[key + offset],
@@ -51,6 +54,10 @@ def _update_state(state, decay, k, v, b, state_dot_a, offset=0):
                 decay[key + offset] * state[key, value],
             ),
         )
+        if state_dtype == "float16":
+            state[key, value] = T.cast(
+                T.cast(state[key, value], "float16"), "float32"
+            )
 
 
 @tilelang.jit(pass_configs=_PASSES, compile_flags=_COMPILE_FLAGS)
@@ -65,6 +72,7 @@ def _forward_kernel(
     indexed: bool = False,
     bias_dtype: str = "float32",
     prefetch_tokens: int = 1,
+    state_dtype: str = "float32",
 ):
     n, batch = T.dynamic("n, batch")
     state_slots = T.dynamic("state_slots") if indexed else batch
@@ -82,14 +90,14 @@ def _forward_kernel(
         V: T.Tensor((n, heads, dim), "bfloat16"),
         A: T.Tensor((n, heads, dim), "bfloat16"),
         B: T.Tensor((n, heads, dim), "bfloat16"),
-        S0: T.Tensor((state_slots if indexed else batch, heads, dim, dim), "float32"),
+        S0: T.Tensor((state_slots if indexed else batch, heads, dim, dim), state_dtype),
         CU: T.Tensor((batch + 1,), "int32"),
         Bias: T.Tensor((heads if has_bias else 0, dim), bias_dtype),
         Status: T.Tensor((3 if has_status else 0,), "int32"),
         Indices: T.Tensor((batch if indexed else 0,), "int32"),
         Y: T.Tensor((n, heads, dim), "bfloat16"),
-        SN: T.Tensor((0 if indexed else batch, heads, dim, dim), "float32"),
-        Boundaries: T.Tensor((checkpoints if save else 0, heads, dim, dim), "float32"),
+        SN: T.Tensor((0 if indexed else batch, heads, dim, dim), state_dtype),
+        Boundaries: T.Tensor((checkpoints if save else 0, heads, dim, dim), state_dtype),
     ):
         with T.Kernel(dim // columns, heads, batch, threads=threads) as (tile, h, seq):
             state = T.alloc_fragment((dim, columns), "float32")
@@ -190,7 +198,9 @@ def _forward_kernel(
                             else:
                                 vv[value] = vs[within * columns + value]
                         _dot_keys(state, av, partial, dot, within * dim)
-                        _update_state(state, wv, kv, vv, bv, dot, within * dim)
+                        _update_state(
+                            state, wv, kv, vv, bv, dot, within * dim, state_dtype
+                        )
                         _dot_keys(state, rv, partial, out, within * dim)
                         for value in T.Parallel(columns):
                             Y[token, h, tile * columns + value] = T.cast(
@@ -444,7 +454,7 @@ def _forward(
     final_state = torch.empty_like(initial_state)
     boundary = torch.empty(
         (n // _CHECKPOINT + batch if save else 0, heads, dim, dim),
-        dtype=torch.float32,
+        dtype=initial_state.dtype,
         device=r.device,
     )
     _forward_kernel(
@@ -458,6 +468,7 @@ def _forward(
         False,
         "bfloat16" if bias.dtype == torch.bfloat16 else "float32",
         prefetch_tokens,
+        str(initial_state.dtype).removeprefix("torch."),
     )(
         r,
         decay_logits,
@@ -547,6 +558,8 @@ def _check_inputs(
     block_values,
     prefetch_tokens,
     batch,
+    *,
+    inference=False,
 ):
     if r.ndim != 3 or r.shape[1] < 1 or r.shape[2] not in (64, 128, 256):
         raise ValueError("r must have shape [N,H,D], with D in {64,128,256}")
@@ -564,11 +577,12 @@ def _check_inputs(
     ):
         raise ValueError("initial_state must have shape [B,H,D,D] with B >= 1")
     if (
-        initial_state.dtype != torch.float32
+        initial_state.dtype not in ((torch.float32, torch.float16) if inference else (torch.float32,))
         or initial_state.device != r.device
         or not initial_state.is_contiguous()
     ):
-        raise ValueError("initial_state must be contiguous FP32 on the r device")
+        dtype = "FP16/FP32" if inference else "FP32"
+        raise ValueError(f"initial_state must be contiguous {dtype} on the r device")
     if (
         cu_seqlens.shape != (batch + 1,)
         or cu_seqlens.dtype != torch.int32
@@ -599,13 +613,14 @@ def _bias_tensor(r, decay_bias):
     return decay_bias.reshape(r.shape[1:])
 
 
-def _config_key(r, batch, bias, *, indexed=False):
+def _config_key(r, batch, bias, *, indexed=False, state_dtype=torch.float32):
     return (
         torch.cuda.get_device_name(r.device),
         tuple(r.shape),
         batch,
         None if bias is None else bias.dtype,
         indexed,
+        state_dtype,
     )
 
 
@@ -650,16 +665,17 @@ def _infer_recurrent(
         64 if block_values is None else block_values,
         1 if prefetch_tokens is None else prefetch_tokens,
         batch,
+        inference=True,
     )
     from ..._internal.tuning import get_config
 
-    config = get_config(_TUNED_CONFIGS, "tmix/wkv7", _config_key(r, batch, decay_bias, indexed=True), (64, 1))
+    config = get_config(_TUNED_CONFIGS, "tmix/wkv7", _config_key(r, batch, decay_bias, indexed=True, state_dtype=state_pool.dtype), (64, 1))
     block_values = config[0] if block_values is None else block_values
     prefetch_tokens = config[1] if prefetch_tokens is None else prefetch_tokens
     _, heads, dim = r.shape
     bias = _bias_tensor(r, decay_bias)
     output = torch.empty_like(v)
-    empty = torch.empty((0, heads, dim, dim), dtype=torch.float32, device=r.device)
+    empty = torch.empty((0, heads, dim, dim), dtype=state_pool.dtype, device=r.device)
     _forward_kernel(
         heads,
         dim,
@@ -671,6 +687,7 @@ def _infer_recurrent(
         True,
         "bfloat16" if bias.dtype == torch.bfloat16 else "float32",
         prefetch_tokens,
+        str(state_pool.dtype).removeprefix("torch."),
     )(
         r,
         decay_logits,
@@ -771,7 +788,7 @@ def tune_tmix_wkv7_recurrent(
 ):
     """Check both forward variants and time the requested production mode.
 
-    Every candidate must preserve functional/indexed BF16 outputs and FP32
+    Every candidate must preserve functional/indexed BF16 outputs and the
     final states. ``indexed=True`` measures in-place inference on a private
     pool with identity slots and valid status. Otherwise it measures the
     functional forward. The two modes retain separate configuration caches;
@@ -779,7 +796,21 @@ def tune_tmix_wkv7_recurrent(
     """
     from ..._internal.tuning import save_config, select_config
 
+    if initial_state.dtype == torch.float16 and not indexed:
+        raise ValueError("FP16 state is inference-only; tuning requires indexed=True")
+
     def functional(config):
+        if initial_state.dtype == torch.float16:
+            _check_inputs(
+                r, decay_logits, k, v, a, b, initial_state, cu_seqlens,
+                scale, decay_bias, *config, initial_state.shape[0], inference=True,
+            )
+            return _forward(
+                r, decay_logits, k, v, a, b, initial_state, cu_seqlens,
+                _bias_tensor(r, decay_bias),
+                torch.empty(0, dtype=torch.int32, device=r.device),
+                scale, False, *config,
+            )[:2]
         return tmix_wkv7_recurrent(
             r,
             decay_logits,
@@ -819,8 +850,11 @@ def tune_tmix_wkv7_recurrent(
     prefetches = (1, 4) if r.shape[0] > batch else (1,)
     candidates = tuple((columns, count) for columns in (64, 32) for count in prefetches)
     best, measurements = select_config(candidates, run, check=check, reference=reference)
-    _TUNED_CONFIGS[_config_key(r, batch, decay_bias, indexed=indexed)] = best
-    save_config("tmix/wkv7", _config_key(r, batch, decay_bias, indexed=indexed), best)
+    key = _config_key(
+        r, batch, decay_bias, indexed=indexed, state_dtype=initial_state.dtype
+    )
+    _TUNED_CONFIGS[key] = best
+    save_config("tmix/wkv7", key, best)
     return {
         "block_values": best[0], "prefetch_tokens": best[1],
         "indexed": indexed, "candidates": measurements,

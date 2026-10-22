@@ -7,6 +7,10 @@ kernel composition and shape-dependent dispatch remain internal. Complete
 models, schedulers, and training frameworks remain the responsibility of
 downstream projects.
 
+An optional FP16-state inference mode halves state storage while keeping BF16
+token IO and FP32 arithmetic. It does not promise bitwise equality with FP32
+training. The default FP32-state path retains training precision and parity.
+
 ## Requirements
 
 - Python 3.10 or newer

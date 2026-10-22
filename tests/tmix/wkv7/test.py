@@ -6,9 +6,12 @@ import torch
 from utils import require_cuda_backend
 
 from flashrwkv2.tmix.wkv7 import (
+    infer_tmix_wkv7_recurrent_fp16_forward_varlen,
     infer_tmix_wkv7_recurrent_fp32io16_forward_varlen,
     prepare_tmix_wkv7_recurrent_fp32io16_state,
     prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor,
+    prepare_tmix_wkv7_recurrent_fp16_state,
+    prepare_tmix_wkv7_recurrent_fp16_state_from_tensor,
     prepare_tmix_wkv7_recurrent_metadata,
 )
 
@@ -48,8 +51,10 @@ def test_public_recurrence_matches_functional_and_preserves_inactive_slots():
     assert actual.dtype == torch.bfloat16
 
 
-def test_state_checkpoint_cow_reset_and_memory():
-    state = prepare_tmix_wkv7_recurrent_fp32io16_state(4, 128, sequence_capacity=3)
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.float16])
+def test_state_checkpoint_cow_reset_and_memory(state_dtype):
+    prepare = prepare_tmix_wkv7_recurrent_fp32io16_state if state_dtype == torch.float32 else prepare_tmix_wkv7_recurrent_fp16_state
+    state = prepare(4, 128, sequence_capacity=3)
     pool = state._components()[0]
     pool.copy_(torch.randn_like(pool))
     checkpoint = state.clone()
@@ -63,7 +68,7 @@ def test_state_checkpoint_cow_reset_and_memory():
     state.copy_(checkpoint)
     assert torch.equal(pool, checkpoint._components()[0])
     state.materialize_slots_(src)
-    assert state.memory_layout["total_nbytes"] == pool.numel() * 4
+    assert state.memory_layout["total_nbytes"] == pool.numel() * pool.element_size()
     assert state.memory_layout["private_bytes_per_slot"] == 0
     with pytest.raises(ValueError, match="unique"):
         state.copy_slots_(checkpoint, src, torch.tensor([1, 1], device="cuda", dtype=torch.int32))
@@ -110,7 +115,9 @@ def test_invalid_metadata_preserves_state(cu, slots):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.cuda_graph
-def test_fp32_wkv_zero_active_precapture_warmup_then_graph_replay(
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.float16])
+def test_wkv_zero_active_precapture_warmup_then_graph_replay(
+    state_dtype,
 ) -> None:
     _require_cuda_extension()
     torch.manual_seed(20260809)
@@ -122,7 +129,7 @@ def test_fp32_wkv_zero_active_precapture_warmup_then_graph_replay(
         for scale in (0.1, 2.0, 0.05, 0.05, 0.05, 0.05)
     )
     initial_state = torch.randn(
-        slots, heads, head_size, head_size, device=device, dtype=torch.float32
+        slots, heads, head_size, head_size, device=device, dtype=state_dtype
     ).mul_(0.02)
     state = initial_state.clone()
     cu_seqlens = torch.tensor([0, -1, -1, -1, -1], device=device, dtype=torch.int32)
@@ -133,7 +140,9 @@ def test_fp32_wkv_zero_active_precapture_warmup_then_graph_replay(
     num_active_sequences = torch.zeros(1, device=device, dtype=torch.int32)
     metadata_addresses = (cu_seqlens.data_ptr(), state_indices.data_ptr())
     stream = torch.cuda.Stream(device=device)
-    state_handle = prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor(state)
+    prepare_state = prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor if state_dtype == torch.float32 else prepare_tmix_wkv7_recurrent_fp16_state_from_tensor
+    infer = infer_tmix_wkv7_recurrent_fp32io16_forward_varlen if state_dtype == torch.float32 else infer_tmix_wkv7_recurrent_fp16_forward_varlen
+    state_handle = prepare_state(state)
 
     # vLLM V2 warms the exact capture shape before torch.cuda.graph().  The
     # padded sequence capacity can exceed the physical state-pool capacity;
@@ -150,7 +159,7 @@ def test_fp32_wkv_zero_active_precapture_warmup_then_graph_replay(
             num_active_tokens=num_active_tokens,
             num_active_sequences=num_active_sequences,
         )
-        infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
+        infer(
             *packed,
             state=state_handle,
             cu_seqlens=cu_seqlens,
@@ -175,7 +184,7 @@ def test_fp32_wkv_zero_active_precapture_warmup_then_graph_replay(
 
     expected_state = initial_state.clone()
     expected_state_handle = (
-        prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor(expected_state)
+        prepare_state(expected_state)
     )
     expected_ticket = prepare_tmix_wkv7_recurrent_metadata(
         cu_seqlens,
@@ -187,7 +196,7 @@ def test_fp32_wkv_zero_active_precapture_warmup_then_graph_replay(
         num_active_tokens=num_active_tokens,
         num_active_sequences=num_active_sequences,
     )
-    expected_output = infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
+    expected_output = infer(
         *packed,
         state=expected_state_handle,
         cu_seqlens=cu_seqlens,
@@ -208,7 +217,7 @@ def test_fp32_wkv_zero_active_precapture_warmup_then_graph_replay(
             num_active_tokens=num_active_tokens,
             num_active_sequences=num_active_sequences,
         )
-        graph_output = infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
+        graph_output = infer(
             *packed,
             state=state_handle,
             cu_seqlens=cu_seqlens,
