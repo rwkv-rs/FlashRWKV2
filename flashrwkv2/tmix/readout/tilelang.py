@@ -11,7 +11,7 @@ _ROW_CONFIGS = {}
 
 
 def _config_key(x, head_size):
-    return (x.device.index, x.shape, x.dtype, head_size)
+    return (torch.cuda.get_device_name(x.device), x.shape, x.dtype, head_size)
 
 
 @tilelang.jit(pass_configs={"tl.enable_fast_math": False}, out_idx=[8, 9], compile_flags=["--fmad=false"])

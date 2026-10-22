@@ -11,7 +11,7 @@ _ROW_CONFIGS = {}
 
 
 def _config_key(x, has_res):
-    return (x.device.index, x.shape, has_res)
+    return (torch.cuda.get_device_name(x.device), x.shape, has_res)
 
 
 def _row_layout(channels, rows_per_block):

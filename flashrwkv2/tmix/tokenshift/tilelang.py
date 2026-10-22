@@ -15,7 +15,7 @@ _FUSED_CONFIGS = {}
 
 
 def _config_key(x, mixes, batch):
-    return (x.device.index, x.shape, len(mixes), batch)
+    return (torch.cuda.get_device_name(x.device), x.shape, len(mixes), batch)
 
 
 def _pack_mixes(x, mixes, *, pack=True):
