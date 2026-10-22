@@ -24,9 +24,7 @@ def test_optional_fp16_state_preserves_inference_packing_and_training_precision(
         infer_tmix_wkv7_recurrent_fp16_forward_varlen,
         prepare_tmix_wkv7_recurrent_fp16_state_from_tensor,
     )
-    from flashrwkv2.tmix.wkv7.tilelang import (
-        _bias_tensor, _forward, tune_tmix_wkv7_recurrent,
-    )
+    from flashrwkv2.tmix.wkv7.tilelang import _bias_tensor, _forward
 
     lengths = (1, 17, 33)
     values, initial, cu, bias = _case(dim, lengths)
@@ -42,15 +40,32 @@ def test_optional_fp16_state_preserves_inference_packing_and_training_precision(
     for actual, expected in zip(reference, independent, strict=True):
         torch.testing.assert_close(actual, expected, atol=2e-4, rtol=8e-3)
 
-    tuned = tune_tmix_wkv7_recurrent(
-        *values, initial, cu, scale=.75, decay_bias=bias, indexed=True,
-    )
-    assert all(item.get("bitwise_equal", False) for item in tuned["candidates"] if "milliseconds" in item)
     slots = torch.tensor([3, 1, 0], dtype=torch.int32, device="cuda")
     pool = initial.new_zeros(5, *initial.shape[1:])
     pool.index_copy_(0, slots.long(), initial)
     original = pool.clone()
     handle = prepare_tmix_wkv7_recurrent_fp16_state_from_tensor(pool)
+    status = torch.tensor([0, values[0].shape[0], len(lengths)], dtype=torch.int32, device="cuda")
+    for columns in (64, 32):
+        for prefetch in (1, 4):
+            functional = _forward(
+                *values, initial, cu, _bias_tensor(values[0], bias),
+                torch.empty(0, dtype=torch.int32, device="cuda"), .75,
+                False, columns, prefetch,
+            )[:2]
+            pool.copy_(original)
+            inferred = _infer_recurrent(
+                *values, pool, cu, slots, status, scale=.75, decay_bias=bias,
+                block_values=columns, prefetch_tokens=prefetch,
+            )
+            for candidate, expected in zip(
+                (*functional, inferred, pool[slots.long()]),
+                (*reference, *reference), strict=True,
+            ):
+                assert torch.equal(candidate.view(torch.int16), expected.view(torch.int16))
+            assert torch.equal(pool[[2, 4]], original[[2, 4]])
+
+    pool.copy_(original)
     actual = infer_tmix_wkv7_recurrent_fp16_forward_varlen(
         *values, state=handle, cu_seqlens=cu, state_indices=slots,
         scale=.75, decay_bias=bias,
@@ -73,6 +88,29 @@ def test_optional_fp16_state_preserves_inference_packing_and_training_precision(
             assert torch.equal(y[0].view(torch.int16), reference[0][token].view(torch.int16))
         assert torch.equal(pool[slot.long()].view(torch.int16), reference[1][sequence:sequence + 1].view(torch.int16))
         offset += length
+
+
+@pytest.mark.parametrize("dim", [64, 128, 256])
+@pytest.mark.parametrize("has_bias", [False, True])
+def test_optional_fp16_tuning_preserves_inference_outputs(dim, has_bias, monkeypatch, tmp_path):
+    from flashrwkv2._internal import tuning
+    from flashrwkv2.tmix.wkv7 import tilelang as implementation
+
+    values, initial, cu, bias = _case(dim, (1, 3))
+    initial = initial.half()
+    original = initial.clone()
+    monkeypatch.setattr(tuning, "_profile_root", lambda: tmp_path)
+    monkeypatch.setattr(implementation, "_TUNED_CONFIGS", {})
+    tuning._read_profile.cache_clear()
+    tuned = implementation.tune_tmix_wkv7_recurrent(
+        *values, initial, cu, scale=.75, decay_bias=bias if has_bias else None,
+        indexed=True,
+    )
+    candidates = tuned["candidates"]
+    assert len(candidates) == 4
+    assert all(item["bitwise_equal"] and item["milliseconds"] > 0 for item in candidates)
+    assert torch.equal(initial.view(torch.int16), original.view(torch.int16))
+    tuning._read_profile.cache_clear()
 
 
 def _case(dim, lengths, *, requires_grad=False, logits=-2.0):
