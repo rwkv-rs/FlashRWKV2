@@ -197,7 +197,7 @@ jobs:
       needs.plan.outputs.run_gpu == 'true' && needs.plan.outputs.trusted == 'true'
     needs: [plan, contract, package]
     runs-on: [self-hosted, linux, x64, rwkv-sha-pro6000x8]
-    timeout-minutes: 180
+    timeout-minutes: 300
     concurrency:
       group: flashrwkv2-pro6000-exclusive
       cancel-in-progress: false
