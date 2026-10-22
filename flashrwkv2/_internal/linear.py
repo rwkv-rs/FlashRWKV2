@@ -526,7 +526,7 @@ def tune_linear(x, weight, output_dtype=None, *, bias=None, benchmark=None):
     ``benchmark`` measures the owning forward operator with each candidate in
     its dispatch cache, preserving the operator's working set during tuning.
     """
-    from .tuning import select_config
+    from .tuning import projection_finalists, select_config
 
     output_dtype = torch.bfloat16 if output_dtype is None else output_dtype
     linear(x, weight, bias, output_dtype)
@@ -573,7 +573,7 @@ def tune_linear(x, weight, output_dtype=None, *, bias=None, benchmark=None):
     for phase in ("tiles", "copies"):
         if phase == "copies":
             # Copy spans can change the best column tile and pipeline depth.
-            spans = (64, 128, 256, 512, 1024) if narrow_tiles else (64, 128)
+            spans = (64, 128, 256, 512, 1024) if x.shape[0] < 16 else (64, 128)
             copies = [span for span in spans if x.shape[1] % span == 0]
             if not copies:
                 break
@@ -583,7 +583,7 @@ def tune_linear(x, weight, output_dtype=None, *, bias=None, benchmark=None):
                 item for item in measurements.values()
                 if item.get("bitwise_equal") and item["config"][0] == row_tile
             ]
-            if x.shape[0] > 128 or narrow_tiles:
+            if x.shape[0] > 128 or x.shape[0] < 16:
                 tiles.extend(item["config"] for item in matched)
             elif best_config[0] != row_tile and matched:
                 tiles.append(
@@ -653,17 +653,8 @@ def tune_linear(x, weight, output_dtype=None, *, bias=None, benchmark=None):
         measurements.update((item["config"], item) for item in checked + rejected)
     # Finalists use the formal benchmark's graph length. Short graphs can rank
     # copy spans differently from a sustained benchmark.
-    finalists = {}
-    for item in measurements.values():
-        if item.get("bitwise_equal"):
-            span = item["config"][3]
-            if (
-                span not in finalists
-                or item["milliseconds"] < finalists[span]["milliseconds"]
-            ):
-                finalists[span] = item
     best_config, checked = select_config(
-        tuple(item["config"] for item in finalists.values()),
+        projection_finalists(measurements.values()),
         run,
         check=lambda config: tuple(
             _forward(x, weight, bias, dtype, config) for dtype in check_dtypes

@@ -75,7 +75,7 @@ def test_tilelang_linear_k1_head_device_compilation_without_gpu(arch):
 @pytest.mark.parametrize(
     "shape", [
         (32, 96, 64), (1, 64, 96), (15, 128, 128),
-        (1, 129, 64), (1, 64, 4096), (16, 64, 160),
+        (1, 129, 64), (1, 256, 4096), (1, 64, 4096), (16, 64, 160),
         (129, 256, 128), (256, 256, 128),
     ]
 )
@@ -95,6 +95,8 @@ def test_tilelang_linear_tuning_checks_production_and_skips_compile_failures(
     compiled_configs = set()
     select_calls = 0
     benchmark_configs = []
+    coarse_measurements = {}
+    sustained_winner = None
 
     def benchmark():
         config = implementation._TUNED_CONFIGS[
@@ -124,7 +126,7 @@ def test_tilelang_linear_tuning_checks_production_and_skips_compile_failures(
         return torch.full((x.shape[0], weight.shape[0]), value, dtype=dtype)
 
     def select_config(candidates, run, *, check, reference, repeat=20):
-        nonlocal select_calls
+        nonlocal select_calls, sustained_winner
         candidates = tuple(candidates)
         assert rejected not in candidates
         if select_calls == 0:
@@ -144,21 +146,33 @@ def test_tilelang_linear_tuning_checks_production_and_skips_compile_failures(
                     assert (16, 8, 3, 1024) not in candidates
             else:
                 assert len({config[:3] for config in candidates}) == (
-                    6 if rows > 128 else 4 if rows >= 16 else 2
+                    6 if rows > 128 else 4 if rows >= 16 else 6
                 )
             spans = (64, 128, 256, 512, 1024) if (
-                rows < 16 and outputs <= 128
+                rows < 16
             ) else (64, 128)
-            assert {config[3] for config in candidates} == (
-                {32, 64} if rows > 128 else
-                {32, *(span for span in spans if channels % span == 0)}
-            )
+            expected_spans = {
+                span for span in (32, *spans)
+                if channels % span == 0
+                and any((m + n) * span * stages * 2 <= 101376 for m, n, stages, _ in candidates)
+            }
+            assert {config[3] for config in candidates} == expected_spans
+            if rows < 16 and channels == 4096 and outputs > 128:
+                assert (16, 32, 2, 512) in candidates
             if rows > 128:
                 assert all((256, width, 2, 64) in candidates for width in (32, 64, 128))
                 assert all(config[2] == 2 for config in candidates if config[3] == 64)
         else:
             assert repeat == 1000
-            assert len(candidates) == len({config[3] for config in candidates})
+            # A third-ranked short-graph tile can win sustained operator timing.
+            span = candidates[0][3]
+            ranked = sorted(
+                (item for item in coarse_measurements.values() if item["bitwise_equal"] and item["config"][3] == span),
+                key=lambda item: item["milliseconds"],
+            )
+            sustained_winner = ranked[min(2, len(ranked) - 1)]["config"]
+            assert sustained_winner in candidates
+            assert all(1 <= sum(c[3] == span for c in candidates) <= 3 for span in {c[3] for c in candidates})
         select_calls += 1
         assert tuple(value.dtype for value in reference) == (
             (torch.float32, torch.bfloat16)
@@ -174,11 +188,18 @@ def test_tilelang_linear_tuning_checks_production_and_skips_compile_failures(
             record = {"config": config, "bitwise_equal": equal}
             if equal:
                 run(config)
-                record["milliseconds"] = 1.0
+                record["milliseconds"] = (
+                    0.1 if repeat == 1000 and config == sustained_winner else 1.0 + len(measurements)
+                )
             measurements.append(record)
-        return max(
-            item["config"] for item in measurements if item["bitwise_equal"]
-        ), measurements
+        if repeat == 20:
+            coarse_measurements.update((item["config"], item) for item in measurements)
+        if repeat == 20:
+            return max(item["config"] for item in measurements if item["bitwise_equal"]), measurements
+        return min(
+            (item for item in measurements if item["bitwise_equal"]),
+            key=lambda item: item["milliseconds"],
+        )["config"], measurements
 
     monkeypatch.setattr(implementation, "linear", lambda *args, **kwargs: None)
     monkeypatch.setattr(implementation, "_compiled", compile_kernel)
@@ -204,6 +225,7 @@ def test_tilelang_linear_tuning_checks_production_and_skips_compile_failures(
     assert compiled_dtypes == (
         {"bfloat16", "float32"} if output_dtype == torch.bfloat16 else {"float32"}
     )
+    assert result["config"] == sustained_winner
     assert result["config"] != rejected
     if rows > 128:
         for copy_k in (64, 128):
@@ -475,6 +497,7 @@ def test_tilelang_linear_narrow_tiles_preserve_results(
         (16, 32, 3, 32), (32, 128, 2, 32), (64, 64, 3, 32), (128, 32, 2, 32),
         (256, 64, 2, 32),
         pytest.param((256, 128, 2, 64), marks=(pytest.mark.memcheck, pytest.mark.racecheck)),
+        pytest.param((16, 32, 2, 512), marks=(pytest.mark.memcheck, pytest.mark.racecheck)),
         pytest.param((16, 16, 3, 512), marks=(pytest.mark.memcheck, pytest.mark.racecheck)),
         pytest.param((16, 8, 2, 1024), marks=(pytest.mark.memcheck, pytest.mark.racecheck)),
     ]

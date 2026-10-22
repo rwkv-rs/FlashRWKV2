@@ -612,7 +612,7 @@ def _grouped_linear(xs, weights, kinds, biases):
 @torch.no_grad()
 def _tune_grouped_linear(xs, weights, kinds, biases, *, benchmark=None):
     """Verify independent FP32 accumulators and BF16 epilogues before timing."""
-    from ..._internal.tuning import compile_candidates, select_config
+    from ..._internal.tuning import compile_candidates, projection_finalists, select_config
 
     xs, weights, biases = _group_inputs(xs, weights, biases)
     cache_key = _group_key(xs, weights, kinds, biases)
@@ -670,7 +670,7 @@ def _tune_grouped_linear(xs, weights, kinds, biases, *, benchmark=None):
     best = candidates[0]
     for phase in ("tiles", "copies"):
         if phase == "copies":
-            spans = (64, 128, 256, 512, 1024) if narrow else (64, 128)
+            spans = (64, 128, 256, 512, 1024) if narrow or rows < 16 else (64, 128)
             copies = tuple(
                 span for span in spans if all(x.shape[1] % span == 0 for x in xs)
             )
@@ -683,7 +683,7 @@ def _tune_grouped_linear(xs, weights, kinds, biases, *, benchmark=None):
                 if item.get("bitwise_equal") and item["config"][0] == row_tile
             ]
             tiles = [best]
-            if rows > 128 or narrow:
+            if rows > 128 or rows < 16 or narrow:
                 tiles.extend(item["config"] for item in matched)
             elif best[0] != row_tile and matched:
                 tiles.append(
@@ -732,17 +732,8 @@ def _tune_grouped_linear(xs, weights, kinds, biases, *, benchmark=None):
                 compiled.append(config)
         best, checked = select_config(compiled, run, check=check, reference=reference)
         measurements.update((item["config"], item) for item in (*checked, *rejected))
-    finalists = {}
-    for item in measurements.values():
-        if item.get("bitwise_equal"):
-            span = item["config"][3]
-            if (
-                span not in finalists
-                or item["milliseconds"] < finalists[span]["milliseconds"]
-            ):
-                finalists[span] = item
     best, checked = select_config(
-        tuple(item["config"] for item in finalists.values()),
+        projection_finalists(measurements.values()),
         run,
         check=check,
         reference=reference,

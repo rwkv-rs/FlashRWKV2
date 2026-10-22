@@ -33,6 +33,19 @@ def compile_candidates(keys, cache, spec):
         )
 
 
+def projection_finalists(measurements):
+    """Retain three verified tiles per copy span for sustained graph timing."""
+    spans = {}
+    for item in measurements:
+        if item.get("bitwise_equal"):
+            spans.setdefault(item["config"][3], []).append(item)
+    return tuple(
+        item["config"]
+        for items in spans.values()
+        for item in sorted(items, key=lambda item: item["milliseconds"])[:3]
+    )
+
+
 @torch.no_grad()
 def select_config(candidates, run, *, check=None, reference=None, warmup=3, repeat=20):
     """Return (configuration, measurements), timing CUDA Graph replay.
