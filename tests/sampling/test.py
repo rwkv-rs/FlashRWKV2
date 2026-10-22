@@ -35,6 +35,101 @@ def test_reproducible_state_pool() -> None:
     assert torch.equal(first, second)
 
 
+@pytest.mark.cuda_graph
+@pytest.mark.memcheck
+@pytest.mark.racecheck
+@pytest.mark.parametrize("provider", ["scalar", "per_request", "six_parameter"])
+@pytest.mark.parametrize("batch,vocab", [(1, 8), (3, 8), (1, 65536)])
+def test_zero_temperature_is_deterministic_greedy(provider, batch, vocab) -> None:
+    logits = torch.full((batch, vocab), -8.0, device="cuda")
+    # Exact ties select the first index; close maxima must never be sampled.
+    logits[:, 2] = 3.016162157058716
+    logits[:, 3] = 3.0155980587005615
+    logits[:, vocab - 1] = logits[:, 2]
+    slots = torch.arange(batch, 0, -1, device="cuda", dtype=torch.int32)
+    states = setup_sampling_states(20261022, batch + 2)
+    penalties = torch.zeros(batch + 2, vocab, device="cuda")
+    controls = {"temperature": 0.0, "top_k": -1}
+    if provider == "per_request":
+        controls["temperature"] = torch.zeros(batch, device="cuda")
+    if provider == "six_parameter":
+        controls.update(presence_penalty=0.25, frequency_penalty=0.5, penalty_decay=0.5)
+
+    def sample():
+        if provider == "six_parameter":
+            return infer_sampling_six_parameter_forward_varlen(
+                logits, penalties, states, slots, **controls
+            )
+        return infer_sampling_temperature_topk_topp_forward_varlen(
+            logits, states, slots, **controls
+        )
+
+    sample()
+    penalties.zero_()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = sample()
+    penalties.zero_()
+    initial_rng = states.clone()
+    expected_penalties = penalties.clone()
+    for _ in range(4):
+        adjusted = logits - expected_penalties[slots.long()]
+        expected = adjusted.argmax(dim=-1).to(torch.int32)
+        if provider == "six_parameter":
+            for row, slot in enumerate(slots.tolist()):
+                index = expected[row].item()
+                seen = expected_penalties[slot, index].item() != 0
+                expected_penalties[slot].mul_(0.5)
+                expected_penalties[slot, index] += 0.5 + (0.0 if seen else 0.25)
+        graph.replay()
+        assert torch.equal(output, expected)
+        assert torch.equal(states, initial_rng)
+        assert torch.equal(penalties, expected_penalties)
+
+
+@pytest.mark.cuda_graph
+@pytest.mark.memcheck
+@pytest.mark.racecheck
+def test_zero_temperature_live_controls_and_inactive_rows() -> None:
+    logits = torch.tensor([[1.0, 1.0, 0.0, -1.0]] * 3, device="cuda")
+    slots = _slots([4, 1, 3])
+    active = _slots([2])
+    temperatures = torch.tensor([0.0, 1.0, 0.0], device="cuda")
+    states = setup_sampling_states(47, 6)
+    penalties = torch.zeros(6, 4, device="cuda")
+
+    def sample():
+        return infer_sampling_six_parameter_forward_varlen(
+            logits, penalties, states, slots,
+            temperature=temperatures, top_k=1,
+            frequency_penalty=0.25,
+            sample_capacity=3, num_active_samples=active,
+        )
+
+    sample()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = sample()
+    for count, values in ((2, [0.0, 1.0, 0.0]), (3, [1.0, 0.0, 0.0]), (0, [0.0] * 3)):
+        active.fill_(count)
+        temperatures.copy_(torch.tensor(values, device="cuda"))
+        penalties.zero_()
+        before = states.clone()
+        graph.replay()
+        assert torch.equal(output[count:], _slots([-1] * (3 - count)))
+        for row, slot in enumerate(slots.tolist()):
+            if row >= count or values[row] == 0.0:
+                assert torch.equal(states[slot], before[slot])
+            else:
+                assert not torch.equal(states[slot], before[slot])
+            if row < count:
+                if values[row] == 0.0:
+                    assert output[row].item() == 0
+                assert penalties[slot].sum().item() == 0.25
+            else:
+                assert torch.count_nonzero(penalties[slot]).item() == 0
+
+
 @pytest.mark.memcheck
 @pytest.mark.racecheck
 def test_scalar_and_per_request_top1_match_with_indexed_slots() -> None:

@@ -130,9 +130,9 @@ __device__ __forceinline__ SamplingControls sampling_row_controls(SamplingContro
   controls.presence = controls.presences ? controls.presences[row] : controls.presence;
   controls.frequency = controls.frequencies ? controls.frequencies[row] : controls.frequency;
   controls.decay = controls.decays ? controls.decays[row] : controls.decay;
-  controls.temperature =
-      fminf(fmaxf(controls.temperatures ? controls.temperatures[row] : controls.temperature, .001f),
-            1000.f);
+  const float temperature =
+      controls.temperatures ? controls.temperatures[row] : controls.temperature;
+  controls.temperature = temperature == 0.f ? 0.f : fminf(fmaxf(temperature, .001f), 1000.f);
   controls.top_k = controls.top_ks ? controls.top_ks[row] : controls.top_k;
   controls.top_p = fminf(fmaxf(controls.top_ps ? controls.top_ps[row] : controls.top_p, 0.f), 1.f);
   if (controls.top_k <= 0 || controls.top_k > vocab_size) controls.top_k = vocab_size;
@@ -141,6 +141,56 @@ __device__ __forceinline__ SamplingControls sampling_row_controls(SamplingContro
     controls.top_p = 1.f;
   }
   return controls;
+}
+
+__device__ __forceinline__ void update_sampling_penalties(int V, float* penalties, int selected,
+                                                         float presence, float frequency,
+                                                         float decay) {
+  for (int i = threadIdx.x; i < V; i += blockDim.x) {
+    float p = penalties[i];
+    const bool seen = p != 0.f || signbit(p);
+    const bool sampled = i == selected;
+    p = fmaf(p, decay, sampled ? frequency + (seen ? 0.f : presence) : 0.f);
+    penalties[i] = (seen || sampled) && p == 0.f ? -0.f : p;
+  }
+}
+
+template <bool Penalties>
+__device__ __forceinline__ void sampling_greedy(int V, const float* logits, float* penalties,
+                                              int* outputs, const int* slot_indices,
+                                              SamplingControls controls) {
+  const int row = blockIdx.x, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  logits += int64_t(row) * V;
+  if constexpr (Penalties) penalties += int64_t(slot_indices[row]) * V;
+  __shared__ float maxima[32];
+  __shared__ unsigned indices[32];
+  float maximum = -FLT_MAX;
+  unsigned selected = static_cast<unsigned>(V);
+  for (int i = threadIdx.x; i < V; i += blockDim.x) {
+    float value = safe_float(logits[i]);
+    if constexpr (Penalties) value -= penalties[i];
+    value = safe_float(value);
+    if (value > maximum || (value == maximum && unsigned(i) < selected)) {
+      maximum = value;
+      selected = i;
+    }
+  }
+  const float global_maximum = block_reduce<float, true>(maximum, maxima);
+  selected = maximum == global_maximum ? selected : static_cast<unsigned>(V);
+  selected = __reduce_min_sync(0xffffffff, selected);
+  if (lane == 0) indices[warp] = selected;
+  __syncthreads();
+  if (warp == 0) {
+    selected = lane < blockDim.x / 32 ? indices[lane] : static_cast<unsigned>(V);
+    selected = __reduce_min_sync(0xffffffff, selected);
+    if (lane == 0) indices[0] = selected;
+  }
+  __syncthreads();
+  selected = indices[0];
+  if (threadIdx.x == 0) outputs[row] = selected;
+  if constexpr (Penalties)
+    update_sampling_penalties(V, penalties, selected, controls.presence, controls.frequency,
+                              controls.decay);
 }
 
 template <bool Penalties, bool Cooperative = false, int CachedCandidates = 0>
@@ -443,13 +493,7 @@ __device__ __forceinline__ void sampling_body(int V, const float* logits, float*
   __syncthreads();
   if (t == 0) outputs[b] = selected;
   if constexpr (Penalties) {
-    for (int i = t; i < V; i += blockDim.x) {
-      float p = penalties[i];
-      const bool seen = p != 0.f || signbit(p);
-      const bool sampled = i == selected;
-      p = fmaf(p, decay, sampled ? repetition + (seen ? 0.f : presence) : 0.f);
-      penalties[i] = (seen || sampled) && p == 0.f ? -0.f : p;
-    }
+    update_sampling_penalties(V, penalties, selected, presence, repetition, decay);
   }
 }
 
@@ -475,6 +519,10 @@ __global__ void __launch_bounds__(1024, 1)
     return;
   }
   controls = sampling_row_controls(controls, row, V);
+  if (controls.temperature == 0.f) {
+    sampling_greedy<Penalties>(V, logits, penalties, outputs, slot_indices, controls);
+    return;
+  }
   sampling_body<Penalties>(V, logits, penalties, outputs, states, probs, weights,
                            1.4426950408889634f / controls.temperature, controls.top_k,
                            controls.top_p, controls.presence, controls.frequency, controls.decay,
@@ -574,6 +622,11 @@ __global__ void __launch_bounds__(1024, 1)
     return;
   }
   controls = sampling_row_controls(controls, 0, V);
+  if (controls.temperature == 0.f) {
+    if (blockIdx.x == 0)
+      sampling_greedy<false>(V, logits, nullptr, outputs, slot_indices, controls);
+    return;
+  }
   const float inv_temperature = 1.4426950408889634f / controls.temperature;
   const int k = controls.top_k;
   const float p = controls.top_p;
@@ -837,7 +890,8 @@ SamplingControls sampling_scalar_controls(double presence, double frequency, dou
   controls.presence = static_cast<float>(presence);
   controls.frequency = static_cast<float>(frequency);
   controls.decay = static_cast<float>(decay);
-  controls.temperature = static_cast<float>(fmin(fmax(temperature, .001), 1000.));
+  controls.temperature =
+      temperature == 0. ? 0.f : static_cast<float>(fmin(fmax(temperature, .001), 1000.));
   controls.top_k = top_k <= 0 || top_k > V ? V : static_cast<int>(top_k);
   controls.top_p = static_cast<float>(fmin(fmax(top_p, 0.), 1.));
   // Preserve a positive top-p that underflows during host double-to-float conversion.

@@ -38,8 +38,11 @@ advancing RNG. Slot mapping selects both RNG and penalty storage. After a draw,
 penalties decay and the selected token receives a frequency increment plus
 a presence increment on its first occurrence. Negative zero preserves the
 seen marker when increments cancel. This additive rule differs from the
-upstream penalty update and is intentionally retained. Scalar temperature
-and top-p keep the existing clamping behavior. CUDA Graph replay can change
+upstream penalty update and is intentionally retained. Zero temperature selects
+the largest penalty-adjusted logit, breaking ties by the lowest token index,
+without advancing RNG. Both scalar and live per-request controls use this rule,
+including cooperative launches. Other temperatures and top-p keep the existing
+clamping behavior. CUDA Graph replay can change
 active count, slots, logits, and per-request controls without recapture.
 
 Single-row calls check the active count and slot range inside the sampling
