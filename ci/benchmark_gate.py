@@ -213,6 +213,42 @@ for _channels in (768, 1024, 2048, 2560, 4096, 5120):
                 ),
             )
 
+# Cover the serving batch sizes and heterogeneous ranks of the real 7.2B model.
+for _rows in (4, 64, 320, 512):
+    for _owner, _arguments in {
+        "head/linear": ("--tokens", str(_rows)),
+        "cmix": ("--operator", "infer", "--batch", str(_rows), "--seqlen", "1"),
+        "post_norm": ("--tokens", str(_rows)),
+        "tmix/readout": ("--tokens", str(_rows)),
+        "tmix/tokenshift": ("--batch", str(_rows), "--seqlen", "1"),
+    }.items():
+        BENCHMARKS[_owner] += (
+            BenchmarkCase(
+                f"tuned_model_t{_rows}", f"benchmarks/{_owner}/bench.py",
+                (*_arguments, "--channels", "4096", "--tune", "--timing-mode", "graph"),
+            ),
+        )
+
+for _rows in (1, 4, 64, 320, 512):
+    for _later in (False, True):
+        BENCHMARKS["tmix/wkv_prepare"] += (
+            BenchmarkCase(
+                f"tuned_model_{'later' if _later else 'first'}_t{_rows}",
+                "benchmarks/tmix/wkv_prepare/bench.py",
+                ("--operator", "infer", "--tokens", str(_rows), "--channels", "4096",
+                 "--rank", "128", "--ranks", "128,128,480,96",
+                 *(("--later-layer",) if _later else ()), "--tune", "--timing-mode", "graph"),
+            ),
+        )
+
+BENCHMARKS["tmix/wkv7"] += (
+    BenchmarkCase(
+        "infer_recurrent_model_decode", "benchmarks/tmix/wkv7/bench.py",
+        ("--shapes", "h64d64", "--cases", "1x1", "4x1", "64x1", "320x1", "512x1",
+         "--decay-bias", "--tune", "--timing-mode", "graph"), "--output",
+    ),
+)
+
 BENCHMARKS["head/l2wrap_ce"] += (
     BenchmarkCase(
         "nora_model_width_chunked_backward",
@@ -230,6 +266,14 @@ BENCHMARKS["head/l2wrap_ce"] += (
         ),
     ),
 )
+
+
+# Publish real serving shapes first so downstream validation can run in parallel.
+for _owner, _cases in BENCHMARKS.items():
+    BENCHMARKS[_owner] = tuple(sorted(
+        _cases,
+        key=lambda case: not case.workload.startswith(("tuned_model_", "infer_recurrent_model_")),
+    ))
 
 
 def _sha256(path: Path) -> str:
@@ -921,7 +965,7 @@ def _self_test() -> None:
         "nora_forward_backward",
         "nora_torch_forward_backward",
         "tuned_multisize",
-    }
+    } | {f"tuned_model_t{rows}" for rows in (4, 64, 320, 512)}
     assert {case.workload for case in BENCHMARKS["tmix/tokenshift"]} == {
         "infer",
         "pretrain_forward_backward",
@@ -930,10 +974,11 @@ def _self_test() -> None:
         f"tuned_c{channels}_t{rows}"
         for channels in (768, 1024, 2048, 2560, 4096, 5120)
         for rows in (1, 27, 256)
-    }
+    } | {f"tuned_model_t{rows}" for rows in (4, 64, 320, 512)}
     assert {case.workload for case in BENCHMARKS["tmix/wkv7"]} == {
         "infer_recurrent_fp32io16",
         "infer_recurrent_multisize",
+        "infer_recurrent_model_decode",
         "pretrain_forward_backward",
         "statetune",
     }

@@ -185,7 +185,9 @@ def _forward(x, weight, bias, output_dtype, config=None):
     x, weight = _aligned(x), _aligned(weight)
     bias = None if bias is None else _aligned(bias)
     if config is None:
-        config = _TUNED_CONFIGS.get(_key(x, weight, output_dtype, bias))
+        from .tuning import get_config
+
+        config = get_config(_TUNED_CONFIGS, "linear", _key(x, weight, output_dtype, bias))
         if config is None:
             block_m = 16
             if x.shape[0] > 16:
@@ -526,7 +528,7 @@ def tune_linear(x, weight, output_dtype=None, *, bias=None, benchmark=None):
     ``benchmark`` measures the owning forward operator with each candidate in
     its dispatch cache, preserving the operator's working set during tuning.
     """
-    from .tuning import projection_finalists, select_config
+    from .tuning import projection_finalists, save_config, select_config
 
     output_dtype = torch.bfloat16 if output_dtype is None else output_dtype
     linear(x, weight, bias, output_dtype)
@@ -665,6 +667,7 @@ def tune_linear(x, weight, output_dtype=None, *, bias=None, benchmark=None):
     measurements.update((item["config"], item) for item in checked)
     best_ms = measurements[best_config]["milliseconds"]
     _TUNED_CONFIGS[_key(x, weight, output_dtype, bias)] = best_config
+    save_config("linear", _key(x, weight, output_dtype, bias), best_config)
     return {
         "config": best_config,
         "milliseconds": best_ms,

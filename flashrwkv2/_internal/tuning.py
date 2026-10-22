@@ -1,10 +1,78 @@
 # SPDX-License-Identifier: MIT
 """Measure explicit kernel candidates only after exact-output validation."""
 
+import hashlib
+import json
 import math
+import os
+from functools import cache
+from pathlib import Path
 from statistics import median
+from tempfile import NamedTemporaryFile
 
 import torch
+
+
+@cache
+def _profile_root():
+    """Share verified execution profiles across processes using the same kernels."""
+    import tilelang
+
+    root = Path(__file__).resolve().parents[1]
+    digest = hashlib.sha256(repr((tilelang.__version__, torch.version.cuda)).encode())
+    for path in sorted(root.rglob("*.py")):
+        digest.update(path.relative_to(root).as_posix().encode())
+        digest.update(path.read_bytes())
+    return Path(torch.hub.get_dir()).parent / "flashrwkv2" / "tuning" / digest.hexdigest()
+
+
+def _profile_path(owner, encoded_key):
+    name = hashlib.sha256(encoded_key.encode()).hexdigest() + ".json"
+    return _profile_root() / owner / name
+
+
+@cache
+def _read_profile(owner, encoded_key):
+    try:
+        record = json.loads(_profile_path(owner, encoded_key).read_text())
+    except FileNotFoundError:
+        return None
+    if not isinstance(record, dict):
+        raise ValueError("invalid verified kernel tuning profile")
+    config = record.get("config")
+    values = config if isinstance(config, list) else [config]
+    if (
+        record.get("key") != json.loads(encoded_key)
+        or record.get("bitwise_equal") is not True
+        or not values
+        or any(type(value) is not int or value <= 0 for value in values)
+    ):
+        raise ValueError("invalid verified kernel tuning profile")
+    return tuple(config) if isinstance(config, list) else config
+
+
+def get_config(configs, owner, key, default=None):
+    if key not in configs:
+        encoded = json.dumps(key, default=str, separators=(",", ":"))
+        config = _read_profile(owner, encoded)
+        configs[key] = default if config is None else config
+    return configs.get(key, default)
+
+
+def save_config(owner, key, config):
+    """Publish a selection only after the owner's exact-output checks and timing."""
+    encoded = json.dumps(key, default=str, separators=(",", ":"))
+    path = _profile_path(owner, encoded)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with NamedTemporaryFile(
+        mode="w", dir=path.parent, suffix=".tmp", delete=False
+    ) as output:
+        json.dump(
+            {"key": json.loads(encoded), "config": config, "bitwise_equal": True},
+            output,
+        )
+    os.replace(output.name, path)
+    _read_profile.cache_clear()
 
 
 def compile_candidates(keys, cache, spec):

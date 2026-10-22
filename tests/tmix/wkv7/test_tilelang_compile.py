@@ -55,6 +55,7 @@ def test_recurrent_tuning_rejects_indexed_only_errors(monkeypatch, indexed, faul
     monkeypatch.setattr(implementation, "_TUNED_CONFIGS", {})
     monkeypatch.setattr(torch.cuda, "get_device_name", lambda device: "cpu-test")
     monkeypatch.setattr(tuning, "select_config", select_config)
+    monkeypatch.setattr(tuning, "save_config", lambda *args: None)
     result = implementation.tune_tmix_wkv7_recurrent(*values, initial, cu, indexed=indexed)
     assert result["block_values"] == 64 and result["prefetch_tokens"] == 1
     assert result["indexed"] == indexed
@@ -100,6 +101,7 @@ def test_recurrent_tuning_and_dispatch_keep_mode_caches_separate(monkeypatch):
     monkeypatch.setattr(implementation, "_TUNED_CONFIGS", {})
     monkeypatch.setattr(torch.cuda, "get_device_name", lambda device: "cpu-test")
     monkeypatch.setattr(tuning, "select_config", select_config)
+    monkeypatch.setattr(tuning, "save_config", lambda *args: None)
     for indexed in (False, True):
         implementation.tune_tmix_wkv7_recurrent(*values, initial, cu, indexed=indexed)
     assert timed == [(False, 64, 4), (True, 32, 1)]

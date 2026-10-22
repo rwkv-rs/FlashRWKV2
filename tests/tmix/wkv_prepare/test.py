@@ -16,6 +16,65 @@ from flashrwkv2.tmix.wkv_prepare import (
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 
 
+@cuda
+@pytest.mark.cuda
+@pytest.mark.memcheck
+@pytest.mark.racecheck
+@pytest.mark.parametrize("stage", ["in", "out"])
+def test_real_model_rank_profile_is_loaded_for_decode_graph(monkeypatch, tmp_path, stage):
+    from flashrwkv2._internal import tuning
+    from flashrwkv2.tmix.wkv_prepare import tilelang as implementation
+
+    monkeypatch.setattr(tuning, "_profile_root", lambda: tmp_path)
+    monkeypatch.setattr(implementation, "_GROUP_CONFIGS", {})
+    generator = torch.Generator(device="cuda").manual_seed(20261022)
+    ranks = (128, 128, 480, 96)
+    channels, rows = 4096, 320
+
+    def random(*shape, dtype=torch.bfloat16):
+        return torch.randn(shape, generator=generator, device="cuda", dtype=dtype) * 0.03
+
+    inputs = tuple(random(rows, channels if stage == "in" else rank) for rank in ranks)
+    weights = tuple(
+        random(rank, channels) if stage == "in" else random(channels, rank)
+        for rank in ranks
+    )
+    kinds = (1, 0, 2, 0) if stage == "in" else (0, 2, 0, 0)
+    biases = (None,) * 4 if stage == "in" else (
+        None, random(channels), None, None
+    )
+    config = (64, 64, 2, 128) if stage == "in" else (256, 64, 2, 32)
+
+    def check(candidate):
+        values, raw = implementation._run_groups(
+            inputs, weights, kinds, biases, raw_mode=2, config=candidate
+        )
+        return *(value.view(torch.int16) for value in values), raw.view(torch.int32)
+
+    reference = check((16, 64, 2, 32))
+    selected, _ = tuning.select_config(
+        (config,),
+        lambda candidate: implementation._run_groups(
+            inputs, weights, kinds, biases, config=candidate
+        )[0],
+        check=check,
+        reference=reference,
+    )
+    key = implementation._group_key(inputs, weights, kinds, biases)
+    tuning.save_config("tmix/wkv_prepare", key, selected)
+    actual = implementation._grouped_linear(inputs, weights, kinds, biases)
+    assert implementation._GROUP_CONFIGS[key] == selected
+    for value, expected in zip(actual, reference[:-1], strict=True):
+        assert torch.equal(value.view(torch.int16), expected)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = implementation._grouped_linear(inputs, weights, kinds, biases)
+    graph.replay()
+    for value, expected in zip(captured, reference[:-1], strict=True):
+        assert torch.equal(value.view(torch.int16), expected)
+    tuning._read_profile.cache_clear()
+
+
 def _linear_reference(x, weight, adapter=(None, None, 1.0, False)):
     result = (x.float() @ weight.float().t()).to(torch.bfloat16)
     a, b, scale, nora = adapter

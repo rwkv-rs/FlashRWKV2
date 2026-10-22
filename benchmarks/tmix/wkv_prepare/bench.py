@@ -31,6 +31,8 @@ def benchmark(args):
         raise ValueError("CUDA baseline inference has no NoRA parameters")
     torch.manual_seed(args.seed)
     channels, rank = args.channels, args.rank
+    ranks = args.ranks or (rank,) * 4
+    rank_profile = str(rank) if args.ranks is None else ",".join(map(str, ranks))
     full_training = backward and not args.adapter_rank
     dtype = torch.bfloat16 if tilelang or operator == "pretrain" else torch.float16
 
@@ -46,8 +48,8 @@ def benchmark(args):
     )
     shifted = [random(*shape, grad=backward) for _ in range(6)]
     dense = [random(channels, channels, grad=full_training) for _ in range(3)]
-    rank_in = [random(rank, channels) for _ in range(4)]
-    rank_out = [random(channels, rank) for _ in range(4)]
+    rank_in = [random(size, channels) for size in ranks]
+    rank_out = [random(channels, size) for size in ranks]
     runtime_in = [
         weight.t().contiguous().requires_grad_(full_training) for weight in rank_in
     ]
@@ -190,10 +192,11 @@ def benchmark(args):
         "operator": "pretrain_tmix_wkv_prepare_bf16"
         if operator == "pretrain"
         else "infer_tmix_wkv_prepare_forward_varlen",
-        "profile": f"tokens={args.tokens}/channels={channels}/rank={rank}/adapter_rank={args.adapter_rank}",
+        "profile": f"tokens={args.tokens}/channels={channels}/rank={rank_profile}/adapter_rank={args.adapter_rank}",
         "tokens": args.tokens,
         "channels": channels,
         "rank": rank,
+        "ranks": ranks,
         "head_size": args.head_size,
         "forward_backward": backward,
         "later_layer": args.later_layer,
@@ -215,6 +218,8 @@ def main():
     parser.add_argument("--tokens", type=int, default=1)
     parser.add_argument("--channels", type=int, default=4096)
     parser.add_argument("--rank", type=int, default=64)
+    parser.add_argument("--ranks", type=lambda value: tuple(map(int, value.split(","))),
+                        help="independent w,a,g,v ranks")
     parser.add_argument("--head-size", type=int, choices=(64, 128, 256), default=64)
     parser.add_argument("--adapter-rank", type=int, default=0)
     parser.add_argument("--operator", choices=("infer", "pretrain"))
@@ -232,6 +237,8 @@ def main():
         help="emit JSONL for model widths, M=1/27/256 and rank=32/64/128",
     )
     args = parser.parse_args()
+    if args.ranks is not None and (len(args.ranks) != 4 or any(size <= 0 for size in args.ranks)):
+        parser.error("--ranks requires four positive integers: w,a,g,v")
     if args.timing_mode == "graph":
         torch.cuda.set_stream(torch.cuda.Stream())
     cases = [(args.tokens, args.channels, args.rank)]

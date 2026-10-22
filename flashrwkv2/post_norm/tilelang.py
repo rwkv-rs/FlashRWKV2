@@ -177,7 +177,8 @@ class _Norm(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, weight, bias, res, eps):
         total = torch.empty_like(x) if res is not None else x
-        rows_per_block = _ROW_CONFIGS.get(_config_key(x, res is not None), 1)
+        from .._internal.tuning import get_config
+        rows_per_block = get_config(_ROW_CONFIGS, "post_norm", _config_key(x, res is not None), 1)
         y, mean, rstd = _forward(x.shape[-1], eps, res is not None, rows_per_block=rows_per_block)(
             x, res if res is not None else x, weight, bias, total
         )
@@ -246,7 +247,8 @@ def norm(
         store_res = return_res and res is not None
         total = torch.empty_like(flat) if store_res else flat
         buffer = total if store_res else flat.new_empty((0, x.shape[-1]))
-        rows_per_block = _ROW_CONFIGS.get(_config_key(flat, res is not None), 1)
+        from .._internal.tuning import get_config
+        rows_per_block = get_config(_ROW_CONFIGS, "post_norm", _config_key(flat, res is not None), 1)
         y, _, _ = _forward(x.shape[-1], float(eps), res is not None, False, store_res, rows_per_block)(
             flat, flat_res if flat_res is not None else flat, weight, bias, buffer
         )
@@ -256,7 +258,7 @@ def norm(
 @torch.no_grad()
 def tune_norm(x, weight, bias, eps=1e-5, res=None):
     """Select row grouping while preserving the canonical per-row FP32 tree."""
-    from .._internal.tuning import select_config
+    from .._internal.tuning import save_config, select_config
 
     norm(x, weight, bias, eps, res)
     flat = x.view(-1, x.shape[-1])
@@ -296,4 +298,5 @@ def tune_norm(x, weight, bias, eps=1e-5, res=None):
 
     best, measurements = select_config((1, 2, 4), run, check=check, reference=reference)
     _ROW_CONFIGS[_config_key(flat, res is not None)] = best
+    save_config("post_norm", _config_key(flat, res is not None), best)
     return measurements

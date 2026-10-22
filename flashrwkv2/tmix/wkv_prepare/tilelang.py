@@ -439,7 +439,9 @@ def _compiled_group(*key):
 def _group_call(xs, weights, kinds, biases, raw_mode, config):
     count = len(xs)
     if config is None:
-        config = _GROUP_CONFIGS.get(_group_key(xs, weights, kinds, biases))
+        from ..._internal.tuning import get_config
+
+        config = get_config(_GROUP_CONFIGS, "tmix/wkv_prepare", _group_key(xs, weights, kinds, biases))
         if config is None:
             narrow = max(w.shape[0] for w in weights) <= 128
             copy_k = next(
@@ -612,7 +614,7 @@ def _grouped_linear(xs, weights, kinds, biases):
 @torch.no_grad()
 def _tune_grouped_linear(xs, weights, kinds, biases, *, benchmark=None):
     """Verify independent FP32 accumulators and BF16 epilogues before timing."""
-    from ..._internal.tuning import compile_candidates, projection_finalists, select_config
+    from ..._internal.tuning import compile_candidates, projection_finalists, save_config, select_config
 
     xs, weights, biases = _group_inputs(xs, weights, biases)
     cache_key = _group_key(xs, weights, kinds, biases)
@@ -741,6 +743,7 @@ def _tune_grouped_linear(xs, weights, kinds, biases, *, benchmark=None):
     )
     measurements.update((item["config"], item) for item in checked)
     _GROUP_CONFIGS[cache_key] = best
+    save_config("tmix/wkv_prepare", cache_key, best)
     return {
         "config": best,
         "milliseconds": measurements[best]["milliseconds"],

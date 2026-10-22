@@ -651,7 +651,9 @@ def _infer_recurrent(
         1 if prefetch_tokens is None else prefetch_tokens,
         batch,
     )
-    config = _TUNED_CONFIGS.get(_config_key(r, batch, decay_bias, indexed=True), (64, 1))
+    from ..._internal.tuning import get_config
+
+    config = get_config(_TUNED_CONFIGS, "tmix/wkv7", _config_key(r, batch, decay_bias, indexed=True), (64, 1))
     block_values = config[0] if block_values is None else block_values
     prefetch_tokens = config[1] if prefetch_tokens is None else prefetch_tokens
     _, heads, dim = r.shape
@@ -735,7 +737,9 @@ def tmix_wkv7_recurrent(
         1 if prefetch_tokens is None else prefetch_tokens,
         batch,
     )
-    config = _TUNED_CONFIGS.get(_config_key(r, batch, decay_bias), (64, 1))
+    from ..._internal.tuning import get_config
+
+    config = get_config(_TUNED_CONFIGS, "tmix/wkv7", _config_key(r, batch, decay_bias), (64, 1))
     block_values = config[0] if block_values is None else block_values
     prefetch_tokens = config[1] if prefetch_tokens is None else prefetch_tokens
     bias = _bias_tensor(r, decay_bias)
@@ -773,7 +777,7 @@ def tune_tmix_wkv7_recurrent(
     functional forward. The two modes retain separate configuration caches;
     neither mode mutates the caller's initial state.
     """
-    from ..._internal.tuning import select_config
+    from ..._internal.tuning import save_config, select_config
 
     def functional(config):
         return tmix_wkv7_recurrent(
@@ -816,6 +820,7 @@ def tune_tmix_wkv7_recurrent(
     candidates = tuple((columns, count) for columns in (64, 32) for count in prefetches)
     best, measurements = select_config(candidates, run, check=check, reference=reference)
     _TUNED_CONFIGS[_config_key(r, batch, decay_bias, indexed=indexed)] = best
+    save_config("tmix/wkv7", _config_key(r, batch, decay_bias, indexed=indexed), best)
     return {
         "block_values": best[0], "prefetch_tokens": best[1],
         "indexed": indexed, "candidates": measurements,

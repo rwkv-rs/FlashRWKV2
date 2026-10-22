@@ -56,6 +56,7 @@ def test_readout_tuning_rejects_changed_statistics_or_production(monkeypatch, fa
     monkeypatch.setattr(implementation, "_forward", forward)
     monkeypatch.setattr(implementation, "_ROW_CONFIGS", {})
     monkeypatch.setattr(tuning, "select_config", select_config)
+    monkeypatch.setattr(tuning, "save_config", lambda *args: None)
     implementation.tune_readout(x, x, x, x, vector, vector, vector, x)
     assert implementation._ROW_CONFIGS[implementation._config_key(x, 64)] == 1
 

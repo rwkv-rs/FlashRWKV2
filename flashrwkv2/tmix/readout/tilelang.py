@@ -183,7 +183,8 @@ class _Readout(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, r, k, v, r_k, weight, bias, gate, head_size, eps):
         options = (x.shape[-1], head_size, str(x.dtype).split(".")[-1])
-        group = _ROW_CONFIGS.get(_config_key(x, head_size), 1)
+        from ..._internal.tuning import get_config
+        group = get_config(_ROW_CONFIGS, "tmix/readout", _config_key(x, head_size), 1)
         y, stats = _forward(options[0], head_size, eps, options[2], rows_per_block=group)(
             x, r, k, v, r_k, weight, bias, gate
         )
@@ -240,7 +241,8 @@ def readout(
     if torch.is_grad_enabled() and any(t.requires_grad for t in args):
         output = _Readout.apply(*args, head_size, float(eps))
     else:
-        group = _ROW_CONFIGS.get(_config_key(args[0], head_size), 1)
+        from ..._internal.tuning import get_config
+        group = get_config(_ROW_CONFIGS, "tmix/readout", _config_key(args[0], head_size), 1)
         output, _ = _forward(c, head_size, float(eps), str(x.dtype).split(".")[-1], False, group)(*args)
     return output.view_as(x)
 
@@ -248,7 +250,7 @@ def readout(
 @torch.no_grad()
 def tune_readout(x, r, k, v, r_k, weight, bias, gate, head_size=64, eps=64e-5):
     """Measure grouped heads; each head retains one warp and its reduction tree."""
-    from ..._internal.tuning import select_config
+    from ..._internal.tuning import save_config, select_config
 
     readout(x, r, k, v, r_k, weight, bias, gate, head_size, eps)
     c = x.shape[-1]
@@ -277,4 +279,5 @@ def tune_readout(x, r, k, v, r_k, weight, bias, gate, head_size=64, eps=64e-5):
 
     best, measurements = select_config((1, 2, 4, 8, 16), run, check=check, reference=reference)
     _ROW_CONFIGS[_config_key(args[0], head_size)] = best
+    save_config("tmix/readout", _config_key(args[0], head_size), best)
     return measurements

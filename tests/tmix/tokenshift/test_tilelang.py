@@ -85,6 +85,7 @@ def test_tokenshift_tuning_checks_both_variants_with_active_metadata(monkeypatch
     monkeypatch.setattr(implementation, "_forward", forward)
     monkeypatch.setattr(implementation, "_BLOCK_CONFIGS", {})
     monkeypatch.setattr(tuning, "select_config", select_config)
+    monkeypatch.setattr(tuning, "save_config", lambda *args: None)
     implementation.tune_tokenshift(x, mixes, cu, initial, _status=status)
     assert implementation._BLOCK_CONFIGS[implementation._config_key(x, mixes, 4)] == 256
 
@@ -140,6 +141,7 @@ def test_fused_tuning_rejects_changed_pool_and_preserves_caller_state(monkeypatc
     monkeypatch.setattr(implementation, "_fused_forward", forward)
     monkeypatch.setattr(implementation, "_FUSED_CONFIGS", {})
     monkeypatch.setattr(tuning, "select_config", select_config)
+    monkeypatch.setattr(tuning, "save_config", lambda *args: None)
     implementation.tune_fused_tokenshift(x, x, x[0], x[0], mixes, pool, indices, status)
     assert torch.count_nonzero(pool) == 0
     assert implementation._FUSED_CONFIGS[implementation._config_key(x, mixes, x.shape[0])] == 1
