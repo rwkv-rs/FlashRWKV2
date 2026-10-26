@@ -58,7 +58,7 @@ def _compiler_identity():
     from tilelang.contrib.cc import get_cplus_compiler
     from tilelang.env import CUDA_HOME
 
-    nvcc = None if CUDA_HOME is None else str(Path(CUDA_HOME) / "bin" / "nvcc")
+    nvcc = str(Path(CUDA_HOME) / "bin" / "nvcc") if CUDA_HOME else None
     versions = []
     for compiler in (nvcc, get_cplus_compiler()):
         versions.append(None if compiler is None else subprocess.run(

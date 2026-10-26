@@ -53,6 +53,19 @@ def tuning_cache(monkeypatch, tmp_path):
     return tuning
 
 
+def test_tuning_compiler_identity_without_cuda_toolkit(monkeypatch):
+    from flashrwkv2._internal import tuning
+
+    monkeypatch.setattr(importlib.import_module("tilelang.env"), "CUDA_HOME", "")
+    tuning._compiler_identity.cache_clear()
+    try:
+        versions, _ = tuning._compiler_identity()
+        assert versions[0] is None
+        assert versions[1]
+    finally:
+        tuning._compiler_identity.cache_clear()
+
+
 def test_tuning_device_class_shares_ordinals_but_separates_products(monkeypatch):
     import torch
     from flashrwkv2._internal import tuning
