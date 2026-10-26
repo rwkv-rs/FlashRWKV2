@@ -168,6 +168,19 @@ def test_tuning_prepares_once_and_reports_actual_dispatch(tuning_cache):
     assert count == [1]
 
 
+def test_tuning_preparation_includes_worker_thread_dispatch(tuning_cache):
+    tuning = tuning_cache
+    def call():
+        tuning.get_config({}, "linear", (("test", 12, 0, 188), 1))
+        worker = threading.Thread(target=lambda: tuning.get_config({}, "linear", (("test", 12, 0, 188), 2)))
+        worker.start()
+        worker.join(timeout=10)
+        assert not worker.is_alive()
+    report = tuning.prepare_tuning([call], mode="inspect")
+    assert report["counts"]["missing"] == 2
+    assert not report["complete"]
+
+
 def test_tuning_revalidates_legacy_without_timing(tuning_cache, tmp_path, monkeypatch):
     import torch
     from pathlib import Path

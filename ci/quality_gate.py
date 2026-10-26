@@ -429,6 +429,7 @@ def finalize(
             "torch_2_11",
             "torch_2_12",
             "torch_2_13",
+            "torch_2_14",
         ):
             if recorded_checks.get(check) != "passed":
                 raise SystemExit(f"package-required evidence lacks passed {check}")
@@ -679,6 +680,7 @@ def _self_test() -> None:
                         "torch_2_11": "passed",
                         "torch_2_12": "passed",
                         "torch_2_13": "passed",
+                        "torch_2_14": "passed",
                         "cuda": "native-runtime",
                         "memcheck": "passed",
                         "racecheck": "passed",

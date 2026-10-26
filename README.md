@@ -16,11 +16,11 @@ training. The default FP32-state path retains training precision and parity.
 - Python 3.10 or newer
 - Linux, a writable FlashRWKV2 cache, and a CUDA GPU with Compute
   Capability 8.0 or newer
-- A system CUDA Toolkit compatible with PyTorch, a compatible host compiler,
+- A system CUDA Toolkit compatible with PyTorch, a C++20 host compiler,
   and Ninja
 - `uv`, using the repository-local `./.venv`
 
-The runtime supports PyTorch 2.11 through 2.13 and pins TileLang 0.1.15.
+The runtime supports PyTorch 2.11 through 2.14 and pins TileLang 0.1.15.
 Importing the package does not compile kernels. TileLang specializes model
 operators for the active GPU and caches compiled kernels. Packed metadata
 validation and sampling use a small ATen/pybind extension, compiled from the
@@ -60,6 +60,21 @@ uv sync
 
 See the [Kernel API reference](https://github.com/rwkv-rs/FlashRWKV2/blob/main/docs/kernel_api.md)
 for the complete public operator surface and tensor contracts.
+
+Training operators support `torch.compile(fullgraph=True)`, including backward,
+LoRA/NoRA, and CUDA Graph capture. Preserve the BF16 intermediate rounding
+contract with Inductor's precision option:
+
+```python
+compiled_model = torch.compile(
+    model, fullgraph=True, options={"emulate_precision_casts": True},
+)
+```
+
+Prepare tuning with eager forward-and-backward calls before compiling or
+capturing. StateTune chunk metadata is prepared once with
+`prepare_tmix_wkv7_statetune_metadata` and supplied through `prepared_metadata`;
+see the [training contract](docs/kernel_api.md#training).
 
 ## Tests
 
@@ -105,6 +120,7 @@ from flashrwkv2 import prepare_tuning
 
 # Each callable uses valid metadata and disposable/reset model state.
 # Include every prefill/decode shape, graph batch and weight layout in service.
+# Training callables also run backward with the actual trainable parameters.
 report = prepare_tuning(warmup_calls, mode="inspect")
 report = prepare_tuning(warmup_calls, mode="tune")  # only missing keys
 report = prepare_tuning(warmup_calls, mode="require")  # before graph capture
@@ -118,6 +134,8 @@ reuse selections across GPU ordinals. Concurrent preparation serializes each
 missing key and rechecks after taking its lock. Ordinary forwards warn about
 untuned defaults and never start tuning. A previously missing file is rechecked
 on later eager calls; existing CUDA Graphs must be recaptured after preparation.
+Preparation is an exclusive phase within each process and includes dispatches
+from autograd worker threads. Finish serving/training calls before preparing.
 To migrate a legacy namespace, pass its full directory as `legacy_dir` with
 `mode="tune"`: matching configurations are revalidated on current inputs without
 benchmarking, while missing shapes are tuned normally. See the

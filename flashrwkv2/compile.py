@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
 
-_CXX_FLAGS = ("-O3", "-Wno-psabi")
+_CXX_FLAGS = ("-O3", "-Wno-psabi", "-std=c++20")
 _LINK_FLAGS = ("-Wl,--strip-debug",)
 _NVCC_FLAGS = (
     "-O3",
@@ -25,7 +25,7 @@ _NVCC_FLAGS = (
     "--expt-extended-lambda",
     "-lineinfo",
     "-Xptxas=-v",
-    "-std=c++17",
+    "-std=c++20",
 )
 _SOURCE_SUFFIXES = {".cpp", ".cu", ".cuh", ".h", ".hpp"}
 _PROCESS_LOCK = threading.Lock()

@@ -124,6 +124,44 @@ Prepare 分别将 R/K/V、W/A/G/V 的低秩输入投影、低秩输出投影分�
 tanh/sigmoid，最后再次舍入到 BF16。反向复用相同的激活 VJP、bias 归约和
 线性 VJP；R/K/V 的 LoRA/NoRA 更新仍作用于各自的 BF16 base projection。
 
+训练前向和反向支持 `torch.compile(fullgraph=True)`。编译路径通过注册算子调用
+同一套 TileLang forward/VJP；普通 eager 调用保留原有路径。Inductor 必须保留
+中间 BF16 舍入，才能与 eager 梯度逐位一致：
+
+```python
+compiled_model = torch.compile(
+    model, fullgraph=True, options={"emulate_precision_casts": True},
+)
+```
+
+先用 eager 的完整 forward/backward 函数执行 `prepare_tuning`，再编译、预热和
+捕获。训练参数集合、LoRA/NoRA 模式与实际训练一致；仅 forward 不能覆盖 dX、dW
+等反向投影 key。准备函数负责清理梯度并恢复可变 state；调优完成后再开始参数更新。
+支持 PyTorch 2.11–2.14；metadata/sampling native 扩展使用 C++20 编译。
+
+StateTune 在编译或 capture 前验证 chunk metadata：
+
+```python
+from flashrwkv2 import (
+    prepare_tmix_wkv7_statetune_metadata,
+    statetune_tmix_wkv7_recurrent_fp32io16,
+)
+
+metadata = prepare_tmix_wkv7_statetune_metadata(
+    sequence_chunk_offsets, chunk_token_starts, chunk_token_ends,
+    total_tokens=r.shape[0],
+)
+output, final_state = statetune_tmix_wkv7_recurrent_fp32io16(
+    initial_state, sequence_chunk_offsets, chunk_token_starts, chunk_token_ends,
+    r, decay_logits, k, v, a, b, prepared_metadata=metadata,
+)
+```
+
+返回的 metadata record 持有独立 CUDA INT32 `cu_seqlens` 和 `total_tokens`。
+使用期间保持 offsets 不变；序列分段或 token 总数变化时重新准备并重新捕获。
+传入 `prepared_metadata` 后，执行路径使用该 record，不再读取原始 chunk 数组。
+未传入时，eager 调用仍在每次执行前验证并转换原有 chunk 参数。
+
 ## Tuning and acceptance
 
 内部 `tune_linear`、`tune_norm`、`tune_tokenshift`、`tune_readout` 与 WKV tuner
@@ -174,7 +212,7 @@ assert loaded["complete"]
 # 此后恢复 serving state，再进行 CUDA Graph capture。
 ```
 
-每个函数必须实际执行模型前向，使用有效且非空的代表性输入与 metadata。
+每个函数必须实际执行模型前向，训练函数还须执行反向，使用有效且非空的代表性输入与 metadata。
 WKV 调优调用需要该 capture shape 全部 token/sequence 均处于 active 状态；
 不能用零 active 的图预热占位输入进行逐位验证。
 报告逐项列出 `owner/key/fingerprint/config/path/status`，其中 key 包含设备类别；
@@ -191,6 +229,8 @@ WKV 调优调用需要该 capture shape 全部 token/sequence 均处于 active �
 多个进程对同一 key 通过文件锁竞争；持锁后再次读取，只有一个进程验证/调优并
 用同目录临时文件原子替换发布。无效 JSON、key 或验证标记立即报错；半写入
 临时文件不会被读者视为已发布 profile。
+单个进程内 prepare 是独占阶段，准备前先结束其他 serving/training 调用；嵌套或
+并发 prepare 会报错。准备报告也覆盖 CUDA autograd worker thread 上的反向 dispatch。
 
 旧缓存迁移显式指定单个旧 namespace，无需改动旧服务目录。路径支持 `~` 展开；
 指定的目录不存在时立即报错，避免路径拼写错误意外触发全量调优：

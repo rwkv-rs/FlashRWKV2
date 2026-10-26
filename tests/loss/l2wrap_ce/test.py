@@ -88,3 +88,36 @@ def test_l2wrap_rejects_target_shape_and_range_without_launching() -> None:
     invalid_targets[0, 0] = logits.shape[-1]
     with pytest.raises(ValueError, match=r"\[0,vocab\)"):
         pretrain_l2wrap_ce_bf16(logits, invalid_targets)
+
+
+@pytest.mark.cuda
+@pytest.mark.cuda_graph
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_fullgraph_l2wrap_loss_capture_preserves_gradient(dtype):
+    logits, targets = _inputs(device="cuda", dtype=dtype)
+    logits.requires_grad_()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        loss = pretrain_l2wrap_ce_bf16(logits, targets)
+        loss.backward()
+        expected, expected_grad = loss.detach().clone(), logits.grad.clone()
+        del loss
+        compiled = torch.compile(pretrain_l2wrap_ce_bf16, fullgraph=True, options={"emulate_precision_casts": True})
+        def step():
+            logits.grad.zero_()
+            result = compiled(logits, targets)
+            result.backward()
+            return result
+        for _ in range(3):
+            step()
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        actual = step()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(actual, expected)
+    assert torch.equal(logits.grad, expected_grad)

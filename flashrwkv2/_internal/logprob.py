@@ -5,6 +5,8 @@ import tilelang
 import tilelang.language as T
 import torch
 
+from .tuning import _AutogradContext
+
 
 @tilelang.jit(pass_configs={"tl.enable_fast_math": False}, out_idx=[1, 2, 3])
 def _partials(vocab: int):
@@ -139,6 +141,38 @@ def logprob_stats(logits, targets):
     return _finish(logits.shape[1])(logits, targets, maximum, denominator, argmax)
 
 
+@torch.library.custom_op("flashrwkv2::head_logprobs_forward", mutates_args=())
+def _compiled_logprobs(logits: torch.Tensor, targets: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return tuple(logprob_stats(logits, targets)[:3])
+
+
+@_compiled_logprobs.register_fake
+def _compiled_logprobs_fake(logits, targets):
+    return tuple(logits.new_empty(logits.shape[0]) for _ in range(3))
+
+
+def _compiled_logprobs_context(ctx, inputs, output):
+    ctx.save_for_backward(*inputs, output[1], output[2])
+    ctx.mark_non_differentiable(output[1], output[2])
+
+
+@torch.library.custom_op("flashrwkv2::head_logprobs_backward", mutates_args=())
+def _compiled_logprobs_vjp(dy: torch.Tensor, saved: list[torch.Tensor]) -> torch.Tensor:
+    return _Logprobs.backward(_AutogradContext(saved_tensors=saved), dy)[0]
+
+
+@_compiled_logprobs_vjp.register_fake
+def _compiled_logprobs_vjp_fake(dy, saved):
+    return torch.empty_like(saved[0])
+
+
+def _compiled_logprobs_backward(ctx, dy, unused_logsum, unused_maximum):
+    return _compiled_logprobs_vjp(dy, list(ctx.saved_tensors)), None
+
+
+_compiled_logprobs.register_autograd(_compiled_logprobs_backward, setup_context=_compiled_logprobs_context)
+
+
 def selected_logprobs(logits, targets):
     """Return selected-token logprobs; targets must be valid vocabulary indices."""
     if logits.ndim < 2 or logits.shape[-1] <= 0 or logits.numel() == 0:
@@ -147,5 +181,6 @@ def selected_logprobs(logits, targets):
         raise ValueError("logits must be contiguous CUDA float32")
     if targets.shape != logits.shape[:-1] or targets.dtype != torch.int64 or targets.device != logits.device:
         raise ValueError("targets must be int64 with one entry per logits row on the same device")
-    result = _Logprobs.apply(logits.view(-1, logits.shape[-1]), targets.reshape(-1).contiguous())
+    flat, indices = logits.view(-1, logits.shape[-1]), targets.reshape(-1).contiguous()
+    result = _compiled_logprobs(flat, indices)[0] if torch.compiler.is_compiling() else _Logprobs.apply(flat, indices)
     return result.view_as(targets)

@@ -5,7 +5,10 @@ from __future__ import annotations
 import pytest
 import torch
 
-from flashrwkv2.tmix.wkv7.statetune import statetune_tmix_wkv7_recurrent_fp32io16
+from flashrwkv2.tmix.wkv7.statetune import (
+    prepare_tmix_wkv7_statetune_metadata,
+    statetune_tmix_wkv7_recurrent_fp32io16,
+)
 
 
 def _case(
@@ -160,3 +163,54 @@ def test_statetune_rejects_invalid_chunk_metadata(sequence, starts, ends, messag
     ]
     with pytest.raises(ValueError, match=message):
         statetune_tmix_wkv7_recurrent_fp32io16(state, *metadata, *values)
+
+
+@pytest.mark.cuda
+@pytest.mark.cuda_graph
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("backend", ["eager", "inductor"])
+def test_statetune_prepared_metadata_fullgraph_and_capture(backend):
+    case = _case(torch.bfloat16, 64, requires_grad=True)
+    state, sequence, starts, ends, *values = case
+    metadata = prepare_tmix_wkv7_statetune_metadata(sequence, starts, ends, total_tokens=5)
+    assert metadata.cu_seqlens.tolist() == [0, 3, 5]
+    assert metadata.total_tokens == 5
+
+    def model():
+        return statetune_tmix_wkv7_recurrent_fp32io16(*case, prepared_metadata=metadata)
+
+    leaves = (state, *values)
+    def step(function):
+        for value in leaves:
+            if value.grad is not None:
+                value.grad.zero_()
+        output, final = function()
+        (output.float().sum() + final.sum()).backward()
+        return output, final
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        eager = step(lambda: statetune_tmix_wkv7_recurrent_fp32io16(*case))
+        expected = tuple(value.detach().clone() for value in eager)
+        gradients = tuple(value.grad.clone() for value in leaves)
+        del eager
+        options = {"emulate_precision_casts": True} if backend == "inductor" else None
+        compiled = torch.compile(model, backend=backend, fullgraph=True, options=options)
+        for _ in range(3):
+            step(compiled)
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        actual = step(compiled)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert actual[0].dtype == torch.bfloat16
+    assert actual[1].dtype == state.grad.dtype == torch.float32
+    assert all(torch.equal(value, reference) for value, reference in zip(actual, expected, strict=True))
+    assert all(torch.equal(value.grad, reference) for value, reference in zip(leaves, gradients, strict=True))
+    with pytest.raises(ValueError, match="token count"):
+        statetune_tmix_wkv7_recurrent_fp32io16(
+            state, sequence, starts, ends, *(value[:4] for value in values), prepared_metadata=metadata,
+        )

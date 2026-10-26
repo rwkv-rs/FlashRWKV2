@@ -14,11 +14,14 @@ from functools import cache, wraps
 from pathlib import Path
 from statistics import median
 from tempfile import NamedTemporaryFile
+from threading import Lock
+from types import SimpleNamespace
 
 import torch
 
 _SCHEMA = 2
-_SESSION = ContextVar("flashrwkv2_tuning", default=None)
+_SESSION = None
+_PREPARATION_LOCK = Lock()
 _TUNING = ContextVar("flashrwkv2_tuning_active", default=False)
 _REVALIDATE = ContextVar("flashrwkv2_revalidate", default=None)
 _LOADED = {}
@@ -33,6 +36,16 @@ _OWNER_SOURCES = {
     "tmix/wkv7": "tmix/wkv7/tilelang.py",
     "tmix/wkv_prepare": "tmix/wkv_prepare/tilelang.py",
 }
+
+
+class _AutogradContext(SimpleNamespace):
+    """Reuse an owner's eager forward/VJP inside an opaque compiled operator."""
+
+    def save_for_backward(self, *tensors):
+        self.saved_tensors = tensors
+
+    def set_materialize_grads(self, value):
+        self.materialize_grads = value
 
 
 @cache
@@ -162,7 +175,7 @@ def get_config(configs, owner, key, default=None, *, tune=None):
     # Owner benchmarks deliberately inject candidates into their process cache.
     if _TUNING.get():
         return configs.get(key, default)
-    session = _SESSION.get()
+    session = _SESSION
     identity = (str(_profile_root()), owner, key)
     # Explicit preparation reloads each key once, including files published or
     # removed by another process after an earlier eager call.
@@ -256,10 +269,11 @@ def prepare_tuning(calls, *, mode="require", legacy_dir=None):
     ``legacy_dir`` is one explicit legacy namespace, revalidated without timing.
     The returned JSON-compatible report describes every actual tuned dispatch.
     """
+    global _SESSION
     if mode not in {"inspect", "require", "tune"}:
         raise ValueError("mode must be inspect, require, or tune")
-    if _capturing() or _SESSION.get() is not None:
-        raise RuntimeError("prepare_tuning must run outside CUDA Graph capture and other preparation")
+    if _capturing():
+        raise RuntimeError("prepare_tuning must run outside CUDA Graph capture")
     if legacy_dir is not None and mode != "tune":
         raise ValueError("legacy_dir requires mode='tune'")
     if legacy_dir is not None:
@@ -267,12 +281,17 @@ def prepare_tuning(calls, *, mode="require", legacy_dir=None):
         if not legacy_dir.is_dir():
             raise NotADirectoryError(f"legacy tuning namespace does not exist: {legacy_dir}")
     session = {"mode": mode, "legacy_dir": legacy_dir, "records": {}}
-    token = _SESSION.set(session)
+    # Autograd executes CUDA backward nodes on engine threads. Preparation is
+    # an exclusive process phase, so those dispatches share the same report.
+    if not _PREPARATION_LOCK.acquire(blocking=False):
+        raise RuntimeError("prepare_tuning must run exclusively within a process")
+    _SESSION = session
     try:
         for call in calls:
             call()
     finally:
-        _SESSION.reset(token)
+        _SESSION = None
+        _PREPARATION_LOCK.release()
     records = list(session["records"].values())
     if not records:
         raise RuntimeError("prepare_tuning observed no configurable kernel dispatches")

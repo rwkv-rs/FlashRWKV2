@@ -238,6 +238,73 @@ def test_prepare_tuning_migration_preserves_block_state_logits_and_logprobs(monk
             assert torch.equal(value.view(dtype), reference.view(dtype))
 
 
+@pytest.mark.parametrize("adapter", ["none", "lora", "nora"])
+@pytest.mark.parametrize("backend", ["eager", "inductor"])
+@pytest.mark.cuda_graph
+def test_fullgraph_training_block_preserves_outputs_gradients_and_capture(adapter, backend):
+    torch.manual_seed(738)
+    params = parameters(128, rank=16, vocab=257)
+    adapters = None if adapter == "none" else adapter_parameters(params)
+    x = (torch.randn(1, 3, 128, device="cuda") * .1).bfloat16().requires_grad_()
+    res = torch.randn_like(x).requires_grad_()
+    initial = (torch.randn(1, 2, 64, 64, device="cuda") * .01).requires_grad_()
+    shifts = [torch.randn(1, 128, device="cuda", dtype=torch.bfloat16).requires_grad_() for _ in range(2)]
+    targets = torch.randint(257, (1, 3), device="cuda")
+    v_first = torch.randn_like(x).requires_grad_()
+    leaves = [x, res, initial, *shifts, v_first, *params.values()]
+    if adapters is not None:
+        leaves.extend(value for pair in adapters.values() for value in pair)
+
+    def model():
+        return train_block(x, res, params, initial, shifts, targets, 64, v_first,
+                           adapters, adapter == "nora")
+
+    def step(function):
+        for value in leaves:
+            if value.grad is not None:
+                value.grad.zero_()
+        outputs = function()
+        loss = outputs[0].sum() + outputs[2].sum() * .001
+        loss.backward()
+        return outputs, loss
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        outputs, loss = step(model)
+        expected = tuple(value.detach().clone() for value in outputs)
+        expected_loss = loss.detach().clone()
+        gradients = [None if value.grad is None else value.grad.clone() for value in leaves]
+        del outputs, loss
+        # Residual branches can initially share an identical returned VJP.
+        # Captured accumulation uses distinct persistent buffers for each leaf.
+        for value, gradient in zip(leaves, gradients, strict=True):
+            value.grad = None if gradient is None else torch.zeros_like(value)
+        options = {"emulate_precision_casts": True} if backend == "inductor" else None
+        compiled = torch.compile(model, backend=backend, fullgraph=True, options=options)
+        for _ in range(3):
+            step(compiled)
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        actual, loss = step(compiled)
+    for _ in range(2):
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(loss, expected_loss)
+        for output, reference in zip(actual, expected, strict=True):
+            integer_dtype = torch.int32 if output.dtype == torch.float32 else torch.int16
+            assert torch.equal(output.view(integer_dtype), reference.view(integer_dtype))
+        differences = []
+        for index, (value, reference) in enumerate(zip(leaves, gradients, strict=True)):
+            assert (value.grad is None) == (reference is None)
+            if reference is not None and not torch.equal(value.grad, reference):
+                differences.append((index, int(torch.count_nonzero(value.grad != reference)),
+                                    float((value.grad.float() - reference.float()).abs().max())))
+        assert not differences, differences
+
+
 @pytest.mark.parametrize(
     "channels,head_size,vocab,length,use_vres",
     ((128, 64, 257, 17, False), (128, 64, 257, 17, True),

@@ -5,7 +5,7 @@ import math
 
 import torch
 
-from ..._internal.tuning import device_class, tuning_operation
+from ..._internal.tuning import _AutogradContext, device_class, tuning_operation
 import tilelang
 import tilelang.language as T
 
@@ -206,6 +206,54 @@ class _Readout(torch.autograd.Function):
         return (*gradients, None, None)
 
 
+@torch.library.custom_op("flashrwkv2::tmix_readout_forward", mutates_args=())
+def _compiled_readout(
+    x: torch.Tensor, r: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+    r_k: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, gate: torch.Tensor,
+    head_size: int, eps: float, save: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from ..._internal.tuning import get_config
+    if x.data_ptr() % (2 * x.element_size()) or any(t.data_ptr() % 4 for t in (r, k, v, r_k, weight, bias, gate)):
+        raise ValueError("readout inputs must be aligned for two-element vector access")
+    group = get_config(_ROW_CONFIGS, "tmix/readout", _config_key(x, head_size), 1,
+                       tune=lambda: tune_readout(x, r, k, v, r_k, weight, bias, gate, head_size, eps))
+    return tuple(_forward(x.shape[-1], head_size, eps, str(x.dtype).split(".")[-1], save, group)(x, r, k, v, r_k, weight, bias, gate))
+
+
+@_compiled_readout.register_fake
+def _compiled_readout_fake(x, r, k, v, r_k, weight, bias, gate, head_size, eps, save):
+    return x.new_empty(x.shape, dtype=torch.bfloat16), x.new_empty((x.shape[0] if save else 0, x.shape[1] // head_size, 3), dtype=torch.float32)
+
+
+def _compiled_readout_context(ctx, inputs, output):
+    *args, head_size, _, _ = inputs
+    ctx.save_for_backward(*args, output[1])
+    ctx.options = (args[0].shape[-1], head_size, str(args[0].dtype).split(".")[-1])
+    ctx.mark_non_differentiable(output[1])
+
+
+@torch.library.custom_op(
+    "flashrwkv2::tmix_readout_backward", mutates_args=(),
+    schema="(Tensor dy, Tensor[] saved, int head_size, bool[] needed) -> Tensor?[]",
+)
+def _compiled_readout_vjp(dy, saved, head_size, needed):
+    ctx = _AutogradContext(saved_tensors=saved, needs_input_grad=(*needed, False, False),
+                           options=(saved[0].shape[-1], head_size, str(saved[0].dtype).split(".")[-1]))
+    return list(_Readout.backward(ctx, dy)[:8])
+
+
+@_compiled_readout_vjp.register_fake
+def _compiled_readout_vjp_fake(dy, saved, head_size, needed):
+    return [None if i in (4, 5, 6) and not needed[i] else torch.empty_like(t) for i, t in enumerate(saved[:8])]
+
+
+def _compiled_readout_backward(ctx, dy, unused_stats):
+    return (*_compiled_readout_vjp(dy, list(ctx.saved_tensors), ctx.options[1], list(ctx.needs_input_grad[:8])), None, None, None)
+
+
+_compiled_readout.register_autograd(_compiled_readout_backward, setup_context=_compiled_readout_context)
+
+
 def readout(
     x: torch.Tensor,
     r: torch.Tensor,
@@ -231,7 +279,7 @@ def readout(
         raise ValueError("readout rows must match x and affine parameters must have C elements")
     if any(not t.is_contiguous() or t.device != x.device for t in (x, *rows, *affine)):
         raise ValueError("readout inputs must be contiguous and share a device")
-    if x.data_ptr() % (2 * x.element_size()) or any(t.data_ptr() % 4 for t in (*rows, *affine)):
+    if not torch.compiler.is_compiling() and (x.data_ptr() % (2 * x.element_size()) or any(t.data_ptr() % 4 for t in (*rows, *affine))):
         raise ValueError("readout inputs must be aligned for two-element vector access")
     if not math.isfinite(eps) or eps <= 0:
         raise ValueError("eps must be finite and positive")
@@ -240,7 +288,10 @@ def readout(
         x.view(-1, c), r.view(-1, c), k.view(-1, c), v.view(-1, c),
         r_k.view(c), ln_weight.view(c), ln_bias.view(c), gate.view(-1, c),
     )
-    if torch.is_grad_enabled() and any(t.requires_grad for t in args):
+    if torch.compiler.is_compiling():
+        save = torch.is_grad_enabled() and any(t.requires_grad for t in args)
+        output, _ = _compiled_readout(*args, head_size, float(eps), save)
+    elif torch.is_grad_enabled() and any(t.requires_grad for t in args):
         output = _Readout.apply(*args, head_size, float(eps))
     else:
         from ..._internal.tuning import get_config

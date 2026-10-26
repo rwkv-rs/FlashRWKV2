@@ -6,6 +6,14 @@ import tilelang
 import tilelang.language as T
 
 
+def check_cuda_condition(condition, message):
+    """Validate device metadata without host reads in compiled/captured calls."""
+    if torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing():
+        torch._assert_async(condition, message)
+    elif not bool(condition.item()):
+        raise ValueError(message)
+
+
 @tilelang.jit(pass_configs={"tl.enable_fast_math": False})
 def _transfer(channels: int, batch: int, dtype: str, write: bool):
     slots = T.dynamic("slots")

@@ -6,6 +6,7 @@ import torch
 from torch.autograd.function import once_differentiable
 
 from ..linear import pretrain_head_linear_bf16
+from ..._internal.tuning import _AutogradContext
 
 
 def _check(hidden, weight, targets, chunk_rows: int) -> None:
@@ -34,8 +35,8 @@ def _check(hidden, weight, targets, chunk_rows: int) -> None:
         raise ValueError("targets must contain one token per hidden row")
     if hidden.device != weight.device or hidden.device != targets.device:
         raise ValueError("head loss tensors must share a device")
-    if torch.any((targets < 0) | (targets >= 65536)).item():
-        raise ValueError("targets must be in [0,65536)")
+    from ..._internal.state import check_cuda_condition
+    check_cuda_condition(((targets >= 0) & (targets < 65536)).all(), "targets must be in [0,65536)")
     if (
         not isinstance(chunk_rows, int)
         or isinstance(chunk_rows, bool)
@@ -134,6 +135,49 @@ class _HeadL2Wrap(torch.autograd.Function):
         )
 
 
+@torch.library.custom_op("flashrwkv2::head_l2wrap_ce_forward", mutates_args=())
+def _compiled_head_loss(hidden: torch.Tensor, weight: torch.Tensor, targets: torch.Tensor,
+                        a: torch.Tensor | None, b: torch.Tensor | None, scale: float,
+                        use_nora: bool, chunk_rows: int) -> torch.Tensor:
+    return _HeadL2Wrap.forward(_AutogradContext(), hidden, weight, targets, a, b, scale, use_nora, chunk_rows)
+
+
+@_compiled_head_loss.register_fake
+def _compiled_head_loss_fake(hidden, weight, targets, a, b, scale, use_nora, chunk_rows):
+    return hidden.new_empty((), dtype=torch.float32)
+
+
+def _compiled_head_loss_context(ctx, inputs, output):
+    hidden, weight, targets, a, b, scale, use_nora, chunk_rows = inputs
+    ctx.save_for_backward(hidden, weight, targets, a, b)
+    ctx.options = (scale, use_nora, chunk_rows)
+
+
+@torch.library.custom_op(
+    "flashrwkv2::head_l2wrap_ce_backward", mutates_args=(),
+    schema="(Tensor dy, Tensor hidden, Tensor weight, Tensor targets, Tensor? a, Tensor? b, float scale, bool use_nora, int chunk_rows, bool[] needed) -> Tensor?[]",
+)
+def _compiled_head_loss_vjp(dy, hidden, weight, targets, a, b, scale, use_nora, chunk_rows, needed):
+    ctx = _AutogradContext(saved_tensors=(hidden, weight, targets, a, b), options=(scale, use_nora, chunk_rows),
+                           needs_input_grad=(*needed, False, False, False))
+    return list(_HeadL2Wrap.backward(ctx, dy)[:5])
+
+
+@_compiled_head_loss_vjp.register_fake
+def _compiled_head_loss_vjp_fake(dy, hidden, weight, targets, a, b, scale, use_nora, chunk_rows, needed):
+    return [torch.empty_like(hidden) if needed[0] else None,
+            torch.empty_like(weight) if needed[1] else None, None,
+            (a.new_empty(a.shape) if use_nora else torch.empty_like(a)) if needed[3] else None,
+            torch.empty_like(b) if needed[4] else None]
+
+
+def _compiled_head_loss_backward(ctx, dy):
+    return (*_compiled_head_loss_vjp(dy, *ctx.saved_tensors, *ctx.options, list(ctx.needs_input_grad[:5])), None, None, None)
+
+
+_compiled_head_loss.register_autograd(_compiled_head_loss_backward, setup_context=_compiled_head_loss_context)
+
+
 def pretrain_head_l2wrap_ce_bf16(
     hidden,
     weight,
@@ -147,7 +191,8 @@ def pretrain_head_l2wrap_ce_bf16(
 ):
     """Memory-bounded head CE; parameter VJPs accumulate across chunks in FP32."""
     _check(hidden, weight, targets, chunk_rows)
-    return _HeadL2Wrap.apply(
+    operation = _compiled_head_loss if torch.compiler.is_compiling() else _HeadL2Wrap.apply
+    return operation(
         hidden, weight, targets, lora_a, lora_b,
         float(lora_scale), bool(use_nora), chunk_rows,
     )

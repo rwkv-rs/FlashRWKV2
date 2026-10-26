@@ -205,7 +205,7 @@ jobs:
       fail-fast: false
       max-parallel: 1
       matrix:
-        torch: ["2.13.0", "2.11.0", "2.12.0"]
+        torch: ["2.14.1", "2.13.0", "2.11.0", "2.12.0"]
     env:
       TORCH_EXTENSIONS_DIR: ${{ github.workspace }}/.torch-extensions-${{ github.run_id }}-torch-${{ matrix.torch }}
     steps:
@@ -269,8 +269,15 @@ jobs:
           )
           PY
       - name: Full correctness, backward, and CUDA Graph suite
-        if: matrix.torch == '2.13.0'
+        if: matrix.torch == '2.13.0' || matrix.torch == '2.14.1'
         run: .venv/bin/python -m pytest -q tests
+      - name: Compiled training compatibility
+        if: matrix.torch == '2.11.0' || matrix.torch == '2.12.0'
+        run: >-
+          .venv/bin/python -m pytest -q tests/tmix/wkv7/test_block.py
+          tests/tmix/wkv7/statetune/test.py tests/head/l2wrap_ce/test.py
+          tests/loss/l2wrap_ce/test.py tests/tmix/wkv_prepare/test.py
+          tests/cmix/test.py -k 'fullgraph or prepare_tuning_covers'
       - name: Compute Sanitizer memcheck
         if: matrix.torch == '2.13.0'
         run: compute-sanitizer --error-exitcode=1 --tool memcheck .venv/bin/python -m pytest -q tests -m memcheck

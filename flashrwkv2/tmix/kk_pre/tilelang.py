@@ -6,6 +6,7 @@ import tilelang.language as T
 import torch
 
 from ..._internal.elementwise import sum_partials
+from ..._internal.tuning import _AutogradContext
 
 
 @tilelang.jit(pass_configs={"tl.enable_fast_math": False})
@@ -181,6 +182,46 @@ class _Prepare(torch.autograd.Function):
         )
 
 
+@torch.library.custom_op("flashrwkv2::tmix_kk_pre_forward", mutates_args=())
+def _compiled_prepare(key: torch.Tensor, key_scale: torch.Tensor, rate: torch.Tensor,
+                      rate_scale: torch.Tensor, head_size: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ctx = _AutogradContext()
+    outputs = _Prepare.forward(ctx, key, key_scale, rate, rate_scale, head_size)
+    return *outputs, ctx.saved_tensors[-1]
+
+
+@_compiled_prepare.register_fake
+def _compiled_prepare_fake(key, key_scale, rate, rate_scale, head_size):
+    return *(torch.empty_like(key) for _ in range(3)), key.new_empty((key.numel() // key.shape[-1], key.shape[-1] // head_size), dtype=torch.float32)
+
+
+def _compiled_prepare_context(ctx, inputs, output):
+    key, key_scale, rate, rate_scale, ctx.head_size = inputs
+    ctx.save_for_backward(key, key_scale, rate, rate_scale, output[3])
+    ctx.mark_non_differentiable(output[3])
+
+
+@torch.library.custom_op(
+    "flashrwkv2::tmix_kk_pre_backward", mutates_args=(),
+    schema="(Tensor gkey, Tensor ga, Tensor gb, Tensor[] saved, int head_size, bool[] needed) -> Tensor?[]",
+)
+def _compiled_prepare_vjp(gkey, ga, gb, saved, head_size, needed):
+    ctx = _AutogradContext(saved_tensors=saved, head_size=head_size, needs_input_grad=(*needed, False))
+    return list(_Prepare.backward(ctx, gkey, ga, gb)[:4])
+
+
+@_compiled_prepare_vjp.register_fake
+def _compiled_prepare_vjp_fake(gkey, ga, gb, saved, head_size, needed):
+    return [None if i in (1, 3) and not needed[i] else torch.empty_like(t) for i, t in enumerate(saved[:4])]
+
+
+def _compiled_prepare_backward(ctx, gkey, ga, gb, unused_inverse):
+    return (*_compiled_prepare_vjp(gkey, ga, gb, list(ctx.saved_tensors), ctx.head_size, list(ctx.needs_input_grad[:4])), None)
+
+
+_compiled_prepare.register_autograd(_compiled_prepare_backward, setup_context=_compiled_prepare_context)
+
+
 def prepare(key, key_scale, rate, rate_scale, head_size=64):
     tensors = (key, key_scale, rate, rate_scale)
     if any(
@@ -205,4 +246,6 @@ def prepare(key, key_scale, rate, rate_scale, head_size=64):
         or rate_scale.shape != key_scale.shape
     ):
         raise ValueError("KK preparation requires key/rate [...,C] and scales [C]")
+    if torch.compiler.is_compiling():
+        return _compiled_prepare(key, key_scale, rate, rate_scale, head_size)[:3]
     return _Prepare.apply(key, key_scale, rate, rate_scale, head_size)

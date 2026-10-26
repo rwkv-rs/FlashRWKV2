@@ -6,7 +6,7 @@ import tilelang.language as T
 import torch
 from torch.autograd.function import once_differentiable
 
-from ..._internal.tuning import device_class, tuning_operation
+from ..._internal.tuning import _AutogradContext, device_class, tuning_operation
 
 from ..._internal.elementwise import _activation_kernel, activation, sum_partials
 from ..._internal.linear import _aligned, _forward, adapter_linear, linear_input_vjp
@@ -573,6 +573,62 @@ class _GroupedLinear(torch.autograd.Function):
         return None, *dxs, *dws, *dbs
 
 
+@torch.library.custom_op(
+    "flashrwkv2::tmix_wkv_prepare_forward", mutates_args=(),
+    schema="(Tensor[] xs, Tensor[] weights, Tensor[] biases, int[] kinds) -> (Tensor[], Tensor)",
+)
+def _compiled_grouped(xs, weights, biases, kinds):
+    biases = tuple(bias if bias.numel() else None for bias in biases)
+    xs, weights, biases = _group_inputs(tuple(xs), tuple(weights), biases)
+    ctx = _AutogradContext()
+    values = _GroupedLinear.forward(ctx, tuple(kinds), *xs, *weights, *biases)
+    # Custom operators expose independent outputs. Keep eager's packed stores;
+    # copies at this compiler boundary preserve unused-output gradient semantics.
+    return [value.clone() for value in values], ctx.saved_tensors[-1]
+
+
+@_compiled_grouped.register_fake
+def _compiled_grouped_fake(xs, weights, biases, kinds):
+    values = [x.new_empty((x.shape[0], weight.shape[0])) for x, weight in zip(xs, weights)]
+    raw_size = sum(x.shape[0] * weight.shape[0] for x, weight, kind in zip(xs, weights, kinds) if kind)
+    return values, xs[0].new_empty(raw_size)
+
+
+def _compiled_grouped_context(ctx, inputs, output):
+    xs, weights, biases, kinds = inputs
+    ctx.save_for_backward(*xs, *weights, *biases, output[1])
+    ctx.kinds = tuple(kinds)
+    ctx.set_materialize_grads(False)
+    ctx.mark_non_differentiable(output[1])
+
+
+@torch.library.custom_op(
+    "flashrwkv2::tmix_wkv_prepare_backward", mutates_args=(),
+    schema="(Tensor?[] gradients, Tensor[] saved, int[] kinds, bool[] needed) -> Tensor?[]",
+)
+def _compiled_grouped_vjp(gradients, saved, kinds, needed):
+    count = len(kinds)
+    values = (*saved[:2 * count], *(bias if bias.numel() else None for bias in saved[2 * count:3 * count]), saved[-1])
+    ctx = _AutogradContext(saved_tensors=values, kinds=tuple(kinds), needs_input_grad=(False, *needed))
+    return list(_GroupedLinear.backward(ctx, *gradients)[1:])
+
+
+@_compiled_grouped_vjp.register_fake
+def _compiled_grouped_vjp_fake(gradients, saved, kinds, needed):
+    count = len(kinds)
+    return [None if not needed[i] or gradients[i % count] is None else t.new_empty(t.shape) for i, t in enumerate(saved[:3 * count])]
+
+
+def _compiled_grouped_backward(ctx, gradients, unused_raw):
+    needed = [*ctx.needs_input_grad[0], *ctx.needs_input_grad[1], *ctx.needs_input_grad[2]]
+    results = _compiled_grouped_vjp(gradients, list(ctx.saved_tensors), list(ctx.kinds), needed)
+    count = len(ctx.kinds)
+    return results[:count], results[count:2 * count], results[2 * count:], None
+
+
+_compiled_grouped.register_autograd(_compiled_grouped_backward, setup_context=_compiled_grouped_context)
+
+
 def _group_inputs(xs, weights, biases):
     device = xs[0].device
     if any(not t.is_cuda or t.device != device for t in (*xs, *weights)):
@@ -600,6 +656,11 @@ def _group_inputs(xs, weights, biases):
 
 def _grouped_linear(xs, weights, kinds, biases):
     shape = xs[0].shape[:-1]
+    if torch.compiler.is_compiling():
+        rows = [x.reshape(-1, x.shape[-1]).contiguous() for x in xs]
+        packed_biases = [rows[0].new_empty(0) if bias is None else bias for bias in biases]
+        values, _ = _compiled_grouped(rows, list(weights), packed_biases, list(kinds))
+        return tuple(value.view(*shape, weight.shape[0]) for value, weight in zip(values, weights))
     xs, weights, biases = _group_inputs(xs, weights, biases)
     if torch.is_grad_enabled() and any(
         t is not None and t.requires_grad for t in (*xs, *weights, *biases)

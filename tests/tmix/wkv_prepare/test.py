@@ -534,3 +534,29 @@ def test_prepare_training_batch_and_raw_decay_bias_are_bitwise_equal(
         )
     for train, infer in zip(train_state, infer_state, strict=True):
         assert torch.equal(train, infer)
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_fullgraph_grouped_projection_preserves_unused_gradients():
+    from flashrwkv2.tmix.wkv_prepare.tilelang import _grouped_linear
+    torch.manual_seed(741)
+    xs = [torch.randn(3, 64, device="cuda", dtype=torch.bfloat16).requires_grad_() for _ in range(2)]
+    weights = [torch.randn(32, 64, device="cuda", dtype=torch.bfloat16).t().contiguous().t().requires_grad_() for _ in range(2)]
+    biases = [torch.randn(32, device="cuda", dtype=torch.bfloat16).requires_grad_() for _ in range(2)]
+    def model():
+        return _grouped_linear(tuple(xs), tuple(weights), (1, 2), tuple(biases))[0]
+    eager = model()
+    eager.float().sum().backward()
+    leaves = (*xs, *weights, *biases)
+    expected = [None if value.grad is None else value.grad.clone() for value in leaves]
+    for value in leaves:
+        value.grad = None
+    compiled = torch.compile(model, fullgraph=True, options={"emulate_precision_casts": True})
+    actual = compiled()
+    actual.float().sum().backward()
+    assert torch.equal(actual, eager)
+    for value, reference in zip(leaves, expected, strict=True):
+        assert (value.grad is None) == (reference is None)
+        if reference is not None:
+            assert torch.equal(value.grad, reference)
