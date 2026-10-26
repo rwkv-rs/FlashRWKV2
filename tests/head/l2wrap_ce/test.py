@@ -113,3 +113,45 @@ def test_head_l2wrap_accumulates_parameter_gradients_in_fp32(chunk_rows, paramet
     torch.testing.assert_close(
         loss, torch.tensor(float(vocab), device="cuda").log(), atol=2e-6, rtol=2e-6,
     )
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("use_nora", [False, True])
+def test_fullgraph_head_loss_ten_steps_preserve_loss_and_grad_norm(use_nora):
+    torch.manual_seed(740)
+    hidden = (torch.randn(1, 6, 64, device="cuda") * .1).bfloat16()
+    weight = (torch.randn(65536, 64, device="cuda") * .01).bfloat16()
+    targets = torch.randint(65536, (1, 6), device="cuda")
+    initial = [torch.randn(4, 64, device="cuda") * .02,
+               torch.randn(65536, 4, device="cuda") * .01]
+    eager_parameters = [value.clone().requires_grad_() for value in initial]
+    compiled_parameters = [value.clone().requires_grad_() for value in initial]
+    eager_optimizer = torch.optim.SGD(eager_parameters, lr=.02)
+    compiled_optimizer = torch.optim.SGD(compiled_parameters, lr=.02)
+
+    def loss_function(a, b):
+        return pretrain_head_l2wrap_ce_bf16(
+            hidden, weight, targets, chunk_rows=4, lora_a=a, lora_b=b,
+            lora_scale=.75, use_nora=use_nora,
+        )
+
+    compiled = torch.compile(loss_function, fullgraph=True, options={"emulate_precision_casts": True})
+    for _ in range(10):
+        eager_optimizer.zero_grad(set_to_none=True)
+        compiled_optimizer.zero_grad(set_to_none=True)
+        expected = loss_function(*eager_parameters)
+        actual = compiled(*compiled_parameters)
+        expected.backward()
+        actual.backward()
+        assert actual.dtype == torch.float32
+        assert torch.equal(actual, expected)
+        expected_norm = torch.linalg.vector_norm(torch.stack([value.grad.norm() for value in eager_parameters]))
+        actual_norm = torch.linalg.vector_norm(torch.stack([value.grad.norm() for value in compiled_parameters]))
+        assert torch.equal(actual_norm, expected_norm)
+        for eager, traced in zip(eager_parameters, compiled_parameters, strict=True):
+            assert eager.grad.dtype == traced.grad.dtype == torch.float32
+            assert torch.equal(eager.grad, traced.grad)
+        eager_optimizer.step()
+        compiled_optimizer.step()
+        assert all(torch.equal(eager, traced) for eager, traced in zip(eager_parameters, compiled_parameters, strict=True))

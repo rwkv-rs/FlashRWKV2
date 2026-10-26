@@ -64,7 +64,7 @@ def test_norm_tuning_rejects_changed_statistics_production_or_res(monkeypatch, f
     monkeypatch.setattr(implementation, "_ROW_CONFIGS", {})
     monkeypatch.setattr(tuning, "select_config", select_config)
     monkeypatch.setattr(tuning, "save_config", lambda *args: None)
-    monkeypatch.setattr(torch.cuda, "get_device_name", lambda device: "test")
+    monkeypatch.setattr(implementation, "device_class", lambda device: "test")
     implementation.tune_norm(x, weight, bias, res=res)
     assert implementation._ROW_CONFIGS[implementation._config_key(x, True)] == 1
 

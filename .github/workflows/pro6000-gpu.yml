@@ -4,7 +4,19 @@ on:
   pull_request:
   push:
     branches: [main]
+  schedule:
+    - cron: '17 8 * * *'
   workflow_dispatch:
+    inputs:
+      mode:
+        description: Validation scope (performance includes full correctness first)
+        type: choice
+        options: [incremental, full, performance]
+        default: full
+      extended:
+        description: All supported Torch versions, cold compilation, and full benchmarks
+        type: boolean
+        default: false
 
 permissions:
   actions: read
@@ -12,21 +24,30 @@ permissions:
   pull-requests: read
 
 concurrency:
-  group: flashrwkv2-quality-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: flashrwkv2-quality-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-${{ inputs.mode || 'auto' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
+
+env:
+  UV_PYTHON: '3.12'
 
 jobs:
   plan:
     name: Plan source validation
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       base_sha: ${{ steps.plan.outputs.base_sha }}
       source_tree_sha: ${{ steps.plan.outputs.source_tree_sha }}
-      build_input_hash: ${{ steps.plan.outputs.build_input_hash }}
       run_gpu: ${{ steps.plan.outputs.run_gpu }}
-      affected_cuda_modules: ${{ steps.plan.outputs.affected_cuda_modules }}
-      cuda_racecheck_modules: ${{ steps.plan.outputs.cuda_racecheck_modules }}
+      run_package: ${{ steps.plan.outputs.run_package }}
+      run_contract: ${{ steps.plan.outputs.run_contract }}
+      mode: ${{ steps.plan.outputs.mode }}
+      extended: ${{ steps.plan.outputs.extended }}
       trusted: ${{ steps.trust.outputs.trusted }}
+      reuse: ${{ steps.reuse.outputs.reuse }}
+      reuse_run: ${{ steps.reuse.outputs.run_id }}
+      reuse_artifact: ${{ steps.reuse.outputs.artifact }}
+      run_performance: ${{ steps.scope.outputs.run_performance }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -42,119 +63,66 @@ jobs:
               return;
             }
             const pull = context.payload.pull_request;
-            const trustedAssociations = new Set(['OWNER', 'MEMBER', 'COLLABORATOR']);
-            const trustedPermissions = new Set(['admin', 'maintain', 'write']);
             let trusted = pull.head.repo?.full_name === process.env.GITHUB_REPOSITORY &&
-              trustedAssociations.has(pull.author_association);
+              new Set(['OWNER', 'MEMBER', 'COLLABORATOR']).has(pull.author_association);
             if (!trusted && pull.head.repo?.full_name === process.env.GITHUB_REPOSITORY &&
                 pull.author_association === 'CONTRIBUTOR') {
               const {data} = await github.rest.repos.getCollaboratorPermissionLevel({
-                ...context.repo,
-                username: pull.user.login,
+                ...context.repo, username: pull.user.login,
               });
-              trusted = trustedPermissions.has(data.permission);
+              trusted = new Set(['admin', 'maintain', 'write']).has(data.permission);
             }
             core.setOutput('trusted', String(trusted));
-      - name: Validate CI contracts and create plan
+      - name: Select incremental, daily, or extended validation
         id: plan
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          REQUESTED_MODE: ${{ inputs.mode || 'incremental' }}
+          EXTENDED: ${{ inputs.extended || 'false' }}
+          EVENT: ${{ github.event_name }}
         run: |
-          if ! git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null; then
-            BASE_SHA="$(git rev-parse HEAD^)"
+          if ! timeout 30s git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null; then
+            BASE_SHA="$(timeout 30s git rev-parse HEAD^)"
           fi
-          python3 ci/select_targets.py --self-test
-          python3 ci/quality_gate.py self-test
-          python3 ci/quality_gate.py plan \
-            --base "$BASE_SHA" \
-            --head "$(git rev-parse HEAD)" \
-            --output artifacts/plan.json \
-            --github-output "$GITHUB_OUTPUT"
-          echo "base_sha=$BASE_SHA" >> "$GITHUB_OUTPUT"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: flashrwkv2-plan-v5-${{ steps.plan.outputs.source_tree_sha }}
-          path: artifacts/plan.json
-          if-no-files-found: error
-
-  package:
-    name: Build source distributions
-    needs: [plan, contract]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - uses: astral-sh/setup-uv@v6
-      - name: Build without Torch or CUDA
-        run: uv build --out-dir artifacts/dist
-      - name: Verify universal source wheel and sdist
+          if [ "$EVENT" = schedule ]; then
+            REQUESTED_MODE=full
+            if [ "$(timeout 10s date -u +%u)" = 7 ]; then EXTENDED=true; fi
+          fi
+          args=()
+          if [ "$EXTENDED" = true ]; then args+=(--extended); fi
+          timeout 60s python3 ci/quality_gate.py plan \
+            --base "$BASE_SHA" --head "$(timeout 30s git rev-parse HEAD)" \
+            --mode "$REQUESTED_MODE" "${args[@]}" \
+            --output artifacts/plan.json --github-output "$GITHUB_OUTPUT"
+      - name: Resolve identical successful validation
+        id: reuse
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          python3 - <<'PY'
-          import hashlib
-          import json
-          import tarfile
-          import zipfile
+          timeout 300s python3 ci/quality_gate.py resolve \
+            --plan artifacts/plan.json --repository "$GITHUB_REPOSITORY" \
+            --current-run "$GITHUB_RUN_ID" --output artifacts/reuse.json \
+            --github-output "$GITHUB_OUTPUT"
+      - name: Select independent performance work
+        id: scope
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          timeout 30s python3 - <<'PY'
+          import json, os
           from pathlib import Path
-
-          dist = Path("artifacts/dist")
-          wheels = list(dist.glob("*.whl"))
-          sdists = list(dist.glob("*.tar.gz"))
-          if len(wheels) != 1 or len(sdists) != 1:
-              raise SystemExit("expected exactly one wheel and one sdist")
-          wheel, sdist = wheels[0], sdists[0]
-          if not wheel.name.endswith("-py3-none-any.whl"):
-              raise SystemExit(f"wheel is not universal: {wheel.name}")
-
-          sources = {
-              path.relative_to("csrc").as_posix(): path.read_bytes()
-              for path in Path("csrc").rglob("*")
-              if path.is_file()
-          }
-          if not sources or not any(name.startswith("sm80/") for name in sources):
-              raise SystemExit("repository CUDA source tree is incomplete")
-          if any(name.startswith(("sm89/", "sm90/", "sm120/")) for name in sources):
-              raise SystemExit("repository contains a duplicate architecture source tree")
-
-          with zipfile.ZipFile(wheel) as archive:
-              names = set(archive.namelist())
-              if any(name.endswith((".so", ".pyd", ".dll")) for name in names):
-                  raise SystemExit("wheel contains a compiled extension")
-              for relative, expected in sources.items():
-                  name = f"flashrwkv2/_csrc/{relative}"
-                  if name not in names or archive.read(name) != expected:
-                      raise SystemExit(f"wheel source mismatch: {relative}")
-
-          with tarfile.open(sdist) as archive:
-              members = {member.name: member for member in archive.getmembers()}
-              prefix = sdist.name.removesuffix(".tar.gz")
-              if any(name.endswith((".so", ".pyd", ".dll")) for name in members):
-                  raise SystemExit("sdist contains a compiled extension")
-              for relative, expected in sources.items():
-                  name = f"{prefix}/csrc/{relative}"
-                  member = members.get(name)
-                  if member is None or archive.extractfile(member).read() != expected:
-                      raise SystemExit(f"sdist source mismatch: {relative}")
-
-          Path("artifacts/package-validation.json").write_text(json.dumps({
-              "checks": {
-                  "package_identity": "passed",
-                  "source_contents": "passed",
-              },
-              "artifacts": {
-                  "wheel": {"name": wheel.name, "sha256": hashlib.sha256(wheel.read_bytes()).hexdigest()},
-                  "sdist": {"name": sdist.name, "sha256": hashlib.sha256(sdist.read_bytes()).hexdigest()},
-              },
-          }, indent=2) + "\n")
+          plan = json.loads(Path('artifacts/plan.json').read_text())
+          run = (os.environ['EVENT'] == 'schedule' or plan['mode'] == 'performance'
+                 or plan['extended'] or plan['impact']['change_class'] == 'benchmark')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'run_performance={str(run).lower()}\n')
           PY
       - uses: actions/upload-artifact@v4
         with:
-          name: flashrwkv2-wheel-v5-${{ needs.plan.outputs.build_input_hash }}
-          path: |
-            artifacts/dist/*
-            artifacts/package-validation.json
+          name: flashrwkv2-plan-v7
+          path: artifacts/plan.json
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 90
 
   contract:
     name: Source and CPU contract
@@ -166,224 +134,264 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: flashrwkv2-plan-v7
+          path: artifacts
+      - name: Check source and CI contracts once
+        env:
+          BASE_SHA: ${{ needs.plan.outputs.base_sha }}
+        run: |
+          timeout 30s git diff --check "$BASE_SHA" HEAD --
+          timeout 60s python3 ci/select_targets.py --self-test
+          timeout 90s python3 ci/quality_gate.py self-test
+          timeout 60s python3 ci/benchmark_gate.py self-test
+      - uses: actions/download-artifact@v4
+        if: needs.plan.outputs.reuse == 'true'
+        with:
+          name: ${{ needs.plan.outputs.reuse_artifact }}
+          run-id: ${{ needs.plan.outputs.reuse_run }}
+          github-token: ${{ github.token }}
+          path: artifacts/reuse
       - uses: astral-sh/setup-uv@v6
+        if: needs.plan.outputs.run_contract == 'true'
         with:
           enable-cache: true
-      - name: Validate source and helpers
+      - name: Validate source and CPU behavior
+        if: needs.plan.outputs.run_contract == 'true'
         run: |
-          git diff --check '${{ needs.plan.outputs.base_sha }}' HEAD --
-          uv sync --frozen --no-install-project --group dev
-          .venv/bin/ruff check --select E9,F63,F7,F82 flashrwkv2 tests benchmarks setup.py
-          .venv/bin/ruff check ci benchmarks
-          .venv/bin/python ci/select_targets.py --self-test
-          .venv/bin/python ci/quality_gate.py self-test
-          .venv/bin/python ci/benchmark_gate.py self-test
-          CUDA_VISIBLE_DEVICES="" .venv/bin/python -m pytest -q tests -m 'not cuda'
+          timeout 600s uv sync --frozen --no-install-project --group dev
+          timeout 60s .venv/bin/ruff check --select E9,F63,F7,F82 flashrwkv2 tests benchmarks setup.py
+          timeout 60s .venv/bin/ruff check ci benchmarks
+          CUDA_VISIBLE_DEVICES="" timeout 600s .venv/bin/python ci/quality_gate.py test \
+            --plan artifacts/plan.json --suite cpu --output artifacts/cpu.json \
+            --reuse artifacts/reuse/quality-manifest.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: flashrwkv2-cpu-v7
+          path: artifacts/cpu.*
+          if-no-files-found: ignore
+          retention-days: 90
 
-  untrusted:
-    name: Reject untrusted GPU revision
-    if: >-
-      needs.plan.outputs.run_gpu == 'true' && needs.plan.outputs.trusted != 'true'
+  package:
+    name: Verify source distributions
+    if: needs.plan.outputs.run_package == 'true'
     needs: plan
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - run: |
-          echo 'Native GPU validation requires a reviewed in-repository revision.' >&2
-          exit 1
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        if: needs.plan.outputs.reuse == 'true'
+        with:
+          name: ${{ needs.plan.outputs.reuse_artifact }}
+          run-id: ${{ needs.plan.outputs.reuse_run }}
+          github-token: ${{ github.token }}
+          path: artifacts/package
+      - uses: astral-sh/setup-uv@v6
+        if: needs.plan.outputs.reuse != 'true'
+      - name: Build without Torch or CUDA
+        if: needs.plan.outputs.reuse != 'true'
+        run: timeout 300s uv build --out-dir artifacts/package/dist
+      - name: Verify Python and native package sources
+        run: |
+          timeout 60s python3 ci/quality_gate.py package \
+            --directory artifacts/package --output artifacts/package/package.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flashrwkv2-package-v7
+          path: |
+            artifacts/package/dist/*
+            artifacts/package/package.json
+          if-no-files-found: error
+          retention-days: 90
 
-  torch-source-compatibility:
-    name: Torch ${{ matrix.torch }} runtime build
+  gpu:
+    name: Affected GPU correctness and sanitizer
     if: >-
       needs.plan.outputs.run_gpu == 'true' && needs.plan.outputs.trusted == 'true'
     needs: [plan, contract, package]
     runs-on: [self-hosted, linux, x64, rwkv-sha-pro6000x8]
-    timeout-minutes: 300
+    timeout-minutes: 120
     concurrency:
       group: flashrwkv2-pro6000-exclusive
       cancel-in-progress: false
-    strategy:
-      fail-fast: false
-      max-parallel: 1
-      matrix:
-        torch: ["2.13.0", "2.11.0", "2.12.0"]
+      queue: max
     env:
-      TORCH_EXTENSIONS_DIR: ${{ github.workspace }}/.torch-extensions-${{ github.run_id }}-torch-${{ matrix.torch }}
+      CUDA_VISIBLE_DEVICES: '0,1'
+      FLASHRWKV_PHYSICAL_GPU: '0'
     steps:
       - uses: actions/checkout@v4
         with:
+          fetch-depth: 0
+          clean: false
           persist-credentials: false
+      - name: Clean previous CI outputs while retaining the project environment
+        run: timeout 30s rm -rf artifacts/ci
       - uses: actions/download-artifact@v4
         with:
-          name: flashrwkv2-wheel-v5-${{ needs.plan.outputs.build_input_hash }}
-          path: artifacts/package
+          name: flashrwkv2-plan-v7
+          path: artifacts/ci
+      - uses: actions/download-artifact@v4
+        with:
+          name: flashrwkv2-package-v7
+          path: artifacts/ci/package
+      - uses: actions/download-artifact@v4
+        if: needs.plan.outputs.reuse == 'true'
+        with:
+          name: ${{ needs.plan.outputs.reuse_artifact }}
+          run-id: ${{ needs.plan.outputs.reuse_run }}
+          github-token: ${{ github.token }}
+          path: artifacts/ci/reuse
       - uses: astral-sh/setup-uv@v6
-      - name: Install the same source wheel
-        env:
-          TORCH_VERSION: ${{ matrix.torch }}
+      - name: Synchronize the project environment
         run: |
-          uv venv .venv --python 3.12 --clear
-          uv pip install --python .venv/bin/python "torch==$TORCH_VERSION" tilelang==0.1.15 pytest numpy ninja
-          uv pip install --python .venv/bin/python --no-deps artifacts/package/dist/*.whl
-      - name: Compile once and verify cache hit
-        env:
-          TORCH_VERSION: ${{ matrix.torch }}
+          timeout 600s uv sync --frozen --no-install-project --group dev
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+      - name: Validate the installed wheel or reuse matching GPU results
         run: |
-          .venv/bin/python -m flashrwkv2.compile > artifacts/compile-first.json
-          .venv/bin/python -m flashrwkv2.compile > artifacts/compile-second.json
-          .venv/bin/python - <<'PY'
-          import json
-          import os
-          import subprocess
-          from pathlib import Path
-
-          first = json.loads(Path("artifacts/compile-first.json").read_text())
-          second = json.loads(Path("artifacts/compile-second.json").read_text())
-          if first["status"] not in {"compiled", "cached"} or second["status"] != "cached":
-              raise SystemExit(f"unexpected runtime cache states: {first}, {second}")
-          if first["target"] != "sm120" or second["cache_key"] != first["cache_key"]:
-              raise SystemExit(f"unexpected runtime target/cache identity: {first}, {second}")
-          library = Path(second["library"])
-          if not library.is_file():
-              raise SystemExit(f"runtime library is missing: {library}")
-          listing = subprocess.run(
-              ["cuobjdump", "--list-elf", str(library)],
-              check=True,
-              capture_output=True,
-              text=True,
-          ).stdout
-          if "sm_120" not in listing or any(f"sm_{cc}" in listing for cc in (80, 89, 90)):
-              raise SystemExit(f"runtime library is not native-only sm120:\n{listing}")
-          Path(f"artifacts/validation-{os.environ['TORCH_VERSION']}.json").write_text(
-              json.dumps({
-                  "checks": {
-                      f"torch_{os.environ['TORCH_VERSION'].split('.')[0]}_{os.environ['TORCH_VERSION'].split('.')[1]}": "passed",
-                      "runtime_build_cache": "passed",
-                  },
-                  "environment": {
-                      "target": second["target"],
-                      "cache_key": second["cache_key"],
-                      "library": second["library"],
-                  },
-                  "results": [],
-              }, indent=2) + "\n"
-          )
-          PY
-      - name: Full correctness, backward, and CUDA Graph suite
-        if: matrix.torch == '2.13.0'
-        run: .venv/bin/python -m pytest -q tests
-      - name: Compute Sanitizer memcheck
-        if: matrix.torch == '2.13.0'
-        run: compute-sanitizer --error-exitcode=1 --tool memcheck .venv/bin/python -m pytest -q tests -m memcheck
-      - name: Compute Sanitizer racecheck
-        if: matrix.torch == '2.13.0'
-        run: compute-sanitizer --error-exitcode=1 --tool racecheck .venv/bin/python -m pytest -q tests -m racecheck
-      - name: Multi-size tuning, native linear comparisons and NoRA training benchmarks
-        if: matrix.torch == '2.13.0'
-        run: |
-          .venv/bin/python ci/benchmark_gate.py run-suite \
-            --modules '["head/linear","tmix/wkv7","tmix/wkv7/rl_infctx","cmix","post_norm","tmix/tokenshift","tmix/readout","head/l2wrap_ce","tmix/wkv_prepare"]' \
-            --python .venv/bin/python --revision '${{ github.sha }}' --status candidate \
-            --output artifacts/nora-benchmarks --summary artifacts/nora-benchmark-summary.json \
-            --require-complete
-      - name: Record complete CUDA coverage
-        if: matrix.torch == '2.13.0'
-        env:
-          MODULES: ${{ needs.plan.outputs.affected_cuda_modules }}
-          RACECHECK_MODULES: ${{ needs.plan.outputs.cuda_racecheck_modules }}
-        run: |
-          .venv/bin/python - <<'PY'
-          import json
-          import os
-          from pathlib import Path
-
-          path = Path("artifacts/validation-2.13.0.json")
-          payload = json.loads(path.read_text())
-          modules = json.loads(os.environ["MODULES"])
-          racecheck = json.loads(os.environ["RACECHECK_MODULES"])
-          payload["checks"].update({
-              "cuda": "native-runtime",
-              "cuda_graph": "passed",
-              "memcheck": "passed",
-              "racecheck": "passed",
-          })
-          payload["results"] = [
-              {"kind": "correctness", "status": "passed", "modules": modules},
-              {"kind": "memcheck", "status": "passed", "modules": modules},
-              {"kind": "racecheck", "status": "passed", "modules": racecheck},
-          ]
-          path.write_text(json.dumps(payload, indent=2) + "\n")
-          PY
+          timeout 6600s python3 ci/quality_gate.py gpu \
+            --plan artifacts/ci/plan.json --package artifacts/ci/package \
+            --python .venv/bin/python --output artifacts/ci/results \
+            --reuse artifacts/ci/reuse/quality-manifest.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: flashrwkv2-validation-torch-${{ matrix.torch }}-${{ needs.plan.outputs.source_tree_sha }}
-          path: |
-            artifacts/compile-*.json
-            artifacts/validation-${{ matrix.torch }}.json
-            artifacts/nora-*.json
-            artifacts/nora-benchmarks/
+          name: flashrwkv2-gpu-v7
+          path: artifacts/ci/results/
           if-no-files-found: error
+          retention-days: 90
+      - name: Clean uploaded CI outputs
+        if: always()
+        run: timeout 30s rm -rf artifacts/ci
 
-  finalize:
-    name: Bind exact artifacts and evidence
-    if: >-
-      always() && needs.plan.result == 'success' && needs.package.result == 'success' &&
-      (needs.torch-source-compatibility.result == 'success' ||
-       (needs.plan.outputs.run_gpu != 'true' && needs.torch-source-compatibility.result == 'skipped'))
-    needs: [plan, contract, package, torch-source-compatibility]
+  gate:
+    name: Quality Gate
+    if: always()
+    needs: [plan, contract, package, gpu]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
+      - name: Require every applicable validation job
+        env:
+          JOBS: ${{ toJSON(needs) }}
+        run: |
+          timeout 30s python3 - <<'PY'
+          import json, os
+          jobs = json.loads(os.environ['JOBS'])
+          assert jobs['plan']['result'] == 'success', 'validation plan failed'
+          assert jobs['contract']['result'] == 'success', 'CPU/CI contract failed'
+          plan = jobs['plan']['outputs']
+          for name, required in [('package', plan['run_package']), ('gpu', plan['run_gpu'])]:
+              expected = 'success' if required == 'true' else 'skipped'
+              assert jobs[name]['result'] == expected, f'{name}: required {expected}, got {jobs[name]["result"]}'
+          PY
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
-          name: flashrwkv2-plan-v5-${{ needs.plan.outputs.source_tree_sha }}
+          name: flashrwkv2-plan-v7
           path: artifacts
       - uses: actions/download-artifact@v4
+        if: needs.plan.outputs.run_contract == 'true'
         with:
-          name: flashrwkv2-wheel-v5-${{ needs.plan.outputs.build_input_hash }}
-          path: artifacts/package
+          name: flashrwkv2-cpu-v7
+          path: artifacts/validation
+      - uses: actions/download-artifact@v4
+        if: needs.plan.outputs.run_package == 'true'
+        with:
+          name: flashrwkv2-package-v7
+          path: artifacts/bundle
       - uses: actions/download-artifact@v4
         if: needs.plan.outputs.run_gpu == 'true'
         with:
-          pattern: flashrwkv2-validation-torch-*-${{ needs.plan.outputs.source_tree_sha }}
-          path: artifacts/validation
-          merge-multiple: true
-      - name: Merge validation evidence
+          name: flashrwkv2-gpu-v7
+          path: artifacts/gpu
+      - name: Bind actual validation to the tested distributions
+        env:
+          RUN_GPU: ${{ needs.plan.outputs.run_gpu }}
+          RUN_PACKAGE: ${{ needs.plan.outputs.run_package }}
         run: |
-          python3 - <<'PY'
-          import json
-          from pathlib import Path
-
-          payload = {"checks": {}, "environment": {}, "results": []}
-          paths = [Path("artifacts/package/package-validation.json")]
-          paths.extend(sorted(Path("artifacts/validation").glob("validation-*.json")))
-          for path in paths:
-              current = json.loads(path.read_text())
-              payload["checks"].update(current.get("checks", {}))
-              payload["environment"].update(current.get("environment", {}))
-              payload["results"].extend(current.get("results", []))
-          Path("artifacts/validation.json").write_text(json.dumps(payload, indent=2) + "\n")
-          PY
-      - name: Finalize and verify exact source distributions
+          timeout 30s mkdir -p artifacts/validation artifacts/bundle
+          if [ "$RUN_GPU" = true ]; then timeout 30s cp artifacts/gpu/gpu.json artifacts/validation/gpu.json; fi
+          args=()
+          if [ "$RUN_PACKAGE" = true ]; then
+            timeout 30s cp artifacts/bundle/package.json artifacts/validation/package.json
+            args+=(--package artifacts/bundle)
+          fi
+          timeout 120s python3 ci/quality_gate.py finalize --plan artifacts/plan.json \
+            --validation artifacts/validation "${args[@]}" --output artifacts/bundle/quality-manifest.json
+          timeout 120s python3 ci/quality_gate.py verify --plan artifacts/plan.json \
+            --manifest artifacts/bundle/quality-manifest.json "${args[@]}"
+      - name: Report validation timing
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          python3 ci/quality_gate.py finalize \
-            --plan artifacts/plan.json \
-            --wheel artifacts/package/dist/*.whl \
-            --sdist artifacts/package/dist/*.tar.gz \
-            --validation artifacts/validation.json \
-            --output artifacts/quality-manifest.json
-          python3 ci/quality_gate.py verify \
-            --manifest artifacts/quality-manifest.json \
-            --expected-tree '${{ needs.plan.outputs.source_tree_sha }}' \
-            --wheel artifacts/package/dist/*.whl \
-            --sdist artifacts/package/dist/*.tar.gz
+          timeout 120s python3 ci/quality_gate.py summary --manifest artifacts/bundle/quality-manifest.json \
+            --repository "$GITHUB_REPOSITORY" --output "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         with:
-          name: flashrwkv2-quality-v5-${{ needs.plan.outputs.source_tree_sha }}
-          path: |
-            artifacts/quality-manifest.json
-            artifacts/package/dist/*
+          name: flashrwkv2-quality-v7-${{ needs.plan.outputs.source_tree_sha }}
+          path: artifacts/bundle/
           if-no-files-found: error
           retention-days: 90
+
+  performance:
+    name: Independent performance report
+    if: needs.plan.outputs.run_performance == 'true' && needs.plan.outputs.trusted == 'true'
+    needs: [plan, gate]
+    runs-on: [self-hosted, linux, x64, rwkv-sha-pro6000x8]
+    timeout-minutes: 240
+    concurrency:
+      group: flashrwkv2-pro6000-exclusive
+      cancel-in-progress: false
+      queue: max
+    env:
+      CUDA_VISIBLE_DEVICES: '0,1'
+      FLASHRWKV_PHYSICAL_GPU: '0'
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          clean: false
+          persist-credentials: false
+      - name: Clean previous CI outputs
+        run: timeout 30s rm -rf artifacts/ci
+      - uses: actions/download-artifact@v4
+        with:
+          name: flashrwkv2-quality-v7-${{ needs.plan.outputs.source_tree_sha }}
+          path: artifacts/ci/quality
+      - uses: astral-sh/setup-uv@v6
+      - name: Prepare the primary Torch environment and tested wheel
+        run: |
+          timeout 600s uv sync --frozen --no-install-project --group dev
+          timeout 180s uv pip install --python .venv/bin/python --no-deps --reinstall artifacts/ci/quality/dist/*.whl
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+      - name: Run affected standard cases or the complete tuning suite
+        env:
+          EXTENDED: ${{ needs.plan.outputs.extended }}
+          MODE: ${{ needs.plan.outputs.mode }}
+        run: |
+          profile=standard
+          if [ "$EXTENDED" = true ] || [ "$MODE" = performance ]; then profile=full; fi
+          timeout 13800s .venv/bin/python ci/benchmark_gate.py report \
+            --quality artifacts/ci/quality/quality-manifest.json --package artifacts/ci/quality \
+            --profile "$profile" --repository "$GITHUB_REPOSITORY" \
+            --python .venv/bin/python --output artifacts/ci/performance \
+            --summary "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: flashrwkv2-performance-v7-${{ needs.plan.outputs.source_tree_sha }}
+          path: artifacts/ci/performance/
+          if-no-files-found: error
+          retention-days: 90
+      - name: Clean uploaded CI outputs
+        if: always()
+        run: timeout 30s rm -rf artifacts/ci

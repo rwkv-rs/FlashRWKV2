@@ -21,6 +21,8 @@ import tilelang
 import tilelang.language as T
 import torch
 
+from ..._internal.tuning import _AutogradContext, device_class, tuning_operation
+
 _CHECKPOINT = 16
 _LOG2E = 1.4426950408889634
 _EXP_NEG_HALF = 0.6065306597126334
@@ -506,42 +508,47 @@ class _Recurrent(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output, grad_final_state):
-        r, w, k, v, a, b, cu, bias, status, boundary = ctx.saved_tensors
-        dy = torch.zeros_like(v) if grad_output is None else grad_output.contiguous()
-        ds = (
-            torch.zeros(ctx.state_shape, dtype=torch.float32, device=r.device)
-            if grad_final_state is None
-            else grad_final_state.contiguous()
-        )
-        gradients = torch.zeros((6, *r.shape), dtype=torch.float32, device=r.device)
-        ds0 = torch.empty_like(ds)
-        _, heads, dim = r.shape
-        _backward_kernel(
-            heads,
-            dim,
-            ctx.scale,
-            bias.numel() != 0,
-            status.numel() != 0,
-            "bfloat16" if bias.dtype == torch.bfloat16 else "float32",
-        )(
-            r,
-            w,
-            k,
-            v,
-            a,
-            b,
-            cu,
-            bias,
-            status,
-            boundary,
-            dy,
-            ds,
-            gradients,
-            ds0,
-        )
-        dr, dw, dk, dv, da, db = gradients.to(torch.bfloat16).unbind(0)
-        dbias = dw.float().sum(dim=0).to(bias.dtype) if bias.numel() else None
-        return dr, dw, dk, dv, da, db, ds0, None, dbias, None, None, None, None
+        gradients, ds0, dbias = _recurrent_vjp(ctx, grad_output, grad_final_state)
+        return *gradients.unbind(0), ds0, None, dbias, None, None, None, None
+
+
+def _recurrent_vjp(ctx, grad_output, grad_final_state):
+    r, w, k, v, a, b, cu, bias, status, boundary = ctx.saved_tensors
+    dy = torch.zeros_like(v) if grad_output is None else grad_output.contiguous()
+    ds = (
+        torch.zeros(ctx.state_shape, dtype=torch.float32, device=r.device)
+        if grad_final_state is None
+        else grad_final_state.contiguous()
+    )
+    gradients = torch.zeros((6, *r.shape), dtype=torch.float32, device=r.device)
+    ds0 = torch.empty_like(ds)
+    _, heads, dim = r.shape
+    _backward_kernel(
+        heads,
+        dim,
+        ctx.scale,
+        bias.numel() != 0,
+        status.numel() != 0,
+        "bfloat16" if bias.dtype == torch.bfloat16 else "float32",
+    )(
+        r,
+        w,
+        k,
+        v,
+        a,
+        b,
+        cu,
+        bias,
+        status,
+        boundary,
+        dy,
+        ds,
+        gradients,
+        ds0,
+    )
+    rounded = gradients.to(torch.bfloat16)
+    dbias = rounded[1].float().sum(dim=0).to(bias.dtype) if bias.numel() else None
+    return rounded, ds0, dbias
 
 
 def _check_inputs(
@@ -615,7 +622,7 @@ def _bias_tensor(r, decay_bias):
 
 def _config_key(r, batch, bias, *, indexed=False, state_dtype=torch.float32):
     return (
-        torch.cuda.get_device_name(r.device),
+        device_class(r.device),
         tuple(r.shape),
         batch,
         None if bias is None else bias.dtype,
@@ -669,7 +676,18 @@ def _infer_recurrent(
     )
     from ..._internal.tuning import get_config
 
-    config = get_config(_TUNED_CONFIGS, "tmix/wkv7", _config_key(r, batch, decay_bias, indexed=True, state_dtype=state_pool.dtype), (64, 1))
+    config = (64, 1)
+    if block_values is None or prefetch_tokens is None:
+        config = get_config(
+            _TUNED_CONFIGS, "tmix/wkv7",
+            _config_key(r, batch, decay_bias, indexed=True, state_dtype=state_pool.dtype), (64, 1),
+            tune=lambda: tune_tmix_wkv7_recurrent(
+                r, decay_logits, k, v, a, b,
+                state_pool, cu_seqlens,
+                scale=scale, decay_bias=decay_bias, indexed=True,
+                state_indices=state_indices, status=status,
+            ),
+        )
     block_values = config[0] if block_values is None else block_values
     prefetch_tokens = config[1] if prefetch_tokens is None else prefetch_tokens
     _, heads, dim = r.shape
@@ -705,6 +723,68 @@ def _infer_recurrent(
         empty,
     )
     return output
+
+
+@torch.library.custom_op("flashrwkv2::tmix_wkv7_forward", mutates_args=())
+def _compiled_recurrent(
+    r: torch.Tensor, w: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+    a: torch.Tensor, b: torch.Tensor, state: torch.Tensor, cu: torch.Tensor,
+    bias: torch.Tensor, status: torch.Tensor, scale: float,
+    block_values: int | None, prefetch_tokens: int | None, save: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    block_values, prefetch_tokens = _functional_config(
+        r, w, k, v, a, b, state, cu, scale, bias if bias.numel() else None, block_values, prefetch_tokens,
+    )
+    return _forward(r, w, k, v, a, b, state, cu, bias, status,
+                    scale, save, block_values, prefetch_tokens)
+
+
+@_compiled_recurrent.register_fake
+def _compiled_recurrent_fake(r, w, k, v, a, b, state, cu, bias, status, scale, block_values, prefetch_tokens, save):
+    boundary = state.new_empty((r.shape[0] // _CHECKPOINT + state.shape[0] if save else 0, *state.shape[1:]))
+    return torch.empty_like(v), torch.empty_like(state), boundary
+
+
+def _compiled_recurrent_context(ctx, inputs, output):
+    r, w, k, v, a, b, state, cu, bias, status, scale, _, _, _ = inputs
+    ctx.save_for_backward(r, w, k, v, a, b, cu, bias, status, output[2])
+    ctx.state_shape, ctx.scale = state.shape, scale
+    ctx.set_materialize_grads(False)
+    ctx.mark_non_differentiable(output[2])
+
+
+@torch.library.custom_op(
+    "flashrwkv2::tmix_wkv7_backward", mutates_args=(),
+    schema="(Tensor? dy, Tensor? ds, Tensor[] saved, SymInt[] state_shape, float scale) -> (Tensor, Tensor, Tensor?)",
+)
+def _compiled_recurrent_vjp(dy, ds, saved, state_shape, scale):
+    return _recurrent_vjp(_AutogradContext(saved_tensors=saved, state_shape=state_shape, scale=scale), dy, ds)
+
+
+@_compiled_recurrent_vjp.register_fake
+def _compiled_recurrent_vjp_fake(dy, ds, saved, state_shape, scale):
+    r, _, _, _, _, _, _, bias, _, _ = saved
+    return r.new_empty((6, *r.shape)), r.new_empty(state_shape, dtype=torch.float32), torch.empty_like(bias) if bias.numel() else None
+
+
+def _compiled_recurrent_backward(ctx, dy, ds, unused_boundary):
+    gradients, ds0, dbias = _compiled_recurrent_vjp(dy, ds, list(ctx.saved_tensors), list(ctx.state_shape), ctx.scale)
+    return *gradients.unbind(0), ds0, None, dbias, None, None, None, None, None
+
+
+_compiled_recurrent.register_autograd(_compiled_recurrent_backward, setup_context=_compiled_recurrent_context)
+
+
+def _functional_config(r, decay_logits, k, v, a, b, initial_state, cu_seqlens, scale, decay_bias, block_values, prefetch_tokens):
+    from ..._internal.tuning import get_config
+    config = (64, 1)
+    if block_values is None or prefetch_tokens is None:
+        config = get_config(
+            _TUNED_CONFIGS, "tmix/wkv7", _config_key(r, initial_state.shape[0], decay_bias), (64, 1),
+            tune=lambda: tune_tmix_wkv7_recurrent(r, decay_logits, k, v, a, b, initial_state, cu_seqlens,
+                                                 scale=scale, decay_bias=decay_bias),
+        )
+    return config[0] if block_values is None else block_values, config[1] if prefetch_tokens is None else prefetch_tokens
 
 
 def tmix_wkv7_recurrent(
@@ -754,11 +834,16 @@ def tmix_wkv7_recurrent(
         1 if prefetch_tokens is None else prefetch_tokens,
         batch,
     )
-    from ..._internal.tuning import get_config
-
-    config = get_config(_TUNED_CONFIGS, "tmix/wkv7", _config_key(r, batch, decay_bias), (64, 1))
-    block_values = config[0] if block_values is None else block_values
-    prefetch_tokens = config[1] if prefetch_tokens is None else prefetch_tokens
+    if torch.compiler.is_compiling():
+        status = _status if _status is not None else r.new_empty(0, dtype=torch.int32)
+        save = torch.is_grad_enabled() and any(value.requires_grad for value in (r, decay_logits, k, v, a, b, initial_state))
+        if decay_bias is not None:
+            save = save or (torch.is_grad_enabled() and decay_bias.requires_grad)
+        return _compiled_recurrent(r, decay_logits, k, v, a, b, initial_state, cu_seqlens,
+                                   _bias_tensor(r, decay_bias), status, float(scale), block_values, prefetch_tokens, save)[:2]
+    block_values, prefetch_tokens = _functional_config(
+        r, decay_logits, k, v, a, b, initial_state, cu_seqlens, scale, decay_bias, block_values, prefetch_tokens,
+    )
     bias = _bias_tensor(r, decay_bias)
     status = (
         _status
@@ -772,6 +857,7 @@ def tmix_wkv7_recurrent(
 
 
 @torch.no_grad()
+@tuning_operation
 def tune_tmix_wkv7_recurrent(
     r,
     decay_logits,
@@ -785,6 +871,8 @@ def tune_tmix_wkv7_recurrent(
     scale=1.0,
     decay_bias=None,
     indexed=False,
+    state_indices=None,
+    status=None,
 ):
     """Check both forward variants and time the requested production mode.
 
@@ -796,6 +884,10 @@ def tune_tmix_wkv7_recurrent(
     """
     from ..._internal.tuning import save_config, select_config
 
+    if state_indices is not None:
+        if status.tolist() != [0, r.shape[0], state_indices.numel()]:
+            raise ValueError("WKV tuning requires valid fully active representative metadata for the capture shape")
+        initial_state = initial_state.index_select(0, state_indices.long())
     if initial_state.dtype == torch.float16 and not indexed:
         raise ValueError("FP16 state is inference-only; tuning requires indexed=True")
 

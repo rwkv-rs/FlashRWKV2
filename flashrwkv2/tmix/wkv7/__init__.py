@@ -149,18 +149,6 @@ def prepare_tmix_wkv7_recurrent_fp16_state_from_tensor(state):
     return _TmixWkv7RecurrentState(state)
 
 
-def _check_metadata_inputs(
-    cu_seqlens: torch.Tensor,
-    state_indices: torch.Tensor,
-) -> None:
-    if not isinstance(cu_seqlens, torch.Tensor):
-        raise TypeError("cu_seqlens must be a torch.Tensor")
-    if cu_seqlens.ndim != 1:
-        raise ValueError("cu_seqlens must be one-dimensional")
-    if not isinstance(state_indices, torch.Tensor):
-        raise TypeError("state_indices must be a torch.Tensor")
-
-
 def prepare_tmix_wkv7_recurrent_metadata(
     cu_seqlens: torch.Tensor,
     state_indices: torch.Tensor,
@@ -183,7 +171,12 @@ def prepare_tmix_wkv7_recurrent_metadata(
     for every stateful operator in the graph.
     """
 
-    _check_metadata_inputs(cu_seqlens, state_indices)
+    if not isinstance(cu_seqlens, torch.Tensor):
+        raise TypeError("cu_seqlens must be a torch.Tensor")
+    if cu_seqlens.ndim != 1:
+        raise ValueError("cu_seqlens must be one-dimensional")
+    if not isinstance(state_indices, torch.Tensor):
+        raise TypeError("state_indices must be a torch.Tensor")
     graph_values = (
         token_capacity,
         sequence_capacity,
@@ -329,6 +322,7 @@ def rl_infctx_tmix_wkv7_recurrent_bf16(
 ):
     """Differentiable packed recurrence and final FP32 state for RL/Infctx."""
     from .tilelang import tmix_wkv7_recurrent
+    from ..._internal.state import check_cuda_condition
 
     _validate_state(state_pool)
     if (
@@ -342,8 +336,7 @@ def rl_infctx_tmix_wkv7_recurrent_bf16(
         | (cu_seqlens[-1] != r.shape[0])
         | (cu_seqlens[1:] < cu_seqlens[:-1]).any()
     )
-    if bool(invalid_lengths.item()):
-        raise ValueError("cu_seqlens must be nondecreasing and span [0,N]")
+    check_cuda_condition(~invalid_lengths, "cu_seqlens must be nondecreasing and span [0,N]")
     if state_indices is None:
         return tmix_wkv7_recurrent(
             r, decay_logits, k, v, a, b, state_pool, cu_seqlens,
@@ -357,10 +350,9 @@ def rl_infctx_tmix_wkv7_recurrent_bf16(
         or not state_indices.is_contiguous()
     ):
         raise ValueError("state_indices must be contiguous CUDA int32 [B]")
-    if bool(((state_indices < 0) | (state_indices >= state_pool.shape[0])).any().item()):
-        raise ValueError("state_indices must be within state_pool")
-    if state_indices.unique().numel() != state_indices.numel():
-        raise ValueError("state_indices must be unique")
+    check_cuda_condition(((state_indices >= 0) & (state_indices < state_pool.shape[0])).all(), "state_indices must be within state_pool")
+    ordered = state_indices.sort().values
+    check_cuda_condition((ordered[1:] != ordered[:-1]).all(), "state_indices must be unique")
     indices = state_indices.long()
     output, final = tmix_wkv7_recurrent(
         r, decay_logits, k, v, a, b, state_pool.index_select(0, indices), cu_seqlens,

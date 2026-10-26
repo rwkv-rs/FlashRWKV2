@@ -124,6 +124,44 @@ Prepare 分别将 R/K/V、W/A/G/V 的低秩输入投影、低秩输出投影分�
 tanh/sigmoid，最后再次舍入到 BF16。反向复用相同的激活 VJP、bias 归约和
 线性 VJP；R/K/V 的 LoRA/NoRA 更新仍作用于各自的 BF16 base projection。
 
+训练前向和反向支持 `torch.compile(fullgraph=True)`。编译路径通过注册算子调用
+同一套 TileLang forward/VJP；普通 eager 调用保留原有路径。Inductor 必须保留
+中间 BF16 舍入，才能与 eager 梯度逐位一致：
+
+```python
+compiled_model = torch.compile(
+    model, fullgraph=True, options={"emulate_precision_casts": True},
+)
+```
+
+先用 eager 的完整 forward/backward 函数执行 `prepare_tuning`，再编译、预热和
+捕获。训练参数集合、LoRA/NoRA 模式与实际训练一致；仅 forward 不能覆盖 dX、dW
+等反向投影 key。准备函数负责清理梯度并恢复可变 state；调优完成后再开始参数更新。
+支持 PyTorch 2.11–2.14；metadata/sampling native 扩展使用 C++20 编译。
+
+StateTune 在编译或 capture 前验证 chunk metadata：
+
+```python
+from flashrwkv2 import (
+    prepare_tmix_wkv7_statetune_metadata,
+    statetune_tmix_wkv7_recurrent_fp32io16,
+)
+
+metadata = prepare_tmix_wkv7_statetune_metadata(
+    sequence_chunk_offsets, chunk_token_starts, chunk_token_ends,
+    total_tokens=r.shape[0],
+)
+output, final_state = statetune_tmix_wkv7_recurrent_fp32io16(
+    initial_state, sequence_chunk_offsets, chunk_token_starts, chunk_token_ends,
+    r, decay_logits, k, v, a, b, prepared_metadata=metadata,
+)
+```
+
+返回的 metadata record 持有独立 CUDA INT32 `cu_seqlens` 和 `total_tokens`。
+使用期间保持 offsets 不变；序列分段或 token 总数变化时重新准备并重新捕获。
+传入 `prepared_metadata` 后，执行路径使用该 record，不再读取原始 chunk 数组。
+未传入时，eager 调用仍在每次执行前验证并转换原有 chunk 参数。
+
 ## Tuning and acceptance
 
 内部 `tune_linear`、`tune_norm`、`tune_tokenshift`、`tune_readout` 与 WKV tuner
@@ -135,11 +173,81 @@ SM89 与 PRO6000 SM120 的 decode、小 batch、prefill 和训练形状。
 投影按拷贝跨度各保留三个已通过逐位验证的候选，再使用每图 1000 次调用重新比较；
 正式基准的 10000 次计时保持独立。
 
-逐位验证后选出的配置同时写入 PyTorch 默认 cache 下的
-`flashrwkv2/tuning`。其他进程使用同一源码、TileLang/CUDA 运行环境、GPU、
-形状、dtype 和权重 stride 时会自动读取该配置；CUDA Graph 捕获前的正常 warmup
-即可采用配置。源码变化会使旧配置失效，没有对应记录时仍使用原有默认配置。
-配置通过原子替换发布；已经运行的进程保留自己的选择，应在调优结束后启动 serving。
+公开接口 `get_tuning_cache_dir()` 返回固定根 `~/.cache/flashrwkv2`；唯一覆盖项
+为导入包前设置的 `FLASHRWKV2_CACHE_DIR`。`TORCH_HOME`、`XDG_CACHE_HOME`、
+release 路径和 venv 路径不影响 verified profiles。三种缓存有独立边界：
+
+- `tuning/v2/<owner>/<fingerprint>/<key-hash>.json` 保存经过逐位验证的执行配置。
+  指纹包含该 owner 的实现 AST、递归导入的本包实现依赖、Torch/TileLang/CUDA
+  版本、实际 NVCC/host compiler 版本及显式编译 flags；注释、文档字符串、公共 `__init__` 包装和无关 owner 的变化不会失效全库。
+  修改内核、编译选项或实现依赖会产生新指纹。驱动版本和安装路径不参与配置指纹。
+- `native/` 保存 metadata/sampling 扩展。保留原有 Python/Torch ABI、工具链、
+  native 源码和架构兼容键，包括 venv 身份；配置可跨 venv 复用不代表 native 二进制
+  可以跨 ABI 直接复制。`python -m flashrwkv2.compile` 的 `cached` 仅描述该扩展。
+- TileLang JIT 的二进制缓存由 TileLang 自身管理，保持其编译器兼容性检查与路径。
+  verified profile 命中后仍可能需要首次编译选中的 kernel。
+
+设备类别是 `(product_name, compute_major, compute_minor, SM_count)`，不含 GPU
+ordinal 或 UUID。同类别多卡共享配置，4090、4090D、PRO6000 分开。原有 shape、
+权重 stride、bias dtype、indexed 模式及 state dtype 保留在各 owner 的 key 中。
+
+服务在 capture 前使用自己的真实权重和形状运行以下公开接口：
+
+```python
+import json
+from flashrwkv2 import get_tuning_cache_dir, prepare_tuning
+
+# warmup_calls: 可重复调用的零参数函数列表，覆盖所有实际 prefill token 数、
+# decode batch、capture batch、首层/后续层和参数布局。
+# 函数负责使用独立状态或恢复状态；prepare_tuning 会实际执行每个函数一次。
+coverage = prepare_tuning(warmup_calls, mode="inspect")
+print(json.dumps(coverage))
+
+# 管理员显式准备：已有有效 key 直接复用，只调缺失项。
+prepared = prepare_tuning(warmup_calls, mode="tune")
+
+# 新 serving 进程加载配置，缺失立即报出 owner、key 和 cache root。
+loaded = prepare_tuning(warmup_calls, mode="require")
+assert loaded["complete"]
+# 此后恢复 serving state，再进行 CUDA Graph capture。
+```
+
+每个函数必须实际执行模型前向，训练函数还须执行反向，使用有效且非空的代表性输入与 metadata。
+WKV 调优调用需要该 capture shape 全部 token/sequence 均处于 active 状态；
+不能用零 active 的图预热占位输入进行逐位验证。
+报告逐项列出 `owner/key/fingerprint/config/path/status`，其中 key 包含设备类别；
+`counts` 区分 `hit/missing/tuned/revalidated`，`complete` 要求实际观察到的全部
+配置命中，未观察到任何可配置 dispatch 会报错。调用方负责提供完整工作负载集合，
+不能用目录内记录总数代替覆盖证明。固定配置算子不产生可调 key。
+`inspect` 可用默认配置收集缺口，`require` 在第一项缺失时中止；普通 forward
+按 owner 首次警告未调优默认配置，不自动启动调优。
+
+缺失项不写入进程内选择缓存，后续 eager forward 能看到新发布的文件。
+已加载有效配置在普通 forward 中复用；显式 prepare 每轮对每个 key 重读一次文件，
+因此能观察外部进程的重新发布或删除。准备操作在 capture 内直接拒绝，未预热的缺失 key
+不能在 capture 中加载。准备前已建立的 CUDA Graph 必须重新捕获。
+多个进程对同一 key 通过文件锁竞争；持锁后再次读取，只有一个进程验证/调优并
+用同目录临时文件原子替换发布。无效 JSON、key 或验证标记立即报错；半写入
+临时文件不会被读者视为已发布 profile。
+单个进程内 prepare 是独占阶段，准备前先结束其他 serving/training 调用；嵌套或
+并发 prepare 会报错。准备报告也覆盖 CUDA autograd worker thread 上的反向 dispatch。
+
+旧缓存迁移显式指定单个旧 namespace，无需改动旧服务目录。路径支持 `~` 展开；
+指定的目录不存在时立即报错，避免路径拼写错误意外触发全量调优：
+
+```python
+prepared = prepare_tuning(
+    warmup_calls, mode="tune",
+    legacy_dir="/home/user/.cache/torch/flashrwkv2/tuning/<old-namespace>",
+)
+print(json.dumps(prepared))
+```
+
+旧记录完整匹配产品名和其余 key 后，只将配置作为候选，在当前算子、实际输入上
+重新核对 BF16 输出、FP32 累加/统计和 WKV state，再发布到新根；迁移不计时。
+逐位复验失败会中止，旧目录不变。没有旧候选的 key 按现有候选集调优。
+跨 release/venv 验证应在目标环境的新进程运行 `mode="require"` 并保存报告；
+修改 Torch/XDG 缓存变量仍应命中相同 profile 路径。
 基准还覆盖真实 7.2B 的 `w/a=128,g=480,v=96` 首层与后续层，以及
 `B=1/4/64/320/512` decode，以保证缓存 key 对应实际推理布局。
 

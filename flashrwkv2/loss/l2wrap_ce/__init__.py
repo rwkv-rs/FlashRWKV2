@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import torch
 
-def _validate(logits: torch.Tensor, targets: torch.Tensor) -> None:
+
+def pretrain_l2wrap_ce_bf16(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    """FP32 cross entropy and the train_temp L2Wrap gradient."""
     if not isinstance(logits, torch.Tensor) or not isinstance(targets, torch.Tensor):
         raise TypeError("logits and targets must be tensors")
     if logits.dtype not in (torch.bfloat16, torch.float32):
@@ -19,17 +21,11 @@ def _validate(logits: torch.Tensor, targets: torch.Tensor) -> None:
         raise ValueError("targets must contain one entry per logits row on the same device")
     if logits.numel() == 0:
         raise ValueError("logits must contain at least one row")
-    if torch.any((targets < 0) | (targets >= logits.shape[-1])).item():
-        raise ValueError("targets must be in [0,vocab)")
+    from ..._internal.state import check_cuda_condition
+    check_cuda_condition(((targets >= 0) & (targets < logits.shape[-1])).all(), "targets must be in [0,vocab)")
+    from .tilelang import L2Wrap, compiled_l2wrap
 
-
-def pretrain_l2wrap_ce_bf16(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-    """FP32 cross entropy and the train_temp L2Wrap gradient."""
-
-    _validate(logits, targets)
-    from .tilelang import L2Wrap
-
-    return L2Wrap.apply(logits, targets)
+    return compiled_l2wrap(logits, targets)[0] if torch.compiler.is_compiling() else L2Wrap.apply(logits, targets)
 
 
 __all__ = ["pretrain_l2wrap_ce_bf16"]

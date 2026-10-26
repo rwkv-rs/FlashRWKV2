@@ -6,6 +6,8 @@ import tilelang.language as T
 import torch
 from torch.autograd.function import once_differentiable
 
+from ..._internal.tuning import _AutogradContext, device_class, tuning_operation
+
 from ..._internal.elementwise import _activation_kernel, activation, sum_partials
 from ..._internal.linear import _aligned, _forward, adapter_linear, linear_input_vjp
 from ..kk_pre.tilelang import prepare as prepare_key
@@ -378,7 +380,7 @@ _GROUP_CONFIGS = {}
 
 def _group_key(xs, weights, kinds, biases):
     return (
-        torch.cuda.get_device_name(xs[0].device),
+        device_class(xs[0].device),
         xs[0].shape[0],
         tuple(x.shape[1] for x in xs),
         tuple(w.shape for w in weights),
@@ -441,7 +443,7 @@ def _group_call(xs, weights, kinds, biases, raw_mode, config):
     if config is None:
         from ..._internal.tuning import get_config
 
-        config = get_config(_GROUP_CONFIGS, "tmix/wkv_prepare", _group_key(xs, weights, kinds, biases))
+        config = get_config(_GROUP_CONFIGS, "tmix/wkv_prepare", _group_key(xs, weights, kinds, biases), tune=lambda: _tune_grouped_linear(xs, weights, kinds, biases))
         if config is None:
             narrow = max(w.shape[0] for w in weights) <= 128
             copy_k = next(
@@ -571,6 +573,62 @@ class _GroupedLinear(torch.autograd.Function):
         return None, *dxs, *dws, *dbs
 
 
+@torch.library.custom_op(
+    "flashrwkv2::tmix_wkv_prepare_forward", mutates_args=(),
+    schema="(Tensor[] xs, Tensor[] weights, Tensor[] biases, int[] kinds) -> (Tensor[], Tensor)",
+)
+def _compiled_grouped(xs, weights, biases, kinds):
+    biases = tuple(bias if bias.numel() else None for bias in biases)
+    xs, weights, biases = _group_inputs(tuple(xs), tuple(weights), biases)
+    ctx = _AutogradContext()
+    values = _GroupedLinear.forward(ctx, tuple(kinds), *xs, *weights, *biases)
+    # Custom operators expose independent outputs. Keep eager's packed stores;
+    # copies at this compiler boundary preserve unused-output gradient semantics.
+    return [value.clone() for value in values], ctx.saved_tensors[-1]
+
+
+@_compiled_grouped.register_fake
+def _compiled_grouped_fake(xs, weights, biases, kinds):
+    values = [x.new_empty((x.shape[0], weight.shape[0])) for x, weight in zip(xs, weights)]
+    raw_size = sum(x.shape[0] * weight.shape[0] for x, weight, kind in zip(xs, weights, kinds) if kind)
+    return values, xs[0].new_empty(raw_size)
+
+
+def _compiled_grouped_context(ctx, inputs, output):
+    xs, weights, biases, kinds = inputs
+    ctx.save_for_backward(*xs, *weights, *biases, output[1])
+    ctx.kinds = tuple(kinds)
+    ctx.set_materialize_grads(False)
+    ctx.mark_non_differentiable(output[1])
+
+
+@torch.library.custom_op(
+    "flashrwkv2::tmix_wkv_prepare_backward", mutates_args=(),
+    schema="(Tensor?[] gradients, Tensor[] saved, int[] kinds, bool[] needed) -> Tensor?[]",
+)
+def _compiled_grouped_vjp(gradients, saved, kinds, needed):
+    count = len(kinds)
+    values = (*saved[:2 * count], *(bias if bias.numel() else None for bias in saved[2 * count:3 * count]), saved[-1])
+    ctx = _AutogradContext(saved_tensors=values, kinds=tuple(kinds), needs_input_grad=(False, *needed))
+    return list(_GroupedLinear.backward(ctx, *gradients)[1:])
+
+
+@_compiled_grouped_vjp.register_fake
+def _compiled_grouped_vjp_fake(gradients, saved, kinds, needed):
+    count = len(kinds)
+    return [None if not needed[i] or gradients[i % count] is None else t.new_empty(t.shape) for i, t in enumerate(saved[:3 * count])]
+
+
+def _compiled_grouped_backward(ctx, gradients, unused_raw):
+    needed = [need for group in ctx.needs_input_grad[:3] for need in group]
+    results = _compiled_grouped_vjp(gradients, list(ctx.saved_tensors), list(ctx.kinds), needed)
+    count = len(ctx.kinds)
+    return results[:count], results[count:2 * count], results[2 * count:], None
+
+
+_compiled_grouped.register_autograd(_compiled_grouped_backward, setup_context=_compiled_grouped_context)
+
+
 def _group_inputs(xs, weights, biases):
     device = xs[0].device
     if any(not t.is_cuda or t.device != device for t in (*xs, *weights)):
@@ -598,13 +656,18 @@ def _group_inputs(xs, weights, biases):
 
 def _grouped_linear(xs, weights, kinds, biases):
     shape = xs[0].shape[:-1]
-    xs, weights, biases = _group_inputs(xs, weights, biases)
-    if torch.is_grad_enabled() and any(
-        t is not None and t.requires_grad for t in (*xs, *weights, *biases)
-    ):
-        values = _GroupedLinear.apply(kinds, *xs, *weights, *biases)
+    if torch.compiler.is_compiling():
+        rows = [x.reshape(-1, x.shape[-1]).contiguous() for x in xs]
+        packed_biases = [rows[0].new_empty(0) if bias is None else bias for bias in biases]
+        values, _ = _compiled_grouped(rows, list(weights), packed_biases, list(kinds))
     else:
-        values, _ = _run_groups(xs, weights, kinds, biases)
+        xs, weights, biases = _group_inputs(xs, weights, biases)
+        if torch.is_grad_enabled() and any(
+            t is not None and t.requires_grad for t in (*xs, *weights, *biases)
+        ):
+            values = _GroupedLinear.apply(kinds, *xs, *weights, *biases)
+        else:
+            values, _ = _run_groups(xs, weights, kinds, biases)
     return tuple(
         value.view(*shape, weight.shape[0])
         for value, weight in zip(values, weights, strict=True)
@@ -612,9 +675,10 @@ def _grouped_linear(xs, weights, kinds, biases):
 
 
 @torch.no_grad()
+@tuning_operation
 def _tune_grouped_linear(xs, weights, kinds, biases, *, benchmark=None):
     """Verify independent FP32 accumulators and BF16 epilogues before timing."""
-    from ..._internal.tuning import compile_candidates, projection_finalists, save_config, select_config
+    from ..._internal.tuning import compile_candidates, projection_finalists, revalidation_config, save_config, select_config
 
     xs, weights, biases = _group_inputs(xs, weights, biases)
     cache_key = _group_key(xs, weights, kinds, biases)
@@ -652,6 +716,12 @@ def _tune_grouped_linear(xs, weights, kinds, biases, *, benchmark=None):
             result.append(value.view(torch.int32))
             position += size
         return tuple(result)
+
+    imported = revalidation_config()
+    if imported is not None:
+        best, checked = select_config((imported,), run, check=check, reference=reference)
+        save_config("tmix/wkv_prepare", cache_key, best)
+        return {"config": best, "candidates": checked}
 
     rows = xs[0].shape[0]
     narrow = max(weight.shape[0] for weight in weights) <= 128

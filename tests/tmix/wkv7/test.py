@@ -3,7 +3,6 @@
 
 import pytest
 import torch
-from utils import require_cuda_backend
 
 from flashrwkv2.tmix.wkv7 import (
     infer_tmix_wkv7_recurrent_fp16_forward_varlen,
@@ -19,7 +18,11 @@ pytestmark = [pytest.mark.cuda, pytest.mark.skipif(not torch.cuda.is_available()
 
 
 def _require_cuda_extension():
-    require_cuda_backend("_C", 8, "prepare_tmix_wkv7_recurrent_metadata")
+    if torch.cuda.get_device_capability() < (8, 0):
+        pytest.skip("CUDA source requires CC >= 8.0")
+    import flashrwkv2
+
+    assert hasattr(flashrwkv2._extension(), "prepare_tmix_wkv7_recurrent_metadata")
 
 
 def _case():

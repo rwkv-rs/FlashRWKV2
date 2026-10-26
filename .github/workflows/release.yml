@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing release tag to validate without publishing
+        description: Existing release tag to verify without publishing (RTX4090 reports must be attached to its draft release)
         required: true
         type: string
   release:
@@ -14,10 +14,16 @@ permissions:
   actions: read
   contents: read
 
+concurrency:
+  group: flashrwkv2-release-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+  queue: max
+
 jobs:
   prepare:
-    name: Verify tested release payload
+    name: Verify complete release acceptance
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     outputs:
       version: ${{ steps.identity.outputs.version }}
       source_tree_sha: ${{ steps.plan.outputs.source_tree_sha }}
@@ -27,22 +33,15 @@ jobs:
           ref: ${{ github.event.release.tag_name || inputs.tag }}
           fetch-depth: 0
           persist-credentials: false
-      - name: Check out current release tooling
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.repository.default_branch }}
-          path: release-tools
-          sparse-checkout: ci
-          persist-credentials: false
-      - name: Verify immutable tag identity
+      - name: Verify tag identity and main ancestry
         id: identity
         env:
           RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
         run: |
-          git fetch origin main --no-tags
-          test "$(git rev-parse HEAD)" = "$(git rev-list -n 1 "$RELEASE_TAG")"
-          git merge-base --is-ancestor HEAD origin/main
-          version="$(python3 - <<'PY'
+          timeout 60s git fetch origin main --no-tags
+          test "$(timeout 30s git rev-parse HEAD)" = "$(timeout 30s git rev-list -n 1 "$RELEASE_TAG")"
+          timeout 30s git merge-base --is-ancestor HEAD origin/main
+          version="$(timeout 30s python3 - <<'PY'
           import tomllib
           from pathlib import Path
           print(tomllib.loads(Path('pyproject.toml').read_text())['project']['version'])
@@ -50,115 +49,46 @@ jobs:
           )"
           test "$RELEASE_TAG" = "v$version"
           echo "version=$version" >> "$GITHUB_OUTPUT"
-      - name: Reconstruct the exact quality plan
+      - name: Require full validation, all Torch versions, and cold compilation
         id: plan
         run: |
-          python3 ci/quality_gate.py plan \
-            --base "$(git rev-parse HEAD^)" \
-            --head "$(git rev-parse HEAD)" \
-            --output release/plan.json \
-            --github-output "$GITHUB_OUTPUT"
-      - name: Resolve immutable evidence and final wheel
+          timeout 60s python3 ci/quality_gate.py plan \
+            --base "$(timeout 30s git rev-parse HEAD^)" \
+            --head "$(timeout 30s git rev-parse HEAD)" --mode full --extended \
+            --output release/plan.json --github-output "$GITHUB_OUTPUT"
+      - name: Resolve the tested source distribution bundle
         id: reuse
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          python3 release-tools/ci/quality_gate.py resolve \
-            --plan release/plan.json \
-            --repository "$GITHUB_REPOSITORY" \
-            --current-run "$GITHUB_RUN_ID" \
-            --output release/reuse.json \
+          timeout 300s python3 ci/quality_gate.py resolve \
+            --plan release/plan.json --repository "$GITHUB_REPOSITORY" \
+            --current-run "$GITHUB_RUN_ID" --output release/reuse.json \
             --github-output "$GITHUB_OUTPUT"
-          python3 - <<'PY'
+          timeout 30s python3 - <<'PY'
           import json
           from pathlib import Path
-          resolved = json.loads(Path('release/reuse.json').read_text())
-          if not resolved['reuse_evidence']:
-              raise SystemExit('release tree has no successful unexpired quality evidence')
-          if not resolved['reuse_wheel']:
-              raise SystemExit('quality evidence final wheel artifact is unavailable')
+          if not json.loads(Path('release/reuse.json').read_text())['complete']:
+              raise SystemExit('release requires a successful full extended Quality Gate for this exact source tree')
           PY
-      - name: Download exact quality evidence
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ steps.reuse.outputs.artifact }}
+          run-id: ${{ steps.reuse.outputs.run_id }}
+          github-token: ${{ github.token }}
+          path: release/tested
+      - name: Verify both architectures, full performance, versions, and original SHA256
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
         run: |
-          python3 release-tools/ci/quality_gate.py extract \
-            --repository "$GITHUB_REPOSITORY" \
-            --artifact '${{ steps.reuse.outputs.evidence_name }}' \
-            --run-id '${{ steps.reuse.outputs.evidence_run_id }}' \
-            --output release/evidence
-          python3 release-tools/ci/quality_gate.py extract \
-            --repository "$GITHUB_REPOSITORY" \
-            --artifact '${{ steps.reuse.outputs.wheel_name }}' \
-            --run-id '${{ steps.reuse.outputs.wheel_run_id }}' \
-            --output release/build
-      - name: Verify filenames, tree, coverage, and SHA256
-        env:
-          VERSION: ${{ steps.identity.outputs.version }}
-          SOURCE_TREE_SHA: ${{ steps.plan.outputs.source_tree_sha }}
-          BUILD_INPUT_HASH: ${{ steps.plan.outputs.build_input_hash }}
-        run: |
-          python3 - <<'PY'
-          import hashlib, json, os, shutil
-          from pathlib import Path
-
-          evidence_root = Path('release/evidence')
-          build_root = Path('release/build')
-          manifests = list(evidence_root.rglob('quality-manifest.json'))
-          wheels = list(build_root.rglob('*.whl'))
-          sdists = list(build_root.rglob('*.tar.gz'))
-          if len(manifests) != 1 or len(wheels) != 1 or len(sdists) != 1:
-              raise SystemExit('release requires exactly one manifest, wheel, and sdist')
-          manifest = json.loads(manifests[0].read_text())
-          wheel, sdist = wheels[0], sdists[0]
-          version = os.environ['VERSION']
-          if not wheel.name.startswith(f'flashrwkv2-{version}-'):
-              raise SystemExit('wheel version filename mismatch')
-          if not wheel.name.endswith('py3-none-any.whl'):
-              raise SystemExit('release wheel is not the tested universal source wheel')
-          if sdist.name != f'flashrwkv2-{version}.tar.gz':
-              raise SystemExit('sdist version filename mismatch')
-          source = manifest.get('source', {})
-          if source.get('source_tree_sha') != os.environ['SOURCE_TREE_SHA']:
-              raise SystemExit('quality evidence source tree mismatch')
-          if source.get('build_input_hash') != os.environ['BUILD_INPUT_HASH']:
-              raise SystemExit('quality evidence build input mismatch')
-          checks = manifest.get('checks', {})
-          required = {
-              'contract': 'passed',
-              'package': 'passed',
-              'package_identity': 'passed',
-              'source_contents': 'passed',
-              'runtime_build_cache': 'passed',
-              'torch_2_11': 'passed',
-              'torch_2_12': 'passed',
-              'torch_2_13': 'passed',
-          }
-          for key, expected in required.items():
-              if checks.get(key) != expected:
-                  raise SystemExit(f'quality evidence lacks {key}={expected}')
-          artifacts = manifest.get('artifacts', {})
-          for kind, path in [('wheel', wheel), ('sdist', sdist)]:
-              expected = artifacts.get(kind, {})
-              digest = hashlib.sha256(path.read_bytes()).hexdigest()
-              if expected.get('name') != path.name or expected.get('sha256') != digest:
-                  raise SystemExit(f'{kind} is not the quality-tested original')
-          if artifacts['wheel'].get('artifact') != f"flashrwkv2-wheel-v5-{os.environ['BUILD_INPUT_HASH']}":
-              raise SystemExit('wheel artifact identity mismatch')
-          destination = Path('release/payload/dist')
-          destination.mkdir(parents=True)
-          shutil.copy2(wheel, destination / wheel.name)
-          shutil.copy2(sdist, destination / sdist.name)
-          shutil.copy2(manifests[0], Path('release/payload/quality-manifest.json'))
-          PY
-          python3 release-tools/ci/quality_gate.py verify \
-            --manifest release/payload/quality-manifest.json \
-            --expected-tree '${{ steps.plan.outputs.source_tree_sha }}' \
-            --wheel release/payload/dist/*.whl \
-            --sdist release/payload/dist/*.tar.gz
+          timeout 300s python3 ci/quality_gate.py release \
+            --plan release/plan.json --bundle release/tested \
+            --repository "$GITHUB_REPOSITORY" --tag "$RELEASE_TAG" \
+            --output release/payload
       - uses: actions/upload-artifact@v4
         with:
-          name: flashrwkv2-release-v4-${{ steps.plan.outputs.source_tree_sha }}
+          name: flashrwkv2-release-v7-${{ steps.plan.outputs.source_tree_sha }}
           path: release/payload/
           if-no-files-found: error
           retention-days: 90
@@ -168,6 +98,7 @@ jobs:
     if: github.event_name == 'release'
     needs: prepare
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     environment:
       name: pypi
       url: https://pypi.org/project/flashrwkv2/${{ needs.prepare.outputs.version }}/
@@ -177,7 +108,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: flashrwkv2-release-v4-${{ needs.prepare.outputs.source_tree_sha }}
+          name: flashrwkv2-release-v7-${{ needs.prepare.outputs.source_tree_sha }}
           path: release/payload
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
@@ -188,19 +119,19 @@ jobs:
     if: github.event_name == 'release'
     needs: [prepare, publish]
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: flashrwkv2-release-v4-${{ needs.prepare.outputs.source_tree_sha }}
+          name: flashrwkv2-release-v7-${{ needs.prepare.outputs.source_tree_sha }}
           path: release/payload
-      - name: Compare public files with quality evidence
+      - name: Compare public files with the tested originals
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
         run: |
-          python3 - <<'PY'
-          import hashlib, json, os, time, urllib.request
+          timeout 240s python3 - <<'PY'
+          import hashlib, json, os, time, urllib.error, urllib.request
           from pathlib import Path
-
           expected = {
               path.name: hashlib.sha256(path.read_bytes()).hexdigest()
               for path in Path('release/payload/dist').iterdir()
@@ -209,22 +140,19 @@ jobs:
           public = {}
           for attempt in range(6):
               try:
-                  with urllib.request.urlopen(url) as response:
+                  with urllib.request.urlopen(url, timeout=20) as response:
                       payload = json.load(response)
-                  public = {
-                      row['filename']: row['digests']['sha256']
-                      for row in payload['urls']
-                  }
-              except Exception:
-                  public = {}
+                  public = {row['filename']: row['digests']['sha256'] for row in payload['urls']}
+              except urllib.error.HTTPError as error:
+                  if error.code != 404:
+                      raise
               if all(public.get(name) == digest for name, digest in expected.items()):
                   break
               if attempt < 5:
                   time.sleep(10)
           mismatches = {
               name: {'expected': digest, 'public': public.get(name)}
-              for name, digest in expected.items()
-              if public.get(name) != digest
+              for name, digest in expected.items() if public.get(name) != digest
           }
           if mismatches:
               raise SystemExit(f'PyPI publication verification failed: {mismatches}')

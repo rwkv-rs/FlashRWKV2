@@ -6,6 +6,7 @@ import tilelang.language as T
 import torch
 
 from ..._internal.elementwise import sum_partials
+from ..._internal.tuning import _AutogradContext
 
 
 @tilelang.jit(pass_configs={"tl.enable_fast_math": False})
@@ -121,6 +122,40 @@ class _VRes(torch.autograd.Function):
         return dv, df, sum_partials(partial) if need_bias else None, dl
 
 
+@torch.library.custom_op("flashrwkv2::tmix_vres_gate_forward", mutates_args=())
+def _compiled_vres(value: torch.Tensor, first: torch.Tensor, bias: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
+    return _VRes.forward(_AutogradContext(), value, first, bias, logits)
+
+
+@_compiled_vres.register_fake
+def _compiled_vres_fake(value, first, bias, logits):
+    return torch.empty_like(value)
+
+
+def _compiled_vres_context(ctx, inputs, output):
+    ctx.save_for_backward(*inputs)
+
+
+@torch.library.custom_op(
+    "flashrwkv2::tmix_vres_gate_backward", mutates_args=(),
+    schema="(Tensor dy, Tensor[] saved, bool need_bias) -> Tensor?[]",
+)
+def _compiled_vres_vjp(dy, saved, need_bias):
+    return list(_VRes.backward(_AutogradContext(saved_tensors=saved, needs_input_grad=(True, True, need_bias, True)), dy))
+
+
+@_compiled_vres_vjp.register_fake
+def _compiled_vres_vjp_fake(dy, saved, need_bias):
+    return [None if i == 2 and not need_bias else torch.empty_like(t) for i, t in enumerate(saved)]
+
+
+def _compiled_vres_backward(ctx, dy):
+    return tuple(_compiled_vres_vjp(dy, list(ctx.saved_tensors), ctx.needs_input_grad[2]))
+
+
+_compiled_vres.register_autograd(_compiled_vres_backward, setup_context=_compiled_vres_context)
+
+
 def vres(value, first, bias, logits):
     tensors = (value, first, bias, logits)
     if any(
@@ -139,4 +174,5 @@ def vres(value, first, bias, logits):
         or bias.shape != (value.shape[-1],)
     ):
         raise ValueError("VRes requires value/first/logits [...,C] and bias [C]")
-    return _VRes.apply(value, first, bias, logits)
+    operation = _compiled_vres if torch.compiler.is_compiling() else _VRes.apply
+    return operation(value, first, bias, logits)

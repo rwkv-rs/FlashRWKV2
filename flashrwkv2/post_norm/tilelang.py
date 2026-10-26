@@ -4,6 +4,8 @@
 import math
 
 import torch
+
+from .._internal.tuning import _AutogradContext, device_class, tuning_operation
 import tilelang
 import tilelang.language as T
 
@@ -11,7 +13,7 @@ _ROW_CONFIGS = {}
 
 
 def _config_key(x, has_res):
-    return (torch.cuda.get_device_name(x.device), x.shape, has_res)
+    return (device_class(x.device), x.shape, has_res)
 
 
 def _row_layout(channels, rows_per_block):
@@ -178,7 +180,7 @@ class _Norm(torch.autograd.Function):
     def forward(ctx, x, weight, bias, res, eps):
         total = torch.empty_like(x) if res is not None else x
         from .._internal.tuning import get_config
-        rows_per_block = get_config(_ROW_CONFIGS, "post_norm", _config_key(x, res is not None), 1)
+        rows_per_block = get_config(_ROW_CONFIGS, "post_norm", _config_key(x, res is not None), 1, tune=lambda: tune_norm(x, weight, bias, eps, res))
         y, mean, rstd = _forward(x.shape[-1], eps, res is not None, rows_per_block=rows_per_block)(
             x, res if res is not None else x, weight, bias, total
         )
@@ -204,6 +206,67 @@ class _Norm(torch.autograd.Function):
             dx, sum_partials(dw) if need_weight else None, sum_partials(db) if need_bias else None,
             dx if ctx.has_res else None, None,
         )
+
+
+@torch.library.custom_op(
+    "flashrwkv2::post_norm_forward", mutates_args=(),
+    schema="(Tensor x, Tensor weight, Tensor bias, Tensor? res, float eps, bool save, bool return_res) -> (Tensor, Tensor?, Tensor, Tensor)",
+)
+def _compiled_norm(x, weight, bias, res, eps, save, return_res):
+    from .._internal.tuning import get_config
+    _check_inputs(x, weight, bias, res, eps)
+    store = res is not None and (save or return_res)
+    total = torch.empty_like(x) if store else x.new_empty((0, x.shape[-1]))
+    group = get_config(_ROW_CONFIGS, "post_norm", _config_key(x, res is not None), 1,
+                       tune=lambda: tune_norm(x, weight, bias, eps, res))
+    y, mean, rstd = _forward(x.shape[-1], eps, res is not None, save, store, group)(
+        x, x if res is None else res, weight, bias, total,
+    )
+    result_sum = total if store else x.clone() if return_res else None
+    return y, result_sum, mean, rstd
+
+
+@_compiled_norm.register_fake
+def _compiled_norm_fake(x, weight, bias, res, eps, save, return_res):
+    total = torch.empty_like(x) if (res is not None and save) or return_res else None
+    stats = x.shape[0] if save else 0
+    return torch.empty_like(x), total, x.new_empty(stats, dtype=torch.float32), x.new_empty(stats, dtype=torch.float32)
+
+
+def _compiled_norm_context(ctx, inputs, output):
+    x, weight, _, res, _, _, _ = inputs
+    _, total, mean, rstd = output
+    ctx.save_for_backward(x if res is None else total, weight, mean, rstd)
+    ctx.has_res = res is not None
+    ctx.set_materialize_grads(False)
+    ctx.mark_non_differentiable(mean, rstd)
+
+
+@torch.library.custom_op(
+    "flashrwkv2::post_norm_backward", mutates_args=(),
+    schema="(Tensor dy, Tensor? dsum, Tensor[] saved, bool need_weight, bool need_bias) -> (Tensor, Tensor?, Tensor?)",
+)
+def _compiled_norm_vjp(dy, dsum, saved, need_weight, need_bias):
+    ctx = _AutogradContext(saved_tensors=saved, has_res=False,
+                           needs_input_grad=(True, need_weight, need_bias, False, False))
+    return _Norm.backward(ctx, dy, dsum)[:3]
+
+
+@_compiled_norm_vjp.register_fake
+def _compiled_norm_vjp_fake(dy, dsum, saved, need_weight, need_bias):
+    total, weight, _, _ = saved
+    return torch.empty_like(total), torch.empty_like(weight) if need_weight else None, torch.empty_like(weight) if need_bias else None
+
+
+def _compiled_norm_backward(ctx, dy, dsum, unused_mean, unused_rstd):
+    if dy is None:
+        dx, dw, db = dsum, None, None
+    else:
+        dx, dw, db = _compiled_norm_vjp(dy, dsum, list(ctx.saved_tensors), *ctx.needs_input_grad[1:3])
+    return dx, dw, db, dx if ctx.has_res else None, None, None, None
+
+
+_compiled_norm.register_autograd(_compiled_norm_backward, setup_context=_compiled_norm_context)
 
 
 def _check_inputs(x, weight, bias, res, eps):
@@ -238,6 +301,12 @@ def norm(
     identity gradient; ln statistics and all arithmetic are FP32. ``return_res``
     exposes the same rounded sum used to compute the statistics.
     """
+    if torch.compiler.is_compiling():
+        flat = x.view(-1, x.shape[-1])
+        flat_res = None if res is None else res.view_as(flat)
+        save = torch.is_grad_enabled() and any(t is not None and t.requires_grad for t in (x, weight, bias, res))
+        y, total, _, _ = _compiled_norm(flat, weight, bias, flat_res, float(eps), save, return_res)
+        return (y.view_as(x), total.view_as(x)) if return_res else y.view_as(x)
     tensors = _check_inputs(x, weight, bias, res, eps)
     flat = x.view(-1, x.shape[-1])
     flat_res = None if res is None else res.view_as(flat)
@@ -248,7 +317,7 @@ def norm(
         total = torch.empty_like(flat) if store_res else flat
         buffer = total if store_res else flat.new_empty((0, x.shape[-1]))
         from .._internal.tuning import get_config
-        rows_per_block = get_config(_ROW_CONFIGS, "post_norm", _config_key(flat, res is not None), 1)
+        rows_per_block = get_config(_ROW_CONFIGS, "post_norm", _config_key(flat, res is not None), 1, tune=lambda: tune_norm(x, weight, bias, eps, res))
         y, _, _ = _forward(x.shape[-1], float(eps), res is not None, False, store_res, rows_per_block)(
             flat, flat_res if flat_res is not None else flat, weight, bias, buffer
         )
@@ -256,6 +325,7 @@ def norm(
 
 
 @torch.no_grad()
+@tuning_operation
 def tune_norm(x, weight, bias, eps=1e-5, res=None):
     """Select row grouping while preserving the canonical per-row FP32 tree."""
     from .._internal.tuning import save_config, select_config

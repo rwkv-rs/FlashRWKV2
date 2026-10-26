@@ -1,4 +1,4 @@
-"""Select the smallest fail-closed FlashRWKV2 CI validation set."""
+"""Select validation by semantic owner and its explicit consumers."""
 
 from __future__ import annotations
 
@@ -31,30 +31,36 @@ MODULES = (
 )
 WORKLOAD_TARGETS = ("tmix/wkv7/rl_infctx",)
 TARGETS = MODULES + WORKLOAD_TARGETS
-RACECHECK_TARGETS = {
-    "cmix",
-    "embedding",
-    "sampling",
-    "tmix/tokenshift",
-    "tmix/wkv7",
-    "tmix/wkv7/rl_infctx",
-}
-CUDA_GRAPH_TARGETS = {"sampling", "tmix/tokenshift", "tmix/wkv7"}
 RELEASE_METADATA_FILES = {
     "pyproject.toml",
     "uv.lock",
     "flashrwkv2/__init__.py",
 }
 SHARED_FILES = {"setup.py", *RELEASE_METADATA_FILES}
-TEST_SHARED_FILES = {"tests/fixtures/tolerances-v1.json"}
-SHARED_PREFIXES = (
-    ".github/workflows/",
-    "ci/",
-    "csrc/bindings.cpp",
-    "csrc/registration.cpp",
-    "csrc/validation.cpp",
-    "csrc/validation/",
-)
+SHARED_PREFIXES = ("csrc/bindings.cpp", "csrc/registration.cpp", "csrc/validation")
+# Edges point from a provider to every semantic consumer, not directory parents.
+MODULE_CONSUMERS = {
+    "post_norm": ("embedding", "cmix", "tmix/tokenshift"),
+    "tmix/tokenshift": ("cmix",),
+    "loss/l2wrap_ce": ("head/l2wrap_ce",),
+    "head/linear": ("head/l2wrap_ce",),
+    "tmix/kk_pre": ("tmix/wkv_prepare",),
+    "tmix/vres_gate": ("tmix/wkv_prepare",),
+    "tmix/wkv7": ("tmix/wkv7/rl_infctx", "tmix/tokenshift", "cmix"),
+}
+PACKAGE_FILES = {
+    "setup.py",
+    "pyproject.toml",
+    "MANIFEST.in",
+    "README.md",
+    "LICENSE",
+    "NOTICE",
+}
+COMPATIBILITY_FILES = {
+    *SHARED_FILES,
+    "flashrwkv2/compile.py",
+    "flashrwkv2/_internal/tuning.py",
+}
 BENCHMARK_SHARED_FILES = {
     "benchmarks/_timing.py",
     "ci/benchmark_gate.py",
@@ -68,11 +74,28 @@ SHARED_PRIMITIVE_CALLERS = {
         "tmix/wkv_prepare",
     ),
     "flashrwkv2/_internal/elementwise.py": (
-        "cmix", "tmix/a_gate", "tmix/kk_pre", "tmix/vres_gate", "tmix/wkv_prepare",
+        "cmix",
+        "post_norm",
+        "tmix/readout",
+        "tmix/tokenshift",
+        "tmix/a_gate",
+        "tmix/kk_pre",
+        "tmix/vres_gate",
+        "tmix/wkv_prepare",
     ),
-    "flashrwkv2/_internal/state.py": ("cmix", "tmix/tokenshift", "tmix/wkv7"),
-    "flashrwkv2/_internal/logprob.py": ("head/linear", "head/l2wrap_ce", "loss/l2wrap_ce"),
-    "flashrwkv2/_internal/tuning.py": tuple(module for module in MODULES if module != "sampling"),
+    "flashrwkv2/_internal/state.py": (
+        "cmix",
+        "tmix/tokenshift",
+        "tmix/wkv7",
+        "head/l2wrap_ce",
+        "loss/l2wrap_ce",
+    ),
+    "flashrwkv2/_internal/logprob.py": (
+        "head/linear",
+        "head/l2wrap_ce",
+        "loss/l2wrap_ce",
+    ),
+    "flashrwkv2/_internal/tuning.py": MODULES,
 }
 DOC_PREFIXES = ("docs/",)
 DOC_FILES = {
@@ -110,9 +133,11 @@ class Impact:
     run_benchmark: bool
     run_sanitizer: bool
     run_all: bool
-    package_smoke_only: bool
     changed_files: tuple[str, ...]
     reasons: tuple[str, ...]
+    run_package: bool = False
+    run_contract: bool = True
+    run_compatibility: bool = False
 
 
 def _target_from_path(path: str, prefix: str) -> str | None:
@@ -120,9 +145,8 @@ def _target_from_path(path: str, prefix: str) -> str | None:
         return None
     relative = path.removeprefix(prefix)
     for target in sorted(TARGETS, key=len, reverse=True):
-        if (
-            relative in {target, f"{target}.py"}
-            or relative.startswith((f"{target}/", f"{target}_"))
+        if relative in {target, f"{target}.py"} or relative.startswith(
+            (f"{target}/", f"{target}_")
         ):
             return target
     return None
@@ -141,11 +165,14 @@ def validate_layout(root: Path = ROOT) -> None:
             if not candidate.is_file():
                 missing.append(str(candidate.relative_to(root)))
         source_root = root / "csrc/sm80" / module
-        if module == "sampling" and (not source_root.is_dir() or not any(
-            path.suffix in {".cpp", ".cu"}
-            for path in source_root.rglob("*")
-            if path.is_file()
-        )):
+        if module == "sampling" and (
+            not source_root.is_dir()
+            or not any(
+                path.suffix in {".cpp", ".cu"}
+                for path in source_root.rglob("*")
+                if path.is_file()
+            )
+        ):
             source_mismatches.append(f"{module}/sm80")
 
     for candidate in (
@@ -163,8 +190,7 @@ def validate_layout(root: Path = ROOT) -> None:
     }
     docs_root = root / "docs/dev/csrc"
     document_stems = {
-        path.relative_to(docs_root).with_suffix("")
-        for path in docs_root.rglob("*.md")
+        path.relative_to(docs_root).with_suffix("") for path in docs_root.rglob("*.md")
     }
     missing_docs = sorted(source_stems - document_stems)
     extra_docs = sorted(document_stems - source_stems)
@@ -175,15 +201,22 @@ def validate_layout(root: Path = ROOT) -> None:
     if source_mismatches:
         errors.append("CUDA source ownership: " + ", ".join(source_mismatches))
     if missing_docs:
-        errors.append(
-            "missing csrc docs: " + ", ".join(map(str, missing_docs))
-        )
+        errors.append("missing csrc docs: " + ", ".join(map(str, missing_docs)))
     if extra_docs:
         errors.append("orphan csrc docs: " + ", ".join(map(str, extra_docs)))
     if errors:
         raise SystemExit("active module layout is incomplete: " + "; ".join(errors))
 
 
+def expand_modules(modules: set[str]) -> tuple[str, ...]:
+    expanded = set(modules)
+    pending = list(modules)
+    while pending:
+        for consumer in MODULE_CONSUMERS.get(pending.pop(), ()):
+            if consumer not in expanded:
+                expanded.add(consumer)
+                pending.append(consumer)
+    return tuple(sorted(expanded))
 
 
 def classify(
@@ -193,159 +226,115 @@ def classify(
     head_sha: str = "",
     release_metadata_only: bool = False,
 ) -> Impact:
-    changed = tuple(
-        sorted({path.strip().removeprefix("./") for path in paths if path.strip()})
-    )
+    changed = tuple(sorted({path.removeprefix("./") for path in paths if path}))
     modules: set[str] = set()
-    cuda_modules: set[str] = set()
-    reasons: list[str] = []
-    run_gpu = False
-    run_benchmark = False
-    run_sanitizer = False
-    run_all = False
-    only_docs = bool(changed)
-
-    if release_metadata_only:
-        return Impact(
-            base_sha=base_sha,
-            head_sha=head_sha,
-            change_class="release_metadata",
-            affected_modules=(),
-            affected_cuda_modules=(),
-            run_gpu=True,
-            run_benchmark=False,
-            run_sanitizer=False,
-            run_all=False,
-            package_smoke_only=True,
-            changed_files=changed,
-            reasons=("release-metadata-only",),
-        )
-
+    reasons: set[str] = set()
+    run_all = run_sanitizer = run_benchmark = run_compatibility = False
+    run_package = any(
+        path in PACKAGE_FILES or path.startswith("LICENSES/") for path in changed
+    )
+    run_contract = False
+    benchmark_only = True
     for path in changed:
-        suffix = Path(path).suffix.lower()
-        if path in DOC_FILES or path.startswith(DOC_PREFIXES):
+        if path in DOC_FILES or path.startswith((*DOC_PREFIXES, "LICENSES/")):
             continue
-        only_docs = False
-        if path == "tests/test_runtime.py":
-            reasons.append("runtime-behavior-tests")
-            continue
-        if path == "tests/utils.py":
-            run_all = run_gpu = run_sanitizer = True
-            reasons.append("shared-test-behavior")
-            continue
-        if path in TEST_SHARED_FILES:
-            run_all = run_gpu = True
-            reasons.append("shared-numerical-test-contract")
+        run_contract = True
+        if release_metadata_only and path in RELEASE_METADATA_FILES:
+            modules.add("sampling")
+            reasons.add("release-metadata")
+            benchmark_only = False
             continue
         if path in BENCHMARK_SHARED_FILES:
-            modules.update(MODULES)
-            cuda_modules.update(MODULES)
-            run_gpu = run_benchmark = True
-            reasons.append("shared-benchmark-behavior")
+            modules.update(TARGETS)
+            run_benchmark = True
+            reasons.add("shared-benchmark")
             continue
-        if path in SHARED_FILES or path.startswith(SHARED_PREFIXES):
-            run_all = run_gpu = run_benchmark = True
-            if path in SHARED_FILES or path.startswith(
-                ("csrc/", "ci/", ".github/workflows/")
-            ):
-                run_sanitizer = True
-            reasons.append(f"shared:{path}")
+        if path.startswith(("ci/", ".github/workflows/")):
+            modules.update(("sampling", "tmix/wkv7"))
+            reasons.add("gpu-pipeline-smoke")
+            benchmark_only = False
             continue
-
-        shared_callers = next(
-            (
-                callers
-                for prefix, callers in SHARED_PRIMITIVE_CALLERS.items()
-                if path.startswith(prefix)
-            ),
-            None,
-        )
-        if shared_callers is not None:
-            modules.update(shared_callers)
-            cuda_modules.update(shared_callers)
-            run_gpu = run_benchmark = run_sanitizer = True
-            reasons.append(f"shared-primitive:{path}")
+        if path == "tests/test_runtime.py":
+            reasons.add("cpu-runtime-tests")
+            benchmark_only = False
             continue
-
-        module = None
-        owner = None
-        for candidate_owner in ("flashrwkv2", "tests", "benchmarks"):
-            module = _target_from_path(path, f"{candidate_owner}/")
+        if path in COMPATIBILITY_FILES or path.startswith("csrc/"):
+            run_compatibility = True
+        if (
+            path in SHARED_FILES
+            or path.startswith(SHARED_PREFIXES)
+            or path == "tests/utils.py"
+        ):
+            run_all = run_sanitizer = True
+            run_benchmark |= not path.startswith("tests/")
+            reasons.add(f"shared:{path}")
+            benchmark_only = False
+            continue
+        if path in SHARED_PRIMITIVE_CALLERS:
+            modules.update(SHARED_PRIMITIVE_CALLERS[path])
+            run_sanitizer = run_benchmark = True
+            reasons.add(f"primitive:{path}")
+            benchmark_only = False
+            continue
+        module = owner = None
+        for candidate in ("flashrwkv2", "tests", "benchmarks"):
+            module = _target_from_path(path, f"{candidate}/")
             if module:
-                owner = candidate_owner
+                owner = candidate
                 break
-        if module is None and path.startswith("csrc/sm"):
-            parts = path.split("/", 2)
-            if len(parts) == 3:
-                module = _target_from_path(parts[2], "")
-                owner = "csrc"
-
+        if module is None and path.startswith("csrc/sm80/"):
+            module = _target_from_path(path, "csrc/sm80/")
+            owner = "csrc"
         if module:
             modules.add(module)
-            run_gpu = True
-            cuda_modules.add(module)
-            if owner in {"flashrwkv2", "benchmarks", "csrc"}:
-                run_benchmark = True
-            if owner == "csrc" and suffix in {".cpp", ".cu", ".cuh", ".h", ".hpp"}:
-                run_sanitizer = True
-            if owner == "flashrwkv2" and suffix == ".py":
-                run_sanitizer = True
-            reasons.append(f"{owner}:{module}")
-            continue
-
-        if suffix in EXECUTABLE_SUFFIXES or path.startswith(
+            run_sanitizer |= owner in {"flashrwkv2", "csrc"}
+            run_benchmark |= owner != "tests"
+            benchmark_only &= owner == "benchmarks"
+            reasons.add(f"{owner}:{module}")
+        elif Path(path).suffix in EXECUTABLE_SUFFIXES or path.startswith(
             ("flashrwkv2/", "tests/", "benchmarks/", "csrc/")
         ):
-            run_all = run_gpu = run_benchmark = run_sanitizer = True
-            reasons.append(f"unknown-executable:{path}")
-        else:
-            reasons.append(f"metadata:{path}")
-
+            run_all = run_sanitizer = True
+            run_benchmark |= not path.startswith("tests/")
+            benchmark_only = False
+            reasons.add(f"shared-or-unknown:{path}")
+    affected = tuple(sorted(TARGETS)) if run_all else expand_modules(modules)
+    run_gpu = bool(affected)
     if run_all:
-        modules = set(TARGETS)
-        cuda_modules = set(TARGETS)
-    affected_modules = tuple(sorted(modules))
-    affected_cuda_modules = tuple(sorted(cuda_modules))
-    if not changed:
-        change_class = "empty"
-    elif only_docs and not run_gpu:
-        change_class = "documentation"
-    elif run_all:
         change_class = "shared_or_unknown"
-    elif run_sanitizer:
-        change_class = "native"
-    elif run_benchmark:
-        change_class = "runtime_or_benchmark"
     elif run_gpu:
-        change_class = "tests"
+        change_class = "benchmark" if benchmark_only else "module"
     else:
-        change_class = "metadata"
-
+        change_class = "cpu" if run_contract else "documentation"
     return Impact(
         base_sha=base_sha,
         head_sha=head_sha,
         change_class=change_class,
-        affected_modules=affected_modules,
-        affected_cuda_modules=affected_cuda_modules,
+        affected_modules=affected,
+        affected_cuda_modules=affected,
         run_gpu=run_gpu,
         run_benchmark=run_benchmark,
         run_sanitizer=run_sanitizer,
         run_all=run_all,
-        package_smoke_only=False,
         changed_files=changed,
-        reasons=tuple(sorted(set(reasons))),
+        reasons=tuple(sorted(reasons)),
+        run_package=run_package or run_gpu,
+        run_contract=run_contract,
+        run_compatibility=run_compatibility,
     )
 
 
 def _git_changed_files(base_sha: str, head_sha: str) -> list[str]:
+    # Disabling rename detection exposes both the removed and added owner.
     result = subprocess.run(
-        ("git", "diff", "--name-only", "--find-renames", base_sha, head_sha, "--"),
+        ("git", "diff", "--name-only", "--no-renames", "-z", base_sha, head_sha, "--"),
         cwd=ROOT,
         check=True,
         capture_output=True,
         text=True,
+        timeout=30,
     )
-    return result.stdout.splitlines()
+    return [path for path in result.stdout.split("\0") if path]
 
 
 def _release_metadata_paths(paths: list[str]) -> tuple[str, ...]:
@@ -373,6 +362,7 @@ def _release_metadata_only(paths: list[str], base_sha: str, head_sha: str) -> bo
             check=True,
             capture_output=True,
             text=True,
+            timeout=30,
         ).stdout
 
     if "pyproject.toml" in changed:
@@ -427,6 +417,7 @@ def _release_metadata_only(paths: list[str], base_sha: str, head_sha: str) -> bo
         check=True,
         capture_output=True,
         text=True,
+        timeout=30,
     )
     current = ""
     saw_change = False
@@ -453,101 +444,95 @@ def _release_metadata_only(paths: list[str], base_sha: str, head_sha: str) -> bo
 
 
 def _write_github_outputs(path: Path, impact: Impact, artifact_path: Path) -> None:
-    values = {
-        "base_sha": impact.base_sha,
-        "head_sha": impact.head_sha,
-        "change_class": impact.change_class,
-        "affected_modules": json.dumps(impact.affected_modules, separators=(",", ":")),
-        "affected_cuda_modules": json.dumps(
-            impact.affected_cuda_modules, separators=(",", ":")
-        ),
-        "cuda_racecheck_modules": json.dumps(
-            tuple(
-                module
-                for module in impact.affected_cuda_modules
-                if module in RACECHECK_TARGETS
-            ),
-            separators=(",", ":"),
-        ),
-        "run_gpu": str(impact.run_gpu).lower(),
-        "run_benchmark": str(impact.run_benchmark).lower(),
-        "run_sanitizer": str(impact.run_sanitizer).lower(),
-        "run_all": str(impact.run_all).lower(),
-        "package_smoke_only": str(impact.package_smoke_only).lower(),
-        "impact_artifact": str(artifact_path),
-    }
+    values = {**asdict(impact), "impact_artifact": str(artifact_path)}
     with path.open("a", encoding="utf-8") as handle:
         for key, value in values.items():
+            if isinstance(value, (bool, tuple)):
+                value = json.dumps(value, separators=(",", ":"))
             handle.write(f"{key}={value}\n")
 
 
 def _self_test() -> None:
     validate_layout()
-    doc = classify(["README.md"])
-    assert doc.change_class == "documentation" and not doc.run_gpu
-    test = classify(["tests/tmix/wkv_prepare/test.py"])
-    assert (
-        test.affected_modules == ("tmix/wkv_prepare",)
-        and test.run_gpu
-        and not test.run_benchmark
-    )
-    assert test.affected_cuda_modules == ("tmix/wkv_prepare",)
-    native = classify(["flashrwkv2/tmix/wkv7/tilelang.py"])
-    assert (
-        native.affected_modules == ("tmix/wkv7",)
-        and native.run_sanitizer
-        and native.run_benchmark
-    )
-    assert native.affected_cuda_modules == ("tmix/wkv7",)
-    assert "tmix/wkv7" in RACECHECK_TARGETS
-    benchmark = classify(["benchmarks/cmix/bench.py"])
-    assert benchmark.affected_modules == ("cmix",) and benchmark.run_benchmark
-    rl_infctx = classify(
-        ["benchmarks/tmix/wkv7/rl_infctx/bench.py"]
-    )
-    assert rl_infctx.affected_modules == ("tmix/wkv7/rl_infctx",)
-    assert rl_infctx.affected_cuda_modules == ("tmix/wkv7/rl_infctx",)
-    assert rl_infctx.run_benchmark
-    shared = classify(["setup.py"])
-    assert shared.run_all and shared.affected_modules == tuple(sorted(TARGETS))
-    assert shared.affected_cuda_modules == tuple(sorted(TARGETS))
-    test_utils = classify(["tests/utils.py"])
-    assert test_utils.run_all and test_utils.run_gpu and test_utils.run_sanitizer
-    assert not test_utils.run_benchmark
-    tolerances = classify(["tests/fixtures/tolerances-v1.json"])
-    assert tolerances.run_all and tolerances.run_gpu
-    assert not tolerances.run_benchmark and not tolerances.run_sanitizer
-    runtime = classify(["tests/test_runtime.py"])
-    assert not runtime.run_gpu and runtime.change_class == "metadata"
-    benchmark_shared = classify(["benchmarks/_timing.py"])
-    assert benchmark_shared.run_benchmark and not benchmark_shared.run_sanitizer
-    assert benchmark_shared.affected_cuda_modules
+    assert not classify(["docs/kernel_api.md"]).run_gpu
+    assert not classify(["docs/kernel_api.md"]).run_package
+    assert classify(["README.md"]).run_package
+    assert not classify(["README.md"]).run_contract
+    assert not classify(["tests/test_runtime.py"]).run_gpu
+    assert classify(["tests/test_runtime.py"]).run_contract
+    for path in (
+        "setup.py",
+        "flashrwkv2/compile.py",
+        "flashrwkv2/__init__.py",
+        "flashrwkv2/new.py",
+        "tests/utils.py",
+    ):
+        assert classify([path]).run_all, path
+    assert classify(["pyproject.toml"]).run_compatibility
+    assert classify(
+        ["csrc/sm80/sampling/infer_fp32_forward_varlen.cu"]
+    ).run_compatibility
+    assert classify(["ci/quality_gate.py"]).run_gpu
+    assert not classify(["ci/quality_gate.py"]).run_all
+    assert not classify(["tests/cmix/test.py"]).run_sanitizer
+    assert classify(["flashrwkv2/cmix/__init__.py"]).run_sanitizer
+    assert classify(["benchmarks/cmix/bench.py"]).change_class == "benchmark"
+    assert not classify(["benchmarks/cmix/bench.py"]).run_all
+    assert set(classify(["flashrwkv2/post_norm/tilelang.py"]).affected_modules) == {
+        "post_norm",
+        "embedding",
+        "cmix",
+        "tmix/tokenshift",
+    }
+    assert set(classify(["flashrwkv2/tmix/kk_pre/tilelang.py"]).affected_modules) == {
+        "tmix/kk_pre",
+        "tmix/wkv_prepare",
+    }
+    assert set(classify(["flashrwkv2/head/linear/__init__.py"]).affected_modules) == {
+        "head/linear",
+        "head/l2wrap_ce",
+    }
     primitive = classify(["flashrwkv2/_internal/linear.py"])
-    assert primitive.affected_modules == tuple(
-        sorted(SHARED_PRIMITIVE_CALLERS["flashrwkv2/_internal/linear.py"])
+    assert set(primitive.affected_modules) == set(
+        SHARED_PRIMITIVE_CALLERS["flashrwkv2/_internal/linear.py"]
     )
-    assert primitive.affected_cuda_modules == primitive.affected_modules
-    assert primitive.run_sanitizer and not primitive.run_all
-    unknown = classify(["flashrwkv2/new_family.py"])
-    assert unknown.run_all and unknown.run_sanitizer
+    # A rename is represented by old and new paths, preserving both owners.
+    moved = classify(
+        ["flashrwkv2/tmix/kk_pre/tilelang.py", "flashrwkv2/tmix/vres_gate/tilelang.py"]
+    )
+    assert set(moved.affected_modules) == {
+        "tmix/kk_pre",
+        "tmix/vres_gate",
+        "tmix/wkv_prepare",
+    }
     release = classify(
-        [
-            "docs/kernel_api.md",
-            "pyproject.toml",
-            "flashrwkv2/__init__.py",
-            "uv.lock",
-        ],
+        ["pyproject.toml", "flashrwkv2/__init__.py", "uv.lock"],
         release_metadata_only=True,
     )
-    assert release.package_smoke_only and release.run_gpu
-    assert not release.run_benchmark and not release.affected_modules
-    assert _release_metadata_paths(list(release.changed_files)) == (
-        "flashrwkv2/__init__.py",
+    assert release.run_gpu and not release.run_all and not release.run_compatibility
+    assert _release_metadata_paths(["pyproject.toml", "README.md"]) == (
         "pyproject.toml",
-        "uv.lock",
     )
-    assert not _release_metadata_paths(["docs/kernel_api.md"])
-    assert not _release_metadata_paths(["pyproject.toml", "setup.py"])
+    assert not _release_metadata_paths(["setup.py", "pyproject.toml"])
+    # Replay recent real changes through the owner map, including removals.
+    revisions = subprocess.run(
+        ("git", "rev-list", "--max-count=8", "--min-parents=1", "HEAD"),
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    ).stdout.splitlines()
+    for revision in revisions:
+        paths = _git_changed_files(f"{revision}^", revision)
+        impact = classify(paths)
+        owners = set()
+        for path in paths:
+            for prefix in ("flashrwkv2/", "tests/", "benchmarks/", "csrc/sm80/"):
+                owner = _target_from_path(path, prefix)
+                if owner:
+                    owners.add(owner)
+        assert set(expand_modules(owners)) <= set(impact.affected_modules), revision
 
 
 def main() -> int:
@@ -570,8 +555,8 @@ def main() -> int:
         if args.files is not None
         else _git_changed_files(args.base, args.head)
     )
-    release_metadata_only = (
-        args.files is None and _release_metadata_only(paths, args.base, args.head)
+    release_metadata_only = args.files is None and _release_metadata_only(
+        paths, args.base, args.head
     )
     impact = classify(
         paths,

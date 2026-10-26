@@ -12,16 +12,17 @@ description = "TileLang RWKV-7 operators with shared BF16 training and inference
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-  "torch>=2.11,<2.14",
+  "torch>=2.11,<2.15",
   "tilelang==0.1.15",
 ]
 license = "MIT"
 
 [dependency-groups]
 dev = [
+  "ninja>=1.11",
   "pytest>=8",
   "ruff>=0.12",
-  "torch==2.13.0",
+  "torch==2.14.1",
 ]
 
 [project.urls]

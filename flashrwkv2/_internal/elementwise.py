@@ -5,6 +5,8 @@ import tilelang
 import tilelang.language as T
 import torch
 
+from .tuning import _AutogradContext
+
 
 @tilelang.jit(pass_configs={"tl.enable_fast_math": False})
 def _activation_kernel(
@@ -138,6 +140,43 @@ class _Activation(torch.autograd.Function):
         return dx.view_as(x), sum_partials(partial) if need_bias else None, None
 
 
+@torch.library.custom_op("flashrwkv2::_activation_forward", mutates_args=())
+def _compiled_activation(x: torch.Tensor, bias: torch.Tensor | None, kind: str) -> torch.Tensor:
+    return _Activation.forward(_AutogradContext(), x, bias, kind)
+
+
+@_compiled_activation.register_fake
+def _compiled_activation_fake(x, bias, kind):
+    return torch.empty_like(x)
+
+
+def _compiled_activation_context(ctx, inputs, output):
+    x, bias, ctx.kind = inputs
+    ctx.save_for_backward(x, bias)
+
+
+@torch.library.custom_op(
+    "flashrwkv2::_activation_backward", mutates_args=(),
+    schema="(Tensor dy, Tensor x, Tensor? bias, str kind, bool need_bias) -> (Tensor, Tensor?)",
+)
+def _compiled_activation_vjp(dy, x, bias, kind, need_bias):
+    ctx = _AutogradContext(saved_tensors=(x, bias), kind=kind,
+                           needs_input_grad=(True, need_bias, False))
+    return _Activation.backward(ctx, dy)[:2]
+
+
+@_compiled_activation_vjp.register_fake
+def _compiled_activation_vjp_fake(dy, x, bias, kind, need_bias):
+    return torch.empty_like(x), torch.empty_like(bias) if need_bias else None
+
+
+def _compiled_activation_backward(ctx, dy):
+    return (*_compiled_activation_vjp(dy, *ctx.saved_tensors, ctx.kind, ctx.needs_input_grad[1]), None)
+
+
+_compiled_activation.register_autograd(_compiled_activation_backward, setup_context=_compiled_activation_context)
+
+
 def activation(x, kind, bias=None):
     """Apply sigmoid, tanh, ReLU², or identity+bias in FP32; return BF16."""
     if kind not in {"sigmoid", "tanh", "relu2", "identity"}:
@@ -155,4 +194,5 @@ def activation(x, kind, bias=None):
         raise ValueError(
             "activation bias must be contiguous [C] with the input dtype/device"
         )
-    return _Activation.apply(x, bias, kind)
+    operation = _compiled_activation if torch.compiler.is_compiling() else _Activation.apply
+    return operation(x, bias, kind)

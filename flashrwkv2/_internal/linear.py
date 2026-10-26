@@ -13,6 +13,8 @@ from numbers import Real
 import torch
 from torch.autograd.function import once_differentiable
 
+from .tuning import _AutogradContext, device_class, tuning_operation
+
 _PASS_CONFIG = {"tl.disable_wgmma": True, "tl.enable_fast_math": False}
 _DEFAULT_CONFIG = (16, 64, 2, 32)
 _TUNED_CONFIGS = {}
@@ -152,20 +154,13 @@ def _compiled(*key):
     return _COMPILED_KERNELS[key]
 
 
-def _precompile(keys):
-    """Elaborate on the caller thread; compile a bounded batch before timing."""
-    from .tuning import compile_candidates
-
-    compile_candidates(keys, _COMPILED_KERNELS, _compile_spec)
-
-
 def _dtype_name(dtype):
     return "bfloat16" if dtype == torch.bfloat16 else "float32"
 
 
 def _key(x, weight, output_dtype, bias=None):
     return (
-        torch.cuda.get_device_name(x.device),
+        device_class(x.device),
         x.shape[0],
         weight.shape[0],
         x.shape[1],
@@ -187,7 +182,10 @@ def _forward(x, weight, bias, output_dtype, config=None):
     if config is None:
         from .tuning import get_config
 
-        config = get_config(_TUNED_CONFIGS, "linear", _key(x, weight, output_dtype, bias))
+        config = get_config(
+            _TUNED_CONFIGS, "linear", _key(x, weight, output_dtype, bias),
+            tune=lambda: tune_linear(x, weight, output_dtype, bias=bias),
+        )
         if config is None:
             block_m = 16
             if x.shape[0] > 16:
@@ -270,6 +268,53 @@ class _Linear(torch.autograd.Function):
         if ctx.needs_input_grad[2]:
             db = dy.float().sum(dim=0).to(ctx.bias_dtype)
         return dx, dw, db, None
+
+
+@torch.library.custom_op("flashrwkv2::_linear_forward", mutates_args=())
+def _compiled_linear(
+    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    return _forward(x, weight, bias, output_dtype)
+
+
+@_compiled_linear.register_fake
+def _compiled_linear_fake(x, weight, bias, output_dtype):
+    return x.new_empty((x.shape[0], weight.shape[0]), dtype=output_dtype)
+
+
+def _compiled_linear_context(ctx, inputs, output):
+    x, weight, bias, _ = inputs
+    ctx.save_for_backward(x, weight)
+    ctx.bias_dtype = None if bias is None else bias.dtype
+
+
+@torch.library.custom_op(
+    "flashrwkv2::_linear_backward", mutates_args=(),
+    schema="(Tensor dy, Tensor x, Tensor weight, ScalarType? bias_dtype, bool[] needed) -> (Tensor?, Tensor?, Tensor?)",
+)
+def _compiled_linear_vjp(
+    dy: torch.Tensor, x: torch.Tensor, weight: torch.Tensor,
+    bias_dtype: torch.dtype | None, needed: list[bool],
+) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+    ctx = _AutogradContext(saved_tensors=(x, weight), bias_dtype=bias_dtype,
+                          needs_input_grad=(*needed, False))
+    return _Linear.backward(ctx, dy)[:3]
+
+
+@_compiled_linear_vjp.register_fake
+def _compiled_linear_vjp_fake(dy, x, weight, bias_dtype, needed):
+    return (torch.empty_like(x) if needed[0] else None,
+            weight.new_empty(weight.shape) if needed[1] else None,
+            x.new_empty(weight.shape[0], dtype=bias_dtype) if needed[2] else None)
+
+
+def _compiled_linear_backward(ctx, dy):
+    return (*_compiled_linear_vjp(dy, *ctx.saved_tensors, ctx.bias_dtype,
+                                 list(ctx.needs_input_grad[:3])), None)
+
+
+_compiled_linear.register_autograd(_compiled_linear_backward, setup_context=_compiled_linear_context)
 
 
 @cache
@@ -420,6 +465,55 @@ class _NoRA(torch.autograd.Function):
         return nora_backward(dy, a, inverse, norm)
 
 
+@torch.library.custom_op("flashrwkv2::_adapter_add", mutates_args=())
+def _compiled_adapter_add(base: torch.Tensor, update: torch.Tensor, scale: float) -> torch.Tensor:
+    return _AdapterAdd.forward(_AutogradContext(), base, update, scale)
+
+
+@_compiled_adapter_add.register_fake
+def _compiled_adapter_add_fake(base, update, scale):
+    return torch.empty_like(base)
+
+
+def _compiled_adapter_context(ctx, inputs, output):
+    ctx.scale = inputs[2]
+
+
+_compiled_adapter_add.register_autograd(_AdapterAdd.backward, setup_context=_compiled_adapter_context)
+
+
+@torch.library.custom_op("flashrwkv2::_nora_forward", mutates_args=())
+def _compiled_nora(a: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return nora_forward(a)
+
+
+@_compiled_nora.register_fake
+def _compiled_nora_fake(a):
+    return a.new_empty(a.shape, dtype=torch.bfloat16), a.new_empty(a.shape[1], dtype=torch.float32), a.new_empty(a.shape[1], dtype=torch.float32)
+
+
+def _compiled_nora_context(ctx, inputs, output):
+    ctx.save_for_backward(inputs[0], output[1], output[2])
+    ctx.mark_non_differentiable(output[1], output[2])
+
+
+@torch.library.custom_op("flashrwkv2::_nora_backward", mutates_args=())
+def _compiled_nora_vjp(dy: torch.Tensor, a: torch.Tensor, inverse: torch.Tensor, norm: torch.Tensor) -> torch.Tensor:
+    return nora_backward(dy, a, inverse, norm)
+
+
+@_compiled_nora_vjp.register_fake
+def _compiled_nora_vjp_fake(dy, a, inverse, norm):
+    return a.new_empty(a.shape)
+
+
+def _compiled_nora_backward(ctx, dy, unused_inverse, unused_norm):
+    return _compiled_nora_vjp(dy, *ctx.saved_tensors)
+
+
+_compiled_nora.register_autograd(_compiled_nora_backward, setup_context=_compiled_nora_context)
+
+
 def linear(x, weight, bias=None, output_dtype=None):
     """Apply a common projection with BF16 operands and FP32 accumulation.
 
@@ -450,7 +544,8 @@ def linear(x, weight, bias=None, output_dtype=None):
         or bias.dtype not in (torch.bfloat16, torch.float32)
     ):
         raise ValueError("linear bias must be [out_features], BF16/FP32, on x's device")
-    result = _Linear.apply(
+    operation = _compiled_linear if torch.compiler.is_compiling() else _Linear.apply
+    result = operation(
         x.reshape(-1, x.shape[-1]).contiguous(),
         weight,
         None if bias is None else bias.contiguous(),
@@ -511,13 +606,18 @@ def adapter_linear(
         if base_result is None
         else base_result
     )
-    normalized = _NoRA.apply(a) if use_nora else a.to(torch.bfloat16)
+    if use_nora:
+        normalized = _compiled_nora(a)[0] if torch.compiler.is_compiling() else _NoRA.apply(a)
+    else:
+        normalized = a.to(torch.bfloat16)
     features = linear(x, normalized)
     update = linear(features, b.to(torch.bfloat16), output_dtype=torch.float32)
-    return _AdapterAdd.apply(result, update, scale)
+    operation = _compiled_adapter_add if torch.compiler.is_compiling() else _AdapterAdd.apply
+    return operation(result, update, scale)
 
 
 @torch.no_grad()
+@tuning_operation
 def tune_linear(x, weight, output_dtype=None, *, bias=None, benchmark=None):
     """Measure output tiles without changing the canonical MMA reduction.
 
@@ -528,7 +628,9 @@ def tune_linear(x, weight, output_dtype=None, *, bias=None, benchmark=None):
     ``benchmark`` measures the owning forward operator with each candidate in
     its dispatch cache, preserving the operator's working set during tuning.
     """
-    from .tuning import projection_finalists, save_config, select_config
+    from .tuning import (
+        compile_candidates, projection_finalists, revalidation_config, save_config, select_config,
+    )
 
     output_dtype = torch.bfloat16 if output_dtype is None else output_dtype
     linear(x, weight, bias, output_dtype)
@@ -572,6 +674,16 @@ def tune_linear(x, weight, output_dtype=None, *, bias=None, benchmark=None):
         _TUNED_CONFIGS[_key(x, weight, output_dtype, bias)] = config
         return benchmark()
 
+    imported = revalidation_config()
+    if imported is not None:
+        best_config, checked = select_config(
+            (imported,), run,
+            check=lambda config: tuple(_forward(x, weight, bias, dtype, config) for dtype in check_dtypes),
+            reference=reference,
+        )
+        save_config("linear", _key(x, weight, output_dtype, bias), best_config)
+        return {"config": best_config, "candidates": checked}
+
     for phase in ("tiles", "copies"):
         if phase == "copies":
             # Copy spans can change the best column tile and pipeline depth.
@@ -614,7 +726,7 @@ def tune_linear(x, weight, output_dtype=None, *, bias=None, benchmark=None):
                 })
                 continue
             eligible.append(config)
-        _precompile(
+        keys = (
             (
                 weight.shape[0], x.shape[1], _dtype_name(dtype),
                 _dtype_name(bias.dtype) if bias is not None else "bfloat16",
@@ -623,6 +735,7 @@ def tune_linear(x, weight, output_dtype=None, *, bias=None, benchmark=None):
             )
             for config in eligible for dtype in check_dtypes
         )
+        compile_candidates(keys, _COMPILED_KERNELS, _compile_spec)
         compiled = []
         for config in eligible:
             try:

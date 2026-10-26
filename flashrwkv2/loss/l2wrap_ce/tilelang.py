@@ -6,6 +6,7 @@ import tilelang.language as T
 import torch
 
 from ..._internal.logprob import logprob_stats
+from ..._internal.tuning import _AutogradContext
 
 
 @tilelang.jit(pass_configs={"tl.enable_fast_math": False}, out_idx=[6])
@@ -53,3 +54,39 @@ class L2Wrap(torch.autograd.Function):
             logits, targets.reshape(-1), logsum, maximum, argmax, grad.float().contiguous()
         )
         return dx.reshape(ctx.shape), None
+
+
+@torch.library.custom_op("flashrwkv2::loss_l2wrap_ce_forward", mutates_args=())
+def compiled_l2wrap(logits: torch.Tensor, targets: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ctx = _AutogradContext()
+    loss = L2Wrap.forward(ctx, logits, targets)
+    return loss, *ctx.saved_tensors[2:]
+
+
+@compiled_l2wrap.register_fake
+def _compiled_l2wrap_fake(logits, targets):
+    return logits.new_empty((), dtype=torch.float32), logits.new_empty(targets.numel(), dtype=torch.float32), logits.new_empty(targets.numel(), dtype=torch.float32), targets.new_empty(targets.numel(), dtype=torch.int32)
+
+
+def _compiled_l2wrap_context(ctx, inputs, output):
+    logits, targets = inputs
+    ctx.save_for_backward(logits.reshape(-1, logits.shape[-1]), targets, *output[1:])
+    ctx.shape = logits.shape
+    ctx.mark_non_differentiable(*output[1:])
+
+
+@torch.library.custom_op("flashrwkv2::loss_l2wrap_ce_backward", mutates_args=())
+def _compiled_l2wrap_vjp(dy: torch.Tensor, saved: list[torch.Tensor], shape: list[int]) -> torch.Tensor:
+    return L2Wrap.backward(_AutogradContext(saved_tensors=saved, shape=shape), dy)[0]
+
+
+@_compiled_l2wrap_vjp.register_fake
+def _compiled_l2wrap_vjp_fake(dy, saved, shape):
+    return saved[0].new_empty(shape)
+
+
+def _compiled_l2wrap_backward(ctx, dy, unused_logsum, unused_maximum, unused_argmax):
+    return _compiled_l2wrap_vjp(dy, list(ctx.saved_tensors), list(ctx.shape)), None
+
+
+compiled_l2wrap.register_autograd(_compiled_l2wrap_backward, setup_context=_compiled_l2wrap_context)

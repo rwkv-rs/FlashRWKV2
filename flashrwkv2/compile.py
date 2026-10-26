@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
 
-_CXX_FLAGS = ("-O3", "-Wno-psabi")
+_CXX_FLAGS = ("-O3", "-Wno-psabi", "-std=c++20")
 _LINK_FLAGS = ("-Wl,--strip-debug",)
 _NVCC_FLAGS = (
     "-O3",
@@ -25,7 +25,7 @@ _NVCC_FLAGS = (
     "--expt-extended-lambda",
     "-lineinfo",
     "-Xptxas=-v",
-    "-std=c++17",
+    "-std=c++20",
 )
 _SOURCE_SUFFIXES = {".cpp", ".cu", ".cuh", ".h", ".hpp"}
 _PROCESS_LOCK = threading.Lock()
@@ -65,14 +65,6 @@ def _source_files(root: Path) -> list[Path]:
         for path in root.rglob("*")
         if path.is_file() and path.suffix in _SOURCE_SUFFIXES
     )
-
-
-def _compile_sources(root: Path) -> list[str]:
-    return [
-        str(path)
-        for path in _source_files(root)
-        if path.suffix in {".cpp", ".cu"}
-    ]
 
 
 def _source_digest(root: Path) -> str:
@@ -246,7 +238,10 @@ def _build_extension(
     extension = CUDAExtension(
         name=name,
         include_dirs=[str(root)],
-        sources=_compile_sources(root),
+        sources=[
+            str(path) for path in _source_files(root)
+            if path.suffix in {".cpp", ".cu"}
+        ],
         extra_compile_args={
             "cxx": list(payload["cxx_flags"]),
             "nvcc": list(payload["nvcc_flags"]),
@@ -282,7 +277,7 @@ def load_extension() -> CompileResult:
             return _RESULT
 
         import torch
-        from torch.utils.cpp_extension import get_default_build_root
+        from ._internal.tuning import get_tuning_cache_dir
 
         root = source_root()
         capability = _capability(torch)
@@ -292,7 +287,7 @@ def load_extension() -> CompileResult:
         cache_key = hashlib.sha256(encoded).hexdigest()
         target = str(payload["target"])
         name = f"_flashrwkv2_{cache_key[:16]}"
-        cache_root = Path(get_default_build_root())
+        cache_root = get_tuning_cache_dir() / "native"
         build_dir = cache_root / name
         manifest = build_dir / "manifest.json"
         lock_path = cache_root / f".{name}.lock"

@@ -43,6 +43,228 @@ PUBLIC_PREFIXES = (
 )
 
 
+@pytest.fixture
+def tuning_cache(monkeypatch, tmp_path):
+    from flashrwkv2._internal import tuning
+
+    monkeypatch.setattr(tuning, "_profile_root", lambda: tmp_path)
+    monkeypatch.setattr(tuning, "_LOADED", {})
+    monkeypatch.setattr(tuning, "_WARMED_DEFAULTS", set())
+    return tuning
+
+
+def test_tuning_compiler_identity_without_cuda_toolkit(monkeypatch):
+    from flashrwkv2._internal import tuning
+
+    monkeypatch.setattr(importlib.import_module("tilelang.env"), "CUDA_HOME", "")
+    tuning._compiler_identity.cache_clear()
+    try:
+        versions, _ = tuning._compiler_identity()
+        assert versions[0] is None
+        assert versions[1]
+    finally:
+        tuning._compiler_identity.cache_clear()
+
+
+def test_tuning_device_class_shares_ordinals_but_separates_products(monkeypatch):
+    import torch
+    from flashrwkv2._internal import tuning
+
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: SimpleNamespace(
+        name="RTX 4090" if device < 2 else "RTX 4090 D",
+        major=8, minor=9, multi_processor_count=128 if device < 2 else 114,
+    ))
+    tuning.device_class.cache_clear()
+    try:
+        assert tuning.device_class(0) == tuning.device_class(1)
+        assert tuning.device_class(0) != tuning.device_class(2)
+    finally:
+        tuning.device_class.cache_clear()
+
+
+@pytest.mark.parametrize("override", [None, ""])
+def test_tuning_default_root_ignores_torch_and_xdg(monkeypatch, tmp_path, override):
+    from pathlib import Path
+    from flashrwkv2._internal import tuning
+
+    if override is None:
+        monkeypatch.delenv("FLASHRWKV2_CACHE_DIR", raising=False)
+    else:
+        monkeypatch.setenv("FLASHRWKV2_CACHE_DIR", override)
+    monkeypatch.setenv("TORCH_HOME", str(tmp_path / "torch"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg"))
+    tuning.get_tuning_cache_dir.cache_clear()
+    try:
+        assert tuning.get_tuning_cache_dir() == Path.home() / ".cache" / "flashrwkv2"
+        assert not tmp_path.joinpath("torch").exists()
+        assert not tmp_path.joinpath("xdg").exists()
+    finally:
+        tuning.get_tuning_cache_dir.cache_clear()
+
+
+def test_tuning_missing_then_published_is_visible_in_same_process(tuning_cache):
+    tuning = tuning_cache
+    key = (("test", 8, 9, 128), 32, "torch.bfloat16")
+    configs = {}
+    call = lambda: tuning.get_config(configs, "linear", key, (16, 64, 2, 32))
+    before = tuning.prepare_tuning([call], mode="inspect")
+    assert not before["complete"]
+    assert before["counts"]["missing"] == 1
+    assert key not in configs
+    tuning.save_config("linear", key, (32, 64, 2, 64))
+    after = tuning.prepare_tuning([call])
+    assert after["complete"] and after["counts"]["hit"] == 1
+    assert call() == (32, 64, 2, 64)
+
+
+def test_tuning_prepare_reloads_external_publication_and_detects_removal(tuning_cache):
+    tuning = tuning_cache
+    key = (("test", 8, 9, 128), 32)
+    call = lambda: tuning.get_config({}, "linear", key)
+    tuning.save_config("linear", key, (16, 64, 2, 32))
+    tuning.prepare_tuning([call])
+    path = tuning._profile_path("linear", tuning._encode(key))
+    record = json.loads(path.read_text())
+    record["config"] = [32, 64, 2, 64]
+    path.write_text(json.dumps(record))
+    refreshed = tuning.prepare_tuning([call])
+    assert refreshed["records"][0]["config"] == (32, 64, 2, 64)
+    path.unlink()
+    with pytest.raises(RuntimeError, match="missing verified tuning profile"):
+        tuning.prepare_tuning([call])
+
+
+def test_tuning_require_and_capture_fail_before_using_missing_key(tuning_cache, monkeypatch):
+    tuning = tuning_cache
+    key = (("test", 8, 9, 128), 128)
+    calls = []
+    def call():
+        return tuning.get_config({}, "linear", key, tune=lambda: calls.append(1))
+    with pytest.raises(RuntimeError, match="missing verified tuning profile"):
+        tuning.prepare_tuning([call])
+    assert not calls
+    monkeypatch.setattr(tuning, "_capturing", lambda: True)
+    with pytest.raises(RuntimeError, match="outside CUDA Graph"):
+        tuning.prepare_tuning([call], mode="tune")
+    with pytest.raises(RuntimeError, match="unprepared tuning key"):
+        call()
+    assert not calls
+
+
+def test_tuning_prepares_once_and_reports_actual_dispatch(tuning_cache):
+    tuning = tuning_cache
+    key = (("test", 12, 0, 188), 128)
+    count = []
+    def tune():
+        count.append(1)
+        tuning.save_config("linear", key, (32, 64, 2, 64))
+    def call():
+        assert tuning.get_config({}, "linear", key, tune=tune) == (32, 64, 2, 64)
+    report = tuning.prepare_tuning([call, call], mode="tune")
+    assert count == [1]
+    assert report["counts"]["tuned"] == 1
+    assert report["records"][0]["key"][0] == ["test", 12, 0, 188]
+    assert tuning.prepare_tuning([call], mode="tune")["counts"]["hit"] == 1
+    assert count == [1]
+
+
+def test_tuning_preparation_includes_worker_thread_dispatch(tuning_cache):
+    tuning = tuning_cache
+    def call():
+        tuning.get_config({}, "linear", (("test", 12, 0, 188), 1))
+        worker = threading.Thread(target=lambda: tuning.get_config({}, "linear", (("test", 12, 0, 188), 2)))
+        worker.start()
+        worker.join(timeout=10)
+        assert not worker.is_alive()
+    report = tuning.prepare_tuning([call], mode="inspect")
+    assert report["counts"]["missing"] == 2
+    assert not report["complete"]
+
+
+def test_tuning_revalidates_legacy_without_timing(tuning_cache, tmp_path, monkeypatch):
+    import torch
+    from pathlib import Path
+    tuning = tuning_cache
+    key = (("test", 12, 0, 188), 128)
+    encoded = tuning._encode(("test", 128))
+    legacy = tmp_path / "legacy"
+    path = legacy / "linear" / (tuning.hashlib.sha256(encoded.encode()).hexdigest() + ".json")
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"key": json.loads(encoded), "config": [32, 64, 2, 64], "bitwise_equal": True}))
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", lambda: pytest.fail("migration must not time candidates"))
+    def tune():
+        config, records = tuning.select_config(
+            ((16, 64, 2, 32),), lambda config: torch.ones(1), reference=torch.ones(1)
+        )
+        assert config == (32, 64, 2, 64)
+        assert records == [{"config": config, "bitwise_equal": True}]
+        tuning.save_config("linear", key, config)
+    report = tuning.prepare_tuning(
+        [lambda: tuning.get_config({}, "linear", key, tune=tune)], mode="tune", legacy_dir=legacy,
+    )
+    assert report["counts"]["revalidated"] == 1
+    assert Path(report["records"][0]["path"]).is_file()
+
+
+def test_missing_legacy_directory_stops_before_tuning(tuning_cache, tmp_path):
+    with pytest.raises(NotADirectoryError, match="legacy tuning namespace does not exist"):
+        tuning_cache.prepare_tuning(
+            [lambda: pytest.fail("an invalid migration path must not start model preparation")],
+            mode="tune", legacy_dir=tmp_path / "missing",
+        )
+
+
+@pytest.mark.parametrize("contents", ["{", "[]", '{"bitwise_equal":false}', '{"config":[0]}'])
+def test_tuning_corrupt_record_fails_closed(tuning_cache, contents):
+    tuning = tuning_cache
+    key = (("test", 8, 9, 128), 1)
+    path = tuning._profile_path("linear", tuning._encode(key))
+    path.parent.mkdir(parents=True)
+    path.write_text(contents)
+    with pytest.raises(ValueError):
+        tuning.prepare_tuning([lambda: tuning.get_config({}, "linear", key)])
+
+
+def test_tuning_processes_share_single_writer_and_ignore_torch_cache(tmp_path):
+    script = """
+import json, os, time
+from pathlib import Path
+from flashrwkv2 import prepare_tuning
+from flashrwkv2._internal import tuning
+key = (("test", 12, 0, 188), 64)
+def tune():
+    with (tuning.get_tuning_cache_dir() / "writers").open("a") as output:
+        output.write("writer\\n")
+    time.sleep(.1)
+    tuning.save_config("linear", key, (32, 64, 2, 64))
+report = prepare_tuning([lambda: tuning.get_config({}, "linear", key, tune=tune)], mode="tune")
+print(json.dumps(report))
+"""
+    processes = []
+    for ordinal in range(3):
+        environment = dict(os.environ, FLASHRWKV2_CACHE_DIR=str(tmp_path / "shared"),
+                           TORCH_HOME=str(tmp_path / f"torch-{ordinal}"),
+                           XDG_CACHE_HOME=str(tmp_path / f"xdg-{ordinal}"))
+        processes.append(subprocess.Popen([sys.executable, "-c", script], env=environment,
+                                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
+    reports = []
+    try:
+        for process in processes:
+            output, error = process.communicate(timeout=45)
+            assert process.returncode == 0, error
+            reports.append(json.loads(output))
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
+    assert (tmp_path / "shared" / "writers").read_text() == "writer\n"
+    assert sum(report["counts"]["tuned"] for report in reports) == 1
+    assert sum(report["counts"]["hit"] for report in reports) == 2
+    assert len({report["records"][0]["path"] for report in reports}) == 1
+
+
 def test_cpu_import_does_not_compile_or_create_cache(tmp_path) -> None:
     cache = tmp_path / "extensions"
     environment = os.environ.copy()
@@ -117,7 +339,7 @@ def test_compile_boundary_accepts_homogeneous_sm89() -> None:
 
 def _mock_runtime_build(monkeypatch, tmp_path, *, fail_once: bool = False):
     import torch
-    import torch.utils.cpp_extension
+    from flashrwkv2._internal import tuning
 
     from flashrwkv2 import compile as compiler
 
@@ -136,9 +358,9 @@ def _mock_runtime_build(monkeypatch, tmp_path, *, fail_once: bool = False):
         },
     )
     monkeypatch.setattr(
-        torch.utils.cpp_extension,
-        "get_default_build_root",
-        lambda: str(tmp_path / "cache"),
+        tuning,
+        "get_tuning_cache_dir",
+        lambda: tmp_path / "cache",
     )
 
     def build(name, root, build_dir, payload, toolchain):
@@ -258,7 +480,11 @@ def test_source_digest_tracks_shared_native_headers(tmp_path) -> None:
 def test_root_exports_module_operators_by_identity() -> None:
     import flashrwkv2
 
-    expected: dict[str, object] = {}
+    from flashrwkv2._internal import tuning
+
+    expected: dict[str, object] = {
+        name: getattr(tuning, name) for name in ("get_tuning_cache_dir", "prepare_tuning")
+    }
     for module_name in PUBLIC_MODULES:
         module = importlib.import_module(module_name)
         for name in module.__all__:
