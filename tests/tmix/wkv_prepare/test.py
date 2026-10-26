@@ -72,7 +72,7 @@ def test_real_model_rank_profile_is_loaded_for_decode_graph(monkeypatch, tmp_pat
     graph.replay()
     for value, expected in zip(captured, reference[:-1], strict=True):
         assert torch.equal(value.view(torch.int16), expected)
-    tuning._read_profile.cache_clear()
+    tuning._LOADED.clear()
 
 
 def _linear_reference(x, weight, adapter=(None, None, 1.0, False)):

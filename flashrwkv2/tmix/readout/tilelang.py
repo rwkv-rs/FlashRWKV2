@@ -4,6 +4,8 @@
 import math
 
 import torch
+
+from ..._internal.tuning import device_class, tuning_operation
 import tilelang
 import tilelang.language as T
 
@@ -11,7 +13,7 @@ _ROW_CONFIGS = {}
 
 
 def _config_key(x, head_size):
-    return (torch.cuda.get_device_name(x.device), x.shape, x.dtype, head_size)
+    return (device_class(x.device), x.shape, x.dtype, head_size)
 
 
 @tilelang.jit(pass_configs={"tl.enable_fast_math": False}, out_idx=[8, 9], compile_flags=["--fmad=false"])
@@ -184,7 +186,7 @@ class _Readout(torch.autograd.Function):
     def forward(ctx, x, r, k, v, r_k, weight, bias, gate, head_size, eps):
         options = (x.shape[-1], head_size, str(x.dtype).split(".")[-1])
         from ..._internal.tuning import get_config
-        group = get_config(_ROW_CONFIGS, "tmix/readout", _config_key(x, head_size), 1)
+        group = get_config(_ROW_CONFIGS, "tmix/readout", _config_key(x, head_size), 1, tune=lambda: tune_readout(x, r, k, v, r_k, weight, bias, gate, head_size, eps))
         y, stats = _forward(options[0], head_size, eps, options[2], rows_per_block=group)(
             x, r, k, v, r_k, weight, bias, gate
         )
@@ -242,12 +244,13 @@ def readout(
         output = _Readout.apply(*args, head_size, float(eps))
     else:
         from ..._internal.tuning import get_config
-        group = get_config(_ROW_CONFIGS, "tmix/readout", _config_key(args[0], head_size), 1)
+        group = get_config(_ROW_CONFIGS, "tmix/readout", _config_key(args[0], head_size), 1, tune=lambda: tune_readout(*args, head_size, eps))
         output, _ = _forward(c, head_size, float(eps), str(x.dtype).split(".")[-1], False, group)(*args)
     return output.view_as(x)
 
 
 @torch.no_grad()
+@tuning_operation
 def tune_readout(x, r, k, v, r_k, weight, bias, gate, head_size=64, eps=64e-5):
     """Measure grouped heads; each head retains one warp and its reduction tree."""
     from ..._internal.tuning import save_config, select_config

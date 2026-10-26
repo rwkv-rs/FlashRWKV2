@@ -7,6 +7,8 @@ import tilelang
 import tilelang.language as T
 import torch
 
+from ..._internal.tuning import device_class, tuning_operation
+
 from ...post_norm.tilelang import _check_inputs as _check_norm
 from ...post_norm.tilelang import _normalize, _row_layout
 
@@ -15,7 +17,7 @@ _FUSED_CONFIGS = {}
 
 
 def _config_key(x, mixes, batch):
-    return (torch.cuda.get_device_name(x.device), x.shape, len(mixes), batch)
+    return (device_class(x.device), x.shape, len(mixes), batch)
 
 
 def _pack_mixes(x, mixes, *, pack=True):
@@ -126,7 +128,7 @@ def fused_post_norm_tokenshift(x, res, weight, bias, mixes, pool, indices, statu
     if x.shape[1] % 2 == 0 and pool.data_ptr() % 4:
         raise ValueError("fused TokenShift state and parameters must be 4-byte aligned")
     from ..._internal.tuning import get_config
-    group = get_config(_FUSED_CONFIGS, "tmix/tokenshift/fused", _config_key(x, mixes, x.shape[0]), 1)
+    group = get_config(_FUSED_CONFIGS, "tmix/tokenshift/fused", _config_key(x, mixes, x.shape[0]), 1, tune=lambda: tune_fused_tokenshift(x, res, weight, bias, mixes, pool, indices, status, eps))
     # CMix reuses its pointer for the unused TMix parameter arguments.
     mix_args = mixes + (mixes[-1],) * (6 - len(mixes))
     total, output = _fused_forward(x.shape[1], len(mixes), float(eps), group)(
@@ -308,7 +310,7 @@ class _TokenShift(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, mixes, cu_seqlens, initial):
         from ..._internal.tuning import get_config
-        block = get_config(_BLOCK_CONFIGS, "tmix/tokenshift", _config_key(x, mixes, initial.shape[0]), 256)
+        block = get_config(_BLOCK_CONFIGS, "tmix/tokenshift", _config_key(x, mixes, initial.shape[0]), 256, tune=lambda: tune_tokenshift(x, mixes, cu_seqlens, initial))
         options = (x.shape[-1], mixes.shape[0], initial.shape[0], str(cu_seqlens.dtype).split(".")[-1], block)
         y, final = _forward(*options)(x, mixes, cu_seqlens, initial, cu_seqlens[:0])
         ctx.save_for_backward(x, mixes, cu_seqlens, initial)
@@ -364,7 +366,7 @@ def tokenshift(
         y, final = _TokenShift.apply(x, mixes, cu_seqlens, initial_shift)
     else:
         from ..._internal.tuning import get_config
-        block = get_config(_BLOCK_CONFIGS, "tmix/tokenshift", _config_key(x, mixes, batch), 256)
+        block = get_config(_BLOCK_CONFIGS, "tmix/tokenshift", _config_key(x, mixes, batch), 256, tune=lambda: tune_tokenshift(x, mixes, cu_seqlens, initial_shift, _status=_status))
         y, final = _forward(channels, mixes.shape[0], batch, str(cu_seqlens.dtype).split(".")[-1], block, True)(
             x, mixes, cu_seqlens, initial_shift, _status
         )
@@ -372,6 +374,7 @@ def tokenshift(
 
 
 @torch.no_grad()
+@tuning_operation
 def tune_tokenshift(x, mixes, cu_seqlens, initial_shift=None, *, _status=None):
     """Check functional/status variants and time the requested production path.
 
@@ -426,6 +429,7 @@ def tune_tokenshift(x, mixes, cu_seqlens, initial_shift=None, *, _status=None):
 
 
 @torch.no_grad()
+@tuning_operation
 def tune_fused_tokenshift(x, res, weight, bias, mixes, pool, indices, status, eps=1e-5):
     """Tune T=1 row grouping using private state, checking outputs and final slots."""
     from ..._internal.tuning import save_config, select_config

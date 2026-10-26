@@ -185,6 +185,59 @@ def infer_block(
     return fr.head_logprobs(logits, targets), logits
 
 
+@pytest.mark.parametrize("length", [1, 5])
+def test_prepare_tuning_migration_preserves_block_state_logits_and_logprobs(monkeypatch, tmp_path, length):
+    import hashlib
+    import json
+    from flashrwkv2._internal import tuning
+
+    monkeypatch.setattr(tuning, "_profile_root", lambda: tmp_path / "new")
+    monkeypatch.setattr(tuning, "_LOADED", {})
+    torch.manual_seed(736)
+    batch, channels, head_size = 2, 128, 64
+    params = parameters(channels)
+    x = torch.randn(batch * length, channels, device="cuda", dtype=torch.bfloat16) * .1
+    res = torch.randn_like(x) * .1
+    initial = torch.randn(batch, 2, 64, 64, device="cuda") * .01
+    shifts = [torch.randn(batch, channels, device="cuda", dtype=torch.bfloat16) * .1 for _ in range(2)]
+    slots = torch.arange(batch, device="cuda", dtype=torch.int32)
+    cu = slots.new_tensor([0, length, batch * length])
+    targets = torch.randint(257, (batch * length,), device="cuda")
+    state, pools = state_pools(initial, shifts, slots, batch)
+    snapshots = []
+
+    @torch.no_grad()
+    def call():
+        for target, source in zip((state._components()[0], *pools), (initial, *shifts), strict=True):
+            target.copy_(source)
+        result = infer_block(x, res, params, state, pools, cu, slots, targets, head_size, None)
+        snapshots.append(tuple(t.clone() for t in (*result, state._components()[0], *pools)))
+
+    before = fr.prepare_tuning([call], mode="inspect")
+    assert not before["complete"]
+    canonical = {"linear": (16, 64, 2, 32), "tmix/wkv_prepare": (16, 64, 2, 32),
+                 "tmix/wkv7": (64, 1), "tmix/tokenshift": 256,
+                 "tmix/tokenshift/fused": 1, "post_norm": 1, "tmix/readout": 1}
+    legacy = tmp_path / "legacy"
+    for record in before["records"]:
+        key = [record["key"][0][0], *record["key"][1:]]
+        encoded = json.dumps(key, separators=(",", ":"))
+        path = legacy / record["owner"] / (hashlib.sha256(encoded.encode()).hexdigest() + ".json")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"key": key, "config": canonical[record["owner"]], "bitwise_equal": True}))
+    prepared = fr.prepare_tuning([call], mode="tune", legacy_dir=legacy)
+    assert prepared["complete"]
+    assert prepared["counts"]["revalidated"] == len(before["records"])
+    tuning._LOADED.clear()
+    loaded = fr.prepare_tuning([call])
+    assert loaded["counts"]["hit"] == len(before["records"])
+    assert all(value.dtype == torch.float32 for value in snapshots[0][:3])
+    for actual in snapshots[1:]:
+        for value, reference in zip(actual, snapshots[0], strict=True):
+            dtype = torch.int32 if value.dtype == torch.float32 else torch.int16
+            assert torch.equal(value.view(dtype), reference.view(dtype))
+
+
 @pytest.mark.parametrize(
     "channels,head_size,vocab,length,use_vres",
     ((128, 64, 257, 17, False), (128, 64, 257, 17, True),

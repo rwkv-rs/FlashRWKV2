@@ -282,7 +282,7 @@ def load_extension() -> CompileResult:
             return _RESULT
 
         import torch
-        from torch.utils.cpp_extension import get_default_build_root
+        from ._internal.tuning import get_tuning_cache_dir
 
         root = source_root()
         capability = _capability(torch)
@@ -292,7 +292,7 @@ def load_extension() -> CompileResult:
         cache_key = hashlib.sha256(encoded).hexdigest()
         target = str(payload["target"])
         name = f"_flashrwkv2_{cache_key[:16]}"
-        cache_root = Path(get_default_build_root())
+        cache_root = get_tuning_cache_dir() / "native"
         build_dir = cache_root / name
         manifest = build_dir / "manifest.json"
         lock_path = cache_root / f".{name}.lock"

@@ -21,6 +21,8 @@ import tilelang
 import tilelang.language as T
 import torch
 
+from ..._internal.tuning import device_class, tuning_operation
+
 _CHECKPOINT = 16
 _LOG2E = 1.4426950408889634
 _EXP_NEG_HALF = 0.6065306597126334
@@ -615,7 +617,7 @@ def _bias_tensor(r, decay_bias):
 
 def _config_key(r, batch, bias, *, indexed=False, state_dtype=torch.float32):
     return (
-        torch.cuda.get_device_name(r.device),
+        device_class(r.device),
         tuple(r.shape),
         batch,
         None if bias is None else bias.dtype,
@@ -669,7 +671,18 @@ def _infer_recurrent(
     )
     from ..._internal.tuning import get_config
 
-    config = get_config(_TUNED_CONFIGS, "tmix/wkv7", _config_key(r, batch, decay_bias, indexed=True, state_dtype=state_pool.dtype), (64, 1))
+    config = (64, 1)
+    if block_values is None or prefetch_tokens is None:
+        config = get_config(
+            _TUNED_CONFIGS, "tmix/wkv7",
+            _config_key(r, batch, decay_bias, indexed=True, state_dtype=state_pool.dtype), (64, 1),
+            tune=lambda: tune_tmix_wkv7_recurrent(
+                r, decay_logits, k, v, a, b,
+                state_pool, cu_seqlens,
+                scale=scale, decay_bias=decay_bias, indexed=True,
+                state_indices=state_indices, status=status,
+            ),
+        )
     block_values = config[0] if block_values is None else block_values
     prefetch_tokens = config[1] if prefetch_tokens is None else prefetch_tokens
     _, heads, dim = r.shape
@@ -756,7 +769,15 @@ def tmix_wkv7_recurrent(
     )
     from ..._internal.tuning import get_config
 
-    config = get_config(_TUNED_CONFIGS, "tmix/wkv7", _config_key(r, batch, decay_bias), (64, 1))
+    config = (64, 1)
+    if block_values is None or prefetch_tokens is None:
+        config = get_config(
+            _TUNED_CONFIGS, "tmix/wkv7", _config_key(r, batch, decay_bias), (64, 1),
+            tune=lambda: tune_tmix_wkv7_recurrent(
+                r, decay_logits, k, v, a, b, initial_state, cu_seqlens,
+                scale=scale, decay_bias=decay_bias,
+            ),
+        )
     block_values = config[0] if block_values is None else block_values
     prefetch_tokens = config[1] if prefetch_tokens is None else prefetch_tokens
     bias = _bias_tensor(r, decay_bias)
@@ -772,6 +793,7 @@ def tmix_wkv7_recurrent(
 
 
 @torch.no_grad()
+@tuning_operation
 def tune_tmix_wkv7_recurrent(
     r,
     decay_logits,
@@ -785,6 +807,8 @@ def tune_tmix_wkv7_recurrent(
     scale=1.0,
     decay_bias=None,
     indexed=False,
+    state_indices=None,
+    status=None,
 ):
     """Check both forward variants and time the requested production mode.
 
@@ -796,6 +820,10 @@ def tune_tmix_wkv7_recurrent(
     """
     from ..._internal.tuning import save_config, select_config
 
+    if state_indices is not None:
+        if status.tolist() != [0, r.shape[0], state_indices.numel()]:
+            raise ValueError("WKV tuning requires valid fully active representative metadata for the capture shape")
+        initial_state = initial_state.index_select(0, state_indices.long())
     if initial_state.dtype == torch.float16 and not indexed:
         raise ValueError("FP16 state is inference-only; tuning requires indexed=True")
 

@@ -53,7 +53,7 @@ def test_recurrent_tuning_rejects_indexed_only_errors(monkeypatch, indexed, faul
     monkeypatch.setattr(implementation, "tmix_wkv7_recurrent", functional)
     monkeypatch.setattr(implementation, "_infer_recurrent", inference)
     monkeypatch.setattr(implementation, "_TUNED_CONFIGS", {})
-    monkeypatch.setattr(torch.cuda, "get_device_name", lambda device: "cpu-test")
+    monkeypatch.setattr(implementation, "device_class", lambda device: "cpu-test")
     monkeypatch.setattr(tuning, "select_config", select_config)
     monkeypatch.setattr(tuning, "save_config", lambda *args: None)
     result = implementation.tune_tmix_wkv7_recurrent(*values, initial, cu, indexed=indexed)
@@ -65,7 +65,7 @@ def test_recurrent_tuning_rejects_indexed_only_errors(monkeypatch, indexed, faul
     }
 
 
-def test_recurrent_tuning_and_dispatch_keep_mode_caches_separate(monkeypatch):
+def test_recurrent_tuning_and_dispatch_keep_mode_caches_separate(monkeypatch, tmp_path):
     from flashrwkv2._internal import tuning
     from flashrwkv2.tmix.wkv7 import tilelang as implementation
 
@@ -99,9 +99,10 @@ def test_recurrent_tuning_and_dispatch_keep_mode_caches_separate(monkeypatch):
     monkeypatch.setattr(implementation, "_forward_kernel", forward_kernel)
     monkeypatch.setattr(implementation, "_check_inputs", lambda *args, **kwargs: None)
     monkeypatch.setattr(implementation, "_TUNED_CONFIGS", {})
-    monkeypatch.setattr(torch.cuda, "get_device_name", lambda device: "cpu-test")
+    monkeypatch.setattr(implementation, "device_class", lambda device: "cpu-test")
     monkeypatch.setattr(tuning, "select_config", select_config)
-    monkeypatch.setattr(tuning, "save_config", lambda *args: None)
+    monkeypatch.setattr(tuning, "_profile_root", lambda: tmp_path)
+    monkeypatch.setattr(tuning, "_LOADED", {})
     for indexed in (False, True):
         implementation.tune_tmix_wkv7_recurrent(*values, initial, cu, indexed=indexed)
     assert timed == [(False, 64, 4), (True, 32, 1)]

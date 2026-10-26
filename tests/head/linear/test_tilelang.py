@@ -210,7 +210,7 @@ def test_tilelang_linear_tuning_checks_production_and_skips_compile_failures(
     monkeypatch.setattr(torch.cuda, "get_device_name", lambda device: "test")
     monkeypatch.setattr(
         torch.cuda, "get_device_properties",
-        lambda device: SimpleNamespace(shared_memory_per_block_optin=101376),
+        lambda device: SimpleNamespace(name="test", major=12, minor=0, multi_processor_count=128, shared_memory_per_block_optin=101376),
     )
     monkeypatch.setattr(tuning, "select_config", select_config)
     monkeypatch.setattr(tuning, "save_config", lambda *args: None)
@@ -269,7 +269,7 @@ def test_verified_projection_profile_is_used_in_a_fresh_process(monkeypatch, tmp
     from flashrwkv2._internal import tuning
 
     monkeypatch.setattr(tuning, "_profile_root", lambda: tmp_path)
-    key = ("profile-test-gpu", 17, 96, 128, (128, 1), torch.bfloat16, None)
+    key = (("profile-test-gpu", 8, 9, 128), 17, 96, 128, (128, 1), torch.bfloat16, None)
     config = (32, 32, 2, 64)
     tuning.save_config("linear", key, config)
     subprocess.run(
@@ -279,7 +279,7 @@ from pathlib import Path
 import torch
 from flashrwkv2._internal import linear, tuning
 tuning._profile_root = lambda: Path(sys.argv[1])
-torch.cuda.get_device_name = lambda device: 'profile-test-gpu'
+linear.device_class = lambda device: ('profile-test-gpu', 8, 9, 128)
 torch.cuda.get_device_capability = lambda device: (8, 9)
 def compiled(outputs, channels, dtype, bias_dtype, has_bias, config, *args):
     assert config == (32, 32, 2, 64), config
@@ -289,42 +289,43 @@ x = torch.ones(17, 128, dtype=torch.bfloat16)
 w = torch.ones(96, 128, dtype=torch.bfloat16)
 assert linear._forward(x, w, None, torch.bfloat16).shape == (17, 96)
 """, str(tmp_path)],
-        check=True,
+        check=True, timeout=30,
     )
-    tuning._read_profile.cache_clear()
 
 
 def test_tuning_profiles_relocate_and_invalidate_with_source_changes(monkeypatch, tmp_path):
     import shutil
-
     from flashrwkv2._internal import tuning
 
     package = tmp_path / "package"
     (package / "_internal").mkdir(parents=True)
-    source = package / "operator.py"
+    source = package / "_internal" / "linear.py"
     source.write_text("scale = 1\n")
     monkeypatch.setattr(tuning, "__file__", str(package / "_internal" / "tuning.py"))
-    monkeypatch.setattr(torch.hub, "get_dir", lambda: str(tmp_path / "torch" / "hub"))
+    monkeypatch.setenv("FLASHRWKV2_CACHE_DIR", str(tmp_path / "cache"))
+    tuning.get_tuning_cache_dir.cache_clear()
     tuning._profile_root.cache_clear()
-    tuning._read_profile.cache_clear()
+    tuning._fingerprint.cache_clear()
     key = ("profile-test-gpu", 320, 4096)
     try:
-        tuning.save_config("tmix/wkv_prepare", key, (256, 64, 2, 32))
-        assert tuning.get_config({}, "tmix/wkv_prepare", key) == (256, 64, 2, 32)
+        tuning.save_config("linear", key, (256, 64, 2, 32))
+        original = tuning._fingerprint("linear")
         installed = tmp_path / "installed-package"
         shutil.copytree(package, installed)
         monkeypatch.setattr(tuning, "__file__", str(installed / "_internal" / "tuning.py"))
-        tuning._profile_root.cache_clear()
-        tuning._read_profile.cache_clear()
-        assert tuning.get_config({}, "tmix/wkv_prepare", key) == (256, 64, 2, 32)
-        source = installed / "operator.py"
-        source.write_text("scale = 2\n")
-        tuning._profile_root.cache_clear()
-        tuning._read_profile.cache_clear()
-        assert tuning.get_config({}, "tmix/wkv_prepare", key) is None
+        (installed / "unrelated.py").write_text("scale = 42\n")
+        (installed / "_internal" / "linear.py").write_text('# comment\n"documentation"\nscale = 1\n')
+        tuning._fingerprint.cache_clear()
+        assert tuning._fingerprint("linear") == original
+        assert tuning._read_profile("linear", tuning._encode(key)) == (256, 64, 2, 32)
+        (installed / "_internal" / "linear.py").write_text("scale = 2\n")
+        tuning._fingerprint.cache_clear()
+        assert tuning._fingerprint("linear") != original
+        assert tuning._read_profile("linear", tuning._encode(key)) is None
     finally:
+        tuning.get_tuning_cache_dir.cache_clear()
         tuning._profile_root.cache_clear()
-        tuning._read_profile.cache_clear()
+        tuning._fingerprint.cache_clear()
 
 
 def test_unverified_tuning_profile_cannot_select_a_kernel(monkeypatch, tmp_path):
@@ -338,12 +339,8 @@ def test_unverified_tuning_profile_cannot_select_a_kernel(monkeypatch, tmp_path)
     path = tuning._profile_path("linear", encoded)
     path.parent.mkdir(parents=True)
     path.write_text(json.dumps({"key": json.loads(encoded), "config": [256, 64, 2, 64]}))
-    tuning._read_profile.cache_clear()
-    try:
-        with pytest.raises(ValueError, match="verified kernel tuning profile"):
-            tuning.get_config({}, "linear", key)
-    finally:
-        tuning._read_profile.cache_clear()
+    with pytest.raises(ValueError, match="verified kernel tuning profile"):
+        tuning.get_config({}, "linear", key)
 
 
 def test_tilelang_precompile_reuses_successes_and_preserves_compile_errors(monkeypatch):

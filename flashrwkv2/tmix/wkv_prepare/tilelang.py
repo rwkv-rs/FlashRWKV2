@@ -6,6 +6,8 @@ import tilelang.language as T
 import torch
 from torch.autograd.function import once_differentiable
 
+from ..._internal.tuning import device_class, tuning_operation
+
 from ..._internal.elementwise import _activation_kernel, activation, sum_partials
 from ..._internal.linear import _aligned, _forward, adapter_linear, linear_input_vjp
 from ..kk_pre.tilelang import prepare as prepare_key
@@ -378,7 +380,7 @@ _GROUP_CONFIGS = {}
 
 def _group_key(xs, weights, kinds, biases):
     return (
-        torch.cuda.get_device_name(xs[0].device),
+        device_class(xs[0].device),
         xs[0].shape[0],
         tuple(x.shape[1] for x in xs),
         tuple(w.shape for w in weights),
@@ -441,7 +443,7 @@ def _group_call(xs, weights, kinds, biases, raw_mode, config):
     if config is None:
         from ..._internal.tuning import get_config
 
-        config = get_config(_GROUP_CONFIGS, "tmix/wkv_prepare", _group_key(xs, weights, kinds, biases))
+        config = get_config(_GROUP_CONFIGS, "tmix/wkv_prepare", _group_key(xs, weights, kinds, biases), tune=lambda: _tune_grouped_linear(xs, weights, kinds, biases))
         if config is None:
             narrow = max(w.shape[0] for w in weights) <= 128
             copy_k = next(
@@ -612,9 +614,10 @@ def _grouped_linear(xs, weights, kinds, biases):
 
 
 @torch.no_grad()
+@tuning_operation
 def _tune_grouped_linear(xs, weights, kinds, biases, *, benchmark=None):
     """Verify independent FP32 accumulators and BF16 epilogues before timing."""
-    from ..._internal.tuning import compile_candidates, projection_finalists, save_config, select_config
+    from ..._internal.tuning import compile_candidates, projection_finalists, revalidation_config, save_config, select_config
 
     xs, weights, biases = _group_inputs(xs, weights, biases)
     cache_key = _group_key(xs, weights, kinds, biases)
@@ -652,6 +655,12 @@ def _tune_grouped_linear(xs, weights, kinds, biases, *, benchmark=None):
             result.append(value.view(torch.int32))
             position += size
         return tuple(result)
+
+    imported = revalidation_config()
+    if imported is not None:
+        best, checked = select_config((imported,), run, check=check, reference=reference)
+        save_config("tmix/wkv_prepare", cache_key, best)
+        return {"config": best, "candidates": checked}
 
     rows = xs[0].shape[0]
     narrow = max(weight.shape[0] for weight in weights) <= 128

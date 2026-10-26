@@ -14,7 +14,7 @@ training. The default FP32-state path retains training precision and parity.
 ## Requirements
 
 - Python 3.10 or newer
-- Linux, a writable PyTorch extension cache, and a CUDA GPU with Compute
+- Linux, a writable FlashRWKV2 cache, and a CUDA GPU with Compute
   Capability 8.0 or newer
 - A system CUDA Toolkit compatible with PyTorch, a compatible host compiler,
   and Ninja
@@ -93,6 +93,36 @@ script and seed for both revisions; emitted JSON records their actual precision.
 `--timing-mode eager` measures dispatch wall time and `graph` measures a captured
 batch with CUDA events. Compare the two timing modes separately. PostNorm,
 TokenShift and Readout benchmarks also expose `--tune`.
+Verified profiles and native builds use `~/.cache/flashrwkv2`, independent of
+`TORCH_HOME`, `XDG_CACHE_HOME`, virtual environments and release directories.
+Set `FLASHRWKV2_CACHE_DIR` before importing FlashRWKV2 to explicitly relocate it.
+TileLang manages its compiled-kernel cache separately. Native extension cache
+hits describe metadata and sampling, while model tuning coverage is checked by
+running representative calls through the public preparation API:
+
+```python
+from flashrwkv2 import prepare_tuning
+
+# Each callable uses valid metadata and disposable/reset model state.
+# Include every prefill/decode shape, graph batch and weight layout in service.
+report = prepare_tuning(warmup_calls, mode="inspect")
+report = prepare_tuning(warmup_calls, mode="tune")  # only missing keys
+report = prepare_tuning(warmup_calls, mode="require")  # before graph capture
+```
+
+`inspect` reports exact dispatch coverage; `require` loads verified selections
+and fails on missing keys; `tune` verifies output/state before timing candidates.
+The report includes each owner, device class, full key, source fingerprint,
+selected configuration and profile path. Same-model GPUs with the same SM count
+reuse selections across GPU ordinals. Concurrent preparation serializes each
+missing key and rechecks after taking its lock. Ordinary forwards warn about
+untuned defaults and never start tuning. A previously missing file is rechecked
+on later eager calls; existing CUDA Graphs must be recaptured after preparation.
+To migrate a legacy namespace, pass its full directory as `legacy_dir` with
+`mode="tune"`: matching configurations are revalidated on current inputs without
+benchmarking, while missing shapes are tuned normally. See the
+[tuning contract](docs/kernel_api.md#tuning-and-acceptance) for compatibility,
+state ownership and deployment examples.
 The historical [0.1.0a9 performance report](docs/performance/wkv7-0.1.0a9.md)
 describes that release's implementation; current results must identify the
 revision, hardware, shapes, and numerical contract.

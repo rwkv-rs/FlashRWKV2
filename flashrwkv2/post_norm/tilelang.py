@@ -4,6 +4,8 @@
 import math
 
 import torch
+
+from .._internal.tuning import device_class, tuning_operation
 import tilelang
 import tilelang.language as T
 
@@ -11,7 +13,7 @@ _ROW_CONFIGS = {}
 
 
 def _config_key(x, has_res):
-    return (torch.cuda.get_device_name(x.device), x.shape, has_res)
+    return (device_class(x.device), x.shape, has_res)
 
 
 def _row_layout(channels, rows_per_block):
@@ -178,7 +180,7 @@ class _Norm(torch.autograd.Function):
     def forward(ctx, x, weight, bias, res, eps):
         total = torch.empty_like(x) if res is not None else x
         from .._internal.tuning import get_config
-        rows_per_block = get_config(_ROW_CONFIGS, "post_norm", _config_key(x, res is not None), 1)
+        rows_per_block = get_config(_ROW_CONFIGS, "post_norm", _config_key(x, res is not None), 1, tune=lambda: tune_norm(x, weight, bias, eps, res))
         y, mean, rstd = _forward(x.shape[-1], eps, res is not None, rows_per_block=rows_per_block)(
             x, res if res is not None else x, weight, bias, total
         )
@@ -248,7 +250,7 @@ def norm(
         total = torch.empty_like(flat) if store_res else flat
         buffer = total if store_res else flat.new_empty((0, x.shape[-1]))
         from .._internal.tuning import get_config
-        rows_per_block = get_config(_ROW_CONFIGS, "post_norm", _config_key(flat, res is not None), 1)
+        rows_per_block = get_config(_ROW_CONFIGS, "post_norm", _config_key(flat, res is not None), 1, tune=lambda: tune_norm(x, weight, bias, eps, res))
         y, _, _ = _forward(x.shape[-1], float(eps), res is not None, False, store_res, rows_per_block)(
             flat, flat_res if flat_res is not None else flat, weight, bias, buffer
         )
@@ -256,6 +258,7 @@ def norm(
 
 
 @torch.no_grad()
+@tuning_operation
 def tune_norm(x, weight, bias, eps=1e-5, res=None):
     """Select row grouping while preserving the canonical per-row FP32 tree."""
     from .._internal.tuning import save_config, select_config

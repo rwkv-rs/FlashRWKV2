@@ -13,6 +13,8 @@ from numbers import Real
 import torch
 from torch.autograd.function import once_differentiable
 
+from .tuning import device_class, tuning_operation
+
 _PASS_CONFIG = {"tl.disable_wgmma": True, "tl.enable_fast_math": False}
 _DEFAULT_CONFIG = (16, 64, 2, 32)
 _TUNED_CONFIGS = {}
@@ -165,7 +167,7 @@ def _dtype_name(dtype):
 
 def _key(x, weight, output_dtype, bias=None):
     return (
-        torch.cuda.get_device_name(x.device),
+        device_class(x.device),
         x.shape[0],
         weight.shape[0],
         x.shape[1],
@@ -187,7 +189,7 @@ def _forward(x, weight, bias, output_dtype, config=None):
     if config is None:
         from .tuning import get_config
 
-        config = get_config(_TUNED_CONFIGS, "linear", _key(x, weight, output_dtype, bias))
+        config = get_config(_TUNED_CONFIGS, "linear", _key(x, weight, output_dtype, bias), tune=lambda: tune_linear(x, weight, output_dtype, bias=bias))
         if config is None:
             block_m = 16
             if x.shape[0] > 16:
@@ -518,6 +520,7 @@ def adapter_linear(
 
 
 @torch.no_grad()
+@tuning_operation
 def tune_linear(x, weight, output_dtype=None, *, bias=None, benchmark=None):
     """Measure output tiles without changing the canonical MMA reduction.
 
@@ -528,7 +531,7 @@ def tune_linear(x, weight, output_dtype=None, *, bias=None, benchmark=None):
     ``benchmark`` measures the owning forward operator with each candidate in
     its dispatch cache, preserving the operator's working set during tuning.
     """
-    from .tuning import projection_finalists, save_config, select_config
+    from .tuning import projection_finalists, revalidation_config, save_config, select_config
 
     output_dtype = torch.bfloat16 if output_dtype is None else output_dtype
     linear(x, weight, bias, output_dtype)
@@ -571,6 +574,16 @@ def tune_linear(x, weight, output_dtype=None, *, bias=None, benchmark=None):
             return _forward(x, weight, bias, output_dtype, config)
         _TUNED_CONFIGS[_key(x, weight, output_dtype, bias)] = config
         return benchmark()
+
+    imported = revalidation_config()
+    if imported is not None:
+        best_config, checked = select_config(
+            (imported,), run,
+            check=lambda config: tuple(_forward(x, weight, bias, dtype, config) for dtype in check_dtypes),
+            reference=reference,
+        )
+        save_config("linear", _key(x, weight, output_dtype, bias), best_config)
+        return {"config": best_config, "candidates": checked}
 
     for phase in ("tiles", "copies"):
         if phase == "copies":
