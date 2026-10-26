@@ -107,9 +107,7 @@ initial 20-minute target for a single-owner change, excluding queue time.
 
 Successful results and original distributions share one 90-day artifact bundle.
 Identical source trees can reuse CPU results and individual GPU version results
-when the policy, environment, and requested coverage match. Scheduled runs also
-skip unchanged validation and package inputs after checking the active
-environment; their summaries reference the original full run. A full run can add
+when the policy, environment, and complete collected test scope match. A full run can add
 missing compatibility or cold-build checks to an existing bundle. Validation
 never combines module coverage from different source revisions.
 
@@ -121,7 +119,7 @@ publishes those original files. Its manual `tag` input verifies acceptance
 without publishing.
 
 RTX4090 acceptance is independent. On its checkout of the same tag, download
-the PRO6000 `flashrwkv2-quality-v6-<source-tree>` artifact to
+the PRO6000 `flashrwkv2-quality-v7-<source-tree>` artifact to
 `artifacts/acceptance`. Use the project `.venv`, with the default Torch version,
 and the wheel from that bundle. With read access to Actions available through
 `GH_TOKEN`, the existing CI entrypoints produce the independent reports:

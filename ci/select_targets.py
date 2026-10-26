@@ -40,7 +40,9 @@ SHARED_FILES = {"setup.py", *RELEASE_METADATA_FILES}
 SHARED_PREFIXES = ("csrc/bindings.cpp", "csrc/registration.cpp", "csrc/validation")
 # Edges point from a provider to every semantic consumer, not directory parents.
 MODULE_CONSUMERS = {
-    "post_norm": ("cmix", "tmix/tokenshift"),
+    "post_norm": ("embedding", "cmix", "tmix/tokenshift"),
+    "tmix/tokenshift": ("cmix",),
+    "loss/l2wrap_ce": ("head/l2wrap_ce",),
     "head/linear": ("head/l2wrap_ce",),
     "tmix/kk_pre": ("tmix/wkv_prepare",),
     "tmix/vres_gate": ("tmix/wkv_prepare",),
@@ -73,20 +75,27 @@ SHARED_PRIMITIVE_CALLERS = {
     ),
     "flashrwkv2/_internal/elementwise.py": (
         "cmix",
+        "post_norm",
+        "tmix/readout",
+        "tmix/tokenshift",
         "tmix/a_gate",
         "tmix/kk_pre",
         "tmix/vres_gate",
         "tmix/wkv_prepare",
     ),
-    "flashrwkv2/_internal/state.py": ("cmix", "tmix/tokenshift", "tmix/wkv7"),
+    "flashrwkv2/_internal/state.py": (
+        "cmix",
+        "tmix/tokenshift",
+        "tmix/wkv7",
+        "head/l2wrap_ce",
+        "loss/l2wrap_ce",
+    ),
     "flashrwkv2/_internal/logprob.py": (
         "head/linear",
         "head/l2wrap_ce",
         "loss/l2wrap_ce",
     ),
-    "flashrwkv2/_internal/tuning.py": tuple(
-        module for module in MODULES if module != "sampling"
-    ),
+    "flashrwkv2/_internal/tuning.py": MODULES,
 }
 DOC_PREFIXES = ("docs/",)
 DOC_FILES = {
@@ -471,6 +480,7 @@ def _self_test() -> None:
     assert not classify(["benchmarks/cmix/bench.py"]).run_all
     assert set(classify(["flashrwkv2/post_norm/tilelang.py"]).affected_modules) == {
         "post_norm",
+        "embedding",
         "cmix",
         "tmix/tokenshift",
     }

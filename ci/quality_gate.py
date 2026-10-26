@@ -10,6 +10,7 @@ import io
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -20,7 +21,10 @@ import urllib.parse
 import urllib.request
 import zipfile
 from dataclasses import asdict, replace
+from email.parser import BytesParser
 from pathlib import Path
+
+import tomllib
 
 # Isolated Python execution must expose CI helpers, never the checkout package.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -33,8 +37,9 @@ from select_targets import (
 )
 
 ROOT = Path(__file__).resolve().parents[1]
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 PRIMARY_TORCH = "2.14.1"
+TILELANG_VERSION = "0.1.15"
 TORCH_VERSIONS = (PRIMARY_TORCH, "2.13.0", "2.11.0", "2.12.0")
 BUILD_INPUT_PATHS = (
     "setup.py",
@@ -126,7 +131,6 @@ def build_plan(
     mode="incremental",
     extended=False,
     target="sm120",
-    scheduled=False,
 ) -> dict:
     changed = _git_changed_files(base_sha, head_sha)
     impact = classify(
@@ -151,7 +155,6 @@ def build_plan(
         "schema_version": SCHEMA_VERSION,
         "mode": mode,
         "extended": extended,
-        "scheduled": scheduled,
         "target": target,
         "base_sha": base_sha,
         "head_sha": head_sha,
@@ -209,8 +212,15 @@ def verify_package(directory: Path) -> dict:
     artifacts = package_artifacts(directory)
     wheel = next(directory.rglob("*.whl"))
     sdist = next(directory.rglob("*.tar.gz"))
-    if not wheel.name.endswith("-py3-none-any.whl"):
-        raise ValueError("expected a universal source wheel")
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]
+    version = project["version"]
+    if (
+        wheel.name != f"flashrwkv2-{version}-py3-none-any.whl"
+        or sdist.name != f"flashrwkv2-{version}.tar.gz"
+    ):
+        raise ValueError(
+            "source distribution filenames do not match the project version"
+        )
     python_sources = {
         p.relative_to(ROOT).as_posix(): p.read_bytes()
         for p in (ROOT / "flashrwkv2").rglob("*.py")
@@ -220,6 +230,22 @@ def verify_package(directory: Path) -> dict:
         for p in (ROOT / "csrc").rglob("*")
         if p.is_file()
     }
+    architectures = {
+        name.split("/", 1)[0]
+        for name in native_sources
+        if re.fullmatch(r"sm\d+", name.split("/", 1)[0])
+    }
+    if architectures != {"sm80"}:
+        raise ValueError("native sources must use the single sm80 source tree")
+
+    def verify_metadata(data):
+        metadata = BytesParser().parsebytes(data)
+        if (
+            re.sub(r"[-_.]+", "-", metadata["Name"]).lower() != "flashrwkv2"
+            or metadata["Version"] != version
+        ):
+            raise ValueError("source distribution metadata does not match the project")
+
     with zipfile.ZipFile(wheel) as archive:
         expected = {
             **python_sources,
@@ -229,6 +255,12 @@ def verify_package(directory: Path) -> dict:
             },
         }
         names = archive.namelist()
+        metadata_names = [
+            name for name in names if name.endswith(".dist-info/METADATA")
+        ]
+        if len(metadata_names) != 1:
+            raise ValueError("wheel must contain one package metadata record")
+        verify_metadata(archive.read(metadata_names[0]))
         if any(name.endswith((".so", ".dll", ".pyd")) for name in names):
             raise ValueError("wheel contains a compiled extension")
         for name, data in expected.items():
@@ -243,6 +275,7 @@ def verify_package(directory: Path) -> dict:
             raise ValueError("wheel includes unexpected package sources")
     with tarfile.open(sdist) as archive:
         prefix = sdist.name.removesuffix(".tar.gz")
+        verify_metadata(archive.extractfile(f"{prefix}/PKG-INFO").read())
         expected = {
             **python_sources,
             **{f"csrc/{name}": data for name, data in native_sources.items()},
@@ -255,6 +288,20 @@ def verify_package(directory: Path) -> dict:
         for name, data in expected.items():
             if archive.extractfile(f"{prefix}/{name}").read() != data:
                 raise ValueError(f"sdist source mismatch: {name}")
+        packaged_sources = {
+            member.name.removeprefix(prefix + "/")
+            for member in archive.getmembers()
+            if member.isfile()
+            and (
+                member.name.startswith(prefix + "/csrc/")
+                or (
+                    member.name.startswith(prefix + "/flashrwkv2/")
+                    and member.name.endswith(".py")
+                )
+            )
+        }
+        if packaged_sources != set(expected):
+            raise ValueError("sdist includes unexpected package sources")
     return {"status": "passed", "artifacts": artifacts}
 
 
@@ -286,7 +333,7 @@ def environment(target: str) -> dict:
         raise ValueError("CUDA is required for GPU validation")
     capability = torch.cuda.get_device_capability()
     actual_target = f"sm{capability[0]}{capability[1]}"
-    if actual_target != target:
+    if target != "auto" and actual_target != target:
         raise ValueError(f"expected {target}, found {actual_target}")
 
     def command(*args):
@@ -321,12 +368,56 @@ def _environment_identity(value: dict) -> dict:
     return {key: item for key, item in value.items() if key != "package_path"}
 
 
+SUITE_MARKERS = {
+    "cpu": "not cuda and not resource",
+    "correctness": "cuda or resource",
+    "memcheck": "cuda and memcheck",
+    "racecheck": "cuda and racecheck",
+    "compatibility": "cuda",
+}
+
+
+def _suite_paths(plan: dict, suite: str) -> list[str]:
+    if suite == "cpu":
+        return ["tests"]
+    return list(COMPATIBILITY_PATHS) if suite == "compatibility" else plan["test_paths"]
+
+
+def _paths_cover(recorded: list[str], requested: list[str]) -> bool:
+    return all(
+        any(path == parent or path.startswith(parent + "/") for parent in recorded)
+        for path in requested
+    )
+
+
+def _selected_for_suite(nodeid: str, markers: list[str], suite: str) -> bool:
+    cuda, resource = "cuda" in markers, "resource" in markers
+    if suite == "cpu":
+        return not cuda and not resource
+    if suite == "correctness":
+        return cuda or resource
+    if suite in {"memcheck", "racecheck"}:
+        return cuda and suite in markers
+    if suite == "compatibility":
+        return cuda and any(
+            word in nodeid.lower() for word in COMPATIBILITY_KEYWORDS.split(" or ")
+        )
+    raise ValueError(f"unknown test suite: {suite}")
+
+
 class TestRecorder:
-    """Record the collection and every execution phase in the same pytest process."""
+    """Capture collection before pytest applies marker/keyword deselection."""
 
     def __init__(self):
+        self.collected = {}
         self.selected = {}
         self.reports = {}
+
+    def pytest_collection_modifyitems(self, items):
+        self.collected = {
+            item.nodeid: sorted({mark.name for mark in item.iter_markers()})
+            for item in items
+        }
 
     def pytest_collection_finish(self, session):
         self.selected = {
@@ -343,28 +434,74 @@ class TestRecorder:
 
 
 def validate_test_result(result: dict, *, allow_empty=False) -> None:
-    selected, reports = result["selected"], result["reports"]
+    collected, selected, reports = (
+        result["collected"],
+        result["selected"],
+        result["reports"],
+    )
+    if not collected:
+        raise ValueError("required test collection is empty")
+    if any(
+        not _paths_cover(result["paths"], [nodeid.split("::")[0]])
+        for nodeid in collected
+    ):
+        raise ValueError("test collection is outside the recorded scope")
+    expected = {
+        nodeid: markers
+        for nodeid, markers in collected.items()
+        if _selected_for_suite(nodeid, markers, result["suite"])
+    }
+    if selected != expected:
+        raise ValueError("selected tests do not cover the complete collected suite")
     if not selected:
-        if allow_empty and result["exit_code"] == 5 and not reports:
+        if (
+            allow_empty
+            and result["status"] == "not-required"
+            and result["exit_code"] == 5
+            and not reports
+        ):
             return
         raise ValueError("required test selection is empty")
-    if result["exit_code"] != 0 or set(selected) != set(reports):
+    if (
+        result["status"] != "passed"
+        or result["exit_code"] != 0
+        or set(selected) != set(reports)
+    ):
         raise ValueError("test execution failed or selected tests were not executed")
     for nodeid, phases in reports.items():
+        if set(phases) != {"setup", "call", "teardown"}:
+            raise ValueError(f"test execution is incomplete: {nodeid}")
         allowed_skip = (
             result["environment"].get("target") == "sm89"
             and nodeid == "tests/sampling/test.py::test_sampling_resource_usage"
-            and "resource gate requires the SM120 backend"
-            in phases.get("call", {}).get("reason", "")
+            and phases["setup"]["outcome"] == phases["teardown"]["outcome"] == "passed"
+            and phases["call"]["outcome"] == "skipped"
+            and "resource gate requires the SM120 backend" in phases["call"]["reason"]
         )
-        if allowed_skip and all(
-            phase["outcome"] != "failed" for phase in phases.values()
-        ):
-            continue
-        if set(phases) != {"setup", "call", "teardown"} or any(
+        if not allowed_skip and any(
             phase["outcome"] != "passed" for phase in phases.values()
         ):
             raise ValueError(f"test did not complete successfully: {nodeid}")
+
+
+def _validate_result_identity(result: dict, plan: dict, suite: str) -> None:
+    for key in (
+        "schema_version",
+        "source_tree_sha",
+        "validation_input_hash",
+        "policy_hash",
+    ):
+        if result[key] != plan[key]:
+            raise ValueError(f"test result {key} mismatch")
+    if suite == "cpu" and (
+        result["environment"].get("target") != "cpu"
+        or result["wheel_sha256"] is not None
+    ):
+        raise ValueError("CPU contracts must identify source execution")
+    if result["suite"] != suite or not _paths_cover(
+        result["paths"], _suite_paths(plan, suite)
+    ):
+        raise ValueError("test result does not cover the requested suite and paths")
 
 
 def run_tests(
@@ -380,7 +517,7 @@ def run_tests(
     if suite == "cpu" and reuse and reuse.is_file():
         previous = _read_json(reuse)
         if (
-            (reuse_identity(previous, plan) or scheduled_equivalent(previous, plan))
+            reuse_identity(previous, plan)
             and previous.get("cpu")
             and previous["cpu"]["environment"] == env
         ):
@@ -390,16 +527,7 @@ def run_tests(
                 flush=True,
             )
             return 0
-    marker = {
-        "cpu": "not cuda and not resource",
-        "correctness": "cuda or resource",
-        "memcheck": "cuda and memcheck",
-        "racecheck": "cuda and racecheck",
-        "compatibility": "cuda",
-    }[suite]
-    paths = ["tests"] if suite == "cpu" else plan["test_paths"]
-    if suite == "compatibility":
-        paths = list(COMPATIBILITY_PATHS)
+    paths = _suite_paths(plan, suite)
     # -I plus an explicit pytest pythonpath prevents checkout shadowing.
     pythonpath = [str(ROOT / "tests")]
     if suite == "cpu":
@@ -415,12 +543,13 @@ def run_tests(
         "pythonpath=" + " ".join(pythonpath),
         "--durations=20",
         "-m",
-        marker,
+        SUITE_MARKERS[suite],
         f"--junitxml={output.with_suffix('.xml')}",
         *[str(ROOT / path) for path in paths],
     ]
     if suite == "compatibility":
         args += ["-k", COMPATIBILITY_KEYWORDS]
+    pytest.hookimpl(tryfirst=True)(TestRecorder.pytest_collection_modifyitems)
     recorder = TestRecorder()
     started = time.monotonic()
     code = int(pytest.main(args, plugins=[recorder]))
@@ -428,7 +557,11 @@ def run_tests(
         "schema_version": SCHEMA_VERSION,
         "plan_hash": plan["plan_hash"],
         "source_tree_sha": plan["source_tree_sha"],
+        "validation_input_hash": plan["validation_input_hash"],
+        "policy_hash": plan["policy_hash"],
         "suite": suite,
+        "paths": paths,
+        "collected": recorder.collected,
         "environment": env,
         "wheel_sha256": package_artifacts(package)["wheel"]["sha256"]
         if package
@@ -437,11 +570,13 @@ def run_tests(
         "reports": recorder.reports,
         "exit_code": code,
         "seconds": time.monotonic() - started,
-        "status": "failed",
+        "status": "passed" if code == 0 else "not-required" if code == 5 else "failed",
     }
     try:
         validate_test_result(result, allow_empty=suite in {"memcheck", "racecheck"})
-        result["status"] = "passed" if recorder.selected else "not-required"
+    except ValueError:
+        result["status"] = "failed"
+        raise
     finally:
         _write_json(output, result)
     return 0
@@ -555,21 +690,16 @@ def run_gpu(
                 text=True,
                 timeout=30,
             ).stdout
-            targets = {
-                word.strip(".:")
-                for word in listing.replace(".", " ").split()
-                if word.startswith("sm_")
+            targets = sorted({f"sm{cc}" for cc in re.findall(r"\bsm_(\d+)\b", listing)})
+            if targets != [plan["target"]]:
+                raise ValueError(f"runtime library target mismatch: {targets}")
+            compile_result = {
+                "first": first,
+                "second": second,
+                "native_targets": targets,
             }
-            if f"sm_{plan['target'][2:]}" not in listing or any(
-                f"sm_{cc}" in listing
-                for cc in (80, 89, 90, 120)
-                if f"sm{cc}" != plan["target"]
-            ):
-                raise ValueError(
-                    f"runtime library does not exclusively target {plan['target']}: {targets}"
-                )
-            _write_json(current / "compile.json", {"first": first, "second": second})
-        compile_seconds = time.monotonic() - compile_started
+        compile_result["seconds"] = time.monotonic() - compile_started
+        _write_json(current / "compile.json", compile_result)
         if reuse_suites:
             suite_results = old["suites"]
         else:
@@ -612,18 +742,11 @@ def run_gpu(
                 "reused_suites": reuse_suites,
                 "environment": env,
                 "cold_cache": plan["cold_cache"],
-                "compile": {
-                    "status": "passed",
-                    "cache_key": second["cache_key"],
-                    "seconds": compile_seconds,
-                },
+                "compile": compile_result,
                 "suites": suite_results,
             }
         )
-    result = {"gpu": reports}
-    if previous and scheduled_equivalent(previous, plan):
-        result["reference"] = previous
-    _write_json(output / "gpu.json", result)
+    _write_json(output / "gpu.json", {"gpu": reports})
 
 
 def _validate_gpu(rows: list[dict], plan: dict, artifacts: dict) -> None:
@@ -640,18 +763,32 @@ def _validate_gpu(rows: list[dict], plan: dict, artifacts: dict) -> None:
             or row["environment"]["torch"].split("+")[0] != version
         ):
             raise ValueError("GPU environment identity mismatch")
-        if row["compile"]["status"] != "passed" or (
-            plan["cold_cache"] and not row["cold_cache"]
+        if row["environment"]["tilelang"] != TILELANG_VERSION:
+            raise ValueError("GPU TileLang version mismatch")
+        compiled = row["compile"]
+        first, second = compiled["first"], compiled["second"]
+        if (
+            first["status"] not in {"compiled", "cached"}
+            or second["status"] != "cached"
+            or first["target"] != plan["target"]
+            or second["target"] != plan["target"]
+            or first["cache_key"] != second["cache_key"]
+            or compiled["native_targets"] != [plan["target"]]
+            or (
+                plan["cold_cache"]
+                and (not row["cold_cache"] or first["status"] != "compiled")
+            )
         ):
-            raise ValueError("runtime build validation is missing")
+            raise ValueError("runtime build/cache evidence is missing or inconsistent")
         suites = {suite["suite"]: suite for suite in row["suites"]}
         required = {"correctness"} if version == PRIMARY_TORCH else {"compatibility"}
         if version == PRIMARY_TORCH and plan["impact"]["run_sanitizer"]:
             required |= {"memcheck", "racecheck"}
-        if not required <= suites.keys():
+        if len(suites) != len(row["suites"]) or not required <= suites.keys():
             raise ValueError("required GPU suite is missing")
         for name in required:
             result = suites[name]
+            _validate_result_identity(result, plan, name)
             validate_test_result(
                 result,
                 allow_empty=name in {"memcheck", "racecheck"}
@@ -693,21 +830,14 @@ def finalize(plan: dict, package: Path | None, validation: Path) -> dict:
         _read_json(validation / "cpu.json") if plan["impact"]["run_contract"] else None
     )
     if cpu:
+        _validate_result_identity(cpu, plan, "cpu")
         validate_test_result(cpu)
-    gpu_payload = (
-        _read_json(validation / "gpu.json")
-        if plan["impact"]["run_gpu"]
-        else {"gpu": []}
+    gpu = (
+        _read_json(validation / "gpu.json")["gpu"] if plan["impact"]["run_gpu"] else []
     )
-    gpu = gpu_payload["gpu"]
-    reference = gpu_payload.get("reference")
-    unchanged = reference is not None and scheduled_equivalent(reference, plan)
-    if unchanged:
-        _validate_scheduled(reference, plan, artifacts, cpu, gpu)
-    else:
-        if cpu and cpu["source_tree_sha"] != plan["source_tree_sha"]:
-            raise ValueError("CPU result identity mismatch")
-        _validate_gpu(gpu, plan, artifacts)
+    if cpu and cpu["source_tree_sha"] != plan["source_tree_sha"]:
+        raise ValueError("CPU result identity mismatch")
+    _validate_gpu(gpu, plan, artifacts)
     if artifacts and _read_json(validation / "package.json") != {
         "status": "passed",
         "artifacts": artifacts,
@@ -715,7 +845,7 @@ def finalize(plan: dict, package: Path | None, validation: Path) -> dict:
         raise ValueError("source distribution verification is missing")
     return {
         "schema_version": SCHEMA_VERSION,
-        "status": "unchanged" if unchanged else "passed",
+        "status": "passed",
         "source_tree_sha": plan["source_tree_sha"],
         "head_sha": plan["head_sha"],
         "build_input_hash": plan["build_input_hash"],
@@ -726,7 +856,6 @@ def finalize(plan: dict, package: Path | None, validation: Path) -> dict:
         "artifacts": artifacts,
         "cpu": cpu,
         "gpu": gpu,
-        "reference": reference if unchanged else None,
     }
 
 
@@ -742,58 +871,13 @@ def reuse_identity(manifest: dict, plan: dict) -> bool:
                 "policy_hash",
             )
         )
-        and covers_plan(manifest, manifest["plan"])
+        and covers_plan(manifest, manifest.get("plan", {}))
     )
-
-
-def scheduled_equivalent(manifest: dict, plan: dict) -> bool:
-    # A scheduled no-op refers to one complete prior run. It never creates
-    # release evidence for a different Git tree, or an inherited module chain.
-    return bool(
-        plan.get("scheduled")
-        and plan["mode"] == "full"
-        and all(
-            manifest.get(key) == plan[key]
-            for key in ("build_input_hash", "validation_input_hash", "policy_hash")
-        )
-        and covers_plan(
-            manifest, {**plan, "source_tree_sha": manifest.get("source_tree_sha")}
-        )
-    )
-
-
-def _validate_scheduled(
-    reference: dict, plan: dict, artifacts: dict, cpu: dict, gpu: list[dict]
-) -> None:
-    if not scheduled_equivalent(reference, plan) or artifacts != reference["artifacts"]:
-        raise ValueError("scheduled no-op does not match a complete prior validation")
-    allowed = {plan["source_tree_sha"], reference["source_tree_sha"]}
-    validate_test_result(cpu)
-    if cpu["source_tree_sha"] not in allowed:
-        raise ValueError("scheduled CPU result identity mismatch")
-    if sorted(row["torch_version"] for row in gpu) != sorted(plan["torch_versions"]):
-        raise ValueError("scheduled GPU version coverage mismatch")
-    for row in gpu:
-        trees = {suite["source_tree_sha"] for suite in row["suites"]}
-        if len(trees) != 1 or not trees <= allowed:
-            raise ValueError("scheduled GPU result identity mismatch")
-        _validate_gpu(
-            [row],
-            {
-                **plan,
-                "source_tree_sha": trees.pop(),
-                "torch_versions": [row["torch_version"]],
-            },
-            artifacts,
-        )
 
 
 def reusable_gpu_row(manifest: dict, plan: dict, version: str, env: dict) -> bool:
-    equivalent = scheduled_equivalent(manifest, plan)
-    if not (reuse_identity(manifest, plan) or equivalent):
+    if not reuse_identity(manifest, plan):
         return False
-    if equivalent:
-        plan = {**plan, "source_tree_sha": manifest["source_tree_sha"]}
     old = next(
         (row for row in manifest["gpu"] if row["torch_version"] == version), None
     )
@@ -824,7 +908,10 @@ def covers_plan(manifest: dict, plan: dict) -> bool:
     if (
         manifest.get("schema_version") != SCHEMA_VERSION
         or manifest.get("status") != "passed"
+        or not isinstance(manifest.get("plan"), dict)
     ):
+        return False
+    if manifest.get("mode") != manifest["plan"]["mode"]:
         return False
     for key in (
         "source_tree_sha",
@@ -845,6 +932,7 @@ def covers_plan(manifest: dict, plan: dict) -> bool:
         return False
     try:
         if plan["impact"]["run_contract"]:
+            _validate_result_identity(manifest["cpu"], plan, "cpu")
             validate_test_result(manifest["cpu"])
             if manifest["cpu"]["source_tree_sha"] != plan["source_tree_sha"]:
                 return False
@@ -855,17 +943,7 @@ def covers_plan(manifest: dict, plan: dict) -> bool:
 
 
 def verify_manifest(manifest: dict, plan: dict, package: Path | None) -> None:
-    if manifest.get("status") == "unchanged":
-        if manifest["source_tree_sha"] != plan["source_tree_sha"]:
-            raise ValueError("scheduled source identity mismatch")
-        _validate_scheduled(
-            manifest["reference"],
-            plan,
-            manifest["artifacts"],
-            manifest["cpu"],
-            manifest["gpu"],
-        )
-    elif not covers_plan(manifest, plan):
+    if not covers_plan(manifest, plan):
         raise ValueError("quality evidence does not satisfy the requested validation")
     if manifest["artifacts"] != (package_artifacts(package) if package else {}):
         raise ValueError("source distributions differ from the tested originals")
@@ -889,6 +967,22 @@ def _artifact_bytes(artifact: dict, token: str) -> bytes:
     request.add_unredirected_header("Authorization", f"Bearer {token}")
     with urllib.request.urlopen(request, timeout=120) as response:
         return response.read()
+
+
+def _run_matches_source(
+    run: dict, revision: str, tree: str, repository: str, token: str
+) -> bool:
+    if run.get("head_repository", {}).get("full_name") != repository:
+        return False
+    commit = _api_json(f"/git/commits/{revision}", repository, token)
+    if commit["tree"]["sha"] != tree:
+        return False
+    # PR checkout uses GitHub's merge commit; its second parent is the run head.
+    return revision == run["head_sha"] or (
+        run["event"] == "pull_request"
+        and len(commit["parents"]) == 2
+        and commit["parents"][1]["sha"] == run["head_sha"]
+    )
 
 
 def resolve_reuse(plan: dict, repository: str, token: str, current_run: int) -> dict:
@@ -917,7 +1011,9 @@ def resolve_reuse(plan: dict, repository: str, token: str, current_run: int) -> 
             continue
         with zipfile.ZipFile(io.BytesIO(_artifact_bytes(artifact, token))) as archive:
             manifest = json.loads(archive.read("quality-manifest.json"))
-            if not reuse_identity(manifest, plan):
+            if not reuse_identity(manifest, plan) or not _run_matches_source(
+                run, manifest["head_sha"], plan["source_tree_sha"], repository, token
+            ):
                 continue
             if plan["impact"]["run_package"] and set(manifest["artifacts"]) != {
                 "wheel",
@@ -937,53 +1033,44 @@ def resolve_reuse(plan: dict, repository: str, token: str, current_run: int) -> 
                 partial = result
     if partial:
         return partial
-    if plan.get("scheduled"):
-        recent = _api_json("/actions/artifacts?per_page=100", repository, token).get(
-            "artifacts", []
-        )
-        for artifact in recent:
-            if artifact["expired"] or not artifact["name"].startswith(
-                "flashrwkv2-quality-v6-"
-            ):
-                continue
-            run_id = artifact["workflow_run"]["id"]
-            if run_id == current_run:
-                continue
-            run = _api_json(f"/actions/runs/{run_id}", repository, token)
-            if run.get("path") != ".github/workflows/pro6000-gpu.yml":
-                continue
-            jobs = _api_json(
-                f"/actions/runs/{run_id}/jobs?per_page=100", repository, token
-            )["jobs"]
-            if not any(
-                job["name"] == "Quality Gate" and job["conclusion"] == "success"
-                for job in jobs
-            ):
-                continue
-            with zipfile.ZipFile(
-                io.BytesIO(_artifact_bytes(artifact, token))
-            ) as archive:
-                manifest = json.loads(archive.read("quality-manifest.json"))
-                if scheduled_equivalent(manifest, plan):
-                    return {
-                        "reuse": True,
-                        "complete": False,
-                        "run_id": str(run_id),
-                        "artifact": artifact["name"],
-                    }
     return {"reuse": False, "complete": False, "run_id": "", "artifact": name}
 
 
-def _performance_covers(result: dict, plan: dict, artifacts: dict, target: str) -> bool:
-    return (
-        result.get("source_tree_sha") == plan["source_tree_sha"]
-        and result.get("wheel_sha256") == artifacts["wheel"]["sha256"]
-        and result.get("profile") == "full"
-        and sorted(result.get("completed_modules", [])) == sorted(TARGETS)
-        and result.get("status") == "completed"
-        and result.get("environment", {}).get("capability")
-        == [int(target[2:-1]), int(target[-1])]
-    )
+def _performance_covers(
+    result: dict, plan: dict, artifacts: dict, target: str, env: dict
+) -> bool:
+    from benchmark_gate import BENCHMARKS, _contract_hash
+    from benchmark_gate import SCHEMA_VERSION as BENCHMARK_SCHEMA
+
+    if (
+        result.get("schema_version") != BENCHMARK_SCHEMA
+        or result.get("source_tree_sha") != plan["source_tree_sha"]
+        or result.get("wheel_sha256") != artifacts["wheel"]["sha256"]
+        or result.get("profile") != "full"
+        or sorted(result.get("completed_modules", [])) != sorted(TARGETS)
+        or result.get("status") != "completed"
+        or any(
+            result.get("environment", {}).get(key) != value
+            for key, value in _environment_identity(env).items()
+        )
+    ):
+        return False
+    measurements = result.get("measurements", {})
+    if set(measurements) != set(TARGETS):
+        return False
+    for module, record in measurements.items():
+        if (
+            record.get("source_tree_sha") != plan["source_tree_sha"]
+            or record.get("wheel_sha256") != artifacts["wheel"]["sha256"]
+            or record.get("target") != target
+            or record.get("profile") != "full"
+            or record.get("benchmark_contract_sha256") != _contract_hash(module)
+            or record.get("profile_count", 0) <= 0
+            or sorted(record.get("workloads", []))
+            != sorted(case.workload for case in BENCHMARKS[module])
+        ):
+            return False
+    return True
 
 
 def release_payload(
@@ -991,6 +1078,14 @@ def release_payload(
 ) -> None:
     manifest = _read_json(bundle / "quality-manifest.json")
     verify_manifest(manifest, plan, bundle)
+    verify_package(bundle)
+    if plan["mode"] != "full" or not plan["extended"] or plan["target"] != "sm120":
+        raise ValueError("release requires full extended PRO6000 acceptance")
+    if not all(
+        "PRO6000" in "".join(row["environment"]["gpu"].upper().split())
+        for row in manifest["gpu"]
+    ):
+        raise ValueError("SM120 release acceptance requires PRO6000 hardware")
     token = os.environ["GH_TOKEN"]
     release = _api_json(
         f"/releases/tags/{urllib.parse.quote(tag, safe='')}", repository, token
@@ -1026,9 +1121,14 @@ def release_payload(
         plan,
         manifest["artifacts"],
         "sm89",
+        next(
+            row["environment"]
+            for row in external["gpu"]
+            if row["torch_version"] == PRIMARY_TORCH
+        ),
     ):
         raise ValueError("complete RTX4090 performance acceptance is missing")
-    name = f"flashrwkv2-performance-v6-{plan['source_tree_sha']}"
+    name = f"flashrwkv2-performance-v7-{plan['source_tree_sha']}"
     artifacts = _api_json(
         f"/actions/artifacts?{urllib.parse.urlencode({'name': name, 'per_page': 100})}",
         repository,
@@ -1053,7 +1153,19 @@ def release_payload(
             continue
         with zipfile.ZipFile(io.BytesIO(_artifact_bytes(artifact, token))) as archive:
             candidate = json.loads(archive.read("summary.json"))
-            if _performance_covers(candidate, plan, manifest["artifacts"], "sm120"):
+            if _run_matches_source(
+                run, candidate["revision"], plan["source_tree_sha"], repository, token
+            ) and _performance_covers(
+                candidate,
+                plan,
+                manifest["artifacts"],
+                "sm120",
+                next(
+                    row["environment"]
+                    for row in manifest["gpu"]
+                    if row["torch_version"] == PRIMARY_TORCH
+                ),
+            ):
                 performance = candidate
                 break
     if performance is None:
@@ -1066,8 +1178,6 @@ def release_payload(
     _write_json(output / "performance-summary.json", performance)
     for name, report in external_reports.items():
         _write_json(output / name, report)
-    import tomllib
-
     version = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]["version"]
     expected = {
         f"flashrwkv2-{version}-py3-none-any.whl",
@@ -1084,10 +1194,6 @@ def validation_summary(manifest: dict, repository: str, output: Path) -> None:
     with output.open("a", encoding="utf-8") as handle:
         handle.write(f"### Validation ({manifest['mode']})\n\n")
         handle.write(f"Source tree: `{manifest['source_tree_sha']}`\n\n")
-        if manifest.get("status") == "unchanged":
-            handle.write(
-                f"Validation inputs and package are unchanged; reused full run for `{manifest['reference']['source_tree_sha']}` after checking the active environment.\n\n"
-            )
         handle.write(
             "| Torch | Target | Suite | Tests | Seconds |\n|---|---|---|---:|---:|\n"
         )
@@ -1160,6 +1266,7 @@ def validation_summary(manifest: dict, repository: str, output: Path) -> None:
 
 
 def _self_test() -> None:
+    import copy
     from unittest.mock import patch
 
     head = _git("rev-parse", "HEAD")
@@ -1168,201 +1275,150 @@ def _self_test() -> None:
         return_value=["flashrwkv2/post_norm/tilelang.py"],
     ):
         plan = build_plan(head, head)
-    assert not plan["impact"]["run_all"] and BLOCK_TEST in plan["test_paths"]
     assert set(plan["impact"]["affected_modules"]) == {
         "post_norm",
+        "embedding",
         "cmix",
         "tmix/tokenshift",
     }
-    with patch(__name__ + "._git_changed_files", return_value=["README.md"]):
-        doc = build_plan(head, head)
-    assert not doc["impact"]["run_gpu"] and doc["impact"]["run_package"]
+    assert BLOCK_TEST in plan["test_paths"] and not plan["impact"]["run_all"]
     full = build_plan(head, head, mode="full", extended=True)
     assert full["torch_versions"] == list(TORCH_VERSIONS) and full["test_paths"] == [
         "tests"
     ]
-    sample = {
-        "selected": {"test::one": ["cuda"]},
-        "reports": {
-            "test::one": {
-                phase: {"outcome": "passed"} for phase in ("setup", "call", "teardown")
-            }
-        },
-        "environment": {"target": "sm120"},
-        "exit_code": 0,
-    }
-    validate_test_result(sample)
-    invalid = [
-        {**sample, "selected": {}},
-        {**sample, "reports": {}},
-        {**sample, "exit_code": 1},
-        {**sample, "reports": {"test::one": {"setup": {"outcome": "skipped"}}}},
-        {
-            **sample,
-            "reports": {
-                "test::one": {
-                    "setup": {"outcome": "passed"},
-                    "call": {"outcome": "passed"},
-                    "teardown": {"outcome": "failed"},
-                }
-            },
-        },
-    ]
-    for result in invalid:
-        try:
-            validate_test_result(result)
-        except ValueError:
-            pass
-        else:
-            raise AssertionError("incomplete test evidence was accepted")
-    assert not covers_plan({"schema_version": 5, "status": "passed"}, plan)
-    assert not covers_plan({}, plan)
-    # Exercise real acceptance boundaries: a passed flag is insufficient without
-    # the selected executions, original wheel, environment and requested scope.
-    import copy
+    with patch(__name__ + "._git_changed_files", return_value=["README.md"]):
+        doc = build_plan(head, head)
+    assert not doc["impact"]["run_gpu"] and doc["impact"]["run_package"]
 
-    env = {
-        "target": "sm120",
-        "torch": PRIMARY_TORCH,
-        "package_path": "/venv/flashrwkv2/__init__.py",
-    }
-    nodes = {
-        f"tests/{owner}/test.py::test_example": ["cuda"]
+    env = {"target": "sm120", "torch": PRIMARY_TORCH, "tilelang": TILELANG_VERSION}
+    collected = {
+        f"tests/{owner}/test.py::test_example[0]": ["cuda", "memcheck", "racecheck"]
         for owner in plan["impact"]["affected_modules"]
     }
-    nodes[BLOCK_TEST + "::test_example"] = ["cuda", "cuda_graph"]
-    completed = {
-        nodeid: copy.deepcopy(sample["reports"]["test::one"]) for nodeid in nodes
-    }
+    collected[BLOCK_TEST + "::test_fullgraph[0]"] = [
+        "cuda",
+        "cuda_graph",
+        "memcheck",
+        "racecheck",
+    ]
+    collected["tests/test_runtime.py::test_example"] = []
     artifacts = {
         "wheel": {"name": "candidate.whl", "sha256": "a" * 64},
         "sdist": {"name": "candidate.tar.gz", "sha256": "b" * 64},
     }
-    suites = [
-        {
-            **sample,
-            "suite": kind,
-            "source_tree_sha": plan["source_tree_sha"],
-            "wheel_sha256": artifacts["wheel"]["sha256"],
-            "environment": env,
-            "selected": nodes,
-            "reports": completed,
+
+    def result(suite):
+        selected = {
+            node: marks
+            for node, marks in collected.items()
+            if (suite == "cpu") == (not marks)
         }
-        for kind in ("correctness", "memcheck", "racecheck")
-    ]
-    cpu = {**sample, "source_tree_sha": plan["source_tree_sha"]}
+        return {
+            **{
+                key: plan[key]
+                for key in (
+                    "schema_version",
+                    "source_tree_sha",
+                    "validation_input_hash",
+                    "policy_hash",
+                )
+            },
+            "suite": suite,
+            "paths": ["tests"],
+            "environment": {"target": "cpu"} if suite == "cpu" else env,
+            "wheel_sha256": None if suite == "cpu" else artifacts["wheel"]["sha256"],
+            "collected": collected,
+            "selected": selected,
+            "reports": {
+                node: {
+                    phase: {"outcome": "passed", "seconds": 0, "reason": ""}
+                    for phase in ("setup", "call", "teardown")
+                }
+                for node in selected
+            },
+            "exit_code": 0,
+            "seconds": 0,
+            "status": "passed",
+        }
+
+    first = {"target": "sm120", "status": "cached", "cache_key": "key"}
+    row = {
+        "torch_version": PRIMARY_TORCH,
+        "environment": env,
+        "cold_cache": False,
+        "compile": {"first": first, "second": first, "native_targets": ["sm120"]},
+        "suites": [result(kind) for kind in ("correctness", "memcheck", "racecheck")],
+    }
     manifest = {
         **{
             key: plan[key]
             for key in (
+                "schema_version",
                 "source_tree_sha",
                 "build_input_hash",
                 "validation_input_hash",
                 "policy_hash",
             )
         },
-        "schema_version": SCHEMA_VERSION,
         "status": "passed",
         "mode": "incremental",
         "plan": plan,
-        "cpu": cpu,
         "artifacts": artifacts,
-        "gpu": [
-            {
-                "torch_version": PRIMARY_TORCH,
-                "environment": env,
-                "compile": {"status": "passed"},
-                "cold_cache": False,
-                "suites": suites,
-            }
-        ],
+        "cpu": result("cpu"),
+        "gpu": [row],
     }
-    assert covers_plan(manifest, plan)
-    assert reuse_identity(manifest, plan)
+    assert covers_plan(manifest, plan) and reuse_identity(manifest, plan)
     assert reusable_gpu_row(manifest, plan, PRIMARY_TORCH, env)
     assert not reusable_gpu_row(
         manifest, plan, PRIMARY_TORCH, {**env, "torch": "different"}
     )
-    extended = {**plan, "torch_versions": list(TORCH_VERSIONS), "cold_cache": True}
-    assert not covers_plan(manifest, extended)
-    assert reuse_identity(manifest, extended)
-    assert reusable_gpu_row(manifest, extended, PRIMARY_TORCH, env)
+    assert not covers_plan(manifest, {**plan, "test_paths": ["tests/new-owner"]})
+    assert not covers_plan(manifest, {**plan, "source_tree_sha": "different"})
+    assert not covers_plan(manifest, {**plan, "cold_cache": True})
+    assert not covers_plan(manifest, {**plan, "torch_versions": list(TORCH_VERSIONS)})
     assert not reusable_gpu_row(manifest, full, PRIMARY_TORCH, env)
-    full_plan = {
-        **plan,
-        "mode": "full",
-        "test_paths": ["tests"],
-        "impact": {
-            **plan["impact"],
-            "run_all": True,
-            "affected_cuda_modules": list(TARGETS),
-        },
-    }
-    full_manifest = copy.deepcopy(manifest)
-    full_manifest.update(mode="full", plan=full_plan)
-    full_nodes = {f"tests/{owner}/test.py::test_example": ["cuda"] for owner in TARGETS}
-    full_nodes[BLOCK_TEST + "::test_example"] = ["cuda", "cuda_graph"]
-    for suite in full_manifest["gpu"][0]["suites"]:
-        suite["selected"] = full_nodes
-        suite["reports"] = {
-            node: copy.deepcopy(sample["reports"]["test::one"]) for node in full_nodes
-        }
-    assert covers_plan(full_manifest, full_plan)
-    scheduled = {**full_plan, "scheduled": True, "source_tree_sha": "d" * 40}
-    assert scheduled_equivalent(full_manifest, scheduled)
-    assert not reuse_identity(full_manifest, scheduled)
-    assert reusable_gpu_row(full_manifest, scheduled, PRIMARY_TORCH, env)
-    _validate_scheduled(
-        full_manifest, scheduled, artifacts, full_manifest["cpu"], full_manifest["gpu"]
-    )
-    assert not scheduled_equivalent(full_manifest, {**scheduled, "scheduled": False})
-    assert not scheduled_equivalent(
-        full_manifest, {**scheduled, "validation_input_hash": "changed"}
-    )
-    unchanged = {
-        **full_manifest,
-        "status": "unchanged",
-        "source_tree_sha": scheduled["source_tree_sha"],
-        "plan": scheduled,
-        "reference": full_manifest,
-    }
-    assert not covers_plan(unchanged, scheduled)
-    assert not scheduled_equivalent(unchanged, scheduled)
-    try:
-        verify_manifest(unchanged, {**scheduled, "scheduled": False}, None)
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("scheduled no-op was accepted as release evidence")
+    for fault in (
+        "deselected",
+        "missing-report",
+        "skipped",
+        "failed-teardown",
+        "wheel",
+        "paths",
+        "cache",
+        "native-target",
+        "duplicate-suite",
+    ):
+        invalid = copy.deepcopy(manifest)
+        suite = invalid["gpu"][0]["suites"][0]
+        node = next(iter(suite["selected"]))
+        if fault == "deselected":
+            suite["selected"].pop(node)
+            suite["reports"].pop(node)
+        elif fault == "missing-report":
+            suite["reports"].pop(node)
+        elif fault == "skipped":
+            suite["reports"][node]["call"]["outcome"] = "skipped"
+        elif fault == "failed-teardown":
+            suite["reports"][node]["teardown"]["outcome"] = "failed"
+        elif fault == "wheel":
+            suite["wheel_sha256"] = "different"
+        elif fault == "paths":
+            suite["paths"] = ["tests/sampling"]
+        elif fault == "cache":
+            invalid["gpu"][0]["compile"]["second"]["status"] = "compiled"
+        elif fault == "native-target":
+            invalid["gpu"][0]["compile"]["native_targets"] = ["sm89"]
+        else:
+            invalid["gpu"][0]["suites"].append(copy.deepcopy(suite))
+        assert not covers_plan(invalid, plan), fault
     for key in (
+        "schema_version",
         "source_tree_sha",
         "build_input_hash",
         "validation_input_hash",
         "policy_hash",
     ):
-        assert not covers_plan({**manifest, key: "mismatch"}, plan), key
-    for fault in (
-        "wheel",
-        "environment",
-        "missing-sanitizer",
-        "missing-test",
-        "skipped-test",
-    ):
-        invalid = copy.deepcopy(manifest)
-        result = invalid["gpu"][0]["suites"][0]
-        if fault == "wheel":
-            result["wheel_sha256"] = "mismatch"
-        elif fault == "environment":
-            result["environment"]["torch"] = "mismatch"
-        elif fault == "missing-sanitizer":
-            invalid["gpu"][0]["suites"].pop()
-        elif fault == "missing-test":
-            result["reports"].pop(next(iter(result["reports"])))
-        else:
-            result["reports"][next(iter(result["reports"]))]["call"]["outcome"] = (
-                "skipped"
-            )
-        assert not covers_plan(invalid, plan), fault
+        assert not covers_plan({**manifest, key: "different"}, plan), key
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         wheel = root / artifacts["wheel"]["name"]
@@ -1379,24 +1435,8 @@ def _self_test() -> None:
         except ValueError:
             pass
         else:
-            raise AssertionError("tampered source distribution was accepted")
-    performance = {
-        "status": "completed",
-        "profile": "full",
-        "source_tree_sha": plan["source_tree_sha"],
-        "wheel_sha256": manifest["artifacts"]["wheel"]["sha256"],
-        "completed_modules": list(TARGETS),
-        "environment": {"capability": [12, 0]},
-    }
-    assert _performance_covers(performance, plan, manifest["artifacts"], "sm120")
-    assert not _performance_covers(
-        {**performance, "completed_modules": ["cmix"]},
-        plan,
-        manifest["artifacts"],
-        "sm120",
-    )
-    assert not _performance_covers(performance, plan, manifest["artifacts"], "sm89")
-    # Prevent an unmarked CUDA test from silently landing in CPU-only CI.
+            raise AssertionError("tampered wheel was accepted")
+    # GPU skip decorators must remain visible to the CPU/GPU selection boundary.
     for path in (ROOT / "tests").rglob("test*.py"):
         text = path.read_text()
         tree = ast.parse(text)
@@ -1409,28 +1449,18 @@ def _self_test() -> None:
             for node in tree.body
         )
         for node in tree.body:
-            if not isinstance(node, ast.FunctionDef) or not node.name.startswith(
-                "test_"
-            ):
-                continue
-            decorators = [
-                ast.get_source_segment(text, mark) for mark in node.decorator_list
-            ]
-            uses_gpu = any(
-                mark == "cuda"
-                or ("skipif" in mark and "torch.cuda.is_available()" in mark)
-                for mark in decorators
-            )
-            assert not uses_gpu or module_cuda or "pytest.mark.cuda" in decorators, (
-                path,
-                node.name,
-            )
-    for path in (ROOT / ".github/workflows").glob("*.yml"):
-        text = path.read_text()
-        assert "timeout-minutes:" in text and "--clear" not in text
-    workflow = (ROOT / ".github/workflows/pro6000-gpu.yml").read_text()
-    assert "name: Quality Gate" in workflow and "queue: max" in workflow
-    assert "17 8 * * *" in workflow and "--inherit-manifest" not in workflow
+            if isinstance(node, ast.FunctionDef) and node.name.startswith("test_"):
+                decorators = [
+                    ast.get_source_segment(text, mark) for mark in node.decorator_list
+                ]
+                uses_gpu = any(
+                    mark == "cuda"
+                    or ("skipif" in mark and "torch.cuda.is_available()" in mark)
+                    for mark in decorators
+                )
+                assert (
+                    not uses_gpu or module_cuda or "pytest.mark.cuda" in decorators
+                ), (path, node.name)
     print("quality_gate self-test passed")
 
 
@@ -1444,7 +1474,6 @@ def main() -> int:
         "--mode", choices=("incremental", "full", "performance"), default="incremental"
     )
     p.add_argument("--extended", action="store_true")
-    p.add_argument("--scheduled", action="store_true")
     p.add_argument("--target", default="sm120", choices=("sm120", "sm89"))
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--github-output", type=Path)
@@ -1505,7 +1534,6 @@ def main() -> int:
             mode=args.mode,
             extended=args.extended,
             target=args.target,
-            scheduled=args.scheduled,
         )
         _write_json(args.output, plan)
         _write_outputs(

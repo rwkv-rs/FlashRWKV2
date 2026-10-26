@@ -19,7 +19,7 @@ from typing import Any
 ROOT = Path(
     os.environ.get("FLASH_RWKV_SOURCE_ROOT", Path(__file__).resolve().parents[1])
 ).resolve()
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -341,35 +341,45 @@ def _python_executable(python: str) -> str:
     return str(Path(executable).absolute())
 
 
+ENVIRONMENT_KEYS = (
+    "target",
+    "gpu",
+    "multiprocessors",
+    "visible_devices",
+    "python",
+    "torch",
+    "torch_cuda",
+    "tilelang",
+    "driver",
+    "nvcc",
+    "cxx",
+    "ninja",
+)
+
+
 def _environment(python: str) -> dict[str, Any]:
-    program = r"""
-import contextlib, json, platform, sys, torch
-from flashrwkv2.compile import load_extension
-with contextlib.redirect_stdout(sys.stderr):
-    compiled = load_extension()
-print(json.dumps({
-  'python': platform.python_version(),
-  'torch': torch.__version__,
-  'torch_cuda': torch.version.cuda,
-  'gpu': torch.cuda.get_device_name(0),
-  'capability': list(torch.cuda.get_device_capability(0)),
-  'extension_path': compiled.library,
-  'runtime_cache_key': compiled.cache_key,
-}))
-"""
-    payload = json.loads(
-        subprocess.run(
-            (_python_executable(python), "-I", "-c", program),
-            cwd=ROOT / "artifacts",
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=1800,
-        ).stdout
+    from quality_gate import _environment_identity, _isolated_json
+
+    executable = _python_executable(python)
+    payload = _environment_identity(
+        _isolated_json(
+            executable,
+            str(ROOT / "ci/quality_gate.py"),
+            "environment",
+            "--target",
+            "auto",
+            timeout=60,
+        )
     )
-    extension_path = Path(payload.pop("extension_path"))
-    payload["extension_sha256"] = _sha256(extension_path)
-    payload["wheel_sha256"] = os.environ.get("FLASH_RWKV_WHEEL_SHA256")
+    compiled = _isolated_json(executable, "-m", "flashrwkv2.compile")
+    payload.update(
+        {
+            "capability": [int(payload["target"][2:-1]), int(payload["target"][-1])],
+            "runtime_cache_key": compiled["cache_key"],
+            "extension_sha256": _sha256(Path(compiled["library"])),
+            "wheel_sha256": os.environ.get("FLASH_RWKV_WHEEL_SHA256"),
+        }
+    )
     query = "driver_version,temperature.gpu,power.draw,clocks.current.sm,clocks_event_reasons.active"
     result = subprocess.run(
         (
@@ -384,7 +394,6 @@ print(json.dumps({
         timeout=30,
     )
     values = [value.strip() for value in result.stdout.strip().split(",")]
-    payload["driver"] = values[0] if values else None
     payload["nvidia_smi"] = result.stdout.strip()
     payload["throttle_reason"] = values[4] if len(values) > 4 else None
     return payload
@@ -447,7 +456,7 @@ def _contract_hash(module: str, profile: str = "full") -> str:
         digest.update(b"\0")
         digest.update(path.read_bytes())
         digest.update(b"\0")
-    digest.update(Path(__file__).read_bytes())
+    digest.update(f"{SCHEMA_VERSION}:{profile}".encode())
     timing = ROOT / "benchmarks/_timing.py"
     digest.update(str(timing.relative_to(ROOT)).encode())
     digest.update(b"\0")
@@ -664,12 +673,13 @@ def run_suite(
     status: str,
     output: Path,
     profile: str = "full",
+    environment: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     unknown = sorted(set(modules) - BENCHMARKS.keys())
     if unknown:
         raise SystemExit(f"no canonical benchmark configured for: {unknown}")
     _assert_gpu_idle()
-    environment = _environment(python)
+    environment = environment or _environment(python)
     output.mkdir(parents=True, exist_ok=True)
     warnings: list[dict[str, Any]] = []
     completed: list[str] = []
@@ -737,7 +747,7 @@ def _compatible(baseline: dict[str, Any], candidate: dict[str, Any]) -> None:
     for key in ("schema_version", "module", "target", "benchmark_contract_sha256"):
         if baseline.get(key) != candidate.get(key):
             raise ValueError(f"baseline {key} mismatch")
-    for key in ("gpu", "capability", "torch", "torch_cuda", "driver"):
+    for key in ENVIRONMENT_KEYS:
         if baseline["environment"].get(key) != candidate["environment"].get(key):
             raise ValueError(f"baseline environment mismatch for {key}")
 
@@ -861,7 +871,7 @@ def fetch_main_baselines(
         ).get("artifacts", [])
         for artifact in artifacts:
             if artifact.get("expired") or not artifact["name"].startswith(
-                "flashrwkv2-performance-v6-"
+                "flashrwkv2-performance-v7-"
             ):
                 continue
             request = urllib.request.Request(artifact["archive_download_url"])
@@ -895,13 +905,7 @@ def fetch_main_baselines(
                     if any(
                         payload.get("environment", {}).get(key)
                         != current_environment.get(key)
-                        for key in (
-                            "gpu",
-                            "capability",
-                            "torch",
-                            "torch_cuda",
-                            "driver",
-                        )
+                        for key in ENVIRONMENT_KEYS
                     ):
                         continue
                     payload["status"] = "baseline"
@@ -926,7 +930,7 @@ def report(
     from quality_gate import (
         PRIMARY_TORCH,
         _environment_identity,
-        _isolated_json,
+        source_tree_sha,
         verify_manifest,
     )
     from select_targets import TARGETS, _git_changed_files, classify
@@ -938,20 +942,14 @@ def report(
     primary = next(
         row for row in manifest["gpu"] if row["torch_version"] == PRIMARY_TORCH
     )
-    if _environment_identity(primary["environment"]) != _environment_identity(
-        _isolated_json(
-            python,
-            str(Path(__file__).with_name("quality_gate.py")),
-            "environment",
-            "--target",
-            plan["target"],
-            timeout=60,
-        )
+    current = _environment(python)
+    if any(
+        current.get(key) != value
+        for key, value in _environment_identity(primary["environment"]).items()
     ):
         raise ValueError(
             "performance environment differs from the correctness environment"
         )
-    current = _environment(python)
     current["wheel_sha256"] = manifest["artifacts"]["wheel"]["sha256"]
     os.environ["FLASH_RWKV_WHEEL_SHA256"] = current["wheel_sha256"]
     # Full reports always cover all owners. Daily reports compare each owner to
@@ -978,7 +976,10 @@ def report(
         impact = classify(changed)
         if (impact.run_benchmark and module in impact.affected_modules) or (
             profile == "full"
-            and previous["environment"].get("wheel_sha256") != current["wheel_sha256"]
+            and (
+                previous["environment"].get("wheel_sha256") != current["wheel_sha256"]
+                or source_tree_sha(previous["revision"]) != plan["source_tree_sha"]
+            )
         ):
             selected.append(module)
         else:
@@ -991,6 +992,7 @@ def report(
             status="candidate",
             output=output / "candidate",
             profile=profile,
+            environment=current,
         )
         if selected
         else {
@@ -1028,6 +1030,22 @@ def report(
             "warnings": [*result["warnings"], *comparison["warnings"]],
         }
     )
+    result["measurements"] = {}
+    for module in result["completed_modules"]:
+        payload = json.loads(
+            (
+                output / "candidate" / f"{module.replace('/', '-')}-candidate.json"
+            ).read_text()
+        )
+        result["measurements"][module] = {
+            "source_tree_sha": source_tree_sha(payload["revision"]),
+            "wheel_sha256": payload["environment"]["wheel_sha256"],
+            "target": payload["target"],
+            "profile": payload["profile"],
+            "benchmark_contract_sha256": payload["benchmark_contract_sha256"],
+            "profile_count": len(payload["profiles"]),
+            "workloads": [row["workload"] for row in payload["workloads"]],
+        }
     _write_json(output / "summary.json", result)
     with summary.open("a", encoding="utf-8") as handle:
         handle.write(f"### Performance ({profile})\n\n")
@@ -1086,6 +1104,7 @@ def _self_test() -> None:
     assert _suite_complete({"completed_modules": ["cmix"]}, ["cmix"])
     assert not _suite_complete({"completed_modules": []}, ["cmix"])
     environment = {
+        **{key: key for key in ENVIRONMENT_KEYS},
         "gpu": "gpu",
         "capability": [12, 0],
         "torch": "torch",

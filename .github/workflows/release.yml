@@ -88,7 +88,7 @@ jobs:
             --output release/payload
       - uses: actions/upload-artifact@v4
         with:
-          name: flashrwkv2-release-v6-${{ steps.plan.outputs.source_tree_sha }}
+          name: flashrwkv2-release-v7-${{ steps.plan.outputs.source_tree_sha }}
           path: release/payload/
           if-no-files-found: error
           retention-days: 90
@@ -108,7 +108,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: flashrwkv2-release-v6-${{ needs.prepare.outputs.source_tree_sha }}
+          name: flashrwkv2-release-v7-${{ needs.prepare.outputs.source_tree_sha }}
           path: release/payload
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
@@ -123,7 +123,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: flashrwkv2-release-v6-${{ needs.prepare.outputs.source_tree_sha }}
+          name: flashrwkv2-release-v7-${{ needs.prepare.outputs.source_tree_sha }}
           path: release/payload
       - name: Compare public files with the tested originals
         env:

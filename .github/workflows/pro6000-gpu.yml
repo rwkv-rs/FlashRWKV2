@@ -89,7 +89,6 @@ jobs:
             if [ "$(timeout 10s date -u +%u)" = 7 ]; then EXTENDED=true; fi
           fi
           args=()
-          if [ "$EVENT" = schedule ]; then args+=(--scheduled); fi
           if [ "$EXTENDED" = true ]; then args+=(--extended); fi
           timeout 60s python3 ci/quality_gate.py plan \
             --base "$BASE_SHA" --head "$(timeout 30s git rev-parse HEAD)" \
@@ -120,7 +119,7 @@ jobs:
           PY
       - uses: actions/upload-artifact@v4
         with:
-          name: flashrwkv2-plan-v6
+          name: flashrwkv2-plan-v7
           path: artifacts/plan.json
           if-no-files-found: error
           retention-days: 90
@@ -137,7 +136,7 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
-          name: flashrwkv2-plan-v6
+          name: flashrwkv2-plan-v7
           path: artifacts
       - name: Check source and CI contracts once
         env:
@@ -170,7 +169,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: flashrwkv2-cpu-v6
+          name: flashrwkv2-cpu-v7
           path: artifacts/cpu.*
           if-no-files-found: ignore
           retention-days: 90
@@ -203,7 +202,7 @@ jobs:
             --directory artifacts/package --output artifacts/package/package.json
       - uses: actions/upload-artifact@v4
         with:
-          name: flashrwkv2-package-v6
+          name: flashrwkv2-package-v7
           path: |
             artifacts/package/dist/*
             artifacts/package/package.json
@@ -234,11 +233,11 @@ jobs:
         run: timeout 30s rm -rf artifacts/ci
       - uses: actions/download-artifact@v4
         with:
-          name: flashrwkv2-plan-v6
+          name: flashrwkv2-plan-v7
           path: artifacts/ci
       - uses: actions/download-artifact@v4
         with:
-          name: flashrwkv2-package-v6
+          name: flashrwkv2-package-v7
           path: artifacts/ci/package
       - uses: actions/download-artifact@v4
         if: needs.plan.outputs.reuse == 'true'
@@ -261,7 +260,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: flashrwkv2-gpu-v6
+          name: flashrwkv2-gpu-v7
           path: artifacts/ci/results/
           if-no-files-found: error
           retention-days: 90
@@ -295,22 +294,22 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
-          name: flashrwkv2-plan-v6
+          name: flashrwkv2-plan-v7
           path: artifacts
       - uses: actions/download-artifact@v4
         if: needs.plan.outputs.run_contract == 'true'
         with:
-          name: flashrwkv2-cpu-v6
+          name: flashrwkv2-cpu-v7
           path: artifacts/validation
       - uses: actions/download-artifact@v4
         if: needs.plan.outputs.run_package == 'true'
         with:
-          name: flashrwkv2-package-v6
+          name: flashrwkv2-package-v7
           path: artifacts/bundle
       - uses: actions/download-artifact@v4
         if: needs.plan.outputs.run_gpu == 'true'
         with:
-          name: flashrwkv2-gpu-v6
+          name: flashrwkv2-gpu-v7
           path: artifacts/gpu
       - name: Bind actual validation to the tested distributions
         env:
@@ -337,7 +336,7 @@ jobs:
             --repository "$GITHUB_REPOSITORY" --output "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         with:
-          name: flashrwkv2-quality-v6-${{ needs.plan.outputs.source_tree_sha }}
+          name: flashrwkv2-quality-v7-${{ needs.plan.outputs.source_tree_sha }}
           path: artifacts/bundle/
           if-no-files-found: error
           retention-days: 90
@@ -366,7 +365,7 @@ jobs:
         run: timeout 30s rm -rf artifacts/ci
       - uses: actions/download-artifact@v4
         with:
-          name: flashrwkv2-quality-v6-${{ needs.plan.outputs.source_tree_sha }}
+          name: flashrwkv2-quality-v7-${{ needs.plan.outputs.source_tree_sha }}
           path: artifacts/ci/quality
       - uses: astral-sh/setup-uv@v6
       - name: Prepare the primary Torch environment and tested wheel
@@ -389,7 +388,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: flashrwkv2-performance-v6-${{ needs.plan.outputs.source_tree_sha }}
+          name: flashrwkv2-performance-v7-${{ needs.plan.outputs.source_tree_sha }}
           path: artifacts/ci/performance/
           if-no-files-found: error
           retention-days: 90
