@@ -620,7 +620,7 @@ def _compiled_grouped_vjp_fake(gradients, saved, kinds, needed):
 
 
 def _compiled_grouped_backward(ctx, gradients, unused_raw):
-    needed = [*ctx.needs_input_grad[0], *ctx.needs_input_grad[1], *ctx.needs_input_grad[2]]
+    needed = [need for group in ctx.needs_input_grad[:3] for need in group]
     results = _compiled_grouped_vjp(gradients, list(ctx.saved_tensors), list(ctx.kinds), needed)
     count = len(ctx.kinds)
     return results[:count], results[count:2 * count], results[2 * count:], None
@@ -660,14 +660,14 @@ def _grouped_linear(xs, weights, kinds, biases):
         rows = [x.reshape(-1, x.shape[-1]).contiguous() for x in xs]
         packed_biases = [rows[0].new_empty(0) if bias is None else bias for bias in biases]
         values, _ = _compiled_grouped(rows, list(weights), packed_biases, list(kinds))
-        return tuple(value.view(*shape, weight.shape[0]) for value, weight in zip(values, weights))
-    xs, weights, biases = _group_inputs(xs, weights, biases)
-    if torch.is_grad_enabled() and any(
-        t is not None and t.requires_grad for t in (*xs, *weights, *biases)
-    ):
-        values = _GroupedLinear.apply(kinds, *xs, *weights, *biases)
     else:
-        values, _ = _run_groups(xs, weights, kinds, biases)
+        xs, weights, biases = _group_inputs(xs, weights, biases)
+        if torch.is_grad_enabled() and any(
+            t is not None and t.requires_grad for t in (*xs, *weights, *biases)
+        ):
+            values = _GroupedLinear.apply(kinds, *xs, *weights, *biases)
+        else:
+            values, _ = _run_groups(xs, weights, kinds, biases)
     return tuple(
         value.view(*shape, weight.shape[0])
         for value, weight in zip(values, weights, strict=True)

@@ -154,13 +154,6 @@ def _compiled(*key):
     return _COMPILED_KERNELS[key]
 
 
-def _precompile(keys):
-    """Elaborate on the caller thread; compile a bounded batch before timing."""
-    from .tuning import compile_candidates
-
-    compile_candidates(keys, _COMPILED_KERNELS, _compile_spec)
-
-
 def _dtype_name(dtype):
     return "bfloat16" if dtype == torch.bfloat16 else "float32"
 
@@ -189,7 +182,10 @@ def _forward(x, weight, bias, output_dtype, config=None):
     if config is None:
         from .tuning import get_config
 
-        config = get_config(_TUNED_CONFIGS, "linear", _key(x, weight, output_dtype, bias), tune=lambda: tune_linear(x, weight, output_dtype, bias=bias))
+        config = get_config(
+            _TUNED_CONFIGS, "linear", _key(x, weight, output_dtype, bias),
+            tune=lambda: tune_linear(x, weight, output_dtype, bias=bias),
+        )
         if config is None:
             block_m = 16
             if x.shape[0] > 16:
@@ -632,7 +628,9 @@ def tune_linear(x, weight, output_dtype=None, *, bias=None, benchmark=None):
     ``benchmark`` measures the owning forward operator with each candidate in
     its dispatch cache, preserving the operator's working set during tuning.
     """
-    from .tuning import projection_finalists, revalidation_config, save_config, select_config
+    from .tuning import (
+        compile_candidates, projection_finalists, revalidation_config, save_config, select_config,
+    )
 
     output_dtype = torch.bfloat16 if output_dtype is None else output_dtype
     linear(x, weight, bias, output_dtype)
@@ -728,7 +726,7 @@ def tune_linear(x, weight, output_dtype=None, *, bias=None, benchmark=None):
                 })
                 continue
             eligible.append(config)
-        _precompile(
+        keys = (
             (
                 weight.shape[0], x.shape[1], _dtype_name(dtype),
                 _dtype_name(bias.dtype) if bias is not None else "bfloat16",
@@ -737,6 +735,7 @@ def tune_linear(x, weight, output_dtype=None, *, bias=None, benchmark=None):
             )
             for config in eligible for dtype in check_dtypes
         )
+        compile_candidates(keys, _COMPILED_KERNELS, _compile_spec)
         compiled = []
         for config in eligible:
             try:

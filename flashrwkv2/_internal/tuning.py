@@ -45,7 +45,7 @@ class _AutogradContext(SimpleNamespace):
         self.saved_tensors = tensors
 
     def set_materialize_grads(self, value):
-        self.materialize_grads = value
+        """The registered autograd context controls gradient materialization."""
 
 
 @cache
@@ -221,16 +221,21 @@ def get_config(configs, owner, key, default=None, *, tune=None):
         _LOADED.pop(identity, None)
         configs.pop(key, None)
     if session is not None:
+        encoded = _encode(key)
         previous = session["records"].get((owner, key))
         if previous is not None and previous["status"] in {"tuned", "revalidated"} and status == "hit":
             status = previous["status"]
         session["records"][(owner, key)] = {
-            "owner": owner, "key": json.loads(_encode(key)),
+            "owner": owner, "key": json.loads(encoded),
             "fingerprint": _fingerprint(owner), "status": status,
-            "config": config, "path": str(_profile_path(owner, _encode(key))),
+            "config": config, "path": str(_profile_path(owner, encoded)),
         }
         if config is None and session["mode"] == "require":
-            raise RuntimeError(f"missing verified tuning profile: {owner} {_encode(key)}; run prepare_tuning(..., mode='tune') before capture; cache={get_tuning_cache_dir()}")
+            raise RuntimeError(
+                f"missing verified tuning profile: {owner} {encoded}; "
+                "run prepare_tuning(..., mode='tune') before capture; "
+                f"cache={get_tuning_cache_dir()}"
+            )
     elif config is None and owner not in _WARNED:
         warnings.warn(f"FlashRWKV2 {owner} uses an untuned default; run prepare_tuning(..., mode='tune') before capture; cache={get_tuning_cache_dir()}", RuntimeWarning, stacklevel=2)
         _WARNED.add(owner)

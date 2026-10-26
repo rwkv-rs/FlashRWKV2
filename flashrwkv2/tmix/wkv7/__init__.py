@@ -149,18 +149,6 @@ def prepare_tmix_wkv7_recurrent_fp16_state_from_tensor(state):
     return _TmixWkv7RecurrentState(state)
 
 
-def _check_metadata_inputs(
-    cu_seqlens: torch.Tensor,
-    state_indices: torch.Tensor,
-) -> None:
-    if not isinstance(cu_seqlens, torch.Tensor):
-        raise TypeError("cu_seqlens must be a torch.Tensor")
-    if cu_seqlens.ndim != 1:
-        raise ValueError("cu_seqlens must be one-dimensional")
-    if not isinstance(state_indices, torch.Tensor):
-        raise TypeError("state_indices must be a torch.Tensor")
-
-
 def prepare_tmix_wkv7_recurrent_metadata(
     cu_seqlens: torch.Tensor,
     state_indices: torch.Tensor,
@@ -183,7 +171,12 @@ def prepare_tmix_wkv7_recurrent_metadata(
     for every stateful operator in the graph.
     """
 
-    _check_metadata_inputs(cu_seqlens, state_indices)
+    if not isinstance(cu_seqlens, torch.Tensor):
+        raise TypeError("cu_seqlens must be a torch.Tensor")
+    if cu_seqlens.ndim != 1:
+        raise ValueError("cu_seqlens must be one-dimensional")
+    if not isinstance(state_indices, torch.Tensor):
+        raise TypeError("state_indices must be a torch.Tensor")
     graph_values = (
         token_capacity,
         sequence_capacity,

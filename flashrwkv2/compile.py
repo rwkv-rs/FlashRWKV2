@@ -67,14 +67,6 @@ def _source_files(root: Path) -> list[Path]:
     )
 
 
-def _compile_sources(root: Path) -> list[str]:
-    return [
-        str(path)
-        for path in _source_files(root)
-        if path.suffix in {".cpp", ".cu"}
-    ]
-
-
 def _source_digest(root: Path) -> str:
     digest = hashlib.sha256()
     digest.update(b"runtime-builder\0")
@@ -246,7 +238,10 @@ def _build_extension(
     extension = CUDAExtension(
         name=name,
         include_dirs=[str(root)],
-        sources=_compile_sources(root),
+        sources=[
+            str(path) for path in _source_files(root)
+            if path.suffix in {".cpp", ".cu"}
+        ],
         extra_compile_args={
             "cxx": list(payload["cxx_flags"]),
             "nvcc": list(payload["nvcc_flags"]),

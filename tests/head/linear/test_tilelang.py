@@ -203,7 +203,7 @@ def test_tilelang_linear_tuning_checks_production_and_skips_compile_failures(
 
     monkeypatch.setattr(implementation, "linear", lambda *args, **kwargs: None)
     monkeypatch.setattr(implementation, "_compiled", compile_kernel)
-    monkeypatch.setattr(implementation, "_precompile", lambda keys: None)
+    monkeypatch.setattr(tuning, "compile_candidates", lambda *args: None)
     monkeypatch.setattr(implementation, "_forward", forward)
     monkeypatch.setattr(implementation, "_TUNED_CONFIGS", {})
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (12, 0))
@@ -380,7 +380,7 @@ def test_unverified_tuning_profile_cannot_select_a_kernel(monkeypatch, tmp_path)
         tuning.get_config({}, "linear", key)
 
 
-def test_tilelang_precompile_reuses_successes_and_preserves_compile_errors(monkeypatch):
+def test_candidate_compilation_reuses_successes_and_preserves_compile_errors(monkeypatch):
     import tilelang
 
     from flashrwkv2._internal import linear as implementation
@@ -409,9 +409,11 @@ def test_tilelang_precompile_reuses_successes_and_preserves_compile_errors(monke
     monkeypatch.setattr(implementation, "_compile_spec", spec)
     monkeypatch.setattr(tilelang, "par_compile", parallel)
     monkeypatch.setattr(tilelang, "compile", failed_compile)
-    implementation._precompile([*keys, keys[0]])
+    from flashrwkv2._internal.tuning import compile_candidates
+
+    compile_candidates([*keys, keys[0]], implementation._COMPILED_KERNELS, implementation._compile_spec)
     assert implementation._compiled(*keys[0]) is ready
-    implementation._precompile([keys[0]])
+    compile_candidates([keys[0]], implementation._COMPILED_KERNELS, implementation._compile_spec)
     assert batches == [(32, 64)]
     with pytest.raises(RuntimeError, match="nvcc rejected"):
         implementation._compiled(*keys[1])
