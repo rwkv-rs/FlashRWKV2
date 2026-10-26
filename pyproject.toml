@@ -19,6 +19,7 @@ license = "MIT"
 
 [dependency-groups]
 dev = [
+  "ninja>=1.11",
   "pytest>=8",
   "ruff>=0.12",
   "torch==2.14.1",

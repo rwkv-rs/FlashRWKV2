@@ -86,6 +86,78 @@ CUDA tests compile TileLang kernels and the metadata/sampling extension lazily.
 The full block suite checks outputs, FP32 state, and selected logprobs bitwise
 across training/inference, prefill/decode, and batch composition.
 
+## CI and release acceptance
+
+`Quality Gate` is the required merge check. Ordinary PRs run CPU contracts,
+package checks when needed, and the affected owners' complete CUDA test matrices
+on PRO6000 with Torch 2.14.1. Provider changes expand to their consumers and the
+block integration suite. Kernel changes also run the selected memcheck/racecheck
+cases. Changes to dependencies, native interfaces, or runtime loading add the
+Torch 2.11–2.14 compatibility matrix. Tests load the installed source wheel;
+pytest's checkout import path is excluded from GPU validation.
+
+Daily validation runs at 08:17 UTC on `main`, with full correctness, CUDA Graph,
+memcheck, and racecheck coverage. Sunday adds all supported Torch versions, a
+cold native build, and the complete benchmark/tuning suite. Daily performance
+reports measure owners changed since their latest compatible successful
+measurement. Performance failures and regressions appear in an independent
+report; they do not block the PR quality check. The Actions summary records
+actual selected/executed tests and tracks five completed PR timings against an
+initial 20-minute target for a single-owner change, excluding queue time.
+
+Successful results and original distributions share one 90-day artifact bundle.
+Identical source trees can reuse CPU results and individual GPU version results
+when the policy, environment, and requested coverage match. Scheduled runs also
+skip unchanged validation and package inputs after checking the active
+environment; their summaries reference the original full run. A full run can add
+missing compatibility or cold-build checks to an existing bundle. Validation
+never combines module coverage from different source revisions.
+
+Before releasing, run the `Quality Gate` workflow on the exact release tag with
+`mode=full` and `extended=true`. This produces the original wheel/sdist, full
+PRO6000 correctness and compatibility results, and a separate complete
+performance report. The `PyPI release` workflow verifies these results and
+publishes those original files. Its manual `tag` input verifies acceptance
+without publishing.
+
+RTX4090 acceptance is independent. On its checkout of the same tag, download
+the PRO6000 `flashrwkv2-quality-v6-<source-tree>` artifact to
+`artifacts/acceptance`. Use the project `.venv`, with the default Torch version,
+and the wheel from that bundle. With read access to Actions available through
+`GH_TOKEN`, the existing CI entrypoints produce the independent reports:
+
+```bash
+timeout 600s uv sync --frozen --no-install-project --group dev
+timeout 60s .venv/bin/python ci/quality_gate.py plan \
+  --base HEAD^ --head HEAD --mode full --extended --target sm89 \
+  --output artifacts/sm89/plan.json
+timeout 60s .venv/bin/python ci/quality_gate.py package \
+  --directory artifacts/acceptance --output artifacts/sm89/package.json
+CUDA_VISIBLE_DEVICES="" timeout 600s .venv/bin/python ci/quality_gate.py test \
+  --plan artifacts/sm89/plan.json --suite cpu --output artifacts/sm89/cpu.json \
+  --reuse artifacts/acceptance/quality-manifest.json
+CUDA_VISIBLE_DEVICES=0,1 PATH="$PWD/.venv/bin:$PATH" timeout 6600s .venv/bin/python ci/quality_gate.py gpu \
+  --plan artifacts/sm89/plan.json --package artifacts/acceptance \
+  --python .venv/bin/python --output artifacts/sm89
+# Compatibility testing ends on an older Torch; restore the primary version.
+timeout 600s uv sync --frozen --no-install-project --group dev
+timeout 180s uv pip install --python .venv/bin/python --no-deps --reinstall artifacts/acceptance/dist/*.whl
+timeout 120s .venv/bin/python ci/quality_gate.py finalize \
+  --plan artifacts/sm89/plan.json --package artifacts/acceptance \
+  --validation artifacts/sm89 --output artifacts/sm89-quality-manifest.json
+CUDA_VISIBLE_DEVICES=0,1 PATH="$PWD/.venv/bin:$PATH" timeout 13800s .venv/bin/python ci/benchmark_gate.py report \
+  --quality artifacts/sm89-quality-manifest.json --package artifacts/acceptance \
+  --profile full --repository rwkv-rs/FlashRWKV2 --python .venv/bin/python \
+  --output artifacts/sm89/performance --summary artifacts/sm89/performance.md
+timeout 30s cp artifacts/sm89/performance/summary.json artifacts/sm89-performance-summary.json
+```
+
+Attach `sm89-quality-manifest.json` and `sm89-performance-summary.json` to the
+tag's draft GitHub release. Both identify the exact source tree and wheel
+SHA256; the release verifier checks RTX4090 identity, full test completion,
+compatibility, sanitizer coverage, and complete performance results on both
+architectures. Publish the release after its manual verification succeeds.
+
 ## Benchmarks
 
 Operator benchmarks live in [`benchmarks/`](benchmarks/). The WKV matrix covers

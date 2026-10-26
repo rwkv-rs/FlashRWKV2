@@ -10,7 +10,6 @@ import os
 import shutil
 import subprocess
 import sys
-import tempfile
 import urllib.request
 import zipfile
 from dataclasses import dataclass
@@ -20,7 +19,7 @@ from typing import Any
 ROOT = Path(
     os.environ.get("FLASH_RWKV_SOURCE_ROOT", Path(__file__).resolve().parents[1])
 ).resolve()
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,6 +148,13 @@ BENCHMARKS = {
 }
 
 
+# Daily cases keep the established shapes and numerical checks, without sweeps.
+STANDARD_BENCHMARKS = {
+    owner: tuple(case for case in cases if "--tune" not in case.arguments)
+    for owner, cases in BENCHMARKS.items()
+}
+
+
 for _owner, _arguments in {
     "cmix": ("--operator", "pretrain", "--backward", "--adapter-rank", "256"),
     "head/linear": ("--tokens", "4", "--adapter-rank", "256"),
@@ -224,7 +230,8 @@ for _rows in (4, 64, 320, 512):
     }.items():
         BENCHMARKS[_owner] += (
             BenchmarkCase(
-                f"tuned_model_t{_rows}", f"benchmarks/{_owner}/bench.py",
+                f"tuned_model_t{_rows}",
+                f"benchmarks/{_owner}/bench.py",
                 (*_arguments, "--channels", "4096", "--tune", "--timing-mode", "graph"),
             ),
         )
@@ -235,17 +242,44 @@ for _rows in (1, 4, 64, 320, 512):
             BenchmarkCase(
                 f"tuned_model_{'later' if _later else 'first'}_t{_rows}",
                 "benchmarks/tmix/wkv_prepare/bench.py",
-                ("--operator", "infer", "--tokens", str(_rows), "--channels", "4096",
-                 "--rank", "128", "--ranks", "128,128,480,96",
-                 *(("--later-layer",) if _later else ()), "--tune", "--timing-mode", "graph"),
+                (
+                    "--operator",
+                    "infer",
+                    "--tokens",
+                    str(_rows),
+                    "--channels",
+                    "4096",
+                    "--rank",
+                    "128",
+                    "--ranks",
+                    "128,128,480,96",
+                    *(("--later-layer",) if _later else ()),
+                    "--tune",
+                    "--timing-mode",
+                    "graph",
+                ),
             ),
         )
 
 BENCHMARKS["tmix/wkv7"] += (
     BenchmarkCase(
-        "infer_recurrent_model_decode", "benchmarks/tmix/wkv7/bench.py",
-        ("--shapes", "h64d64", "--cases", "1x1", "4x1", "64x1", "320x1", "512x1",
-         "--decay-bias", "--tune", "--timing-mode", "graph"), "--output",
+        "infer_recurrent_model_decode",
+        "benchmarks/tmix/wkv7/bench.py",
+        (
+            "--shapes",
+            "h64d64",
+            "--cases",
+            "1x1",
+            "4x1",
+            "64x1",
+            "320x1",
+            "512x1",
+            "--decay-bias",
+            "--tune",
+            "--timing-mode",
+            "graph",
+        ),
+        "--output",
     ),
 )
 
@@ -273,17 +307,23 @@ for _case in tuple(BENCHMARKS["tmix/wkv7"]):
     if _case.workload in ("infer_recurrent_multisize", "infer_recurrent_model_decode"):
         BENCHMARKS["tmix/wkv7"] += (
             BenchmarkCase(
-                _case.workload + "_fp16_state", _case.path,
-                (*_case.arguments, "--state-dtype", "float16"), _case.output_argument,
+                _case.workload + "_fp16_state",
+                _case.path,
+                (*_case.arguments, "--state-dtype", "float16"),
+                _case.output_argument,
             ),
         )
 
 # Publish real serving shapes first so downstream validation can run in parallel.
 for _owner, _cases in BENCHMARKS.items():
-    BENCHMARKS[_owner] = tuple(sorted(
-        _cases,
-        key=lambda case: not case.workload.startswith(("tuned_model_", "infer_recurrent_model_")),
-    ))
+    BENCHMARKS[_owner] = tuple(
+        sorted(
+            _cases,
+            key=lambda case: (
+                not case.workload.startswith(("tuned_model_", "infer_recurrent_model_"))
+            ),
+        )
+    )
 
 
 def _sha256(path: Path) -> str:
@@ -319,11 +359,12 @@ print(json.dumps({
 """
     payload = json.loads(
         subprocess.run(
-            (_python_executable(python), "-c", program),
-            cwd=tempfile.gettempdir(),
+            (_python_executable(python), "-I", "-c", program),
+            cwd=ROOT / "artifacts",
             check=True,
             capture_output=True,
             text=True,
+            timeout=1800,
         ).stdout
     )
     extension_path = Path(payload.pop("extension_path"))
@@ -340,6 +381,7 @@ print(json.dumps({
         check=True,
         capture_output=True,
         text=True,
+        timeout=30,
     )
     values = [value.strip() for value in result.stdout.strip().split(",")]
     payload["driver"] = values[0] if values else None
@@ -359,6 +401,7 @@ def _assert_gpu_idle() -> None:
         check=True,
         capture_output=True,
         text=True,
+        timeout=30,
     )
     pids = [line.strip() for line in result.stdout.splitlines() if line.strip()]
     if pids:
@@ -390,9 +433,9 @@ def _json_payloads(stdout: str) -> list[dict[str, Any]]:
     return payloads
 
 
-def _contract_hash(module: str) -> str:
+def _contract_hash(module: str, profile: str = "full") -> str:
     digest = hashlib.sha256()
-    for case in BENCHMARKS[module]:
+    for case in (STANDARD_BENCHMARKS if profile == "standard" else BENCHMARKS)[module]:
         digest.update(case.workload.encode())
         digest.update(b"\0")
         digest.update(json.dumps(case.arguments, separators=(",", ":")).encode())
@@ -404,6 +447,7 @@ def _contract_hash(module: str) -> str:
         digest.update(b"\0")
         digest.update(path.read_bytes())
         digest.update(b"\0")
+    digest.update(Path(__file__).read_bytes())
     timing = ROOT / "benchmarks/_timing.py"
     digest.update(str(timing.relative_to(ROOT)).encode())
     digest.update(b"\0")
@@ -532,8 +576,12 @@ def _run_case(
     command = [_python_executable(python), str(script), *case.arguments]
     output_path: Path | None = None
     if case.output_argument is not None:
-        output_path = Path(tempfile.gettempdir()) / (
-            f"flashrwkv2-{module.replace('/', '-')}-{case.workload}-{os.getpid()}.json"
+        output_path = (
+            ROOT
+            / "artifacts"
+            / (
+                f"flashrwkv2-{module.replace('/', '-')}-{case.workload}-{os.getpid()}.json"
+            )
         )
         command.extend((case.output_argument, str(output_path)))
     environment_variables = os.environ.copy()
@@ -541,11 +589,12 @@ def _run_case(
     environment_variables["FLASHRWKV_BENCHMARK_STATUS"] = status
     result = subprocess.run(
         command,
-        cwd=tempfile.gettempdir(),
+        cwd=ROOT / "artifacts",
         env=environment_variables,
         check=True,
         capture_output=True,
         text=True,
+        timeout=1800,
     )
     payloads = (
         [json.loads(output_path.read_text(encoding="utf-8"))]
@@ -577,12 +626,15 @@ def run_module(
     revision: str,
     status: str,
     environment: dict[str, Any],
+    profile: str = "full",
 ) -> dict[str, Any]:
     profiles = []
     experiments = []
     workloads = []
-    for case in BENCHMARKS[module]:
-        print(f"Running benchmark: {module}/{case.workload}", file=sys.stderr, flush=True)
+    for case in (STANDARD_BENCHMARKS if profile == "standard" else BENCHMARKS)[module]:
+        print(
+            f"Running benchmark: {module}/{case.workload}", file=sys.stderr, flush=True
+        )
         case_profiles, case_experiments, case_records = _run_case(
             module, case, python=python, status=status
         )
@@ -595,7 +647,8 @@ def run_module(
         "module": module,
         "target": f"sm{environment['capability'][0]}{environment['capability'][1]}",
         "revision": revision,
-        "benchmark_contract_sha256": _contract_hash(module),
+        "benchmark_contract_sha256": _contract_hash(module, profile),
+        "profile": profile,
         "environment": environment,
         "profiles": profiles,
         "experiments": experiments,
@@ -610,6 +663,7 @@ def run_suite(
     revision: str,
     status: str,
     output: Path,
+    profile: str = "full",
 ) -> dict[str, Any]:
     unknown = sorted(set(modules) - BENCHMARKS.keys())
     if unknown:
@@ -628,6 +682,7 @@ def run_suite(
                 revision=revision,
                 status=status,
                 environment=environment,
+                profile=profile,
             )
         except (
             KeyError,
@@ -636,15 +691,21 @@ def run_suite(
             TypeError,
             ValueError,
             subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
         ) as error:  # Benchmark failures are advisory by design.
             warning = {
                 "kind": "benchmark-unavailable",
                 "module": module,
                 "message": f"{type(error).__name__}: {error}",
             }
-            if isinstance(error, subprocess.CalledProcessError):
-                warning["stdout"] = error.stdout
-                warning["stderr"] = error.stderr
+            if isinstance(
+                error, (subprocess.CalledProcessError, subprocess.TimeoutExpired)
+            ):
+                for stream in ("stdout", "stderr"):
+                    log = getattr(error, stream)
+                    warning[stream] = (
+                        log.decode(errors="replace") if isinstance(log, bytes) else log
+                    )
             warnings.append(warning)
             payload = {
                 "schema_version": SCHEMA_VERSION,
@@ -769,7 +830,7 @@ def _api_json(url: str, token: str) -> dict[str, Any]:
             "X-GitHub-Api-Version": "2022-11-28",
         },
     )
-    with urllib.request.urlopen(request) as response:
+    with urllib.request.urlopen(request, timeout=30) as response:
         return json.load(response)
 
 
@@ -779,60 +840,56 @@ def fetch_main_baselines(
     modules: list[str],
     output: Path,
     current_environment: dict[str, Any],
+    profile: str = "full",
 ) -> list[str]:
+    import io
+
     output.mkdir(parents=True, exist_ok=True)
-    runs_url = (
+    runs = _api_json(
         f"https://api.github.com/repos/{repository}/actions/workflows/"
-        "pro6000-gpu.yml/runs?branch=main&status=success&per_page=20"
-    )
-    runs = _api_json(runs_url, token).get("workflow_runs", [])
-    wanted = {module.replace("/", "-"): module for module in modules}
-    found: set[str] = set()
+        "pro6000-gpu.yml/runs?branch=main&per_page=30",
+        token,
+    ).get("workflow_runs", [])
+    found = set()
     for run in runs:
+        # A failed advisory benchmark must not invalidate a passed quality gate.
         if run.get("name") != "Quality Gate":
             continue
-        artifacts_url = (
-            f"https://api.github.com/repos/{repository}/actions/runs/"
-            f"{run['id']}/artifacts?per_page=100"
-        )
-        artifacts = _api_json(artifacts_url, token).get("artifacts", [])
-        evidence = next(
-            (
-                row
-                for row in artifacts
-                if row.get("name", "").startswith("flashrwkv2-quality-v5-")
-                and not row.get("expired")
-            ),
-            None,
-        )
-        if evidence is None:
-            continue
-        request = urllib.request.Request(evidence["archive_download_url"])
-        request.add_unredirected_header("Authorization", f"Bearer {token}")
-        with (
-            urllib.request.urlopen(request) as response,
-            tempfile.NamedTemporaryFile() as archive,
-        ):
-            archive.write(response.read())
-            archive.flush()
-            with zipfile.ZipFile(archive.name) as bundle:
+        artifacts = _api_json(
+            f"https://api.github.com/repos/{repository}/actions/runs/{run['id']}/artifacts?per_page=100",
+            token,
+        ).get("artifacts", [])
+        for artifact in artifacts:
+            if artifact.get("expired") or not artifact["name"].startswith(
+                "flashrwkv2-performance-v6-"
+            ):
+                continue
+            request = urllib.request.Request(artifact["archive_download_url"])
+            request.add_unredirected_header("Authorization", f"Bearer {token}")
+            with urllib.request.urlopen(request, timeout=120) as response:
+                archive_bytes = response.read()
+            with zipfile.ZipFile(io.BytesIO(archive_bytes)) as bundle:
+                summary = json.loads(bundle.read("summary.json"))
+                if (
+                    summary.get("status") != "completed"
+                    or summary.get("profile") != profile
+                ):
+                    continue
                 names = set(bundle.namelist())
-                for safe, module in wanted.items():
+                for module in modules:
                     if module in found:
                         continue
-                    candidates = [
-                        name
-                        for name in names
-                        if name.endswith(f"/{safe}-candidate.json")
-                        or name == f"{safe}-candidate.json"
-                    ]
-                    if len(candidates) != 1:
+                    name = f"candidate/{module.replace('/', '-')}-candidate.json"
+                    if name not in names:
                         continue
-                    payload = json.loads(bundle.read(candidates[0]))
-                    if payload.get("status") != "candidate":
+                    payload = json.loads(bundle.read(name))
+                    if (
+                        payload.get("schema_version") != SCHEMA_VERSION
+                        or payload.get("status") != "candidate"
+                    ):
                         continue
                     if payload.get("benchmark_contract_sha256") != _contract_hash(
-                        module
+                        module, profile
                     ):
                         continue
                     if any(
@@ -848,13 +905,145 @@ def fetch_main_baselines(
                     ):
                         continue
                     payload["status"] = "baseline"
-                    (output / f"{safe}-baseline.json").write_text(
-                        json.dumps(payload, indent=2) + "\n", encoding="utf-8"
+                    _write_json(
+                        output / f"{module.replace('/', '-')}-baseline.json", payload
                     )
                     found.add(module)
         if len(found) == len(modules):
             break
     return [module for module in modules if module not in found]
+
+
+def report(
+    quality: Path,
+    package: Path,
+    profile: str,
+    repository: str,
+    python: str,
+    output: Path,
+    summary: Path,
+) -> int:
+    from quality_gate import (
+        PRIMARY_TORCH,
+        _environment_identity,
+        _isolated_json,
+        verify_manifest,
+    )
+    from select_targets import TARGETS, _git_changed_files, classify
+
+    output.mkdir(parents=True, exist_ok=True)
+    manifest = json.loads(quality.read_text())
+    plan = manifest["plan"]
+    verify_manifest(manifest, plan, package)
+    primary = next(
+        row for row in manifest["gpu"] if row["torch_version"] == PRIMARY_TORCH
+    )
+    if _environment_identity(primary["environment"]) != _environment_identity(
+        _isolated_json(
+            python,
+            str(Path(__file__).with_name("quality_gate.py")),
+            "environment",
+            "--target",
+            plan["target"],
+            timeout=60,
+        )
+    ):
+        raise ValueError(
+            "performance environment differs from the correctness environment"
+        )
+    current = _environment(python)
+    current["wheel_sha256"] = manifest["artifacts"]["wheel"]["sha256"]
+    os.environ["FLASH_RWKV_WHEEL_SHA256"] = current["wheel_sha256"]
+    # Full reports always cover all owners. Daily reports compare each owner to
+    # its latest successful baseline, so changes across multiple days accumulate.
+    modules = (
+        sorted(TARGETS)
+        if plan["impact"]["run_all"]
+        else list(plan["impact"]["affected_modules"])
+    )
+    if profile == "full" and modules != sorted(TARGETS):
+        raise ValueError("full performance acceptance requires full correctness first")
+    baseline = output / "baseline"
+    fetch_main_baselines(
+        repository, os.environ["GH_TOKEN"], modules, baseline, current, profile
+    )
+    selected, reused = [], []
+    for module in modules:
+        path = baseline / f"{module.replace('/', '-')}-baseline.json"
+        if not path.is_file():
+            selected.append(module)
+            continue
+        previous = json.loads(path.read_text())
+        changed = _git_changed_files(previous["revision"], plan["head_sha"])
+        impact = classify(changed)
+        if (impact.run_benchmark and module in impact.affected_modules) or (
+            profile == "full"
+            and previous["environment"].get("wheel_sha256") != current["wheel_sha256"]
+        ):
+            selected.append(module)
+        else:
+            reused.append(module)
+    result = (
+        run_suite(
+            selected,
+            python=python,
+            revision=plan["head_sha"],
+            status="candidate",
+            output=output / "candidate",
+            profile=profile,
+        )
+        if selected
+        else {
+            "status": "completed",
+            "completed_modules": [],
+            "modules": [],
+            "warnings": [],
+        }
+    )
+    # Reused measurements retain their measured revision and wheel identity.
+    # They can support daily reports, while full release acceptance below only
+    # admits measurements of the exact release wheel.
+    for module in reused:
+        payload = json.loads(
+            (baseline / f"{module.replace('/', '-')}-baseline.json").read_text()
+        )
+        payload["status"] = "candidate"
+        _write_json(
+            output / "candidate" / f"{module.replace('/', '-')}-candidate.json", payload
+        )
+    comparison = compare_suite(selected, baseline, output / "candidate")
+    _write_json(output / "comparison.json", comparison)
+    result.update(
+        {
+            "schema_version": SCHEMA_VERSION,
+            "source_tree_sha": plan["source_tree_sha"],
+            "revision": plan["head_sha"],
+            "wheel_sha256": current["wheel_sha256"],
+            "environment": current,
+            "profile": profile,
+            "modules": modules,
+            "measured_modules": selected,
+            "completed_modules": sorted([*result["completed_modules"], *reused]),
+            "reused_modules": reused,
+            "warnings": [*result["warnings"], *comparison["warnings"]],
+        }
+    )
+    _write_json(output / "summary.json", result)
+    with summary.open("a", encoding="utf-8") as handle:
+        handle.write(f"### Performance ({profile})\n\n")
+        handle.write(
+            f"Measured {len(selected)} modules; reused {len(result['reused_modules'])}; status: {result['status']}.\n\n"
+        )
+        for warning in result["warnings"]:
+            detail = (
+                f"{warning.get('percent', 0):.2f}%"
+                if warning["kind"] == "performance-regression"
+                else warning.get("message", "")
+            )
+            handle.write(
+                f"- {warning['kind']}: {warning.get('module', '')} {warning.get('profile', '')} {detail}\n"
+            )
+    return 0 if result["status"] == "completed" else 1
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -1004,6 +1193,15 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
 
+    report_parser = commands.add_parser("report")
+    report_parser.add_argument("--quality", type=Path, required=True)
+    report_parser.add_argument("--package", type=Path, required=True)
+    report_parser.add_argument("--profile", choices=("standard", "full"), required=True)
+    report_parser.add_argument("--repository", required=True)
+    report_parser.add_argument("--python", required=True)
+    report_parser.add_argument("--output", type=Path, required=True)
+    report_parser.add_argument("--summary", type=Path, required=True)
+
     run_parser = commands.add_parser("run-suite")
     run_parser.add_argument("--modules", required=True)
     run_parser.add_argument("--python", default=sys.executable)
@@ -1035,6 +1233,31 @@ def main() -> int:
         _self_test()
         print("benchmark_gate self-test passed")
         return 0
+    if args.command == "report":
+        try:
+            return report(
+                args.quality,
+                args.package,
+                args.profile,
+                args.repository,
+                args.python,
+                args.output,
+                args.summary,
+            )
+        except (KeyError, ValueError, OSError, subprocess.SubprocessError) as error:
+            _write_json(
+                args.output / "summary.json",
+                {
+                    "status": "failed",
+                    "profile": args.profile,
+                    "error": f"{type(error).__name__}: {error}",
+                },
+            )
+            with args.summary.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    f"\nPerformance report failed: {type(error).__name__}: {error}\n"
+                )
+            raise
     modules = _parse_modules(args.modules)
     if args.command == "run-suite":
         summary = run_suite(
