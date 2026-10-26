@@ -293,6 +293,43 @@ assert linear._forward(x, w, None, torch.bfloat16).shape == (17, 96)
     )
 
 
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_public_tuning_profile_is_used_by_real_cuda_dispatch_in_a_fresh_process(monkeypatch, tmp_path):
+    import os
+    import subprocess
+    import sys
+    import flashrwkv2 as fr
+    from flashrwkv2._internal import tuning
+
+    monkeypatch.setenv("FLASHRWKV2_CACHE_DIR", str(tmp_path / "cache"))
+    tuning.get_tuning_cache_dir.cache_clear()
+    tuning._profile_root.cache_clear()
+    try:
+        torch.manual_seed(737)
+        x = torch.randn(5, 64, device="cuda", dtype=torch.bfloat16)
+        weight = torch.randn(17, 64, device="cuda", dtype=torch.bfloat16)
+        expected = fr.infer_head_linear_all_forward_varlen(x, weight)
+        report = fr.prepare_tuning([lambda: fr.infer_head_linear_all_forward_varlen(x, weight)], mode="tune")
+        assert report["counts"]["tuned"] == 1
+        torch.save((x.cpu(), weight.cpu(), expected.cpu()), tmp_path / "inputs.pt")
+        environment = dict(os.environ, TORCH_HOME=str(tmp_path / "other-torch"),
+                           XDG_CACHE_HOME=str(tmp_path / "other-xdg"))
+        subprocess.run([sys.executable, "-c", """
+import sys, torch
+import flashrwkv2 as fr
+x, weight, expected = torch.load(sys.argv[1], weights_only=True)
+x, weight = x.cuda(), weight.cuda()
+results = []
+report = fr.prepare_tuning([lambda: results.append(fr.infer_head_linear_all_forward_varlen(x, weight))])
+assert report['counts']['hit'] == 1 and report['complete'], report
+assert torch.equal(results[0].cpu().view(torch.int32), expected.view(torch.int32))
+""", str(tmp_path / "inputs.pt")], env=environment, check=True, timeout=120)
+    finally:
+        tuning.get_tuning_cache_dir.cache_clear()
+        tuning._profile_root.cache_clear()
+
+
 def test_tuning_profiles_relocate_and_invalidate_with_source_changes(monkeypatch, tmp_path):
     import shutil
     from flashrwkv2._internal import tuning
