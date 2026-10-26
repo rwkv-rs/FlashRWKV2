@@ -185,7 +185,8 @@ WKV 调优调用需要该 capture shape 全部 token/sequence 均处于 active �
 按 owner 首次警告未调优默认配置，不自动启动调优。
 
 缺失项不写入进程内选择缓存，后续 eager forward 能看到新发布的文件。
-已加载有效配置在进程中复用；准备操作在 capture 内直接拒绝，未预热的缺失 key
+已加载有效配置在普通 forward 中复用；显式 prepare 每轮对每个 key 重读一次文件，
+因此能观察外部进程的重新发布或删除。准备操作在 capture 内直接拒绝，未预热的缺失 key
 不能在 capture 中加载。准备前已建立的 CUDA Graph 必须重新捕获。
 多个进程对同一 key 通过文件锁竞争；持锁后再次读取，只有一个进程验证/调优并
 用同目录临时文件原子替换发布。无效 JSON、key 或验证标记立即报错；半写入

@@ -100,6 +100,23 @@ def test_tuning_missing_then_published_is_visible_in_same_process(tuning_cache):
     assert call() == (32, 64, 2, 64)
 
 
+def test_tuning_prepare_reloads_external_publication_and_detects_removal(tuning_cache):
+    tuning = tuning_cache
+    key = (("test", 8, 9, 128), 32)
+    call = lambda: tuning.get_config({}, "linear", key)
+    tuning.save_config("linear", key, (16, 64, 2, 32))
+    tuning.prepare_tuning([call])
+    path = tuning._profile_path("linear", tuning._encode(key))
+    record = json.loads(path.read_text())
+    record["config"] = [32, 64, 2, 64]
+    path.write_text(json.dumps(record))
+    refreshed = tuning.prepare_tuning([call])
+    assert refreshed["records"][0]["config"] == (32, 64, 2, 64)
+    path.unlink()
+    with pytest.raises(RuntimeError, match="missing verified tuning profile"):
+        tuning.prepare_tuning([call])
+
+
 def test_tuning_require_and_capture_fail_before_using_missing_key(tuning_cache, monkeypatch):
     tuning = tuning_cache
     key = (("test", 8, 9, 128), 128)

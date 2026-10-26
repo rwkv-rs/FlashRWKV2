@@ -163,7 +163,10 @@ def get_config(configs, owner, key, default=None, *, tune=None):
         return configs.get(key, default)
     session = _SESSION.get()
     identity = (str(_profile_root()), owner, key)
-    config = _LOADED.get(identity)
+    # Explicit preparation reloads each key once, including files published or
+    # removed by another process after an earlier eager call.
+    refresh = session is not None and (owner, key) not in session["records"]
+    config = None if refresh else _LOADED.get(identity)
     status = "hit"
     if config is None:
         if _capturing() and identity in _WARMED_DEFAULTS and session is None:
@@ -200,6 +203,7 @@ def get_config(configs, owner, key, default=None, *, tune=None):
     else:
         status = "missing"
         # Never cache defaults: a later publication must become visible.
+        _LOADED.pop(identity, None)
         configs.pop(key, None)
     if session is not None:
         previous = session["records"].get((owner, key))
