@@ -46,7 +46,6 @@ RELEASE_METADATA_FILES = {
     "flashrwkv2/__init__.py",
 }
 SHARED_FILES = {"setup.py", *RELEASE_METADATA_FILES}
-TEST_SHARED_FILES = {"tests/fixtures/tolerances-v1.json"}
 SHARED_PREFIXES = (
     ".github/workflows/",
     "ci/",
@@ -232,10 +231,6 @@ def classify(
         if path == "tests/utils.py":
             run_all = run_gpu = run_sanitizer = True
             reasons.append("shared-test-behavior")
-            continue
-        if path in TEST_SHARED_FILES:
-            run_all = run_gpu = True
-            reasons.append("shared-numerical-test-contract")
             continue
         if path in BENCHMARK_SHARED_FILES:
             modules.update(MODULES)
@@ -514,9 +509,6 @@ def _self_test() -> None:
     test_utils = classify(["tests/utils.py"])
     assert test_utils.run_all and test_utils.run_gpu and test_utils.run_sanitizer
     assert not test_utils.run_benchmark
-    tolerances = classify(["tests/fixtures/tolerances-v1.json"])
-    assert tolerances.run_all and tolerances.run_gpu
-    assert not tolerances.run_benchmark and not tolerances.run_sanitizer
     runtime = classify(["tests/test_runtime.py"])
     assert not runtime.run_gpu and runtime.change_class == "metadata"
     benchmark_shared = classify(["benchmarks/_timing.py"])

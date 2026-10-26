@@ -94,7 +94,6 @@ def build_plan(base_sha: str, head_sha: str) -> dict[str, Any]:
         head_sha=head_sha,
         release_metadata_only=release_only,
     )
-    function_targets: list[dict[str, Any]] = []
     if changed and all(
         path in {"AGENTS.md", "README.md", "RTK.md"}
         or path.startswith(("ci/", ".github/workflows/", "docs/"))
@@ -134,32 +133,16 @@ def build_plan(base_sha: str, head_sha: str) -> dict[str, Any]:
         "impact": asdict(impact),
         "contract_required": impact.change_class != "documentation",
         "package_required": impact.run_gpu,
-        "scope": (
-            "function"
-            if function_targets
-            else "control"
-            if impact.change_class == "control_plane"
-            else "tree"
-        ),
-        "function_targets": function_targets or [],
-        "cuda_correctness_nodeids": [
-            target["nodeid"] for target in function_targets or []
-        ],
-        "cuda_memcheck_nodeids": [
-            target["nodeid"] for target in function_targets or []
-            if target["memcheck"]
-        ],
-        "cuda_racecheck_nodeids": [
-            target["nodeid"] for target in function_targets or []
-            if target["racecheck"]
-        ],
+        "scope": "control" if impact.change_class == "control_plane" else "tree",
+        "function_targets": [],
+        "cuda_correctness_nodeids": [],
+        "cuda_memcheck_nodeids": [],
+        "cuda_racecheck_nodeids": [],
         "benchmark_modules": (
             list(impact.affected_cuda_modules) if impact.run_benchmark else []
         ),
         "cpu_test_paths": (
-            []
-            if function_targets
-            else ["tests"]
+            ["tests"]
             if impact.run_all
             else [
                 (
@@ -174,12 +157,12 @@ def build_plan(base_sha: str, head_sha: str) -> dict[str, Any]:
         "cuda_graph_modules": [
             module
             for module in impact.affected_cuda_modules
-            if not function_targets and module in CUDA_GRAPH_TARGETS
+            if module in CUDA_GRAPH_TARGETS
         ],
         "cuda_racecheck_modules": [
             module
             for module in impact.affected_cuda_modules
-            if not function_targets and module in RACECHECK_TARGETS
+            if module in RACECHECK_TARGETS
         ],
         "cuda_execution_mode": "native-runtime",
     }
@@ -266,23 +249,10 @@ def _artifact_covers_plan(
         return False
     if source.get("build_input_hash") != plan["build_input_hash"]:
         return False
-    if plan.get("scope") == "function":
-        observed = {
-            entry.get("nodeid")
-            for entry in manifest.get("function_coverage", [])
-            if entry.get("correctness") == "passed"
-        }
-        required_functions = {
-            target["nodeid"]
-            for target in plan["function_targets"]
-        }
-        if not required_functions <= observed:
+    coverage = manifest.get("coverage", {})
+    for module in plan["impact"]["affected_cuda_modules"]:
+        if coverage.get(module, {}).get("correctness") != "passed":
             return False
-    else:
-        coverage = manifest.get("coverage", {})
-        for module in plan["impact"]["affected_cuda_modules"]:
-            if coverage.get(module, {}).get("correctness") != "passed":
-                return False
     if plan["package_required"] and not {
         "wheel",
         "sdist",
@@ -416,11 +386,8 @@ def finalize(
         ]
         if len(matches) != 1 or matches[0].get("status") != "passed":
             raise SystemExit(f"validation lacks passed CUDA {kind} result")
-        coverage_key = "nodeids" if plan.get("scope") == "function" else "modules"
-        if sorted(matches[0].get(coverage_key, [])) != sorted(expected):
-            raise SystemExit(
-                f"validation CUDA {kind} {coverage_key} coverage mismatch"
-            )
+        if sorted(matches[0].get("modules", [])) != sorted(expected):
+            raise SystemExit(f"validation CUDA {kind} modules coverage mismatch")
     if plan["package_required"]:
         for check in (
             "package_identity",
@@ -440,34 +407,19 @@ def finalize(
     ):
         raise SystemExit("CUDA validation was not recorded as native-runtime")
     if not impact["package_smoke_only"]:
-        expected = (
-            plan["cuda_correctness_nodeids"]
-            if plan.get("scope") == "function"
-            else impact["affected_cuda_modules"]
-        )
+        expected = impact["affected_cuda_modules"]
         if expected:
             require_result("correctness", expected)
     if impact["run_sanitizer"]:
         if recorded_checks.get("memcheck") != "passed":
             raise SystemExit("sanitizer evidence lacks passed memcheck")
-        racecheck_required = bool(
-            plan.get("cuda_racecheck_nodeids")
-            or plan["cuda_racecheck_modules"]
-        )
+        racecheck_required = bool(plan["cuda_racecheck_modules"])
         if racecheck_required and recorded_checks.get("racecheck") != "passed":
             raise SystemExit("sanitizer evidence lacks required racecheck")
-        memcheck = (
-            plan["cuda_memcheck_nodeids"]
-            if plan.get("scope") == "function"
-            else impact["affected_cuda_modules"]
-        )
+        memcheck = impact["affected_cuda_modules"]
         if memcheck:
             require_result("memcheck", memcheck)
-        racecheck = (
-            plan["cuda_racecheck_nodeids"]
-            if plan.get("scope") == "function"
-            else plan["cuda_racecheck_modules"]
-        )
+        racecheck = plan["cuda_racecheck_modules"]
         if racecheck:
             require_result("racecheck", racecheck)
     if plan["cuda_graph_modules"] and recorded_checks.get("cuda_graph") != "passed":
@@ -502,7 +454,7 @@ def finalize(
             )
         coverage[module] = entry
 
-    if plan.get("scope") not in {"function", "control"}:
+    if plan.get("scope") != "control":
         for module in TARGETS:
             entry = coverage.get(module)
             if not entry or entry.get("correctness") != "passed":
@@ -534,16 +486,7 @@ def finalize(
             "sanitizer": "passed" if impact["run_sanitizer"] else "not-required",
         },
         "coverage": coverage,
-        "function_coverage": [
-            {
-                **target,
-                "source_tree_sha": current_tree,
-                "correctness": "passed",
-                "memcheck": "passed" if target["memcheck"] else "not-required",
-                "racecheck": "passed" if target["racecheck"] else "not-required",
-            }
-            for target in plan.get("function_targets", [])
-        ],
+        "function_coverage": [],
         "environment": validation_payload.get("environment", {}),
         "results": validation_payload.get("results", []),
         "artifacts": artifacts,

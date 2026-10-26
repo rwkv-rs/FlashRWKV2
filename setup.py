@@ -29,10 +29,7 @@ class SourceSdist(sdist):
 
     def make_release_tree(self, base_dir, files):
         super().make_release_tree(base_dir, files)
-        destination = Path(base_dir) / "csrc"
-        if destination.exists():
-            shutil.rmtree(destination)
-        shutil.copytree(ROOT / "csrc", destination)
+        _copy_native_sources(Path(base_dir) / "csrc")
 
 
 setup(

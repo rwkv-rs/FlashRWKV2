@@ -24,10 +24,6 @@ SOURCE_PATHS = (
 )
 
 
-def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[3]
-
-
 def _source_hash(root: Path) -> str:
     digest = hashlib.sha256()
     for relative in SOURCE_PATHS:
@@ -92,7 +88,7 @@ def main() -> None:
 
     timing = measure_cuda(launch)
 
-    root = _repo_root()
+    root = Path(__file__).resolve().parents[3]
     result = {
         "operator": "pretrain_l2wrap_ce_bf16",
         "rows": args.rows,
