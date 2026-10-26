@@ -192,7 +192,8 @@ WKV 调优调用需要该 capture shape 全部 token/sequence 均处于 active �
 用同目录临时文件原子替换发布。无效 JSON、key 或验证标记立即报错；半写入
 临时文件不会被读者视为已发布 profile。
 
-旧缓存迁移显式指定单个旧 namespace，无需改动旧服务目录：
+旧缓存迁移显式指定单个旧 namespace，无需改动旧服务目录。路径支持 `~` 展开；
+指定的目录不存在时立即报错，避免路径拼写错误意外触发全量调优：
 
 ```python
 prepared = prepare_tuning(

@@ -69,11 +69,15 @@ def test_tuning_device_class_shares_ordinals_but_separates_products(monkeypatch)
         tuning.device_class.cache_clear()
 
 
-def test_tuning_default_root_ignores_torch_and_xdg(monkeypatch, tmp_path):
+@pytest.mark.parametrize("override", [None, ""])
+def test_tuning_default_root_ignores_torch_and_xdg(monkeypatch, tmp_path, override):
     from pathlib import Path
     from flashrwkv2._internal import tuning
 
-    monkeypatch.delenv("FLASHRWKV2_CACHE_DIR", raising=False)
+    if override is None:
+        monkeypatch.delenv("FLASHRWKV2_CACHE_DIR", raising=False)
+    else:
+        monkeypatch.setenv("FLASHRWKV2_CACHE_DIR", override)
     monkeypatch.setenv("TORCH_HOME", str(tmp_path / "torch"))
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg"))
     tuning.get_tuning_cache_dir.cache_clear()
@@ -175,6 +179,14 @@ def test_tuning_revalidates_legacy_without_timing(tuning_cache, tmp_path, monkey
     )
     assert report["counts"]["revalidated"] == 1
     assert Path(report["records"][0]["path"]).is_file()
+
+
+def test_missing_legacy_directory_stops_before_tuning(tuning_cache, tmp_path):
+    with pytest.raises(NotADirectoryError, match="legacy tuning namespace does not exist"):
+        tuning_cache.prepare_tuning(
+            [lambda: pytest.fail("an invalid migration path must not start model preparation")],
+            mode="tune", legacy_dir=tmp_path / "missing",
+        )
 
 
 @pytest.mark.parametrize("contents", ["{", "[]", '{"bitwise_equal":false}', '{"config":[0]}'])

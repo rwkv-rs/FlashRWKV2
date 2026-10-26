@@ -38,7 +38,8 @@ _OWNER_SOURCES = {
 @cache
 def get_tuning_cache_dir():
     """Return the fixed cache root; only FLASHRWKV2_CACHE_DIR overrides it."""
-    return Path(os.environ.get("FLASHRWKV2_CACHE_DIR", "~/.cache/flashrwkv2")).expanduser().resolve()
+    configured = os.environ.get("FLASHRWKV2_CACHE_DIR") or "~/.cache/flashrwkv2"
+    return Path(configured).expanduser().resolve()
 
 
 @cache
@@ -199,6 +200,7 @@ def get_config(configs, owner, key, default=None, *, tune=None):
                     status = "revalidated" if candidate is not None else "tuned"
     if config is not None:
         _LOADED[identity] = config
+        _WARMED_DEFAULTS.discard(identity)
         configs[key] = config
     else:
         status = "missing"
@@ -260,6 +262,10 @@ def prepare_tuning(calls, *, mode="require", legacy_dir=None):
         raise RuntimeError("prepare_tuning must run outside CUDA Graph capture and other preparation")
     if legacy_dir is not None and mode != "tune":
         raise ValueError("legacy_dir requires mode='tune'")
+    if legacy_dir is not None:
+        legacy_dir = Path(legacy_dir).expanduser().resolve()
+        if not legacy_dir.is_dir():
+            raise NotADirectoryError(f"legacy tuning namespace does not exist: {legacy_dir}")
     session = {"mode": mode, "legacy_dir": legacy_dir, "records": {}}
     token = _SESSION.set(session)
     try:
