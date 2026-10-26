@@ -140,6 +140,12 @@ SM89 与 PRO6000 SM120 的 decode、小 batch、prefill 和训练形状。
 形状、dtype 和权重 stride 时会自动读取该配置；CUDA Graph 捕获前的正常 warmup
 即可采用配置。源码变化会使旧配置失效，没有对应记录时仍使用原有默认配置。
 配置通过原子替换发布；已经运行的进程保留自己的选择，应在调优结束后启动 serving。
+`flashrwkv2.compile` 只预编译 metadata 与 sampling 的 native 扩展；模型 warmup
+读取已有配置，调优由各模块 benchmark 的 `--tune` 显式执行。部署必须将匹配
+当前源码和运行环境的 verified profiles 发布到服务实际使用的缓存目录。
+`XDG_CACHE_HOME` 或 `TORCH_HOME` 改变会改变该目录；按 release 隔离缓存的
+部署应共享或发布 `flashrwkv2/tuning` 子目录，并在 CUDA Graph 捕获前用新进程
+核对实际 workload 的配置命中。历史 benchmark 的成功记录不会自动进入新部署。
 基准还覆盖真实 7.2B 的 `w/a=128,g=480,v=96` 首层与后续层，以及
 `B=1/4/64/320/512` decode，以保证缓存 key 对应实际推理布局。
 

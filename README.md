@@ -93,6 +93,16 @@ script and seed for both revisions; emitted JSON records their actual precision.
 `--timing-mode eager` measures dispatch wall time and `graph` measures a captured
 batch with CUDA events. Compare the two timing modes separately. PostNorm,
 TokenShift and Readout benchmarks also expose `--tune`.
+Verified tuning profiles are written to the active PyTorch cache and loaded
+by subsequent processes with matching source, TileLang/CUDA environment,
+GPU, shape, dtype and weight strides. `flashrwkv2.compile` precompiles the
+metadata and sampling extension; run the operator benchmarks with `--tune`
+to select model kernel configurations. Deploy those profiles to the cache
+used by the service before warmup and CUDA Graph capture. Deployments that
+set a separate `XDG_CACHE_HOME` for each release must publish or share the
+`flashrwkv2/tuning` subtree across releases. See the
+[tuning contract](docs/kernel_api.md#tuning-and-acceptance) for cache matching
+and correctness requirements.
 The historical [0.1.0a9 performance report](docs/performance/wkv7-0.1.0a9.md)
 describes that release's implementation; current results must identify the
 revision, hardware, shapes, and numerical contract.
