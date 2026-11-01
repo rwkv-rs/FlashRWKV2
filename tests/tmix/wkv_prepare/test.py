@@ -94,7 +94,8 @@ def test_fixed_decode_projection_restricts_models_and_layouts(monkeypatch):
     kinds, biases = (1, 0, 2), (None,) * 3
     fixed = implementation._fixed_projection_config
     assert fixed(xs, weights, kinds, biases) == (16, 32, 2, 512)
-    assert fixed(tuple(torch.empty(2, 2048, device="meta") for _ in ranks), weights, kinds, biases) is None
+    assert fixed(tuple(torch.empty(2, 2048, device="meta") for _ in ranks), weights, kinds, biases) == (16, 16, 2, 512)
+    assert fixed(tuple(torch.empty(17, 2048, device="meta") for _ in ranks), weights, kinds, biases) is None
     assert fixed(xs, weights, (0, 0, 0), biases) is None
     assert fixed(xs, weights, kinds, (weights[0][0], None, None)) is None
     mixed_layout = (weights[0].t().contiguous().t(), *weights[1:])

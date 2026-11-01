@@ -683,7 +683,8 @@ def test_fixed_decode_linear_limits_models_devices_and_layouts(monkeypatch, chan
     value = torch.empty(4 * channels, channels, device="meta").t()
     value_x = torch.empty(1, 4 * channels, device="meta")
     fixed = implementation._fixed_projection_config
-    assert fixed(x, key, torch.bfloat16, None) == (16, 64, 2, 128)
+    key_config = {2048: (16, 64, 2, 256), 2560: (16, 128, 2, 128), 4096: (16, 64, 2, 128)}[channels]
+    assert fixed(x, key, torch.bfloat16, None) == key_config
     assert fixed(x, output, torch.bfloat16, None) == (16, 32, 2, 512 if channels == 4096 else 256)
     assert fixed(x, head, torch.float32, None) == (16, 64, 2, 128)
     assert fixed(value_x, value, torch.bfloat16, None) == (
@@ -691,9 +692,8 @@ def test_fixed_decode_linear_limits_models_devices_and_layouts(monkeypatch, chan
     )
     assert fixed(x, key, torch.float32, None) is None
     assert fixed(x, key, torch.bfloat16, key[0]) is None
-    assert fixed(torch.empty(2, channels, device="meta"), key, torch.bfloat16, None) == (
-        (16, 64, 2, 128) if channels == 4096 else None
-    )
+    assert fixed(torch.empty(2, channels, device="meta"), key, torch.bfloat16, None) == key_config
+    assert fixed(torch.empty(17, channels, device="meta"), key, torch.bfloat16, None) is None
     assert fixed(value_x, value.contiguous(), torch.bfloat16, None) is None
     info = ("test", 12, 0, 188)
     assert fixed(value_x, value, torch.bfloat16, None) is None
@@ -743,7 +743,10 @@ def test_fixed_square_weight_vjp_limits_reduction_and_dtype(monkeypatch, batch, 
 @pytest.mark.parametrize("kind,width,rows", tuple(
     (kind, width, rows)
     for kind in ("cmix_key", "cmix_value", "attention_output", "head")
-    for width, rows in ((2048, 1), (4096, 2), (4096, 16), (4096, 256), (4096, 1024))
+    for width, rows in (
+        (2048, 1), (2048, 2), (2048, 16), (2560, 1), (2560, 2), (2560, 16),
+        (4096, 1), (4096, 2), (4096, 16), (4096, 256), (4096, 1024),
+    )
 ) + (("attention_input_vjp", 4096, 256), ("attention_input_vjp", 4096, 1024)))
 def test_fixed_decode_linear_preserves_fp32_and_graph(monkeypatch, tmp_path, kind, width, rows):
     from flashrwkv2._internal import linear as implementation

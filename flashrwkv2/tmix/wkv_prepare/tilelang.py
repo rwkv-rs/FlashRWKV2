@@ -405,7 +405,7 @@ def _fixed_projection_config(xs, weights, kinds, biases):
             and weight.stride() == (channels, 1)
             for x, weight in zip(xs, weights, strict=True)
         ):
-            if rows == 1 or (channels == 4096 and rows <= 16):
+            if rows <= 16:
                 return (16, 32, 2, 256) if channels < 4096 else (16, 64, 2, 128)
             if 192 < rows <= 256:
                 return (64, 128, 2, 64) if channels < 4096 else (128, 64, 2, 64)
@@ -430,9 +430,9 @@ def _fixed_projection_config(xs, weights, kinds, biases):
         output_major = all(weight.stride() == (channels, 1) for weight in weights)
         input_major = all(weight.stride() == (1, weight.shape[0]) for weight in weights)
         model_13b = channels == 4096 and ranks == (192, 192, 384, 128)[:len(ranks)]
-        if rows == 1 or (rows <= 16 and model_13b):
+        if rows <= 16:
             if output_major or input_major:
-                return (16, 32 if input_major or channels < 4096 else 16, 2, 512)
+                return (16, 32 if input_major or (rows == 1 and channels < 4096) else 16, 2, 512)
             return None
         if model_13b and (input_major or output_major):
             if rows <= 256:
@@ -450,7 +450,7 @@ def _fixed_projection_config(xs, weights, kinds, biases):
         output_major = all(weight.shape == (channels, rank) and weight.stride() == (rank, 1)
                            for weight, rank in zip(weights, ranks, strict=True))
         model_13b = channels == 4096 and ranks == (192, 192, 384, 128)[:len(ranks)]
-        if (rows == 1 or (rows <= 16 and model_13b)) and (input_major or output_major):
+        if rows <= 16 and (input_major or output_major):
             return (16, 32, 2, 64)
         if model_13b and (input_major or output_major):
             if rows <= 256 and len(ranks) == 3:
