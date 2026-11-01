@@ -210,6 +210,12 @@ decode 为 `(block_values=64, prefetch_tokens=1)`，多 token 工作量为
 宽度 5120 和更大 batch 暂保留原来的 profile 选择：实测部分工作量的两行或
 四行配置更快，且不同架构的拐点不同。
 
+普通单路 TokenShift 在上述两种架构的模型宽度 2048、2560、4096、5120 下，
+不超过 64 个 token 使用 256 元素分块；宽度 4096、5120 的 128–4096 个
+token 使用 512 元素分块。其他宽度、路数和区间继续使用 profile，以覆盖
+序列数量和模型宽度对拐点的影响。训练 VJP、functional 和 indexed 变体
+使用同一分派。
+
 WKV Prepare 的单 token 低秩输入投影，在上述两种架构的下列模型维度上使用
 `(block_m=16, block_n=16, stages=2, copy_k=512)`；首层只使用前三个 rank，
 后续层使用四个 rank。输入主序和输出主序的连续权重均适用：

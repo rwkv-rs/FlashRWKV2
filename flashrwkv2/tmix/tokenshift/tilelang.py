@@ -318,13 +318,29 @@ def _backward(
     return kernel
 
 
+def _tokenshift_block(x, mixes, cu, initial, status=None):
+    from ..._internal.tuning import get_config
+
+    fixed = None
+    if mixes.shape[0] == 1 and _fixed_rows(x):
+        if x.shape[0] <= 64:
+            fixed = 256
+        elif x.shape[1] in (4096, 5120) and 128 <= x.shape[0] <= 4096:
+            fixed = 512
+    return get_config(
+        _BLOCK_CONFIGS, "tmix/tokenshift", _config_key(x, mixes, initial.shape[0]),
+        256 if fixed is None else fixed,
+        tune=lambda: tune_tokenshift(x, mixes, cu, initial, _status=status),
+        fixed=fixed is not None,
+    )
+
+
 class _TokenShift(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, mixes, cu_seqlens, initial):
         if x.shape[-1] % 2 == 0 and any(t.data_ptr() % 4 for t in (x, mixes, initial)):
             raise ValueError("tokenshift inputs must be 4-byte aligned")
-        from ..._internal.tuning import get_config
-        block = get_config(_BLOCK_CONFIGS, "tmix/tokenshift", _config_key(x, mixes, initial.shape[0]), 256, tune=lambda: tune_tokenshift(x, mixes, cu_seqlens, initial))
+        block = _tokenshift_block(x, mixes, cu_seqlens, initial)
         options = (x.shape[-1], mixes.shape[0], str(cu_seqlens.dtype).split(".")[-1], block)
         y, final = _forward(*options)(x, mixes, cu_seqlens, initial, cu_seqlens[:0])
         ctx.save_for_backward(x, mixes, cu_seqlens, initial)
@@ -369,9 +385,7 @@ def _compiled_tokenshift_vjp(
     dy: torch.Tensor, dfinal: torch.Tensor, x: torch.Tensor, mixes: torch.Tensor,
     cu: torch.Tensor, initial: torch.Tensor, need_mix: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
-    from ..._internal.tuning import get_config
-    block = get_config(_BLOCK_CONFIGS, "tmix/tokenshift", _config_key(x, mixes, initial.shape[0]), 256,
-                       tune=lambda: tune_tokenshift(x, mixes, cu, initial))
+    block = _tokenshift_block(x, mixes, cu, initial)
     ctx = _AutogradContext(saved_tensors=(x, mixes, cu, initial),
                           options=(x.shape[-1], mixes.shape[0], str(cu.dtype).split(".")[-1], block),
                           needs_input_grad=(True, need_mix, False, True))
@@ -427,8 +441,7 @@ def tokenshift(
         operation = _compiled_tokenshift if torch.compiler.is_compiling() else _TokenShift.apply
         y, final = operation(x, mixes, cu_seqlens, initial_shift)
     else:
-        from ..._internal.tuning import get_config
-        block = get_config(_BLOCK_CONFIGS, "tmix/tokenshift", _config_key(x, mixes, batch), 256, tune=lambda: tune_tokenshift(x, mixes, cu_seqlens, initial_shift, _status=_status))
+        block = _tokenshift_block(x, mixes, cu_seqlens, initial_shift, _status)
         y, final = _forward(channels, mixes.shape[0], str(cu_seqlens.dtype).split(".")[-1], block, True)(
             x, mixes, cu_seqlens, initial_shift, _status
         )
