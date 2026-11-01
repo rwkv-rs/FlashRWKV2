@@ -195,7 +195,10 @@ output, final_state = statetune_tmix_wkv7_recurrent_fp32io16(
 
 ### 当前调优接口
 
-SM89/SM120 的 head size 64、FP32 state WKV recurrence 使用确定性配置：
+已验证设备的固定策略按架构与 SM 数量限定：SM89/128 SM（RTX 4090）和
+SM120/188 SM（RTX PRO 6000）。同架构但 SM 数量不同的设备继续使用 profile。
+
+这两类设备的 head size 64、FP32 state WKV recurrence 使用确定性配置：
 decode 为 `(block_values=64, prefetch_tokens=1)`，多 token 工作量为
 `(64, 4)`。functional 和 indexed 路径共享该规则；显式传入的配置仍优先。
 这些路径不读取 verified profile，也不执行运行时调优。内部 WKV tuner 仍可用于
@@ -229,6 +232,13 @@ WKV Prepare 的单 token 低秩输入投影，在上述两种架构的下列模�
 小 N tile 为低秩输出提供更多 CTA，较长的复制跨度减少大 K 维循环次数；
 MMA 仍按连续 32 元素累加。其他 rank、混合权重布局和多 token 工作量沿用
 profile 选择。
+
+CMix 与 Head 的单 token 投影也只选三种 tile：对于宽度 2048、2560、4096
+的连续输出主序 CMix key 和 65536 词表 FP32 Head，使用
+(16, 64, 2, 128)；输入主序 CMix value 在宽度 2048、2560 使用
+(16, 32, 2, 256)，宽度 4096 时 4090 使用 (16, 64, 2, 128)，
+PRO 6000 使用 (16, 32, 2, 512)。这些形状在跨层权重超过 L2 的情况下
+比较，权重布局、输出 dtype、无 bias 以及单 token 都是分派条件。
 
 内部 `tune_linear`、`tune_norm`、`tune_tokenshift`、`tune_readout` 与 WKV tuner
 按设备及实际 shape 选择配置。先与固定数值基准逐位比较，再用 CUDA Graph 计时；

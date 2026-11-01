@@ -13,7 +13,7 @@ from numbers import Real
 import torch
 from torch.autograd.function import once_differentiable
 
-from .tuning import _AutogradContext, device_class, tuning_operation, workload_bucket
+from .tuning import _AutogradContext, _fixed_strategy_device, device_class, tuning_operation, workload_bucket
 
 _PASS_CONFIG = {"tl.disable_wgmma": True, "tl.enable_fast_math": False}
 _DEFAULT_CONFIG = (16, 64, 2, 32)
@@ -176,15 +176,37 @@ def _aligned(tensor):
     return tensor if tensor.data_ptr() % 16 == 0 else tensor.clone()
 
 
+def _fixed_decode_config(x, weight, output_dtype, bias):
+    info = device_class(x.device)
+    channels, outputs = x.shape[1], weight.shape[0]
+    if x.shape[0] != 1 or bias is not None or not _fixed_strategy_device(info):
+        return None
+    if weight.stride() == (channels, 1) and channels in (2048, 2560, 4096):
+        if (output_dtype == torch.bfloat16 and outputs == 4 * channels) or (
+            output_dtype == torch.float32 and outputs == 65536
+        ):
+            return (16, 64, 2, 128)
+    if (
+        output_dtype == torch.bfloat16 and outputs in (2048, 2560, 4096)
+        and channels == 4 * outputs and weight.stride() == (1, outputs)
+    ):
+        if outputs < 4096:
+            return (16, 32, 2, 256)
+        return (16, 64, 2, 128) if info[1] == 8 else (16, 32, 2, 512)
+    return None
+
+
 def _forward(x, weight, bias, output_dtype, config=None):
     x, weight = _aligned(x), _aligned(weight)
     bias = None if bias is None else _aligned(bias)
     if config is None:
         from .tuning import get_config
 
+        fixed = _fixed_decode_config(x, weight, output_dtype, bias)
         config = get_config(
-            _TUNED_CONFIGS, "linear", _key(x, weight, output_dtype, bias),
+            _TUNED_CONFIGS, "linear", _key(x, weight, output_dtype, bias), fixed,
             tune=lambda: tune_linear(x, weight, output_dtype, bias=bias),
+            fixed=fixed is not None,
         )
         if config is None:
             block_m = 16

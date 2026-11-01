@@ -664,3 +664,105 @@ def test_tilelang_linear_cuda_graph():
         actual = linear(x, weight)
     graph.replay()
     assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("channels", (2048, 2560, 4096))
+def test_fixed_decode_linear_limits_models_devices_and_layouts(monkeypatch, channels):
+    from flashrwkv2._internal import linear as implementation
+
+    info = ("test", 8, 9, 128)
+    monkeypatch.setattr(implementation, "device_class", lambda device: info)
+    x = torch.empty(1, channels, device="meta")
+    key = torch.empty(4 * channels, channels, device="meta")
+    head = torch.empty(65536, channels, device="meta")
+    value = torch.empty(4 * channels, channels, device="meta").t()
+    value_x = torch.empty(1, 4 * channels, device="meta")
+    fixed = implementation._fixed_decode_config
+    assert fixed(x, key, torch.bfloat16, None) == (16, 64, 2, 128)
+    assert fixed(x, head, torch.float32, None) == (16, 64, 2, 128)
+    assert fixed(value_x, value, torch.bfloat16, None) == (
+        (16, 32, 2, 256) if channels < 4096 else (16, 64, 2, 128)
+    )
+    assert fixed(x, key, torch.float32, None) is None
+    assert fixed(x, key, torch.bfloat16, key[0]) is None
+    assert fixed(torch.empty(2, channels, device="meta"), key, torch.bfloat16, None) is None
+    assert fixed(value_x, value.contiguous(), torch.bfloat16, None) is None
+    info = ("test", 12, 0, 188)
+    if channels == 4096:
+        assert fixed(value_x, value, torch.bfloat16, None) == (16, 32, 2, 512)
+    info = ("other", 8, 9, 114)
+    assert fixed(x, key, torch.bfloat16, None) is None
+
+
+@cuda
+@pytest.mark.cuda
+@pytest.mark.cuda_graph
+@pytest.mark.parametrize("kind", ("cmix_key", "cmix_value", "head"))
+def test_fixed_decode_linear_preserves_fp32_and_graph(monkeypatch, tmp_path, kind):
+    from flashrwkv2._internal import linear as implementation
+    from flashrwkv2._internal import tuning
+
+    if not tuning._fixed_strategy_device(tuning.device_class(torch.device("cuda"))):
+        pytest.skip("fixed linear strategy is qualified on tested devices")
+    torch.manual_seed(719)
+    width = 2048
+    channels = 4 * width if kind == "cmix_value" else width
+    outputs = 65536 if kind == "head" else (4 * width if kind == "cmix_key" else width)
+    x = torch.randn(1, channels, device="cuda", dtype=torch.bfloat16) * .03
+    if kind == "cmix_value":
+        weight = torch.randn(channels, outputs, device="cuda", dtype=torch.bfloat16).t()
+    else:
+        weight = torch.randn(outputs, channels, device="cuda", dtype=torch.bfloat16)
+    dtype = torch.float32 if kind == "head" else torch.bfloat16
+    fixed = implementation._fixed_decode_config(x, weight, dtype, None)
+    reference = implementation._forward(x, weight, None, torch.float32, (16, 64, 2, 32))
+    accumulator = implementation._forward(x, weight, None, torch.float32, fixed)
+    assert torch.equal(accumulator.view(torch.int32), reference.view(torch.int32))
+    expected = reference.to(dtype)
+
+    monkeypatch.setattr(tuning, "_profile_root", lambda: tmp_path)
+    monkeypatch.setattr(tuning, "_read_profile", lambda *args: pytest.fail("read a profile"))
+    monkeypatch.setattr(implementation, "tune_linear", lambda *args, **kwargs: pytest.fail("tuned a fixed configuration"))
+    monkeypatch.setattr(implementation, "_TUNED_CONFIGS", {})
+
+    def call():
+        return implementation._forward(x, weight, None, dtype)
+
+    for mode in ("inspect", "require", "tune"):
+        report = tuning.prepare_tuning([call], mode=mode)
+        assert report["complete"] and report["counts"]["fixed"] == 1
+        assert report["records"][0]["config"] == fixed
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = call()
+    graph.replay()
+    assert torch.equal(actual, expected)
+    assert not tuple(tmp_path.iterdir())
+
+
+@cuda
+@pytest.mark.cuda
+def test_fixed_decode_linear_preserves_training_gradients(monkeypatch):
+    from flashrwkv2._internal import linear as implementation
+    from flashrwkv2._internal import tuning
+
+    if not tuning._fixed_strategy_device(tuning.device_class(torch.device("cuda"))):
+        pytest.skip("fixed linear strategy is qualified on tested devices")
+    torch.manual_seed(720)
+    x = (torch.randn(1, 2048, device="cuda", dtype=torch.bfloat16) * .03).requires_grad_()
+    weight = (torch.randn(8192, 2048, device="cuda", dtype=torch.bfloat16) * .03).requires_grad_()
+    upstream = torch.randn(1, 8192, device="cuda", dtype=torch.bfloat16)
+    key = implementation._key(x, weight, torch.bfloat16)
+    token = tuning._TUNING.set(True)
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(implementation, "_fixed_decode_config", lambda *args: None)
+            patch.setattr(implementation, "_TUNED_CONFIGS", {key: (16, 64, 2, 32)})
+            expected = linear(x, weight)
+            expected_grads = torch.autograd.grad(expected, (x, weight), upstream)
+        actual = linear(x, weight)
+        actual_grads = torch.autograd.grad(actual, (x, weight), upstream)
+    finally:
+        tuning._TUNING.reset(token)
+    assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+    assert all(torch.equal(a.view(torch.int16), b.view(torch.int16)) for a, b in zip(actual_grads, expected_grads))
