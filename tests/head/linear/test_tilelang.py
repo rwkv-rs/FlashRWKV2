@@ -872,7 +872,11 @@ def test_deterministic_linear_checks_layout_and_device(monkeypatch):
 @cuda
 @pytest.mark.cuda
 @pytest.mark.cuda_graph
-def test_dynamic_weight_reduction_preserves_accumulators_and_graph(monkeypatch):
+@pytest.mark.parametrize("rows,outputs,reductions", (
+    (96, 128, (1, 17, 31, 32, 33, 63, 64, 65, 89, 90, 100, 127, 128, 129, 1000, 1024, 4096)),
+    (129, 16384, (32, 33, 128, 129, 1024)),
+))
+def test_dynamic_weight_reduction_preserves_accumulators_and_graph(monkeypatch, rows, outputs, reductions):
     from flashrwkv2._internal import linear as implementation
     from flashrwkv2._internal.tuning import _fixed_strategy_device, device_class
 
@@ -880,9 +884,9 @@ def test_dynamic_weight_reduction_preserves_accumulators_and_graph(monkeypatch):
         pytest.skip("deterministic strategy is qualified on tested devices")
     torch.manual_seed(801)
     monkeypatch.setattr(implementation, "_COMPILED_KERNELS", {})
-    for reduction in (1, 17, 31, 32, 33, 63, 64, 65, 89, 90, 100, 127, 128, 129, 1000, 1024, 4096):
-        x = (torch.randn(96, reduction, device="cuda") * .1).bfloat16()
-        weight = (torch.randn(reduction, 128, device="cuda") * .1).bfloat16().t()
+    for reduction in reductions:
+        x = (torch.randn(rows, reduction, device="cuda") * .1).bfloat16()
+        weight = (torch.randn(reduction, outputs, device="cuda") * .1).bfloat16().t()
         reference = _forward(x, weight, None, torch.float32, config=(16, 64, 2, 32))
         for dtype in (torch.float32, torch.bfloat16):
             assert torch.equal(_forward(x, weight, None, dtype, dynamic_k=True), reference.to(dtype))
