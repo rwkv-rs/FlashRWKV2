@@ -925,7 +925,7 @@ def test_fixed_group_projection_preserves_accumulators_and_vjp(monkeypatch, tmp_
     torch.manual_seed(722)
     channels = 2048
     if stage == "dense":
-        ranks, kinds, fixed = (channels,) * 3, (0, 0, 0), (16, 32, 2, 256)
+        ranks, kinds = (channels,) * 3, (0, 0, 0)
         xs = tuple(torch.randn(1, channels, device="cuda", dtype=torch.bfloat16).requires_grad_() for _ in ranks)
         weights = tuple(torch.randn(channels, channels, device="cuda", dtype=torch.bfloat16).requires_grad_() for _ in ranks)
         biases = (None,) * 3
@@ -942,10 +942,8 @@ def test_fixed_group_projection_preserves_accumulators_and_vjp(monkeypatch, tmp_
         weights = tuple(torch.randn(rank, channels, device="cuda", dtype=torch.bfloat16).t().detach().requires_grad_() for rank in ranks)
         first_bias = None if stage == "lowrank_output" else torch.randn(channels, device="cuda", dtype=torch.bfloat16).requires_grad_()
         biases = (first_bias, torch.randn(channels, device="cuda", dtype=torch.bfloat16).requires_grad_()) + (None,) * (len(ranks) - 2)
-        fixed = implementation._fixed_projection_config(xs, weights, kinds, biases)
-        assert fixed is not None
-
     fixed = implementation._fixed_projection_config(xs, weights, kinds, biases)
+    assert fixed is not None
     with torch.no_grad():
         reference, raw = implementation._run_groups(xs, weights, kinds, biases, raw_mode=2, config=(16, 64, 2, 32))
         candidate, candidate_raw = implementation._run_groups(xs, weights, kinds, biases, raw_mode=2, config=fixed)

@@ -320,7 +320,7 @@ def test_fullgraph_training_block_preserves_outputs_gradients_and_capture(adapte
     "channels,head_size,vocab,length,use_vres",
     ((128, 64, 257, 17, False), (128, 64, 257, 17, True),
      (1024, 128, 257, 17, False), (4096, 64, 257, 17, True),
-     (256, 256, 65536, 3, False)),
+     (256, 256, 65536, 3, False), (128, 64, 257, 2048, True)),
 )
 def test_block_bitwise_training_prefill_decode_and_batch(channels, head_size, vocab, length, use_vres):
     torch.manual_seed(731)
