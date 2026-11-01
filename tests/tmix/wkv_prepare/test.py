@@ -96,7 +96,7 @@ def test_fixed_decode_projection_restricts_models_and_layouts(monkeypatch):
     assert fixed(xs, weights, kinds, biases) == (16, 32, 2, 512)
     assert fixed(tuple(torch.empty(2, 2048, device="meta") for _ in ranks), weights, kinds, biases) == (16, 16, 2, 512)
     assert fixed(tuple(torch.empty(513, 2048, device="meta") for _ in ranks), weights, kinds, biases) == (32, 32, 2, 128)
-    assert fixed(xs, weights, (0, 0, 0), biases) is None
+    assert fixed(xs, weights, (0, 0, 0), biases) == fixed(xs, weights, kinds, biases)
     assert fixed(xs, weights, kinds, (weights[0][0], None, None)) is None
     mixed_layout = (weights[0].t().contiguous().t(), *weights[1:])
     assert fixed(xs, mixed_layout, kinds, biases) is None
@@ -109,6 +109,9 @@ def test_fixed_decode_projection_restricts_models_and_layouts(monkeypatch):
     assert fixed(output_xs, tuple(w.contiguous() for w in output_weights), (0, 2, 0), output_biases) == (16, 32, 2, 64)
     training_biases = (torch.empty(2048, device="meta"), *output_biases[1:])
     assert fixed(output_xs, output_weights, (0, 2, 0), training_biases) == fixed(
+        output_xs, output_weights, (0, 2, 0), output_biases
+    )
+    assert fixed(output_xs, output_weights, (0, 0, 0), biases) == fixed(
         output_xs, output_weights, (0, 2, 0), output_biases
     )
     assert fixed(output_xs, output_weights, (0, 2, 0), biases) is None
@@ -464,6 +467,8 @@ def test_fixed_grouped_operator_benchmark_uses_its_candidate(monkeypatch):
 @pytest.mark.cuda
 @pytest.mark.parametrize("channels,ranks,rows", (
     (2048, (96, 96, 256), 1),
+    (2048, (96, 96, 256, 64), 128), (2560, (96, 96, 320, 64), 128),
+    (4096, (128, 128, 480, 96), 128), (4096, (192, 192, 384), 128),
     (2048, (96, 96, 256), 577), (2048, (96, 96, 256, 64), 897),
     (2560, (96, 96, 320, 64), 801), (2560, (96, 96, 320, 64), 1024),
     (4096, (192, 192, 384, 128), 256),
@@ -1029,7 +1034,9 @@ def test_fullgraph_grouped_projection_preserves_unused_gradients():
 @cuda
 @pytest.mark.cuda
 @pytest.mark.cuda_graph
-@pytest.mark.parametrize("stage", ("dense", "lowrank_output", "training_output"))
+@pytest.mark.parametrize("stage", (
+    "dense", "lowrank_output", "training_output", "training_output_72b", "training_output_13b_first",
+))
 def test_fixed_group_projection_preserves_accumulators_and_vjp(monkeypatch, tmp_path, stage):
     from flashrwkv2._internal import tuning
     from flashrwkv2.tmix.wkv_prepare import tilelang as implementation
@@ -1044,13 +1051,20 @@ def test_fixed_group_projection_preserves_accumulators_and_vjp(monkeypatch, tmp_
         weights = tuple(torch.randn(channels, channels, device="cuda", dtype=torch.bfloat16).requires_grad_() for _ in ranks)
         biases = (None,) * 3
     else:
-        ranks, kinds = (96, 96, 256, 64), (0, 2, 0, 0)
-        rows = 128 if stage == "training_output" else 1
-        fixed = (32, 64, 2, 64) if rows == 128 else (16, 32, 2, 64)
+        if stage == "training_output_72b":
+            channels, ranks = 4096, (128, 128, 480, 96)
+        elif stage == "training_output_13b_first":
+            channels, ranks = 4096, (192, 192, 384)
+        else:
+            ranks = (96, 96, 256, 64)
+        kinds = (0, 2, 0, 0)[:len(ranks)]
+        rows = 1 if stage == "lowrank_output" else 128
         xs = tuple(torch.randn(rows, rank, device="cuda", dtype=torch.bfloat16).requires_grad_() for rank in ranks)
         weights = tuple(torch.randn(rank, channels, device="cuda", dtype=torch.bfloat16).t().detach().requires_grad_() for rank in ranks)
-        first_bias = torch.randn(channels, device="cuda", dtype=torch.bfloat16).requires_grad_() if stage == "training_output" else None
-        biases = (first_bias, torch.randn(channels, device="cuda", dtype=torch.bfloat16).requires_grad_(), None, None)
+        first_bias = None if stage == "lowrank_output" else torch.randn(channels, device="cuda", dtype=torch.bfloat16).requires_grad_()
+        biases = (first_bias, torch.randn(channels, device="cuda", dtype=torch.bfloat16).requires_grad_()) + (None,) * (len(ranks) - 2)
+        fixed = implementation._fixed_projection_config(xs, weights, kinds, biases)
+        assert fixed is not None
 
     with torch.no_grad():
         reference, raw = implementation._run_groups(xs, weights, kinds, biases, raw_mode=2, config=(16, 64, 2, 32))
@@ -1094,3 +1108,142 @@ def test_fixed_group_projection_preserves_accumulators_and_vjp(monkeypatch, tmp_
     graph.replay()
     assert all(torch.equal(a.view(torch.int16), b.view(torch.int16)) for a, b in zip(captured, reference))
     assert not tuple(tmp_path.iterdir())
+
+
+@cuda
+@pytest.mark.cuda
+@pytest.mark.cuda_graph
+def test_grouped_weight_vjp_reuses_dynamic_reduction(monkeypatch):
+    from flashrwkv2._internal import tuning
+    from flashrwkv2._internal.linear import _forward
+    from flashrwkv2.tmix.wkv_prepare import tilelang as implementation
+
+    if not tuning._fixed_strategy_device(tuning.device_class(torch.device("cuda"))):
+        pytest.skip("dynamic grouped VJP is qualified on RTX 4090")
+    torch.manual_seed(723)
+    ranks, channels = (96, 96, 256, 64), 2048
+    kinds, biases, config = (0,) * 4, (None,) * 4, (64, 64, 1, 64)
+    monkeypatch.setattr(implementation, "_GROUP_KERNELS", {})
+    for reduction in (32, 64, 96, 128, 160, 512, 1024):
+        xs = tuple(torch.randn(channels, reduction, device="cuda", dtype=torch.bfloat16) * .02 for _ in ranks)
+        weights = tuple((torch.randn(reduction, rank, device="cuda", dtype=torch.bfloat16) * .02).t() for rank in ranks)
+        values, raw = implementation._run_groups(
+            xs, weights, kinds, biases, raw_mode=2, config=config, dynamic_k=True
+        )
+        offset = 0
+        for x, weight, value in zip(xs, weights, values, strict=True):
+            reference = _forward(x, weight, None, torch.float32, config=(16, 64, 2, 32))
+            size = reference.numel()
+            assert torch.equal(raw[offset : offset + size].view_as(reference), reference)
+            assert torch.equal(value, reference.bfloat16())
+            offset += size
+        assert len(implementation._GROUP_KERNELS) == 1
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured, captured_raw = implementation._run_groups(
+                xs, weights, kinds, biases, raw_mode=2, config=config, dynamic_k=True
+            )
+        graph.replay()
+        assert torch.equal(captured_raw, raw)
+        assert all(torch.equal(a, b) for a, b in zip(captured, values, strict=True))
+
+
+@cuda
+@pytest.mark.cuda
+@pytest.mark.cuda_graph
+@pytest.mark.parametrize("stage", ("input", "output"))
+def test_grouped_training_vjp_preserves_compile_and_graph(monkeypatch, tmp_path, stage):
+    from flashrwkv2._internal import tuning
+    from flashrwkv2.tmix.wkv_prepare import tilelang as implementation
+
+    if not tuning._fixed_strategy_device(tuning.device_class(torch.device("cuda"))):
+        pytest.skip("grouped VJP is qualified on RTX 4090")
+    torch.manual_seed(724)
+    rows, channels, ranks = 128, 2048, (96, 96, 256, 64)
+    if stage == "input":
+        xs = tuple((torch.randn(rows, channels, device="cuda", dtype=torch.bfloat16) * .02).requires_grad_() for _ in ranks)
+        weights = tuple((torch.randn(channels, rank, device="cuda", dtype=torch.bfloat16) * .02).t().detach().requires_grad_() for rank in ranks)
+        biases, kinds = (), (1, 0, 2, 0)
+    else:
+        xs = tuple((torch.randn(rows, rank, device="cuda", dtype=torch.bfloat16) * .02).requires_grad_() for rank in ranks)
+        weights = tuple((torch.randn(rank, channels, device="cuda", dtype=torch.bfloat16) * .02).t().detach().requires_grad_() for rank in ranks)
+        biases = tuple((torch.randn(channels, device="cuda", dtype=torch.bfloat16) * .02).requires_grad_() for _ in range(2))
+        kinds = (0, 2, 0, 0)
+    leaves = (*xs, *weights, *biases)
+    upstream = tuple(torch.randn(rows, weight.shape[0], device="cuda", dtype=torch.bfloat16) for weight in weights)
+
+    def model(*args):
+        packed_biases = (None,) * 4 if stage == "input" else (*args[8:], None, None)
+        return implementation._grouped_linear(args[:4], args[4:8], kinds, packed_biases)
+
+    packed_biases = (None,) * 4 if stage == "input" else (*biases, None, None)
+    key = implementation._group_key(xs, weights, kinds, packed_biases)
+    token = tuning._TUNING.set(True)
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(implementation, "_fixed_projection_config", lambda *args: None)
+            patch.setattr(implementation, "_GROUP_CONFIGS", {key: (16, 64, 2, 32)})
+            reference = model(*leaves)
+            reference_grads = torch.autograd.grad(reference, leaves, upstream)
+    finally:
+        tuning._TUNING.reset(token)
+
+    monkeypatch.setattr(tuning, "_profile_root", lambda: tmp_path)
+    if stage == "input":
+        monkeypatch.setattr(tuning, "_read_profile", lambda *args: None)
+    else:
+        monkeypatch.setattr(tuning, "_read_profile", lambda *args: pytest.fail("read a profile"))
+    monkeypatch.setattr(implementation, "_GROUP_KERNELS", {})
+    compiled = torch.compile(model, fullgraph=True, options={"emulate_precision_casts": True})
+    actual = compiled(*leaves)
+    actual_grads = torch.autograd.grad(actual, leaves, upstream)
+    assert all(torch.equal(a, b) for a, b in zip(actual, reference, strict=True))
+    assert all(torch.equal(a, b) for a, b in zip(actual_grads, reference_grads, strict=True))
+    if stage == "output":
+        assert any(len(key) == 11 and key[-1] is True for key in implementation._GROUP_KERNELS)
+    else:
+        assert any(key[1] == (channels,) * 4 and key[3] == (0,) * 4 and key[7] == 0
+                   for key in implementation._GROUP_KERNELS)
+
+    graph_leaves = tuple(value.detach().requires_grad_() for value in leaves)
+
+    def backward():
+        values = model(*graph_leaves)
+        return torch.autograd.grad(values, graph_leaves, upstream)
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        backward()
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        captured = backward()
+    graph.replay()
+    assert all(torch.equal(a, b) for a, b in zip(captured, reference_grads, strict=True))
+
+    compiled_leaves = tuple(value.detach().requires_grad_() for value in leaves)
+
+    def compiled_backward():
+        return torch.autograd.grad(compiled(*compiled_leaves), compiled_leaves, upstream)
+
+    with torch.cuda.stream(stream):
+        compiled_backward()
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    compiled_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(compiled_graph, stream=stream):
+        captured_compiled = compiled_backward()
+    compiled_graph.replay()
+    assert all(torch.equal(a, b) for a, b in zip(captured_compiled, reference_grads, strict=True))
+
+    with monkeypatch.context() as patch:
+        patch.setattr(tuning, "_read_profile", lambda *args: None)
+        indices = (0, 4) if stage == "input" else (0, 4, 8)
+        partial = torch.autograd.grad(model(*leaves)[0], tuple(leaves[i] for i in indices), upstream[0])
+        assert all(torch.equal(a, reference_grads[i]) for a, i in zip(partial, indices, strict=True))
+        frozen_leaves = (*xs, weights[0].detach(), *weights[1:], *biases)
+        frozen_inputs = (*xs, *weights[1:], *biases)
+        frozen = torch.autograd.grad(model(*frozen_leaves), frozen_inputs, upstream)
+        assert all(torch.equal(a, b) for a, b in zip(frozen, (g for i, g in enumerate(reference_grads) if i != 4), strict=True))

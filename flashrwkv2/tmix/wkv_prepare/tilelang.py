@@ -160,8 +160,14 @@ def _group_program(
     raw_mode,
     arch,
     count,
+    dynamic_k=False,
 ):
     rows = T.dynamic("rows", dtype="int64")
+    if dynamic_k:
+        reduction = T.dynamic("reduction", dtype="int32")
+        channels = tuple(reduction for _ in channels)
+    else:
+        reduction = max(channels[:count])
     bm, bn, stages, copy_k = config
     total = sum(outputs[:count])
     raw_sizes = tuple(
@@ -259,9 +265,7 @@ def _group_program(
             )
             acc = T.alloc_fragment((bm, bn), T.float32)
             T.clear(acc)
-            for k in T.Pipelined(
-                T.ceildiv(max(channels[:count]), copy_k), num_stages=stages
-            ):
+            for k in T.Pipelined(T.ceildiv(reduction, copy_k), num_stages=stages):
                 if group == 0:
                     T.copy(X0[mb * bm, k * copy_k], xs)
                     if input_major:
@@ -423,18 +427,16 @@ def _fixed_projection_config(xs, weights, kinds, biases):
                 32 < rows <= 192 or 256 < rows <= 512 or 960 < rows <= 1024
             ):
                 return (64, 128, 2, 64)
-        return None
     profiles = (
         (2048, (96, 96, 256, 64)),
         (2560, (96, 96, 320, 64)),
         (4096, (128, 128, 480, 96)),
         (4096, (192, 192, 384, 128)),
     )
-    if kinds in ((1, 0, 2), (1, 0, 2, 0)) and all(bias is None for bias in biases):
-        channels = xs[0].shape[1]
-        ranks = tuple(weight.shape[0] for weight in weights)
-        if not any(channels == width and ranks == profile[:len(ranks)] for width, profile in profiles):
-            return None
+    ranks = tuple(weight.shape[0] for weight in weights)
+    if kinds in ((1, 0, 2), (1, 0, 2, 0), (0, 0, 0), (0, 0, 0, 0)) and all(
+        bias is None for bias in biases
+    ) and any(channels == width and ranks == profile[:len(ranks)] for width, profile in profiles):
         if any(x.shape[1] != channels for x in xs) or any(weight.shape[1] != channels for weight in weights):
             return None
         output_major = all(weight.stride() == (channels, 1) for weight in weights)
@@ -484,8 +486,10 @@ def _fixed_projection_config(xs, weights, kinds, biases):
                     )
                 return (32, 32 if rows <= wave_limit else 64, 2, 128)
             return (64, 128, 2, 64) if len(ranks) == 3 else (128, 64, 2, 64)
-    if (kinds in ((0, 2, 0), (0, 2, 0, 0)) and biases[1] is not None
-            and all(bias is None for bias in biases[2:])):
+    if (
+        kinds in ((0, 2, 0), (0, 2, 0, 0)) and biases[1] is not None
+        and all(bias is None for bias in biases[2:])
+    ) or (kinds in ((0, 0, 0), (0, 0, 0, 0)) and all(bias is None for bias in biases)):
         channels = weights[0].shape[0]
         ranks = tuple(x.shape[1] for x in xs)
         if not any(channels == width and ranks == profile[:len(ranks)] for width, profile in profiles):
@@ -545,6 +549,7 @@ def _group_spec(
     raw_mode,
     arch,
     count,
+    dynamic_k=False,
 ):
     flags = {"tl.disable_wgmma": True, "tl.enable_fast_math": False}
     if arch // 10 == 12:
@@ -566,6 +571,7 @@ def _group_spec(
             raw_mode,
             arch,
             count,
+            dynamic_k,
         ),
         {
             "out_idx": [12, 13],
@@ -582,7 +588,7 @@ def _compiled_group(*key):
     return _GROUP_KERNELS[key]
 
 
-def _group_call(xs, weights, kinds, biases, raw_mode, config):
+def _group_call(xs, weights, kinds, biases, raw_mode, config, dynamic_k=False):
     count = len(xs)
     if config is None:
         from ..._internal.tuning import get_config
@@ -611,6 +617,8 @@ def _group_call(xs, weights, kinds, biases, raw_mode, config):
     strides = tuple(w.stride() for w in physical)
     flags = tuple(bias is not None for bias in biases)
     pad = 4 - count
+    if dynamic_k:
+        channels = (0,) * count
     channels += channels[-1:] * pad
     outputs += outputs[-1:] * pad
     strides += strides[-1:] * pad
@@ -628,7 +636,7 @@ def _group_call(xs, weights, kinds, biases, raw_mode, config):
         raw_mode,
         major * 10 + minor,
         count,
-    )
+    ) + ((True,) if dynamic_k else ())
     empty = xs[0].new_empty(0)
     bias_args = tuple(empty if bias is None else bias for bias in biases)
     args = (
@@ -639,8 +647,8 @@ def _group_call(xs, weights, kinds, biases, raw_mode, config):
     return key, args
 
 
-def _run_groups(xs, weights, kinds, biases, raw_mode=0, config=None):
-    key, args = _group_call(xs, weights, kinds, biases, raw_mode, config)
+def _run_groups(xs, weights, kinds, biases, raw_mode=0, config=None, dynamic_k=False):
+    key, args = _group_call(xs, weights, kinds, biases, raw_mode, config, dynamic_k)
     result, raw = _compiled_group(*key)(*args)
     rows = xs[0].shape[0]
     values, start = [], 0
@@ -674,6 +682,20 @@ class _GroupedLinear(torch.autograd.Function):
         )
         raw = saved[-1]
         dxs, dws, dbs = [None] * count, [None] * count, [None] * count
+        identity_kinds, no_bias = (0,) * count, (None,) * count
+        grouped_weights, grouped_config = None, None
+        if (
+            ctx.kinds in ((0, 2, 0), (0, 2, 0, 0), (1, 0, 2), (1, 0, 2, 0))
+            and all(gradient is not None for gradient in gradients)
+            and all(ctx.needs_input_grad[1 : 1 + 2 * count])
+            and xs[0].shape[0] >= 32 and xs[0].shape[0] % 32 == 0
+        ):
+            grouped_weights = tuple(weight.t() for weight in weights)
+            grouped_config = _fixed_projection_config(
+                gradients, grouped_weights, identity_kinds, no_bias
+            )
+        grouped_weight_vjp = all(weight.shape[0] == weights[0].shape[0] for weight in weights)
+        dys = []
         position = 0
         for i, (x, weight, bias, kind, gradient) in enumerate(
             zip(xs, weights, biases, ctx.kinds, gradients, strict=True)
@@ -715,10 +737,24 @@ class _GroupedLinear(torch.autograd.Function):
                 dy = dlinear
                 if need_bias:
                     dbs[i] = sum_partials(partial)
-            if ctx.needs_input_grad[1 + i]:
-                dxs[i] = linear_input_vjp(dy, weight)
-            if ctx.needs_input_grad[1 + count + i]:
-                dws[i] = _forward(dy.t().contiguous(), x.t(), None, weight.dtype)
+            if grouped_config is not None:
+                dys.append(dy)
+                if not grouped_weight_vjp:
+                    dws[i] = _forward(dy.t().contiguous(), x.t(), None, weight.dtype)
+            else:
+                if ctx.needs_input_grad[1 + i]:
+                    dxs[i] = linear_input_vjp(dy, weight)
+                if ctx.needs_input_grad[1 + count + i]:
+                    dws[i] = _forward(dy.t().contiguous(), x.t(), None, weight.dtype)
+        if grouped_config is not None:
+            dxs = _run_groups(
+                tuple(dys), grouped_weights, identity_kinds, no_bias, config=grouped_config
+            )[0]
+            if grouped_weight_vjp:
+                dws = _run_groups(
+                    tuple(dy.t().contiguous() for dy in dys), tuple(x.t() for x in xs),
+                    identity_kinds, no_bias, config=(64, 64, 1, 64), dynamic_k=True,
+                )[0]
         return None, *dxs, *dws, *dbs
 
 
@@ -759,7 +795,8 @@ def _compiled_grouped_vjp(gradients, saved, kinds, needed):
     count = len(kinds)
     values = (*saved[:2 * count], *(bias if bias.numel() else None for bias in saved[2 * count:3 * count]), saved[-1])
     ctx = _AutogradContext(saved_tensors=values, kinds=tuple(kinds), needs_input_grad=(False, *needed))
-    return list(_GroupedLinear.backward(ctx, *gradients)[1:])
+    results = _GroupedLinear.backward(ctx, *gradients)[1:]
+    return [value.clone() if value is not None and value._base is not None else value for value in results]
 
 
 @_compiled_grouped_vjp.register_fake
