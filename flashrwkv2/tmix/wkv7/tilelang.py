@@ -21,7 +21,12 @@ import tilelang
 import tilelang.language as T
 import torch
 
-from ..._internal.tuning import _AutogradContext, device_class, tuning_operation
+from ..._internal.tuning import (
+    _AutogradContext,
+    device_class,
+    tuning_operation,
+    workload_bucket,
+)
 
 _CHECKPOINT = 16
 _LOG2E = 1.4426950408889634
@@ -623,8 +628,9 @@ def _bias_tensor(r, decay_bias):
 def _config_key(r, batch, bias, *, indexed=False, state_dtype=torch.float32):
     return (
         device_class(r.device),
-        tuple(r.shape),
-        batch,
+        (workload_bucket(r.shape[0]), *r.shape[1:]),
+        workload_bucket(batch),
+        r.shape[0] > batch,
         None if bias is None else bias.dtype,
         indexed,
         state_dtype,

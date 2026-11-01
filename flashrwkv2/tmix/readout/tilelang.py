@@ -3,17 +3,23 @@
 
 import math
 
-import torch
-
-from ..._internal.tuning import _AutogradContext, device_class, tuning_operation
 import tilelang
 import tilelang.language as T
+import torch
+
+from ..._internal.tuning import (
+    _AutogradContext,
+    device_class,
+    tuning_operation,
+    workload_bucket,
+)
 
 _ROW_CONFIGS = {}
 
 
 def _config_key(x, head_size):
-    return (device_class(x.device), x.shape, x.dtype, head_size)
+    rows = workload_bucket(x.numel() // x.shape[-1])
+    return (device_class(x.device), (rows, x.shape[-1]), x.dtype, head_size)
 
 
 @tilelang.jit(pass_configs={"tl.enable_fast_math": False}, out_idx=[8, 9], compile_flags=["--fmad=false"])

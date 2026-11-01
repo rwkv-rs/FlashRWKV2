@@ -3,17 +3,23 @@
 
 import math
 
-import torch
-
-from .._internal.tuning import _AutogradContext, device_class, tuning_operation
 import tilelang
 import tilelang.language as T
+import torch
+
+from .._internal.tuning import (
+    _AutogradContext,
+    device_class,
+    tuning_operation,
+    workload_bucket,
+)
 
 _ROW_CONFIGS = {}
 
 
 def _config_key(x, has_res):
-    return (device_class(x.device), x.shape, has_res)
+    rows = workload_bucket(x.numel() // x.shape[-1])
+    return (device_class(x.device), (rows, x.shape[-1]), has_res)
 
 
 def _row_layout(channels, rows_per_block):

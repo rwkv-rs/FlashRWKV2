@@ -189,15 +189,21 @@ running representative calls through the public preparation API:
 from flashrwkv2 import prepare_tuning
 
 # Each callable uses valid metadata and disposable/reset model state.
-# Include every prefill/decode shape, graph batch and weight layout in service.
+# Cover each workload bucket, prefill/decode mode and weight layout in service.
 # Training callables also run backward with the actual trainable parameters.
 report = prepare_tuning(warmup_calls, mode="inspect")
 report = prepare_tuning(warmup_calls, mode="tune")  # only missing keys
 report = prepare_tuning(warmup_calls, mode="require")  # before graph capture
 ```
 
-`inspect` reports exact dispatch coverage; `require` loads verified selections
+`inspect` reports workload-bucket dispatch coverage; `require` loads verified selections
 and fails on missing keys; `tune` verifies output/state before timing candidates.
+Token counts and batch sizes share power-of-two workload buckets capped at 512
+(plus a separate empty bucket); model widths, weight layouts and dtypes remain
+exact. Same-shape weight replacements reuse the same profiles. TokenShift and
+state transfers use dynamic batch dimensions. Projection tuning checks at most
+24 unique configurations, prunes shared-memory and divisibility constraints
+before compilation, and retimes at most three finalists.
 The report includes each owner, device class, full key, source fingerprint,
 selected configuration and profile path. Same-model GPUs with the same SM count
 reuse selections across GPU ordinals. Concurrent preparation serializes each

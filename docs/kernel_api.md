@@ -188,8 +188,12 @@ release 路径和 venv 路径不影响 verified profiles。三种缓存有独立
   verified profile 命中后仍可能需要首次编译选中的 kernel。
 
 设备类别是 `(product_name, compute_major, compute_minor, SM_count)`，不含 GPU
-ordinal 或 UUID。同类别多卡共享配置，4090、4090D、PRO6000 分开。原有 shape、
-权重 stride、bias dtype、indexed 模式及 state dtype 保留在各 owner 的 key 中。
+ordinal 或 UUID。同类别多卡共享配置，4090、4090D、PRO6000 分开。
+行数与 batch 按向上取整的 2 的幂分桶，最大为 512，空输入使用独立的 0 桶，
+每个工作量维度最多 11 桶。模型宽度、head size、权重 shape/stride、bias dtype、
+indexed 模式及 state dtype 保持精确；WKV 额外区分单 token decode 与多 token prefill。
+同规格权重替换复用配置。TokenShift 与状态池搬运使用动态 batch；二分查找在
+运行时迭代到区间收敛，不再按精确 batch 数生成展开代码。
 
 服务在 capture 前使用自己的真实权重和形状运行以下公开接口：
 
@@ -197,8 +201,8 @@ ordinal 或 UUID。同类别多卡共享配置，4090、4090D、PRO6000 分开�
 import json
 from flashrwkv2 import get_tuning_cache_dir, prepare_tuning
 
-# warmup_calls: 可重复调用的零参数函数列表，覆盖所有实际 prefill token 数、
-# decode batch、capture batch、首层/后续层和参数布局。
+# warmup_calls: 可重复调用的零参数函数列表，覆盖实际工作量桶、prefill/decode、
+# capture 配置、首层/后续层和参数布局。
 # 函数负责使用独立状态或恢复状态；prepare_tuning 会实际执行每个函数一次。
 coverage = prepare_tuning(warmup_calls, mode="inspect")
 print(json.dumps(coverage))
@@ -251,22 +255,21 @@ print(json.dumps(prepared))
 基准还覆盖真实 7.2B 的 `w/a=128,g=480,v=96` 首层与后续层，以及
 `B=1/4/64/320/512` decode，以保证缓存 key 对应实际推理布局。
 
-投影先以 32 元素的 K 拷贝跨度选择输出 tile，再为获胜 tile 测量 64/128 元素的跨度。
-同时测量 M 取输入行数向上取整到 2 的幂（限于 16–256）的最佳 tile；超过 128 行时，
-保留该 M tile 的 32/64/128 三种列宽。拷贝阶段分别核对两级和三级 pipeline，
-先按设备共享内存上限排除无法启动的候选。较大的跨度必须整除输入宽度。
-不足 16 行的投影保留全部列宽，
-并额外比较 256/512/1024 元素的拷贝跨度，以减少长 K 维的搬运开销。
-每次拷贝内部仍按连续 32 元素块执行相同的 MMA 序列，
-保持 MMA 次数与 FP32 累加顺序。未显式调优时，默认 M tile 按行数从
-16/32/64/128 中选择；只有 CTA 网格可覆盖设备 SM 时才增大 M tile。
-超过 128 行的投影会测量 256 行 tile，较大的 tile 使用最多 256 个线程复用权重，
-MMA 的 K 序列保持不变。
+普通投影与 WKV Prepare 共用候选生成规则，每次调优最多 24 个不同配置：
+先以 32 元素的 K 拷贝跨度比较两级、三级 pipeline；每种列宽只保留能覆盖一轮
+SM 工作量的两个最大相邻 M tile（16–256），第一阶段最多 12 个候选。
+随后只为两个经过逐位验证且计时最好的不同输出 tile 比较 64/128 拷贝跨度；
+单 token/小 batch 或窄输出额外保留一个可整除所有输入宽度的最大 256–1024
+跨度，第二阶段最多 12 个候选。所有候选在生成 TIR 前按共享内存上限和
+整除约束剪枝，已测配置不重复扫描。最后仅对全局前三名使用较长 CUDA Graph
+复测。每次拷贝仍按连续 32 元素块执行相同的 MMA 序列，保持累加顺序。
+未显式调优时，默认 M tile 按工作量桶从 16/32/64/128 选择，且保持至少一轮
+CTA 覆盖设备 SM；普通前向不启动搜索。
 
 调优同时核对 FP32 累加或统计量及实际生产输出；ln 是否保存统计量、是否写回
 res 等变体都必须保持相同结果。线性层的 bias presence/dtype 属于调优 key。
 编译不受工具链支持的线性候选会在结果中记录 `compile_error`；运行失败直接报错。
-候选的 staging buffers 超出设备共享内存上限时，记录 `resource_error` 并在启动前排除。
+候选的 staging buffers 超出设备共享内存上限时，在编译前直接排除。
 投影候选先串行生成 TIR，再用 TileLang 按可用 CPU 核心数调度的编译线程构建并复用进程内 kernel cache。
 全部构建结束后才逐一检查输出和计时；编译失败仍在对应候选中保留错误信息。
 `tune_linear` 可通过 `benchmark` 回调测量实际前向阶段，结果用 `timing_scope`

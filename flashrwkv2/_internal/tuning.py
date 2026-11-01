@@ -350,17 +350,66 @@ def compile_candidates(keys, cache, spec):
         )
 
 
-def projection_finalists(measurements):
-    """Retain three verified tiles per copy span for sustained graph timing."""
-    spans = {}
-    for item in measurements:
-        if item.get("bitwise_equal"):
-            spans.setdefault(item["config"][3], []).append(item)
+def workload_bucket(size):
+    """At most eleven workload classes; model dimensions remain exact."""
+    return 0 if size == 0 else min(512, 1 << (size - 1).bit_length())
+
+
+def projection_configs(rows, channels, outputs, device, measurements=()):
+    """At most 12 tiles followed by 12 copy variants of two verified tiles.
+
+    Keep the two largest row tiles that fill an SM wave. Copy spans must divide
+    every input width and fit shared memory before any TIR is constructed.
+    """
+    props = torch.cuda.get_device_properties(device)
+    measured = {item["config"]: item for item in measurements}
+    if measured:
+        tiles = dict.fromkeys(
+            item["config"][:2]
+            for item in sorted(
+                (item for item in measured.values() if item.get("bitwise_equal")),
+                key=lambda item: item["milliseconds"],
+            )
+        )
+        spans = [64, 128]
+        if rows < 16 or max(outputs) <= 128:
+            spans.extend(
+                span for span in (1024, 512, 256)
+                if all(width % span == 0 for width in channels)
+            )
+            spans = spans[:3]
+        candidates = (
+            (m, n, stages, span)
+            for m, n in tuple(tiles)[:2]
+            for stages in (2, 3)
+            for span in spans
+            if all(width % span == 0 for width in channels)
+        )
+    else:
+        columns = (8, 16, 32, 64, 128) if rows < 16 and max(outputs) <= 128 else (32, 64, 128)
+        candidates = []
+        for n in columns:
+            if n > max(32, 1 << (max(outputs) - 1).bit_length()):
+                continue
+            blocks_n = sum(math.ceil(width / n) for width in outputs)
+            row_tiles = [16]
+            row_tiles.extend(
+                m for m in (32, 64, 128, 256)
+                if m <= rows and math.ceil(rows / m) * blocks_n >= props.multi_processor_count
+            )
+            candidates.extend((m, n, stages, 32) for m in row_tiles[-2:] for stages in (2, 3))
     return tuple(
-        item["config"]
-        for items in spans.values()
-        for item in sorted(items, key=lambda item: item["milliseconds"])[:3]
+        config for config in candidates
+        if config not in measured
+        and (config[0] + config[1]) * config[2] * config[3] * 2 <= props.shared_memory_per_block_optin
     )
+
+
+def projection_finalists(measurements):
+    """Retain at most three verified configurations for sustained graph timing."""
+    eligible = (item for item in measurements if item.get("bitwise_equal"))
+    ranked = sorted(eligible, key=lambda item: item["milliseconds"])
+    return tuple(item["config"] for item in ranked[:3])
 
 
 @torch.no_grad()

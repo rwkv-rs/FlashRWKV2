@@ -6,10 +6,14 @@ import tilelang.language as T
 import torch
 from torch.autograd.function import once_differentiable
 
-from ..._internal.tuning import _AutogradContext, device_class, tuning_operation
-
 from ..._internal.elementwise import _activation_kernel, activation, sum_partials
 from ..._internal.linear import _aligned, _forward, adapter_linear, linear_input_vjp
+from ..._internal.tuning import (
+    _AutogradContext,
+    device_class,
+    tuning_operation,
+    workload_bucket,
+)
 from ..kk_pre.tilelang import prepare as prepare_key
 from ..vres_gate.tilelang import vres
 
@@ -381,7 +385,7 @@ _GROUP_CONFIGS = {}
 def _group_key(xs, weights, kinds, biases):
     return (
         device_class(xs[0].device),
-        xs[0].shape[0],
+        workload_bucket(xs[0].shape[0]),
         tuple(x.shape[1] for x in xs),
         tuple(w.shape for w in weights),
         tuple(w.stride() for w in weights),
@@ -678,7 +682,14 @@ def _grouped_linear(xs, weights, kinds, biases):
 @tuning_operation
 def _tune_grouped_linear(xs, weights, kinds, biases, *, benchmark=None):
     """Verify independent FP32 accumulators and BF16 epilogues before timing."""
-    from ..._internal.tuning import compile_candidates, projection_finalists, revalidation_config, save_config, select_config
+    from ..._internal.tuning import (
+        compile_candidates,
+        projection_configs,
+        projection_finalists,
+        revalidation_config,
+        save_config,
+        select_config,
+    )
 
     xs, weights, biases = _group_inputs(xs, weights, biases)
     cache_key = _group_key(xs, weights, kinds, biases)
@@ -723,65 +734,16 @@ def _tune_grouped_linear(xs, weights, kinds, biases, *, benchmark=None):
         save_config("tmix/wkv_prepare", cache_key, best)
         return {"config": best, "candidates": checked}
 
-    rows = xs[0].shape[0]
-    narrow = max(weight.shape[0] for weight in weights) <= 128
-    block_rows = (16,) if rows < 16 else (16, 32, 64, 128)
-    if rows > 128:
-        block_rows += (256,)
-    columns = (8, 16, 32) if narrow else (32, 64, 128)
-    candidates = tuple(
-        (block_m, block_n, stages, 32)
-        for block_m in block_rows
-        for block_n in columns
-        for stages in (2, 3)
-    )
-    shared_limit = torch.cuda.get_device_properties(
-        xs[0].device
-    ).shared_memory_per_block_optin
     measurements = {}
-    best = candidates[0]
-    for phase in ("tiles", "copies"):
-        if phase == "copies":
-            spans = (64, 128, 256, 512, 1024) if narrow or rows < 16 else (64, 128)
-            copies = tuple(
-                span for span in spans if all(x.shape[1] % span == 0 for x in xs)
-            )
-            if not copies:
-                break
-            row_tile = min(256, max(16, 1 << (rows - 1).bit_length()))
-            matched = [
-                item
-                for item in measurements.values()
-                if item.get("bitwise_equal") and item["config"][0] == row_tile
-            ]
-            tiles = [best]
-            if rows > 128 or rows < 16 or narrow:
-                tiles.extend(item["config"] for item in matched)
-            elif best[0] != row_tile and matched:
-                tiles.append(
-                    min(matched, key=lambda item: item["milliseconds"])["config"]
-                )
-            candidates = tuple(
-                dict.fromkeys(
-                    (*tile[:2], stages, copy_k)
-                    for tile in tiles
-                    for stages in (2, 3)
-                    for copy_k in (32, *copies)
-                )
-            )
-        eligible, rejected = [], []
-        for config in candidates:
-            block_m, block_n, stages, copy_k = config
-            required = (block_m + block_n) * stages * copy_k * 2
-            if required > shared_limit:
-                rejected.append(
-                    {
-                        "config": config,
-                        "resource_error": f"shared memory requires {required} bytes; device limit is {shared_limit} bytes",
-                    }
-                )
-            else:
-                eligible.append(config)
+    for _ in range(2):
+        eligible = projection_configs(
+            xs[0].shape[0], tuple(x.shape[1] for x in xs),
+            tuple(weight.shape[0] for weight in weights), xs[0].device,
+            measurements.values(),
+        )
+        if not eligible:
+            break
+        rejected = []
         compile_candidates(
             (
                 _group_call(xs, weights, kinds, biases, mode, config)[0]
@@ -802,7 +764,7 @@ def _tune_grouped_linear(xs, weights, kinds, biases, *, benchmark=None):
                 rejected.append({"config": config, "compile_error": str(error)})
             else:
                 compiled.append(config)
-        best, checked = select_config(compiled, run, check=check, reference=reference)
+        _, checked = select_config(compiled, run, check=check, reference=reference)
         measurements.update((item["config"], item) for item in (*checked, *rejected))
     best, checked = select_config(
         projection_finalists(measurements.values()),

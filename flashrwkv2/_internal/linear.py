@@ -13,7 +13,7 @@ from numbers import Real
 import torch
 from torch.autograd.function import once_differentiable
 
-from .tuning import _AutogradContext, device_class, tuning_operation
+from .tuning import _AutogradContext, device_class, tuning_operation, workload_bucket
 
 _PASS_CONFIG = {"tl.disable_wgmma": True, "tl.enable_fast_math": False}
 _DEFAULT_CONFIG = (16, 64, 2, 32)
@@ -161,7 +161,7 @@ def _dtype_name(dtype):
 def _key(x, weight, output_dtype, bias=None):
     return (
         device_class(x.device),
-        x.shape[0],
+        workload_bucket(x.shape[0]),
         weight.shape[0],
         x.shape[1],
         weight.stride(),
@@ -188,8 +188,9 @@ def _forward(x, weight, bias, output_dtype, config=None):
         )
         if config is None:
             block_m = 16
-            if x.shape[0] > 16:
-                max_m = min(128, 1 << (x.shape[0] - 1).bit_length())
+            rows = workload_bucket(x.shape[0])
+            if rows > 16:
+                max_m = min(128, rows)
                 block_n = _DEFAULT_CONFIG[1]
                 blocks_n = (weight.shape[0] + block_n - 1) // block_n
                 multiprocessors = torch.cuda.get_device_properties(
@@ -197,7 +198,7 @@ def _forward(x, weight, bias, output_dtype, config=None):
                 ).multi_processor_count
                 for candidate in (32, 64, 128):
                     # Keep a full CTA wave while capping row padding.
-                    blocks = ((x.shape[0] + candidate - 1) // candidate) * blocks_n
+                    blocks = ((rows + candidate - 1) // candidate) * blocks_n
                     if candidate > max_m or blocks < multiprocessors:
                         break
                     block_m = candidate
@@ -629,7 +630,12 @@ def tune_linear(x, weight, output_dtype=None, *, bias=None, benchmark=None):
     its dispatch cache, preserving the operator's working set during tuning.
     """
     from .tuning import (
-        compile_candidates, projection_finalists, revalidation_config, save_config, select_config,
+        compile_candidates,
+        projection_configs,
+        projection_finalists,
+        revalidation_config,
+        save_config,
+        select_config,
     )
 
     output_dtype = torch.bfloat16 if output_dtype is None else output_dtype
@@ -648,25 +654,10 @@ def tune_linear(x, weight, output_dtype=None, *, bias=None, benchmark=None):
         )
         if not torch.equal(reference[0][row : row + 1], single):
             raise RuntimeError("canonical linear failed FP32 batch invariance")
-    block_rows = (16,) if x.shape[0] < 16 else (16, 32, 64, 128)
-    if x.shape[0] > 128:
-        block_rows += (256,)
-    narrow_tiles = x.shape[0] < 16 and weight.shape[0] <= 128
-    block_cols = (8, 16, 32, 64, 128) if narrow_tiles else (32, 64, 128)
-    candidates = (
-        (block_m, block_n, stages, 32)
-        for block_m in block_rows
-        for block_n in block_cols
-        for stages in (2, 3)
-    )
     major, minor = torch.cuda.get_device_capability(x.device)
     input_major = weight.stride(0) == 1
     weight_strides = (weight.t() if input_major else weight).stride()
-    shared_memory_limit = torch.cuda.get_device_properties(
-        x.device
-    ).shared_memory_per_block_optin
     measurements = {}
-    best_config = _DEFAULT_CONFIG
 
     def run(config):
         if benchmark is None:
@@ -684,48 +675,14 @@ def tune_linear(x, weight, output_dtype=None, *, bias=None, benchmark=None):
         save_config("linear", _key(x, weight, output_dtype, bias), best_config)
         return {"config": best_config, "candidates": checked}
 
-    for phase in ("tiles", "copies"):
-        if phase == "copies":
-            # Copy spans can change the best column tile and pipeline depth.
-            spans = (64, 128, 256, 512, 1024) if x.shape[0] < 16 else (64, 128)
-            copies = [span for span in spans if x.shape[1] % span == 0]
-            if not copies:
-                break
-            tiles = [best_config]
-            row_tile = min(256, max(16, 1 << (x.shape[0] - 1).bit_length()))
-            matched = [
-                item for item in measurements.values()
-                if item.get("bitwise_equal") and item["config"][0] == row_tile
-            ]
-            if x.shape[0] > 128 or x.shape[0] < 16:
-                tiles.extend(item["config"] for item in matched)
-            elif best_config[0] != row_tile and matched:
-                tiles.append(
-                    min(matched, key=lambda item: item["milliseconds"])["config"]
-                )
-            candidates = tuple(
-                dict.fromkeys(
-                    tile[:2] + (stages, span)
-                    for tile in tiles
-                    for stages in (2, 3)
-                    for span in (32, *copies)
-                )
-            )
-        eligible, rejected = [], []
-        for config in candidates:
-            block_m, block_n, stages, copy_k = config
-            # Both BF16 staging tiles retain one buffer per pipeline stage.
-            shared_memory = (block_m + block_n) * copy_k * stages * 2
-            if shared_memory > shared_memory_limit:
-                rejected.append({
-                    "config": config,
-                    "resource_error": (
-                        f"shared memory requires {shared_memory} bytes; "
-                        f"device limit is {shared_memory_limit} bytes"
-                    ),
-                })
-                continue
-            eligible.append(config)
+    for _ in range(2):
+        eligible = projection_configs(
+            x.shape[0], (x.shape[1],), (weight.shape[0],), x.device,
+            measurements.values(),
+        )
+        if not eligible:
+            break
+        rejected = []
         keys = (
             (
                 weight.shape[0], x.shape[1], _dtype_name(dtype),
@@ -757,7 +714,7 @@ def tune_linear(x, weight, output_dtype=None, *, bias=None, benchmark=None):
                 rejected.append({"config": config, "compile_error": str(error)})
             else:
                 compiled.append(config)
-        best_config, checked = select_config(
+        _, checked = select_config(
             compiled,
             run,
             check=lambda config: tuple(

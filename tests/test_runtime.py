@@ -68,6 +68,7 @@ def test_tuning_compiler_identity_without_cuda_toolkit(monkeypatch):
 
 def test_tuning_device_class_shares_ordinals_but_separates_products(monkeypatch):
     import torch
+
     from flashrwkv2._internal import tuning
 
     monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: SimpleNamespace(
@@ -85,6 +86,7 @@ def test_tuning_device_class_shares_ordinals_but_separates_products(monkeypatch)
 @pytest.mark.parametrize("override", [None, ""])
 def test_tuning_default_root_ignores_torch_and_xdg(monkeypatch, tmp_path, override):
     from pathlib import Path
+
     from flashrwkv2._internal import tuning
 
     if override is None:
@@ -182,8 +184,9 @@ def test_tuning_preparation_includes_worker_thread_dispatch(tuning_cache):
 
 
 def test_tuning_revalidates_legacy_without_timing(tuning_cache, tmp_path, monkeypatch):
-    import torch
     from pathlib import Path
+
+    import torch
     tuning = tuning_cache
     key = (("test", 12, 0, 188), 128)
     encoded = tuning._encode(("test", 128))
@@ -339,9 +342,9 @@ def test_compile_boundary_accepts_homogeneous_sm89() -> None:
 
 def _mock_runtime_build(monkeypatch, tmp_path, *, fail_once: bool = False):
     import torch
-    from flashrwkv2._internal import tuning
 
     from flashrwkv2 import compile as compiler
+    from flashrwkv2._internal import tuning
 
     calls = {"build": 0}
     monkeypatch.setattr(compiler, "_RESULT", None)
@@ -479,7 +482,6 @@ def test_source_digest_tracks_shared_native_headers(tmp_path) -> None:
 
 def test_root_exports_module_operators_by_identity() -> None:
     import flashrwkv2
-
     from flashrwkv2._internal import tuning
 
     expected: dict[str, object] = {
@@ -553,3 +555,67 @@ def test_retired_public_aliases_are_absent() -> None:
     assert retired.isdisjoint(flashrwkv2.__all__)
     for name in retired:
         assert not hasattr(flashrwkv2, name)
+
+
+@pytest.mark.parametrize("rows", [1, 15, 16, 89, 100, 256, 512, 4096])
+@pytest.mark.parametrize("channels,outputs", [((4096,), (96,)), ((160,), (64,)), ((2048,), (65536,)), ((4096, 4096, 4096, 4096), (128, 128, 480, 96))])
+def test_projection_search_is_bounded_and_prunes_before_compilation(monkeypatch, rows, channels, outputs):
+    from flashrwkv2._internal import tuning
+
+    props = SimpleNamespace(multi_processor_count=128, shared_memory_per_block_optin=101376)
+    monkeypatch.setattr(tuning.torch.cuda, "get_device_properties", lambda _: props)
+    tiles = tuning.projection_configs(rows, channels, outputs, "cuda")
+    assert 0 < len(tiles) <= 12
+    measured = [{"config": c, "bitwise_equal": True, "milliseconds": i + 1}
+                for i, c in enumerate(tiles)]
+    copies = tuning.projection_configs(rows, channels, outputs, "cuda", measured)
+    assert len(copies) <= 12
+    assert not set(tiles) & set(copies)
+    assert len(set(tiles + copies)) == len(tiles + copies)
+    assert len({c[:2] for c in copies}) <= 2
+    for m, n, stages, span in tiles + copies:
+        assert (m + n) * stages * span * 2 <= props.shared_memory_per_block_optin
+        assert span == 32 or all(width % span == 0 for width in channels)
+    assert len(tuning.projection_finalists(measured)) <= 3
+
+
+def test_tuning_buckets_reuse_profiles_for_unseen_batches(tuning_cache, monkeypatch):
+    import torch
+
+    from flashrwkv2._internal import linear
+    from flashrwkv2.post_norm import tilelang as norm
+    from flashrwkv2.tmix.readout import tilelang as readout
+    from flashrwkv2.tmix.tokenshift import tilelang as shift
+    from flashrwkv2.tmix.wkv7 import tilelang as wkv
+    from flashrwkv2.tmix.wkv_prepare import tilelang as prepare
+
+    tuning = tuning_cache
+    modules = (linear, norm, readout, shift, wkv, prepare)
+    for module in modules:
+        monkeypatch.setattr(module, "device_class", lambda _: ("test", 8, 9, 128))
+    weight = torch.empty(128, 64)
+    mixes = torch.empty(6, 64)
+    def keys(rows):
+        x = torch.empty(rows, 64)
+        return {
+            "linear": linear._key(x, weight, torch.float32),
+            "post_norm": norm._config_key(x, False),
+            "tmix/readout": readout._config_key(x, 64),
+            "tmix/tokenshift": shift._config_key(x, mixes, rows),
+            "tmix/wkv7": wkv._config_key(x.view(rows, 1, 64), rows, None, indexed=True),
+            "tmix/wkv_prepare": prepare._group_key((x,), (weight,), (0,), (None,)),
+        }
+    baseline = keys(89)
+    for owner, key in baseline.items():
+        tuning.save_config(owner, key, 1)
+    for rows in (90, 100, 127, 128):
+        actual = keys(rows)
+        assert actual == baseline
+        report = tuning.prepare_tuning([
+            lambda owner=owner, key=key: tuning.get_config({}, owner, key)
+            for owner, key in actual.items()
+        ])
+        assert report["complete"] and report["counts"]["hit"] == len(baseline)
+    assert len({tuning.workload_bucket(n) for n in range(8193)}) == 11
+    assert keys(129) != baseline
+    assert wkv._config_key(torch.empty(100, 1, 64), 90, None, indexed=True) != baseline["tmix/wkv7"]
