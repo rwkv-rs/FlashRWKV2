@@ -111,3 +111,59 @@ def test_readout_bitwise_batch_grad_and_vjp(head_size, channels):
     torch.testing.assert_close(actual, expected, atol=0.004, rtol=0.01)
     for gradient, ref in zip(gradients, expected_gradients, strict=True):
         torch.testing.assert_close(gradient, ref, atol=0.03, rtol=0.02)
+
+
+@pytest.mark.cuda
+@pytest.mark.cuda_graph
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("rows", (1, 4, 16))
+@pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float32))
+def test_fixed_decode_readout_preserves_stats_vjp_and_graph(monkeypatch, tmp_path, rows, dtype):
+    from flashrwkv2._internal import tuning
+    from flashrwkv2.tmix.readout import tilelang as implementation
+
+    if not tuning._fixed_strategy_device(tuning.device_class(torch.device("cuda"))):
+        pytest.skip("fixed readout strategy is qualified on tested devices")
+    torch.manual_seed(721)
+    channels = 2048
+    x = torch.randn(rows, channels, device="cuda", dtype=dtype)
+    bf = tuple(torch.randn(rows, channels, device="cuda", dtype=torch.bfloat16) for _ in range(4))
+    vectors = tuple(torch.randn(channels, device="cuda", dtype=torch.bfloat16) for _ in range(3))
+    args = (x, *bf[:3], *vectors, bf[3])
+    dtype_name = str(dtype).split(".")[-1]
+    group = 4 if rows == 1 else 8
+    expected, expected_stats = implementation._forward(channels, 64, 64e-5, dtype_name, True, 1)(*args)
+    actual, actual_stats = implementation._forward(channels, 64, 64e-5, dtype_name, True, group)(*args)
+    assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+    assert torch.equal(actual_stats.view(torch.int32), expected_stats.view(torch.int32))
+
+    variables = tuple(t.detach().requires_grad_() for t in args)
+    upstream = torch.randn_like(expected)
+    with monkeypatch.context() as patch:
+        patch.setattr(implementation, "_readout_group", lambda *args: 1)
+        baseline = readout(*variables)
+        expected_grads = torch.autograd.grad(baseline, variables, upstream)
+
+    monkeypatch.setattr(tuning, "_profile_root", lambda: tmp_path)
+    monkeypatch.setattr(tuning, "_read_profile", lambda *args: pytest.fail("read a profile"))
+    monkeypatch.setattr(implementation, "tune_readout", lambda *args: pytest.fail("tuned a fixed configuration"))
+    monkeypatch.setattr(implementation, "_ROW_CONFIGS", {})
+    trained = readout(*variables)
+    actual_grads = torch.autograd.grad(trained, variables, upstream)
+    assert torch.equal(trained.view(torch.int16), baseline.view(torch.int16))
+    assert all(torch.equal(a, b) for a, b in zip(actual_grads, expected_grads))
+
+    def call():
+        with torch.no_grad():
+            return readout(*args)
+
+    for mode in ("inspect", "require", "tune"):
+        report = tuning.prepare_tuning([call], mode=mode)
+        assert report["complete"] and report["counts"]["fixed"] == 1
+        assert report["records"][0]["config"] == group
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = call()
+    graph.replay()
+    assert torch.equal(captured.view(torch.int16), expected.view(torch.int16))
+    assert not tuple(tmp_path.iterdir())

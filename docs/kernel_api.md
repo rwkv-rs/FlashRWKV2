@@ -233,6 +233,11 @@ WKV Prepare 的单 token 低秩输入投影，在上述两种架构的下列模�
 MMA 仍按连续 32 元素累加。其他 rank、混合权重布局和多 token 工作量沿用
 profile 选择。
 
+Readout 在 head size 64、宽度 2048、2560、4096、5120 且 token 数不超过
+16 时，单 token 每 CTA 处理 4 个 head，其余情况处理 8 个 head。BF16/FP32
+输入、训练统计和推理共用该规则；每个 head 仍使用独立 warp 和原来的归约
+顺序。离线对照中个别形状的相对差异超过 5%，绝对差异小于 0.1 微秒。
+
 CMix 与 Head 的单 token 投影也只选三种 tile：对于宽度 2048、2560、4096
 的连续输出主序 CMix key 和 65536 词表 FP32 Head，使用
 (16, 64, 2, 128)；输入主序 CMix value 在宽度 2048、2560 使用
