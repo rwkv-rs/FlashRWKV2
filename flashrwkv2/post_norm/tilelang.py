@@ -24,7 +24,7 @@ def _config_key(x, has_res):
 
 
 def _fixed_rows(x):
-    # These model widths use one row per CTA on both qualified architectures.
+    # These model widths use one row per CTA on the qualified device.
     return x.shape[-1] in (2048, 2560, 4096, 5120) and _fixed_strategy_device(device_class(x.device))
 
 
