@@ -693,9 +693,8 @@ def test_fixed_decode_linear_limits_models_devices_and_layouts(monkeypatch, chan
     assert fixed(x, key, torch.float32, None) is None
     assert fixed(x, key, torch.bfloat16, key[0]) is None
     assert fixed(torch.empty(2, channels, device="meta"), key, torch.bfloat16, None) == key_config
-    assert fixed(torch.empty(17, channels, device="meta"), key, torch.bfloat16, None) == (
-        (32, 64, 2, 128) if channels == 4096 else None
-    )
+    assert fixed(torch.empty(17, channels, device="meta"), key, torch.bfloat16, None) == (32, 64, 2, 128)
+    assert fixed(torch.empty(513, channels, device="meta"), key, torch.bfloat16, None) is None
     assert fixed(value_x, value.contiguous(), torch.bfloat16, None) is None
     info = ("test", 12, 0, 188)
     assert fixed(value_x, value, torch.bfloat16, None) is None
@@ -771,6 +770,34 @@ def test_fixed_small_head_row_wave_boundaries(monkeypatch, width, rows, expected
     assert implementation._fixed_projection_config(x, weight, torch.bfloat16, None) is None
 
 
+@pytest.mark.parametrize("kind,width,rows,expected", (
+    ("cmix_key", 2048, 32, (32, 64, 2, 128)), ("cmix_key", 2048, 33, (64, 64, 2, 128)),
+    ("cmix_key", 2048, 64, (64, 64, 2, 128)), ("cmix_key", 2048, 65, (128, 64, 2, 128)),
+    ("cmix_key", 2048, 128, (128, 64, 2, 128)), ("cmix_key", 2048, 129, (64, 128, 2, 64)),
+    ("cmix_key", 2048, 192, (64, 128, 2, 64)), ("cmix_key", 2048, 193, (128, 128, 2, 64)),
+    ("cmix_key", 2560, 64, (64, 64, 2, 64)), ("cmix_key", 2560, 128, (64, 64, 2, 64)),
+    ("cmix_key", 2560, 129, (64, 128, 2, 64)), ("cmix_key", 2560, 193, (128, 64, 2, 128)),
+    ("cmix_key", 2560, 224, (128, 64, 2, 128)), ("cmix_key", 2560, 225, (128, 128, 2, 64)),
+    ("attention_output", 2048, 64, (32, 32, 2, 128)), ("attention_output", 2048, 65, (32, 64, 2, 64)),
+    ("attention_output", 2048, 96, (32, 64, 2, 64)), ("attention_output", 2048, 97, (64, 64, 2, 64)),
+    ("attention_output", 2048, 256, (64, 64, 2, 64)), ("attention_output", 2048, 257, (64, 128, 2, 64)),
+    ("attention_output", 2560, 32, (32, 32, 2, 128)), ("attention_output", 2560, 33, (32, 64, 2, 64)),
+    ("attention_output", 2560, 192, (64, 64, 2, 64)), ("attention_output", 2560, 193, (64, 128, 2, 64)),
+    ("cmix_value", 2560, 384, (64, 128, 2, 64)), ("cmix_value", 2560, 385, (128, 128, 2, 64)),
+    ("cmix_value", 2560, 512, (128, 128, 2, 64)), ("cmix_value", 2560, 513, None),
+))
+def test_fixed_small_dense_row_wave_boundaries(monkeypatch, kind, width, rows, expected):
+    from flashrwkv2._internal import linear as implementation
+
+    monkeypatch.setattr(implementation, "device_class", lambda device: ("test", 8, 9, 128))
+    channels = 4 * width if kind == "cmix_value" else width
+    outputs = 4 * width if kind == "cmix_key" else width
+    x = torch.empty(rows, channels, device="meta")
+    weight = torch.empty(channels, outputs, device="meta").t() if kind == "cmix_value" else torch.empty(outputs, channels, device="meta")
+    assert implementation._fixed_projection_config(x, weight, torch.bfloat16, None) == expected
+    assert implementation._fixed_projection_config(x, weight, torch.float32, None) is None
+
+
 @cuda
 @pytest.mark.cuda
 @pytest.mark.cuda_graph
@@ -785,7 +812,10 @@ def test_fixed_small_head_row_wave_boundaries(monkeypatch, width, rows, expected
 ) + tuple(("attention_input_vjp", 4096, rows) for rows in (64, 128, 256, 320, 512, 1024))
   + tuple((kind, 4096, rows) for kind in ("cmix_key", "head") for rows in (33, 65))
   + tuple(("head", width, rows) for width in (2048, 2560)
-          for rows in (17, 32, 33, 64, 65, 128, 129, 256, 320, 512)))
+          for rows in (17, 32, 33, 64, 65, 128, 129, 256, 320, 512))
+  + tuple((kind, width, rows) for kind in ("cmix_key", "cmix_value", "attention_output")
+          for width in (2048, 2560)
+          for rows in (17, 32, 33, 64, 65, 96, 97, 128, 129, 160, 192, 193, 224, 225, 256, 257, 320, 384, 385, 512)))
 def test_fixed_decode_linear_preserves_fp32_and_graph(monkeypatch, tmp_path, kind, width, rows):
     from flashrwkv2._internal import linear as implementation
     from flashrwkv2._internal import tuning
@@ -884,17 +914,25 @@ def test_fixed_square_weight_vjp_fp32_preserves_accumulation_and_graph(monkeypat
 
 @cuda
 @pytest.mark.cuda
-@pytest.mark.parametrize("width,rows", ((2048, 1), (4096, 64), (4096, 128), (4096, 256), (4096, 1024)))
-def test_fixed_decode_linear_preserves_training_gradients(monkeypatch, width, rows):
+@pytest.mark.parametrize("kind,width,rows", (
+    ("key", 2048, 1), ("key", 2048, 64), ("key", 2048, 128),
+    ("key", 2560, 64), ("key", 2560, 128), ("key", 2560, 193),
+    ("value", 2048, 64), ("value", 2560, 128),
+    ("key", 4096, 64), ("key", 4096, 128), ("key", 4096, 256), ("key", 4096, 1024),
+))
+def test_fixed_decode_linear_preserves_training_gradients(monkeypatch, kind, width, rows):
     from flashrwkv2._internal import linear as implementation
     from flashrwkv2._internal import tuning
 
     if not tuning._fixed_strategy_device(tuning.device_class(torch.device("cuda"))):
         pytest.skip("fixed linear strategy is qualified on tested devices")
     torch.manual_seed(720)
-    x = (torch.randn(rows, width, device="cuda", dtype=torch.bfloat16) * .03).requires_grad_()
-    weight = (torch.randn(4 * width, width, device="cuda", dtype=torch.bfloat16) * .03).requires_grad_()
-    upstream = torch.randn(rows, 4 * width, device="cuda", dtype=torch.bfloat16)
+    channels = 4 * width if kind == "value" else width
+    outputs = width if kind == "value" else 4 * width
+    x = (torch.randn(rows, channels, device="cuda", dtype=torch.bfloat16) * .03).requires_grad_()
+    weight = torch.randn(channels, outputs, device="cuda", dtype=torch.bfloat16).t() if kind == "value" else torch.randn(outputs, channels, device="cuda", dtype=torch.bfloat16)
+    weight = (weight * .03).requires_grad_()
+    upstream = torch.randn(rows, outputs, device="cuda", dtype=torch.bfloat16)
     key = implementation._key(x, weight, torch.bfloat16)
     token = tuning._TUNING.set(True)
     try:

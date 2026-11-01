@@ -202,6 +202,32 @@ def _fixed_projection_config(x, weight, output_dtype, bias):
             if rows <= 128:
                 return (128, 64, 2, 128)
             return (256, 64, 2, 64)
+        if rows <= 512 and output_dtype == torch.bfloat16:
+            if channels in (2048, 2560) and outputs == 4 * channels and output_major:
+                if rows <= 32:
+                    return (32, 64, 2, 128)
+                if rows <= 64:
+                    return (64, 64, 2, 128 if channels == 2048 else 64)
+                if rows <= 128:
+                    return (128, 64, 2, 128) if channels == 2048 else (64, 64, 2, 64)
+                if rows <= 192:
+                    return (64, 128, 2, 64)
+                if channels == 2560 and rows <= 224:
+                    return (128, 64, 2, 128)
+                return (128, 128, 2, 64)
+            if outputs in (2048, 2560) and (
+                (channels == outputs and output_major)
+                or (channels == 4 * outputs and input_major)
+            ):
+                if rows <= 32 or (outputs == 2048 and rows <= 64):
+                    return (32, 32, 2, 128)
+                if rows <= 96:
+                    return (32, 64, 2, 64)
+                if rows <= (256 if outputs == 2048 else 192):
+                    return (64, 64, 2, 64)
+                if outputs == 2560 and channels == 4 * outputs and rows > 384:
+                    return (128, 128, 2, 64)
+                return (64, 128, 2, 64)
         if output_dtype == torch.bfloat16 and outputs == 4096 and (
             (channels == 4096 and output_major)
             or (channels in (4096, 16384) and input_major)
