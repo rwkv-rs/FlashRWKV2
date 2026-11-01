@@ -785,7 +785,7 @@ def test_block_independent_torch_vjp_and_optimizer_step(mode):
 ) + tuple(
     (batch, channels, ranks, canonical)
     for channels, ranks in ((2048, (96, 96, 256, 64)), (2560, (96, 96, 320, 64)))
-    for batch in (17, 64, 128, 320, 512)
+    for batch in (4, 17, 64, 128, 320, 512)
     for canonical in (False, True)
 ))
 def test_real_decode_block_needs_no_tuning_profile(monkeypatch, tmp_path, later_layer, batch, channels, ranks, canonical):
