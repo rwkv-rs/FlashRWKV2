@@ -104,6 +104,15 @@ def test_tuning_default_root_ignores_torch_and_xdg(monkeypatch, tmp_path, overri
         tuning.get_tuning_cache_dir.cache_clear()
 
 
+def test_fixed_strategy_is_qualified_by_architecture_and_sm_count():
+    from flashrwkv2._internal.tuning import _fixed_strategy_device
+
+    assert _fixed_strategy_device(("4090", 8, 9, 128))
+    assert _fixed_strategy_device(("PRO 6000", 12, 0, 188))
+    assert not _fixed_strategy_device(("4090 D", 8, 9, 114))
+    assert not _fixed_strategy_device(("other", 12, 0, 170))
+
+
 def test_fixed_configuration_skips_profiles_and_search_in_every_mode(tuning_cache, monkeypatch):
     tuning = tuning_cache
     key = (("test", 8, 9, 128), 32)

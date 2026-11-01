@@ -23,6 +23,7 @@ import torch
 
 from ..._internal.tuning import (
     _AutogradContext,
+    _fixed_strategy_device,
     device_class,
     tuning_operation,
     workload_bucket,
@@ -641,7 +642,7 @@ def _fixed_recurrent_config(r, batch, state_dtype):
     # Each value column retains the same key reduction and FP32 update order.
     # Multi-token prefetch overlaps input loads; decode needs no prefetch.
     device = device_class(r.device)
-    if device[1:3] not in ((8, 9), (12, 0)) or r.shape[-1] != 64 or state_dtype != torch.float32:
+    if not _fixed_strategy_device(device) or r.shape[-1] != 64 or state_dtype != torch.float32:
         return None
     return 64, 4 if r.shape[0] > batch else 1
 

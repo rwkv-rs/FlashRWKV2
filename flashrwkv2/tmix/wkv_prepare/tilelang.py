@@ -10,6 +10,7 @@ from ..._internal.elementwise import _activation_kernel, activation, sum_partial
 from ..._internal.linear import _aligned, _forward, adapter_linear, linear_input_vjp
 from ..._internal.tuning import (
     _AutogradContext,
+    _fixed_strategy_device,
     device_class,
     tuning_operation,
     workload_bucket,
@@ -407,7 +408,7 @@ def _fixed_decode_config(xs, weights, kinds, biases):
         or kinds not in ((1, 0, 2), (1, 0, 2, 0))
         or any(bias is not None for bias in biases)
         or any(x.shape[1] != channels for x in xs)
-        or device_class(xs[0].device)[1:3] not in ((8, 9), (12, 0))
+        or not _fixed_strategy_device(device_class(xs[0].device))
     ):
         return None
     ranks = tuple(weight.shape[0] for weight in weights)

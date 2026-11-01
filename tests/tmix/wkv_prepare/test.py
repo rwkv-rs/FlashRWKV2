@@ -105,7 +105,7 @@ def test_fixed_decode_projection_preserves_accumulators_and_graph(
     from flashrwkv2._internal import tuning
     from flashrwkv2.tmix.wkv_prepare import tilelang as implementation
 
-    if torch.cuda.get_device_capability() not in ((8, 9), (12, 0)):
+    if not tuning._fixed_strategy_device(tuning.device_class(torch.device("cuda"))):
         pytest.skip("fixed grouped strategy is qualified on SM89 and SM120")
     torch.manual_seed(716)
     channels, ranks = 2048, (96, 96, 256, 64)[:count]
@@ -154,7 +154,7 @@ def test_fixed_decode_projection_preserves_training_gradients(monkeypatch):
     from flashrwkv2._internal import tuning
     from flashrwkv2.tmix.wkv_prepare import tilelang as implementation
 
-    if torch.cuda.get_device_capability() not in ((8, 9), (12, 0)):
+    if not tuning._fixed_strategy_device(tuning.device_class(torch.device("cuda"))):
         pytest.skip("fixed grouped strategy is qualified on SM89 and SM120")
     torch.manual_seed(717)
     channels, ranks = 2048, (96, 96, 256)

@@ -66,6 +66,11 @@ def device_class(device):
     return (props.name, props.major, props.minor, props.multi_processor_count)
 
 
+def _fixed_strategy_device(info):
+    # These SM counts were measured on RTX 4090 and RTX PRO 6000.
+    return info[1:] in ((8, 9, 128), (12, 0, 188))
+
+
 @cache
 def _compiler_identity():
     from tilelang.contrib.cc import get_cplus_compiler

@@ -443,7 +443,7 @@ def test_fixed_recurrent_dispatch_preserves_state_without_tuning(monkeypatch, le
     from flashrwkv2._internal import tuning
     from flashrwkv2.tmix.wkv7 import tilelang as implementation
 
-    if torch.cuda.get_device_capability() not in ((8, 9), (12, 0)):
+    if not tuning._fixed_strategy_device(tuning.device_class(torch.device("cuda"))):
         pytest.skip("fixed recurrent strategy is qualified on SM89 and SM120")
     values, state, cu, bias = _case(64, lengths)
     indices = torch.arange(len(lengths), device="cuda", dtype=torch.int32)
@@ -484,7 +484,9 @@ def test_fixed_recurrent_dispatch_preserves_state_without_tuning(monkeypatch, le
 
 
 def test_fixed_recurrent_training_matches_canonical_gradients():
-    if torch.cuda.get_device_capability() not in ((8, 9), (12, 0)):
+    from flashrwkv2._internal import tuning
+
+    if not tuning._fixed_strategy_device(tuning.device_class(torch.device("cuda"))):
         pytest.skip("fixed recurrent strategy is qualified on SM89 and SM120")
     values, state, cu, bias = _case(64, (1, 5), requires_grad=True)
     expected = tmix_wkv7_recurrent(

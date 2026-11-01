@@ -100,7 +100,7 @@ def test_fixed_norm_needs_no_profile_and_captures(monkeypatch, channels, has_res
     from flashrwkv2._internal import tuning
     from flashrwkv2.post_norm import tilelang as implementation
 
-    if torch.cuda.get_device_capability() not in ((8, 9), (12, 0)):
+    if not tuning._fixed_strategy_device(tuning.device_class(torch.device("cuda"))):
         pytest.skip("fixed norm strategy is qualified on SM89 and SM120")
     torch.manual_seed(703)
     x = torch.randn(17, channels, device="cuda", dtype=torch.bfloat16)

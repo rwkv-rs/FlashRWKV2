@@ -9,6 +9,7 @@ import torch
 
 from .._internal.tuning import (
     _AutogradContext,
+    _fixed_strategy_device,
     device_class,
     tuning_operation,
     workload_bucket,
@@ -24,7 +25,7 @@ def _config_key(x, has_res):
 
 def _fixed_rows(x):
     # These model widths use one row per CTA on both qualified architectures.
-    return x.shape[-1] in (2048, 2560, 4096, 5120) and device_class(x.device)[1:3] in ((8, 9), (12, 0))
+    return x.shape[-1] in (2048, 2560, 4096, 5120) and _fixed_strategy_device(device_class(x.device))
 
 
 def _row_layout(channels, rows_per_block):
