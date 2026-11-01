@@ -185,6 +185,23 @@ def _fixed_projection_config(x, weight, output_dtype, bias):
     if (rows == 4096 and channels in (64, 128, 256, 320, 512, 1024) and outputs == 4096
             and output_dtype in (torch.bfloat16, torch.float32) and weight.stride() == (1, outputs)):
         return (128, 64, 2, 64) if channels <= 256 else (128, 128, 2, 64)
+    if 512 < rows <= 1024 and output_dtype == torch.bfloat16:
+        output_major = weight.stride() == (channels, 1)
+        input_major = weight.stride() == (1, outputs)
+        if channels in (2048, 2560) and outputs == 4 * channels and output_major:
+            if channels == 2560 and rows <= 576:
+                return (64, 128, 2, 64)
+            return (128, 128, 2, 64)
+        if outputs in (2048, 2560) and (
+            (channels == outputs and output_major)
+            or (channels == 4 * outputs and input_major)
+        ):
+            # At width 2560, 128-row tiles fill one 128-SM wave through row 768.
+            if outputs == 2560 and rows > 768:
+                return (128, 64, 2, 32)
+            if channels == outputs and rows <= (704 if outputs == 2048 else 576):
+                return (64, 128, 2, 64)
+            return (128, 128, 2, 64)
     if rows > 16:
         if not (rows <= 512 or 960 < rows <= 1024):
             return None
