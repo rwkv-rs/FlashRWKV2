@@ -32,6 +32,7 @@ def _matmul_program(
     input_major=False,
     no_set_max_nreg=False,
     dynamic_k=False,
+    aligned_k=True,
 ):
     import tilelang.language as T
 
@@ -54,6 +55,8 @@ def _matmul_program(
         ),
         Y: T.Tensor((rows, outputs), output_dtype),
     ):
+        if dynamic_k and aligned_k:
+            T.assume(channels % 32 == 0)
         with T.Kernel(
             T.ceildiv(outputs, block_n),
             T.ceildiv(rows, block_m),
@@ -144,6 +147,7 @@ def _compile_spec(
             # SM12x supports TMA but not CTA register reconfiguration.
             no_set_max_nreg=arch // 10 == 12,
             dynamic_k=dynamic_k,
+            aligned_k=aligned_k,
         ),
         {
             "out_idx": [3],

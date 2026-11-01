@@ -169,6 +169,7 @@ def _group_program(
     arch,
     count,
     dynamic_k=False,
+    aligned_k=True,
 ):
     rows = T.dynamic("rows", dtype="int64")
     if dynamic_k:
@@ -231,6 +232,8 @@ def _group_program(
         Y: T.Tensor((rows * total,), T.bfloat16),
         Raw: T.Tensor((rows * raw_total,), raw_dtype),
     ):
+        if dynamic_k and aligned_k:
+            T.assume(reduction % 32 == 0)
         with T.Kernel(
             sum(tiles[:count]),
             T.ceildiv(rows, bm),
@@ -456,6 +459,7 @@ def _group_spec(
             arch,
             count,
             dynamic_k,
+            aligned_k,
         ),
         {
             "out_idx": [12, 13],
