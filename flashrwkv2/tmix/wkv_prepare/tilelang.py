@@ -622,10 +622,12 @@ class _GroupedLinear(torch.autograd.Function):
                     x.shape[0], width
                 )
                 position += x.shape[0] * width
-            if gradient is None:
+            need_input = ctx.needs_input_grad[1 + i]
+            need_weight = ctx.needs_input_grad[1 + count + i]
+            need_bias = ctx.needs_input_grad[1 + 2 * count + i]
+            if gradient is None or not (need_input or need_weight or need_bias):
                 continue
             dy = _aligned(gradient.contiguous())
-            need_bias = ctx.needs_input_grad[1 + 2 * count + i]
             if kind or bias is not None:
                 # Identity's derivative does not read the saved activation.
                 if not kind:
@@ -655,9 +657,9 @@ class _GroupedLinear(torch.autograd.Function):
                     dbs[i] = sum_partials(partial)
             if grouped_input_vjp or grouped_weight_vjp:
                 dys.append(dy)
-            if not grouped_input_vjp and ctx.needs_input_grad[1 + i]:
+            if not grouped_input_vjp and need_input:
                 dxs[i] = linear_input_vjp(dy, weight)
-            if not grouped_weight_vjp and ctx.needs_input_grad[1 + count + i]:
+            if not grouped_weight_vjp and need_weight:
                 dws[i] = _forward(dy.t().contiguous(), x.t(), None, weight.dtype, dynamic_k=True)
         if grouped_input_vjp:
             dxs = _run_groups(tuple(dys), grouped_weights, identity_kinds, no_bias)[0]

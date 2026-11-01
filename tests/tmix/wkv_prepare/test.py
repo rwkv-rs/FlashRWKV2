@@ -1135,7 +1135,7 @@ def test_grouped_training_vjp_preserves_compile_and_graph(monkeypatch, tmp_path,
 
 @cuda
 @pytest.mark.cuda
-@pytest.mark.parametrize("mode", ("frozen_input", "frozen_weight", "mixed_layout", "unused"))
+@pytest.mark.parametrize("mode", ("frozen_input", "frozen_weight", "frozen_route", "mixed_layout", "unused"))
 def test_grouped_vjp_eligibility_preserves_partial_gradients(monkeypatch, mode):
     from flashrwkv2._internal import linear as shared
     from flashrwkv2._internal import tuning
@@ -1145,12 +1145,13 @@ def test_grouped_vjp_eligibility_preserves_partial_gradients(monkeypatch, mode):
         pytest.skip("grouped VJP is qualified on tested devices")
     torch.manual_seed(725)
     xs = tuple(torch.randn(3, 64, device="cuda").bfloat16().requires_grad_(
-        mode != "frozen_input" or i != 1) for i in range(2))
+        not ((mode == "frozen_input" and i == 1) or (mode == "frozen_route" and i == 0))) for i in range(2))
     weights = tuple((torch.randn(64, 32, device="cuda").bfloat16().t()
                      if mode != "mixed_layout" or i == 0 else
                      torch.randn(32, 64, device="cuda").bfloat16()).requires_grad_(
-                         mode != "frozen_weight" or i != 0) for i in range(2))
-    biases = tuple(torch.randn(32, device="cuda").bfloat16().requires_grad_() for _ in range(2))
+                         not (mode in ("frozen_weight", "frozen_route") and i == 0)) for i in range(2))
+    biases = tuple(torch.randn(32, device="cuda").bfloat16().requires_grad_(
+        mode != "frozen_route" or i != 0) for i in range(2))
     leaves = tuple(v for v in (*xs, *weights, *biases) if v.requires_grad)
     def model():
         values = implementation._grouped_linear(xs, weights, (1, 2), biases)
@@ -1164,6 +1165,12 @@ def test_grouped_vjp_eligibility_preserves_partial_gradients(monkeypatch, mode):
             gradients = torch.autograd.grad(sum(v.float().sum() for v in expected), leaves, allow_unused=True)
     finally:
         tuning._TUNING.reset(token)
+    if mode == "frozen_route":
+        activation_kernel = implementation._activation_kernel
+        def needed_activation(channels, kind, *args):
+            assert kind != "tanh", "computed a derivative for a fully frozen route"
+            return activation_kernel(channels, kind, *args)
+        monkeypatch.setattr(implementation, "_activation_kernel", needed_activation)
     compiled = torch.compile(model, fullgraph=True, options={"emulate_precision_casts": True})
     for call in (model, compiled):
         actual = call()
