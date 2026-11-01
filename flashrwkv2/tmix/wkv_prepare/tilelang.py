@@ -395,7 +395,7 @@ def _group_key(xs, weights, kinds, biases):
     )
 
 
-def _fixed_decode_config(xs, weights, kinds, biases):
+def _fixed_projection_config(xs, weights, kinds, biases):
     if not _fixed_strategy_device(device_class(xs[0].device)):
         return None
     rows, channels = xs[0].shape
@@ -431,7 +431,7 @@ def _fixed_decode_config(xs, weights, kinds, biases):
         input_major = all(weight.stride() == (1, weight.shape[0]) for weight in weights)
         if rows == 1:
             return (16, 16, 2, 512) if output_major or input_major else None
-        if channels == 4096 and ranks == (192, 192, 384, 128)[:len(ranks)] and input_major:
+        if channels == 4096 and ranks == (192, 192, 384, 128)[:len(ranks)] and (input_major or output_major):
             if rows <= 256:
                 return (32, 32, 2, 128)
             return (64, 128, 2, 64) if len(ranks) == 3 else (128, 64, 2, 64)
@@ -442,14 +442,19 @@ def _fixed_decode_config(xs, weights, kinds, biases):
         ranks = tuple(x.shape[1] for x in xs)
         if not any(channels == width and ranks == profile[:len(ranks)] for width, profile in profiles):
             return None
-        if all(weight.shape == (channels, rank) and weight.stride() == (1, channels)
-               for weight, rank in zip(weights, ranks, strict=True)):
-            if rows == 1:
-                return (16, 32, 2, 64)
-            if channels == 4096 and ranks == (192, 192, 384, 128)[:len(ranks)]:
-                if rows <= 256 and len(ranks) == 3:
-                    return (128, 64, 2, 32)
-                return (128, 128, 2, 32)
+        input_major = all(weight.shape == (channels, rank) and weight.stride() == (1, channels)
+                          for weight, rank in zip(weights, ranks, strict=True))
+        output_major = all(weight.shape == (channels, rank) and weight.stride() == (rank, 1)
+                           for weight, rank in zip(weights, ranks, strict=True))
+        model_13b = channels == 4096 and ranks == (192, 192, 384, 128)[:len(ranks)]
+        if rows == 1 and (input_major or output_major):
+            return (16, 32, 2, 64)
+        if model_13b and (input_major or output_major):
+            if rows <= 256 and len(ranks) == 3:
+                return (128, 64, 2, 32)
+            if rows > 256 and output_major:
+                return (64, 128, 2, 64)
+            return (128, 128, 2, 32)
     return None
 
 
@@ -506,7 +511,7 @@ def _group_call(xs, weights, kinds, biases, raw_mode, config):
     if config is None:
         from ..._internal.tuning import get_config
 
-        fixed = _fixed_decode_config(xs, weights, kinds, biases)
+        fixed = _fixed_projection_config(xs, weights, kinds, biases)
         config = get_config(
             _GROUP_CONFIGS, "tmix/wkv_prepare", _group_key(xs, weights, kinds, biases),
             fixed, tune=lambda: _tune_grouped_linear(xs, weights, kinds, biases),

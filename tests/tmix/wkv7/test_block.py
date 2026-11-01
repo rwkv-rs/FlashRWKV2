@@ -735,28 +735,40 @@ def test_block_independent_torch_vjp_and_optimizer_step(mode):
 
 @pytest.mark.cuda_graph
 @pytest.mark.parametrize("later_layer", (False, True))
-def test_real_decode_block_needs_no_tuning_profile(monkeypatch, tmp_path, later_layer):
+@pytest.mark.parametrize("batch,channels,ranks,canonical", (
+    (1, 2048, (96, 96, 256, 64), False),
+    (1, 2048, (96, 96, 256, 64), True),
+    (1, 2560, (96, 96, 320, 64), True),
+    (1, 4096, (128, 128, 480, 96), True),
+    (1, 4096, (192, 192, 384, 128), True),
+    (256, 4096, (192, 192, 384, 128), True),
+    (1024, 4096, (192, 192, 384, 128), True),
+))
+def test_real_decode_block_needs_no_tuning_profile(monkeypatch, tmp_path, later_layer, batch, channels, ranks, canonical):
     from flashrwkv2._internal import tuning
 
     if not tuning._fixed_strategy_device(tuning.device_class(torch.device("cuda"))):
         pytest.skip("fixed decode strategy is qualified on tested devices")
     torch.manual_seed(723)
-    channels, head_size = 2048, 64
-    ranks = (96, 96, 256, 64)
+    head_size = 64
     params = parameters(channels, rank=ranks[0], vocab=65536)
     for name, rank in zip(("w", "a", "g", "v"), ranks, strict=True):
-        params[name + "1"] = (torch.randn(channels, rank, device="cuda") * .02).bfloat16()
-        params[name + "2"] = (torch.randn(rank, channels, device="cuda") * .02).bfloat16()
+        if canonical:
+            params[name + "1"] = (torch.randn(rank, channels, device="cuda") * .02).bfloat16().t()
+            params[name + "2"] = (torch.randn(channels, rank, device="cuda") * .02).bfloat16().t()
+        else:
+            params[name + "1"] = (torch.randn(channels, rank, device="cuda") * .02).bfloat16()
+            params[name + "2"] = (torch.randn(rank, channels, device="cuda") * .02).bfloat16()
     params["cmix_v"] = params["cmix_v"].t().contiguous().t()
-    x = torch.randn(1, channels, device="cuda", dtype=torch.bfloat16) * .1
+    x = torch.randn(batch, channels, device="cuda", dtype=torch.bfloat16) * .1
     res = torch.randn_like(x) * .1
-    initial = torch.randn(1, channels // head_size, head_size, head_size, device="cuda") * .01
+    initial = torch.randn(batch, channels // head_size, head_size, head_size, device="cuda") * .01
     shifts = [torch.randn_like(x) * .1 for _ in range(2)]
-    slots = torch.zeros(1, device="cuda", dtype=torch.int32)
-    cu = torch.tensor((0, 1), device="cuda", dtype=torch.int32)
-    targets = torch.tensor((42,), device="cuda", dtype=torch.int64)
+    slots = torch.arange(batch, device="cuda", dtype=torch.int32)
+    cu = torch.arange(batch + 1, device="cuda", dtype=torch.int32)
+    targets = torch.full((batch,), 42, device="cuda", dtype=torch.int64)
     v_first = torch.randn_like(x) * .1 if later_layer else None
-    state, pools = state_pools(initial, shifts, slots, 1)
+    state, pools = state_pools(initial, shifts, slots, batch)
     monkeypatch.setattr(tuning, "_profile_root", lambda: tmp_path)
     monkeypatch.setattr(tuning, "_read_profile", lambda *args: pytest.fail("read a profile"))
 
@@ -764,7 +776,7 @@ def test_real_decode_block_needs_no_tuning_profile(monkeypatch, tmp_path, later_
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
         ticket = fr.prepare_tmix_wkv7_recurrent_metadata(
-            cu, slots, total_tokens=1, state_pool_size=1, max_seqlen=1,
+            cu, slots, total_tokens=batch, state_pool_size=batch, max_seqlen=1,
         )
 
         def call():

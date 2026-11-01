@@ -176,7 +176,7 @@ def _aligned(tensor):
     return tensor if tensor.data_ptr() % 16 == 0 else tensor.clone()
 
 
-def _fixed_decode_config(x, weight, output_dtype, bias):
+def _fixed_projection_config(x, weight, output_dtype, bias):
     info = device_class(x.device)
     channels, outputs = x.shape[1], weight.shape[0]
     if bias is not None or not _fixed_strategy_device(info):
@@ -223,7 +223,7 @@ def _forward(x, weight, bias, output_dtype, config=None):
     if config is None:
         from .tuning import get_config
 
-        fixed = _fixed_decode_config(x, weight, output_dtype, bias)
+        fixed = _fixed_projection_config(x, weight, output_dtype, bias)
         config = get_config(
             _TUNED_CONFIGS, "linear", _key(x, weight, output_dtype, bias), fixed,
             tune=lambda: tune_linear(x, weight, output_dtype, bias=bias),
@@ -563,7 +563,7 @@ def linear(x, weight, bias=None, output_dtype=None):
 
     ``output_dtype`` is BF16 by default; FP32 is available for logits and fused
     adapter epilogues. The first-order VJP uses the same rounded forward weights.
-    Call :func:`tune_linear` before CUDA Graph capture to select a measured tile.
+    Prepare nonfixed configurations before CUDA Graph capture.
     """
     if not x.is_cuda or not weight.is_cuda or weight.device != x.device:
         raise ValueError("linear operands must share a CUDA device")

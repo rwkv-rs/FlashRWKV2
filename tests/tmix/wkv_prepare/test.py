@@ -75,6 +75,15 @@ def test_real_model_rank_profile_is_loaded_for_decode_graph(monkeypatch, tmp_pat
     tuning._LOADED.clear()
 
 
+def test_prepare_prefers_canonical_weight_when_runtime_is_also_supplied():
+    from flashrwkv2.tmix.wkv_prepare import _original_weight
+
+    canonical = torch.empty(192, 4096, device="meta")
+    runtime = torch.empty(4096, 192, device="meta")
+    assert _original_weight(canonical, runtime, "w1") is canonical
+    assert _original_weight(None, runtime, "w1").stride() == (1, 192)
+
+
 def test_fixed_decode_projection_restricts_models_and_layouts(monkeypatch):
     from flashrwkv2.tmix.wkv_prepare import tilelang as implementation
 
@@ -83,7 +92,7 @@ def test_fixed_decode_projection_restricts_models_and_layouts(monkeypatch):
     xs = tuple(torch.empty(1, 2048, device="meta") for _ in ranks)
     weights = tuple(torch.empty(rank, 2048, device="meta") for rank in ranks)
     kinds, biases = (1, 0, 2), (None,) * 3
-    fixed = implementation._fixed_decode_config
+    fixed = implementation._fixed_projection_config
     assert fixed(xs, weights, kinds, biases) == (16, 16, 2, 512)
     assert fixed(tuple(torch.empty(2, 2048, device="meta") for _ in ranks), weights, kinds, biases) is None
     assert fixed(xs, weights, (0, 0, 0), biases) is None
@@ -96,9 +105,50 @@ def test_fixed_decode_projection_restricts_models_and_layouts(monkeypatch):
     output_weights = tuple(torch.empty(rank, 2048, device="meta").t() for rank in ranks)
     output_biases = (None, torch.empty(2048, device="meta"), None)
     assert fixed(output_xs, output_weights, (0, 2, 0), output_biases) == (16, 32, 2, 64)
+    assert fixed(output_xs, tuple(w.contiguous() for w in output_weights), (0, 2, 0), output_biases) == (16, 32, 2, 64)
     assert fixed(output_xs, output_weights, (0, 2, 0), biases) is None
     dense_weights = tuple(torch.empty(2048, 2048, device="meta") for _ in ranks)
     assert fixed(xs, dense_weights, (0, 0, 0), biases) == (16, 32, 2, 256)
+
+
+@cuda
+@pytest.mark.cuda
+@pytest.mark.cuda_graph
+@pytest.mark.parametrize("channels,ranks", (
+    (2048, (96, 96, 256, 64)), (2560, (96, 96, 320, 64)),
+    (4096, (128, 128, 480, 96)), (4096, (192, 192, 384, 128)),
+))
+@pytest.mark.parametrize("count", (3, 4))
+def test_fixed_canonical_decode_output_preserves_accumulators_and_graph(monkeypatch, tmp_path, channels, ranks, count):
+    from flashrwkv2._internal import tuning
+    from flashrwkv2.tmix.wkv_prepare import tilelang as implementation
+
+    if not tuning._fixed_strategy_device(tuning.device_class(torch.device("cuda"))):
+        pytest.skip("fixed grouped strategy is qualified on RTX 4090")
+    torch.manual_seed(855)
+    ranks = ranks[:count]
+    xs = tuple(torch.randn(1, rank, device="cuda", dtype=torch.bfloat16) * .02 for rank in ranks)
+    weights = tuple(torch.randn(channels, rank, device="cuda", dtype=torch.bfloat16) * .02 for rank in ranks)
+    kinds = (0, 2, 0, 0)[:count]
+    biases = (None, torch.randn(channels, device="cuda", dtype=torch.bfloat16), None) + (None,) * (count - 3)
+    expected, raw = implementation._run_groups(xs, weights, kinds, biases, raw_mode=2, config=(16, 64, 2, 32))
+    monkeypatch.setattr(tuning, "_profile_root", lambda: tmp_path)
+    monkeypatch.setattr(tuning, "_read_profile", lambda *args: pytest.fail("read a profile"))
+    actual, actual_raw = implementation._run_groups(xs, weights, kinds, biases, raw_mode=2)
+    assert torch.equal(actual_raw, raw)
+    assert all(torch.equal(a, b) for a, b in zip(actual, expected, strict=True))
+
+    def call():
+        return implementation._grouped_linear(xs, weights, kinds, biases)
+
+    report = tuning.prepare_tuning([call], mode="require")
+    assert report["complete"] and report["counts"]["fixed"] == 1
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = call()
+    graph.replay()
+    assert all(torch.equal(a, b) for a, b in zip(captured, expected, strict=True))
+    assert not tuple(tmp_path.iterdir())
 
 
 @pytest.mark.parametrize("channels", (2048, 2560, 4096))
@@ -109,7 +159,7 @@ def test_fixed_rkv_projection_follows_measured_row_wave(monkeypatch, channels, r
     monkeypatch.setattr(implementation, "device_class", lambda device: ("test", 8, 9, 128))
     xs = tuple(torch.empty(rows, channels, device="meta") for _ in range(3))
     weights = tuple(torch.empty(channels, channels, device="meta") for _ in range(3))
-    fixed = implementation._fixed_decode_config(xs, weights, (0, 0, 0), (None,) * 3)
+    fixed = implementation._fixed_projection_config(xs, weights, (0, 0, 0), (None,) * 3)
     expected = (64, 128, 2, 64) if channels < 4096 else (128, 64, 2, 64)
     assert fixed == (expected if 192 < rows <= 256 else None)
 
@@ -122,7 +172,7 @@ def test_fixed_rkv_projection_follows_large_row_wave(monkeypatch, channels, rows
     monkeypatch.setattr(implementation, "device_class", lambda device: ("test", 8, 9, 128))
     xs = tuple(torch.empty(rows, channels, device="meta") for _ in range(3))
     weights = tuple(torch.empty(channels, channels, device="meta") for _ in range(3))
-    fixed = implementation._fixed_decode_config(xs, weights, (0, 0, 0), (None,) * 3)
+    fixed = implementation._fixed_projection_config(xs, weights, (0, 0, 0), (None,) * 3)
     assert fixed == ((64, 128, 2, 64) if channels == 4096 and 960 < rows <= 1024 else None)
 
 
@@ -167,7 +217,7 @@ def test_fixed_rkv_row_wave_preserves_accumulators_and_graph(monkeypatch, tmp_pa
 
 
 @pytest.mark.parametrize("stage,count", (("in", 3), ("in", 4), ("out", 3), ("out", 4)))
-@pytest.mark.parametrize("rows,band", ((192, 0), (193, 1), (256, 1), (257, 0), (960, 0), (961, 2), (1024, 2), (1025, 0)))
+@pytest.mark.parametrize("rows,band", ((1, 3), (192, 0), (193, 1), (256, 1), (257, 0), (960, 0), (961, 2), (1024, 2), (1025, 0)))
 def test_fixed_13b_projection_restricts_row_wave_and_layout(monkeypatch, stage, count, rows, band):
     from flashrwkv2.tmix.wkv_prepare import tilelang as implementation
 
@@ -177,17 +227,18 @@ def test_fixed_13b_projection_restricts_row_wave_and_layout(monkeypatch, stage, 
         xs = tuple(torch.empty(rows, channels, device="meta") for _ in ranks)
         weights = tuple(torch.empty(channels, rank, device="meta").t() for rank in ranks)
         kinds, biases = (1, 0, 2, 0)[:count], (None,) * count
-        configs = (None, (32, 32, 2, 128), (64, 128, 2, 64) if count == 3 else (128, 64, 2, 64))
+        configs = (None, (32, 32, 2, 128), (64, 128, 2, 64) if count == 3 else (128, 64, 2, 64), (16, 16, 2, 512))
     else:
         xs = tuple(torch.empty(rows, rank, device="meta") for rank in ranks)
         weights = tuple(torch.empty(rank, channels, device="meta").t() for rank in ranks)
         kinds = (0, 2, 0, 0)[:count]
         biases = (None, torch.empty(channels, device="meta"), None) + (None,) * (count - 3)
-        configs = (None, (128, 64, 2, 32) if count == 3 else (128, 128, 2, 32), (128, 128, 2, 32))
-    assert implementation._fixed_decode_config(xs, weights, kinds, biases) == configs[band]
-    assert implementation._fixed_decode_config(
+        configs = (None, (128, 64, 2, 32) if count == 3 else (128, 128, 2, 32), (128, 128, 2, 32), (16, 32, 2, 64))
+    assert implementation._fixed_projection_config(xs, weights, kinds, biases) == configs[band]
+    canonical = (64, 128, 2, 64) if stage == "out" and band == 2 else configs[band]
+    assert implementation._fixed_projection_config(
         xs, tuple(weight.contiguous() for weight in weights), kinds, biases
-    ) is None
+    ) == canonical
 
 
 @cuda
@@ -197,7 +248,8 @@ def test_fixed_13b_projection_restricts_row_wave_and_layout(monkeypatch, stage, 
     ("in", 3, 193), ("in", 4, 256), ("in", 3, 961), ("in", 4, 1024),
     ("out", 3, 193), ("out", 4, 256), ("out", 3, 961), ("out", 4, 1024),
 ))
-def test_fixed_13b_projection_preserves_accumulators_and_graph(monkeypatch, tmp_path, stage, count, rows):
+@pytest.mark.parametrize("canonical", (False, True))
+def test_fixed_13b_projection_preserves_accumulators_and_graph(monkeypatch, tmp_path, stage, count, rows, canonical):
     from flashrwkv2._internal import tuning
     from flashrwkv2.tmix.wkv_prepare import tilelang as implementation
 
@@ -207,11 +259,17 @@ def test_fixed_13b_projection_preserves_accumulators_and_graph(monkeypatch, tmp_
     channels, ranks = 4096, (192, 192, 384, 128)[:count]
     if stage == "in":
         xs = tuple(torch.randn(rows, channels, device="cuda", dtype=torch.bfloat16) * .02 for _ in ranks)
-        weights = tuple(torch.randn(channels, rank, device="cuda", dtype=torch.bfloat16).t() * .02 for rank in ranks)
+        weights = tuple(
+            (torch.randn(rank, channels, device="cuda", dtype=torch.bfloat16) if canonical else
+             torch.randn(channels, rank, device="cuda", dtype=torch.bfloat16).t()) * .02 for rank in ranks
+        )
         kinds, biases = (1, 0, 2, 0)[:count], (None,) * count
     else:
         xs = tuple(torch.randn(rows, rank, device="cuda", dtype=torch.bfloat16) * .02 for rank in ranks)
-        weights = tuple(torch.randn(rank, channels, device="cuda", dtype=torch.bfloat16).t() * .02 for rank in ranks)
+        weights = tuple(
+            (torch.randn(channels, rank, device="cuda", dtype=torch.bfloat16) if canonical else
+             torch.randn(rank, channels, device="cuda", dtype=torch.bfloat16).t()) * .02 for rank in ranks
+        )
         kinds = (0, 2, 0, 0)[:count]
         biases = (None, torch.randn(channels, device="cuda", dtype=torch.bfloat16), None) + (None,) * (count - 3)
     expected, raw = implementation._run_groups(xs, weights, kinds, biases, raw_mode=2, config=(16, 64, 2, 32))
@@ -354,7 +412,7 @@ def test_fixed_decode_projection_preserves_training_gradients(monkeypatch, chann
     token = tuning._TUNING.set(True)
     try:
         with monkeypatch.context() as patch:
-            patch.setattr(implementation, "_fixed_decode_config", lambda *args: None)
+            patch.setattr(implementation, "_fixed_projection_config", lambda *args: None)
             patch.setattr(implementation, "_GROUP_CONFIGS", {key: (16, 64, 2, 32)})
             expected = implementation._grouped_linear(xs, weights, kinds, biases)
             expected_grads = torch.autograd.grad(expected, (*xs, *weights), upstream)
@@ -888,7 +946,7 @@ def test_fixed_decode_remaining_groups_preserve_accumulators_and_vjp(monkeypatch
     token = tuning._TUNING.set(True)
     try:
         with monkeypatch.context() as patch:
-            patch.setattr(implementation, "_fixed_decode_config", lambda *args: None)
+            patch.setattr(implementation, "_fixed_projection_config", lambda *args: None)
             patch.setattr(implementation, "_GROUP_CONFIGS", {key: (16, 64, 2, 32)})
             expected = implementation._grouped_linear(xs, weights, kinds, biases)
             expected_grads = torch.autograd.grad(expected, variables, upstream)

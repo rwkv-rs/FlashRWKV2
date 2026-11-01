@@ -682,7 +682,7 @@ def test_fixed_decode_linear_limits_models_devices_and_layouts(monkeypatch, chan
     head = torch.empty(65536, channels, device="meta")
     value = torch.empty(4 * channels, channels, device="meta").t()
     value_x = torch.empty(1, 4 * channels, device="meta")
-    fixed = implementation._fixed_decode_config
+    fixed = implementation._fixed_projection_config
     assert fixed(x, key, torch.bfloat16, None) == (16, 64, 2, 128)
     assert fixed(x, output, torch.bfloat16, None) == (16, 32, 2, 256)
     assert fixed(x, head, torch.float32, None) == (16, 64, 2, 128)
@@ -717,8 +717,8 @@ def test_fixed_4096_linear_row_wave_boundaries(monkeypatch, kind, rows):
         expected = (256, 64, 2, 64) if kind in ("cmix_key", "head") else (128, 128, 2, 64)
     else:
         expected = None
-    assert implementation._fixed_decode_config(x, weight, dtype, None) == expected
-    assert implementation._fixed_decode_config(x, weight, dtype, weight[0]) is None
+    assert implementation._fixed_projection_config(x, weight, dtype, None) == expected
+    assert implementation._fixed_projection_config(x, weight, dtype, weight[0]) is None
 
 
 @cuda
@@ -741,7 +741,7 @@ def test_fixed_decode_linear_preserves_fp32_and_graph(monkeypatch, tmp_path, kin
     else:
         weight = torch.randn(outputs, channels, device="cuda", dtype=torch.bfloat16)
     dtype = torch.float32 if kind == "head" else torch.bfloat16
-    fixed = implementation._fixed_decode_config(x, weight, dtype, None)
+    fixed = implementation._fixed_projection_config(x, weight, dtype, None)
     reference = implementation._forward(x, weight, None, torch.float32, (16, 64, 2, 32))
     accumulator = implementation._forward(x, weight, None, torch.float32, fixed)
     assert torch.equal(accumulator.view(torch.int32), reference.view(torch.int32))
@@ -769,6 +769,28 @@ def test_fixed_decode_linear_preserves_fp32_and_graph(monkeypatch, tmp_path, kin
 
 @cuda
 @pytest.mark.cuda
+def test_fixed_large_linear_compiled_forward_and_gradients(monkeypatch, tmp_path):
+    from flashrwkv2._internal import tuning
+
+    if not tuning._fixed_strategy_device(tuning.device_class(torch.device("cuda"))):
+        pytest.skip("fixed linear strategy is qualified on RTX 4090")
+    torch.manual_seed(854)
+    x = (torch.randn(256, 4096, device="cuda", dtype=torch.bfloat16) * .03).requires_grad_()
+    weight = (torch.randn(4096, 4096, device="cuda", dtype=torch.bfloat16) * .03).requires_grad_()
+    upstream = torch.randn_like(x)
+    monkeypatch.setattr(tuning, "_profile_root", lambda: tmp_path)
+    monkeypatch.setattr(tuning, "_read_profile", lambda *args: pytest.fail("read a profile"))
+    expected = linear(x, weight)
+    expected_grads = torch.autograd.grad(expected, (x, weight), upstream)
+    actual = torch.compile(linear, fullgraph=True)(x, weight)
+    actual_grads = torch.autograd.grad(actual, (x, weight), upstream)
+    assert torch.equal(actual, expected)
+    assert all(torch.equal(a, b) for a, b in zip(actual_grads, expected_grads, strict=True))
+    assert not tuple(tmp_path.iterdir())
+
+
+@cuda
+@pytest.mark.cuda
 @pytest.mark.parametrize("width,rows", ((2048, 1), (4096, 256), (4096, 1024)))
 def test_fixed_decode_linear_preserves_training_gradients(monkeypatch, width, rows):
     from flashrwkv2._internal import linear as implementation
@@ -784,7 +806,7 @@ def test_fixed_decode_linear_preserves_training_gradients(monkeypatch, width, ro
     token = tuning._TUNING.set(True)
     try:
         with monkeypatch.context() as patch:
-            patch.setattr(implementation, "_fixed_decode_config", lambda *args: None)
+            patch.setattr(implementation, "_fixed_projection_config", lambda *args: None)
             patch.setattr(implementation, "_TUNED_CONFIGS", {key: (16, 64, 2, 32)})
             expected = linear(x, weight)
             expected_grads = torch.autograd.grad(expected, (x, weight), upstream)
