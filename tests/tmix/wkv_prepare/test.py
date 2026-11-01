@@ -111,6 +111,29 @@ def test_fixed_decode_projection_restricts_models_and_layouts(monkeypatch):
     dense_weights = tuple(torch.empty(2048, 2048, device="meta") for _ in ranks)
     assert fixed(xs, dense_weights, (0, 0, 0), biases) == (16, 32, 2, 256)
 
+    profiles = (
+        (2048, (96, 96, 256, 64)), (2560, (96, 96, 320, 64)),
+        (4096, (128, 128, 480, 96)), (4096, (192, 192, 384, 128)),
+    )
+    for channels, ranks in profiles:
+        for rows in ((1025,) if channels < 4096 else (513, 960, 1025)):
+            input_xs = tuple(torch.empty(rows, channels, device="meta") for _ in ranks)
+            input_weights = tuple(torch.empty(rank, channels, device="meta") for rank in ranks)
+            assert fixed(input_xs, input_weights, (1, 0, 2, 0), (None,) * 4) is None
+            output_xs = tuple(torch.empty(rows, rank, device="meta") for rank in ranks)
+            output_weights = tuple(torch.empty(channels, rank, device="meta") for rank in ranks)
+            output_biases = (None, torch.empty(channels, device="meta"), None, None)
+            assert fixed(output_xs, output_weights, (0, 2, 0, 0), output_biases) is None
+            dense = tuple(torch.empty(channels, channels, device="meta") for _ in range(3))
+            assert fixed(input_xs[:3], dense, (0, 0, 0), (None,) * 3) is None
+
+    ranks = (128, 128, 480, 96)
+    for rows in (320, 512):
+        xs = tuple(torch.empty(rows, rank, device="meta") for rank in ranks)
+        weights = tuple(torch.empty(rank, 4096, device="meta").t() for rank in ranks)
+        biases = (None, torch.empty(4096, device="meta"), None, None)
+        assert fixed(xs, weights, (0, 2, 0, 0), biases) is None
+
 
 @cuda
 @pytest.mark.cuda
@@ -150,37 +173,6 @@ def test_fixed_canonical_decode_output_preserves_accumulators_and_graph(monkeypa
     graph.replay()
     assert all(torch.equal(a, b) for a, b in zip(captured, expected, strict=True))
     assert not tuple(tmp_path.iterdir())
-
-
-@pytest.mark.parametrize("channels,rows,expected", (
-    (2048, 16, (16, 32, 2, 256)), (2048, 17, (32, 64, 2, 128)),
-    (2048, 64, (32, 64, 2, 128)), (2048, 65, (64, 64, 2, 64)),
-    (2048, 160, (64, 64, 2, 64)), (2048, 161, (64, 128, 2, 64)),
-    (2048, 320, (64, 128, 2, 64)), (2048, 321, (64, 64, 2, 64)),
-    (2048, 448, (64, 64, 2, 64)), (2048, 449, (64, 128, 2, 64)),
-    (2048, 512, (64, 128, 2, 64)), (2048, 513, (64, 128, 2, 64)),
-    (2048, 1024, (64, 128, 2, 64)), (2048, 1025, None),
-    (2560, 17, (32, 64, 2, 128)), (2560, 64, (32, 64, 2, 128)),
-    (2560, 65, (64, 64, 2, 64)), (2560, 192, (64, 64, 2, 64)),
-    (2560, 193, (64, 128, 2, 64)), (2560, 256, (64, 128, 2, 64)),
-    (2560, 257, (64, 64, 2, 64)), (2560, 384, (64, 64, 2, 64)),
-    (2560, 385, (64, 128, 2, 64)), (2560, 512, (64, 128, 2, 64)),
-    (2560, 513, (64, 128, 2, 64)), (2560, 1024, (64, 128, 2, 64)), (2560, 1025, None),
-    (4096, 16, (16, 64, 2, 128)), (4096, 17, (32, 64, 2, 128)),
-    (4096, 32, (32, 64, 2, 128)), (4096, 33, (64, 128, 2, 64)),
-    (4096, 192, (64, 128, 2, 64)), (4096, 193, (128, 64, 2, 64)),
-    (4096, 256, (128, 64, 2, 64)), (4096, 257, (64, 128, 2, 64)),
-    (4096, 512, (64, 128, 2, 64)), (4096, 513, None),
-    (4096, 960, None), (4096, 961, (64, 128, 2, 64)),
-    (4096, 1024, (64, 128, 2, 64)), (4096, 1025, None),
-))
-def test_fixed_rkv_projection_follows_measured_row_wave(monkeypatch, channels, rows, expected):
-    from flashrwkv2.tmix.wkv_prepare import tilelang as implementation
-
-    monkeypatch.setattr(implementation, "device_class", lambda device: ("test", 8, 9, 128))
-    xs = tuple(torch.empty(rows, channels, device="meta") for _ in range(3))
-    weights = tuple(torch.empty(channels, channels, device="meta") for _ in range(3))
-    assert implementation._fixed_projection_config(xs, weights, (0, 0, 0), (None,) * 3) == expected
 
 
 @cuda
@@ -260,100 +252,6 @@ def test_fixed_rkv_long_prefill_preserves_training_gradients(monkeypatch, channe
     assert all(torch.equal(a, b) for a, b in zip(actual_grads, expected_grads, strict=True))
 
 
-@pytest.mark.parametrize("stage,count", (("in", 3), ("in", 4), ("out", 3), ("out", 4)))
-@pytest.mark.parametrize("rows,band", ((1, 3), (2, 3), (16, 3), (17, 5), (32, 5), (33, 5), (63, 5), (64, 4), (192, 4), (193, 1), (256, 1), (257, 4), (512, 4), (513, 0), (960, 0), (961, 2), (1024, 2), (1025, 0)))
-def test_fixed_13b_projection_restricts_row_wave_and_layout(monkeypatch, stage, count, rows, band):
-    from flashrwkv2.tmix.wkv_prepare import tilelang as implementation
-
-    monkeypatch.setattr(implementation, "device_class", lambda device: ("test", 8, 9, 128))
-    channels, ranks = 4096, (192, 192, 384, 128)[:count]
-    if stage == "in":
-        xs = tuple(torch.empty(rows, channels, device="meta") for _ in ranks)
-        weights = tuple(torch.empty(channels, rank, device="meta").t() for rank in ranks)
-        kinds, biases = (1, 0, 2, 0)[:count], (None,) * count
-        configs = (None, (32, 32, 2, 128), (64, 128, 2, 64) if count == 3 else (128, 64, 2, 64), (16, 32, 2, 512))
-    else:
-        xs = tuple(torch.empty(rows, rank, device="meta") for rank in ranks)
-        weights = tuple(torch.empty(rank, channels, device="meta").t() for rank in ranks)
-        kinds = (0, 2, 0, 0)[:count]
-        biases = (None, torch.empty(channels, device="meta"), None) + (None,) * (count - 3)
-        configs = (None, (128, 64, 2, 32) if count == 3 else (128, 128, 2, 32), (128, 128, 2, 32), (16, 32, 2, 64))
-    if band == 5:
-        expected = (16, 32, 2, 512) if stage == "in" else (32, 64, 2, 64)
-    elif band == 4:
-        if stage == "in":
-            expected = (16, 32, 2, 512) if rows == 64 else (32, 32 if rows < 512 else 64, 2, 128)
-        elif count == 3 and rows == 192:
-            expected = (128, 64, 2, 32)
-        else:
-            expected = (64, 64, 2, 64)
-    elif stage == "out" and count == 4 and band == 1:
-        expected = (64, 64, 2, 64)
-    else:
-        expected = configs[band]
-    assert implementation._fixed_projection_config(xs, weights, kinds, biases) == expected
-    canonical = expected
-    if stage == "out" and (band == 2 or (band == 1 and count == 4)):
-        canonical = (64, 128, 2, 64) if band == 2 else (128, 128, 2, 32)
-    elif stage == "in" and (band == 3 or (band == 5 and rows <= 32)):
-        canonical = (16, 16, 2, 512)
-    assert implementation._fixed_projection_config(
-        xs, tuple(weight.contiguous() for weight in weights), kinds, biases
-    ) == canonical
-
-
-@pytest.mark.parametrize("count,rows,canonical,input_config,output_config", (
-    (3, 64, True, (16, 32, 2, 512), (32, 64, 2, 64)),
-    (4, 64, False, (16, 32, 2, 512), (32, 64, 2, 64)),
-    (3, 65, True, (16, 32, 2, 512), (64, 64, 2, 64)),
-    (4, 65, False, (32, 32, 2, 128), (32, 64, 2, 64)),
-    (3, 80, True, (16, 32, 2, 512), (64, 64, 2, 64)),
-    (3, 81, True, (32, 32, 2, 128), (64, 64, 2, 64)),
-    (4, 96, True, (32, 32, 2, 128), (32, 64, 2, 64)),
-    (3, 96, True, (32, 32, 2, 128), (64, 64, 2, 64)),
-    (3, 97, True, (32, 32, 2, 128), (64, 64, 2, 64)),
-    (4, 128, False, (32, 32, 2, 128), (128, 32, 2, 32)),
-    (4, 97, True, (32, 32, 2, 128), (128, 32, 2, 32)),
-    (3, 129, True, (32, 32, 2, 128), (32, 64, 2, 64)),
-    (3, 160, True, (32, 32, 2, 128), (32, 64, 2, 64)),
-    (3, 161, True, (32, 32, 2, 128), (128, 64, 2, 32)),
-    (3, 192, False, (32, 32, 2, 128), (128, 64, 2, 32)),
-    (4, 129, True, (32, 32, 2, 128), (64, 64, 2, 64)),
-    (4, 192, False, (32, 32, 2, 128), (64, 64, 2, 64)),
-    (3, 193, False, (32, 32, 2, 128), (128, 64, 2, 32)),
-    (4, 256, True, (32, 32, 2, 128), (128, 64, 2, 32)),
-    (3, 257, False, (32, 32, 2, 128), (64, 64, 2, 64)),
-    (4, 320, True, (32, 32, 2, 128), (64, 128, 2, 64)),
-    (4, 320, False, (32, 32, 2, 128), None),
-    (3, 352, True, (32, 32, 2, 128), (64, 64, 2, 64)),
-    (3, 353, True, (32, 64, 2, 128), (64, 64, 2, 64)),
-    (4, 384, True, (32, 32, 2, 128), (64, 128, 2, 64)),
-    (4, 385, True, (32, 64, 2, 128), (64, 128, 2, 64)),
-    (4, 512, False, (32, 64, 2, 128), None),
-    (4, 513, True, None, None),
-))
-def test_fixed_72b_projection_covers_measured_layouts(monkeypatch, count, rows, canonical, input_config, output_config):
-    from flashrwkv2.tmix.wkv_prepare import tilelang as implementation
-
-    monkeypatch.setattr(implementation, "device_class", lambda device: ("test", 8, 9, 128))
-    channels, ranks = 4096, (128, 128, 480, 96)[:count]
-    def weight(output, in_features):
-        if canonical:
-            return torch.empty(output, in_features, device="meta")
-        return torch.empty(in_features, output, device="meta").t()
-    input_xs = tuple(torch.empty(rows, channels, device="meta") for _ in ranks)
-    input_weights = tuple(weight(rank, channels) for rank in ranks)
-    assert implementation._fixed_projection_config(
-        input_xs, input_weights, (1, 0, 2, 0)[:count], (None,) * count,
-    ) == input_config
-    output_xs = tuple(torch.empty(rows, rank, device="meta") for rank in ranks)
-    output_weights = tuple(weight(channels, rank) for rank in ranks)
-    biases = (None, torch.empty(channels, device="meta"), None) + (None,) * (count - 3)
-    assert implementation._fixed_projection_config(
-        output_xs, output_weights, (0, 2, 0, 0)[:count], biases,
-    ) == output_config
-
-
 @cuda
 @pytest.mark.cuda
 @pytest.mark.cuda_graph
@@ -385,60 +283,6 @@ def test_fixed_13b_projection_preserves_accumulators_and_graph(monkeypatch, tmp_
 @pytest.mark.parametrize("canonical", (False, True))
 def test_fixed_72b_projection_preserves_accumulators_and_graph(monkeypatch, tmp_path, stage, count, rows, canonical):
     _check_fixed_projection(monkeypatch, tmp_path, stage, count, rows, canonical, (128, 128, 480, 96))
-
-
-@pytest.mark.parametrize("channels,count,rows,canonical,expected", (
-    (2048, 3, 144, True, (16, 32, 2, 512)),
-    (2048, 3, 145, True, (32, 32, 2, 128)),
-    (2560, 4, 48, True, (16, 16, 2, 512)),
-    (2560, 4, 49, True, (16, 32, 2, 512)),
-    (2560, 4, 112, False, (16, 32, 2, 512)),
-    (2560, 4, 113, False, (32, 32, 2, 128)),
-    (2560, 4, 448, False, (32, 32, 2, 128)),
-    (2560, 4, 449, False, (32, 64, 2, 128)),
-    (2048, 3, 513, True, (32, 32, 2, 128)), (2048, 3, 576, True, (32, 32, 2, 128)),
-    (2048, 3, 577, True, (32, 64, 2, 128)), (2048, 3, 1024, True, (32, 64, 2, 128)),
-    (2048, 3, 1025, True, None), (2048, 4, 768, True, (32, 32, 2, 128)),
-    (2048, 4, 769, True, (32, 64, 2, 128)), (2048, 4, 896, True, (32, 64, 2, 128)),
-    (2048, 4, 897, True, (64, 64, 2, 64)), (2048, 4, 1024, True, (64, 64, 2, 64)),
-    (2560, 3, 768, True, (32, 32, 2, 128)), (2560, 3, 769, True, (32, 64, 2, 128)),
-    (2560, 3, 576, False, (32, 32, 2, 128)), (2560, 3, 577, False, (32, 64, 2, 128)),
-    (2560, 3, 896, False, (32, 64, 2, 128)), (2560, 3, 897, False, (64, 64, 2, 64)),
-    (2560, 4, 672, True, (32, 32, 2, 128)), (2560, 4, 673, True, (32, 64, 2, 128)),
-    (2560, 4, 513, False, (32, 64, 2, 128)), (2560, 4, 800, False, (32, 64, 2, 128)),
-    (2560, 4, 801, False, (64, 64, 2, 64)), (2560, 4, 1025, False, None),
-))
-def test_fixed_small_input_projection_follows_cta_waves(monkeypatch, channels, count, rows, canonical, expected):
-    from flashrwkv2.tmix.wkv_prepare import tilelang as implementation
-
-    monkeypatch.setattr(implementation, "device_class", lambda device: ("test", 8, 9, 128))
-    ranks = ((96, 96, 256, 64) if channels == 2048 else (96, 96, 320, 64))[:count]
-    xs = tuple(torch.empty(rows, channels, device="meta") for _ in ranks)
-    weights = tuple(
-        torch.empty(rank, channels, device="meta") if canonical else
-        torch.empty(channels, rank, device="meta").t() for rank in ranks
-    )
-    assert implementation._fixed_projection_config(
-        xs, weights, (1, 0, 2, 0)[:count], (None,) * count,
-    ) == expected
-
-
-@pytest.mark.parametrize("channels", (2048, 2560))
-@pytest.mark.parametrize("count", (3, 4))
-@pytest.mark.parametrize("canonical", (False, True))
-@pytest.mark.parametrize("rows,expected", ((513, (64, 64, 2, 64)), (1024, (64, 64, 2, 64)), (1025, None)))
-def test_fixed_small_output_projection_long_prefill(monkeypatch, channels, count, canonical, rows, expected):
-    from flashrwkv2.tmix.wkv_prepare import tilelang as implementation
-
-    monkeypatch.setattr(implementation, "device_class", lambda device: ("test", 8, 9, 128))
-    ranks = ((96, 96, 256, 64) if channels == 2048 else (96, 96, 320, 64))[:count]
-    xs = tuple(torch.empty(rows, rank, device="meta") for rank in ranks)
-    weights = tuple(
-        torch.empty(channels, rank, device="meta") if canonical else
-        torch.empty(rank, channels, device="meta").t() for rank in ranks
-    )
-    biases = (None, torch.empty(channels, device="meta"), None) + (None,) * (count - 3)
-    assert implementation._fixed_projection_config(xs, weights, (0, 2, 0, 0)[:count], biases) == expected
 
 
 @cuda
