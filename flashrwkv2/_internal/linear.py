@@ -55,7 +55,7 @@ def _matmul_program(
         ),
         Y: T.Tensor((rows, outputs), output_dtype),
     ):
-        if dynamic_k and aligned_k:
+        if dynamic_k and aligned_k and copy_k == 32:
             T.assume(channels % 32 == 0)
         with T.Kernel(
             T.ceildiv(outputs, block_n),

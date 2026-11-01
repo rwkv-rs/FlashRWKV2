@@ -50,6 +50,26 @@ def test_tilelang_linear_device_compilation_without_gpu(arch, input_major, confi
 
 
 @pytest.mark.resource
+@pytest.mark.parametrize("arch", (89, 120))
+@pytest.mark.parametrize("input_major", (False, True))
+def test_dynamic_aligned_reduction_preserves_vectorized_copies(arch, input_major):
+    from tilelang.contrib.nvcc import get_cuda_version
+    from tilelang.env import CUDA_HOME
+
+    if CUDA_HOME is None or not (Path(CUDA_HOME) / "bin" / "nvcc").is_file():
+        pytest.skip("CUDA Toolkit is required for device compilation")
+    if arch == 120 and get_cuda_version() < (12, 8):
+        pytest.skip("SM120 compilation requires CUDA Toolkit 12.8 or newer")
+    kernel = _compiled(
+        128, 0, "bfloat16", "bfloat16", False, (128, 64, 2, 32),
+        None, input_major, arch, True, True,
+    )
+    copies = [line for line in kernel.get_kernel_source().splitlines() if "(X[" in line]
+    assert copies
+    assert all("cp_async" in line and "<16>" in line for line in copies)
+
+
+@pytest.mark.resource
 @pytest.mark.parametrize("arch", [89, 120])
 def test_tilelang_linear_k1_head_device_compilation_without_gpu(arch):
     """The chunked HeadCE forward projects [rows,1] into 65536 logits."""
@@ -897,6 +917,29 @@ def test_dynamic_weight_reduction_preserves_accumulators_and_graph(monkeypatch, 
         assert torch.equal(captured, reference)
     keys = [key for key in implementation._COMPILED_KERNELS if len(key) == 11 and key[-2] is True]
     assert len(keys) == 4
+
+
+@cuda
+@pytest.mark.cuda
+@pytest.mark.cuda_graph
+@pytest.mark.parametrize("input_major", (False, True))
+def test_dynamic_aligned_pipeline_preserves_short_reductions(input_major):
+    torch.manual_seed(805)
+    for reduction in (32, 64, 96, 128, 1024, 4096):
+        x = (torch.randn(129, reduction, device="cuda") * .1).bfloat16()
+        weight = (torch.randn(128, reduction, device="cuda") * .1).bfloat16()
+        if input_major:
+            weight = weight.t().contiguous().t()
+        reference = _forward(x, weight, None, torch.float32, config=(16, 64, 2, 32))
+        for dtype in (torch.float32, torch.bfloat16):
+            actual = _forward(x, weight, None, dtype, config=(128, 64, 2, 32), dynamic_k=True)
+            assert torch.equal(actual, reference.to(dtype))
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = _forward(x, weight, None, torch.float32,
+                                config=(128, 64, 2, 32), dynamic_k=True)
+        graph.replay()
+        assert torch.equal(captured, reference)
 
 
 @cuda

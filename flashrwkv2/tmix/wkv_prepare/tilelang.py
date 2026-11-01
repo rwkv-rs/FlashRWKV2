@@ -232,7 +232,7 @@ def _group_program(
         Y: T.Tensor((rows * total,), T.bfloat16),
         Raw: T.Tensor((rows * raw_total,), raw_dtype),
     ):
-        if dynamic_k and aligned_k:
+        if dynamic_k and aligned_k and copy_k == 32:
             T.assume(reduction % 32 == 0)
         with T.Kernel(
             sum(tiles[:count]),
