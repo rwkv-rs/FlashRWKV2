@@ -10,6 +10,7 @@ import torch
 from ..._internal.tuning import (
     _AutogradContext,
     device_class,
+    prepared_kernel,
     tuning_operation,
     workload_bucket,
 )
@@ -139,13 +140,12 @@ def fused_post_norm_tokenshift(x, res, weight, bias, mixes, pool, indices, statu
         _FUSED_CONFIGS, "tmix/tokenshift/fused", _config_key(x, mixes, x.shape[0]), 1,
         tune=lambda: tune_fused_tokenshift(x, res, weight, bias, mixes, pool, indices, status, eps),
         fixed=(
-            x.shape[0] <= 1024 and x.shape[1] in (2048, 2560, 4096)
-            and len(mixes) in (1, 6) and _fixed_rows(x)
+            len(mixes) in (1, 6) and _fixed_rows(x)
         ),
     )
     # CMix reuses its pointer for the unused TMix parameter arguments.
     mix_args = mixes + (mixes[-1],) * (6 - len(mixes))
-    total, output = _fused_forward(x.shape[1], len(mixes), float(eps), group)(
+    total, output = prepared_kernel("tmix/tokenshift/fused", _fused_forward, (x.shape[1], len(mixes), float(eps), group))(
         x, res, weight, bias, *mix_args, pool, indices, status
     )
     return total, tuple(output.unbind(0))
@@ -321,16 +321,7 @@ def _backward(
 def _tokenshift_block(x, mixes, cu, initial, status=None):
     from ..._internal.tuning import get_config
 
-    fixed = None
-    if mixes.shape[0] in (1, 6) and _fixed_rows(x):
-        rows, channels = x.shape
-        if mixes.shape[0] == 1:
-            if rows <= 64 or (channels in (2048, 2560) and rows <= 128):
-                fixed = 256
-            elif rows <= (1024 if channels in (2048, 2560) else 4096):
-                fixed = 512
-        elif channels in (2048, 2560) and 64 <= rows <= 1024:
-            fixed = 256 if channels == 2048 else 128
+    fixed = 256 if mixes.shape[0] in (1, 6) and _fixed_rows(x) else None
     return get_config(
         _BLOCK_CONFIGS, "tmix/tokenshift", _config_key(x, mixes, initial.shape[0]),
         256 if fixed is None else fixed,
@@ -346,7 +337,7 @@ class _TokenShift(torch.autograd.Function):
             raise ValueError("tokenshift inputs must be 4-byte aligned")
         block = _tokenshift_block(x, mixes, cu_seqlens, initial)
         options = (x.shape[-1], mixes.shape[0], str(cu_seqlens.dtype).split(".")[-1], block)
-        y, final = _forward(*options)(x, mixes, cu_seqlens, initial, cu_seqlens[:0])
+        y, final = prepared_kernel("tmix/tokenshift", _forward, options)(x, mixes, cu_seqlens, initial, cu_seqlens[:0])
         ctx.save_for_backward(x, mixes, cu_seqlens, initial)
         ctx.options = options
         return y, final
@@ -358,7 +349,8 @@ class _TokenShift(torch.autograd.Function):
 
         group = min(32, tilelang.next_power_of_2(max(1, x.shape[0] // 128)))
         need_mix = ctx.needs_input_grad[1]
-        dx, dm, di = _backward(*ctx.options, group, need_mix)(
+        dx, dm, di = prepared_kernel("tmix/tokenshift", _backward, (*ctx.options, group, need_mix),
+            ((*ctx.options, g, need_mix) for g in (1, 2, 4, 8, 16, 32)))(
             dy.contiguous(), dfinal.contiguous(), x, mixes, cu, initial
         )
         gradient = sum_partials(dm.flatten(1)).view_as(mixes) if need_mix else None
@@ -446,7 +438,7 @@ def tokenshift(
         y, final = operation(x, mixes, cu_seqlens, initial_shift)
     else:
         block = _tokenshift_block(x, mixes, cu_seqlens, initial_shift, _status)
-        y, final = _forward(channels, mixes.shape[0], str(cu_seqlens.dtype).split(".")[-1], block, True)(
+        y, final = prepared_kernel("tmix/tokenshift", _forward, (channels, mixes.shape[0], str(cu_seqlens.dtype).split(".")[-1], block, True))(
             x, mixes, cu_seqlens, initial_shift, _status
         )
     return tuple(y.unbind(0)), final

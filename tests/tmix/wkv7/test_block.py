@@ -191,6 +191,13 @@ def test_prepare_tuning_migration_preserves_block_state_logits_and_logprobs(monk
     import json
     from flashrwkv2._internal import tuning
 
+    from flashrwkv2._internal import linear as linear_impl
+    from flashrwkv2.post_norm import tilelang as norm_impl
+    from flashrwkv2.tmix.readout import tilelang as readout_impl
+    from flashrwkv2.tmix.wkv_prepare import tilelang as prepare_impl
+    from flashrwkv2.tmix.wkv7 import tilelang as wkv_impl
+    for module in (linear_impl, norm_impl, readout_impl, prepare_impl, wkv_impl):
+        monkeypatch.setattr(module, "_fixed_strategy_device", lambda *args: False)
     monkeypatch.setattr(tuning, "_profile_root", lambda: tmp_path / "new")
     monkeypatch.setattr(tuning, "_LOADED", {})
     torch.manual_seed(736)

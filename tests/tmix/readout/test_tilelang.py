@@ -113,22 +113,15 @@ def test_readout_bitwise_batch_grad_and_vjp(head_size, channels):
         torch.testing.assert_close(gradient, ref, atol=0.03, rtol=0.02)
 
 
-@pytest.mark.parametrize("channels,rows,fixed", (
-    (2048, 17, True), (2048, 512, True), (2048, 513, True),
-    (2048, 1024, True), (2048, 1025, False),
-    (2560, 17, True), (2560, 512, True), (2560, 513, True),
-    (2560, 1024, True), (2560, 1025, False),
-    (4096, 17, True), (4096, 192, True), (4096, 193, True), (4096, 256, True),
-    (4096, 961, True), (4096, 1024, True), (4096, 1025, False), (5120, 17, False),
-))
-def test_fixed_readout_batch_boundaries(monkeypatch, channels, rows, fixed):
+@pytest.mark.parametrize("channels,rows", ((2048, 1), (2560, 17), (4096, 1025), (5120, 4096)))
+def test_fixed_readout_covers_dynamic_rows(monkeypatch, channels, rows):
     from flashrwkv2._internal import tuning
     from flashrwkv2.tmix.readout import tilelang as implementation
 
     monkeypatch.setattr(implementation, "device_class", lambda device: ("test", 8, 9, 128))
     monkeypatch.setattr(tuning, "get_config", lambda configs, owner, key, default, *, tune, fixed: (fixed, default))
     x = torch.empty(rows, channels, device="meta", dtype=torch.bfloat16)
-    assert implementation._readout_group(x, x, x, x, x, x, x, x, 64, 64e-5) == (fixed, 8 if fixed else 1)
+    assert implementation._readout_group(x, x, x, x, x, x, x, x, 64, 64e-5) == (True, 4 if rows == 1 else 8)
 
 
 @pytest.mark.cuda

@@ -25,6 +25,7 @@ from ..._internal.tuning import (
     _AutogradContext,
     _fixed_strategy_device,
     device_class,
+    prepared_kernel,
     tuning_operation,
     workload_bucket,
 )
@@ -440,6 +441,13 @@ def _backward_kernel(
     return kernel
 
 
+def _prepared_forward_kernel(*options):
+    variants = (options[:9] + (prefetch,) + options[10:] for prefetch in (1, 4)) if (
+        options[1] == 64 and options[-1] == "float32"
+    ) else (options,)
+    return prepared_kernel("tmix/wkv7", _forward_kernel, options, variants)
+
+
 def _forward(
     r,
     decay_logits,
@@ -465,7 +473,7 @@ def _forward(
         dtype=initial_state.dtype,
         device=r.device,
     )
-    _forward_kernel(
+    _prepared_forward_kernel(
         heads,
         dim,
         scale,
@@ -529,14 +537,14 @@ def _recurrent_vjp(ctx, grad_output, grad_final_state):
     gradients = torch.zeros((6, *r.shape), dtype=torch.float32, device=r.device)
     ds0 = torch.empty_like(ds)
     _, heads, dim = r.shape
-    _backward_kernel(
+    prepared_kernel("tmix/wkv7", _backward_kernel, (
         heads,
         dim,
         ctx.scale,
         bias.numel() != 0,
         status.numel() != 0,
         "bfloat16" if bias.dtype == torch.bfloat16 else "float32",
-    )(
+    ))(
         r,
         w,
         k,
@@ -713,7 +721,7 @@ def _infer_recurrent(
     bias = _bias_tensor(r, decay_bias)
     output = torch.empty_like(v)
     empty = torch.empty((0, heads, dim, dim), dtype=state_pool.dtype, device=r.device)
-    _forward_kernel(
+    _prepared_forward_kernel(
         heads,
         dim,
         float(scale),

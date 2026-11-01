@@ -235,7 +235,7 @@ def test_verified_projection_profile_is_used_in_a_fresh_process(monkeypatch, tmp
     from flashrwkv2._internal import tuning
 
     monkeypatch.setattr(tuning, "_profile_root", lambda: tmp_path)
-    key = (("profile-test-gpu", 8, 9, 128), 32, 96, 128, (128, 1), torch.bfloat16, None)
+    key = (("profile-test-gpu", 8, 9, 114), 32, 96, 128, (128, 1), torch.bfloat16, None)
     config = (32, 32, 2, 64)
     tuning.save_config("linear", key, config)
     subprocess.run(
@@ -245,7 +245,7 @@ from pathlib import Path
 import torch
 from flashrwkv2._internal import linear, tuning
 tuning._profile_root = lambda: Path(sys.argv[1])
-linear.device_class = lambda device: ('profile-test-gpu', 8, 9, 128)
+linear.device_class = lambda device: ('profile-test-gpu', 8, 9, 114)
 torch.cuda.get_device_capability = lambda device: (8, 9)
 def compiled(outputs, channels, dtype, bias_dtype, has_bias, config, *args):
     assert config == (32, 32, 2, 64), config
@@ -670,55 +670,8 @@ def test_tilelang_linear_cuda_graph():
     assert torch.equal(actual, expected)
 
 
-@pytest.mark.parametrize("channels", (2048, 2560, 4096))
-def test_fixed_decode_linear_limits_models_devices_and_layouts(monkeypatch, channels):
-    from flashrwkv2._internal import linear as implementation
-
-    info = ("test", 8, 9, 128)
-    monkeypatch.setattr(implementation, "device_class", lambda device: info)
-    x = torch.empty(1, channels, device="meta")
-    key = torch.empty(4 * channels, channels, device="meta")
-    output = torch.empty(channels, channels, device="meta")
-    head = torch.empty(65536, channels, device="meta")
-    value = torch.empty(4 * channels, channels, device="meta").t()
-    value_x = torch.empty(1, 4 * channels, device="meta")
-    fixed = implementation._fixed_projection_config
-    key_config = {2048: (16, 64, 2, 256), 2560: (16, 128, 2, 128), 4096: (16, 64, 2, 128)}[channels]
-    assert fixed(x, key, torch.bfloat16, None) == key_config
-    assert fixed(x, output, torch.bfloat16, None) == (16, 32, 2, 512 if channels == 4096 else 256)
-    assert fixed(x, head, torch.float32, None) == (16, 64, 2, 128)
-    assert fixed(x, head, torch.bfloat16, None) is None
-    assert fixed(x, head.t().contiguous().t(), torch.float32, None) is None
-    assert fixed(value_x, value, torch.bfloat16, None) == (
-        (16, 32, 2, 256) if channels < 4096 else (16, 64, 2, 128)
-    )
-    assert fixed(x, key, torch.float32, None) is None
-    assert fixed(x, key, torch.bfloat16, key[0]) is None
-    assert fixed(torch.empty(2, channels, device="meta"), key, torch.bfloat16, None) == key_config
-    assert fixed(torch.empty(17, channels, device="meta"), key, torch.bfloat16, None) == (32, 64, 2, 128)
-    assert fixed(torch.empty(513, channels, device="meta"), key, torch.bfloat16, None) == {
-        2048: (128, 128, 2, 64), 2560: (64, 128, 2, 64), 4096: None,
-    }[channels]
-    assert fixed(value_x, value.contiguous(), torch.bfloat16, None) is None
-    info = ("test", 12, 0, 188)
-    assert fixed(value_x, value, torch.bfloat16, None) is None
-    info = ("other", 8, 9, 114)
-    assert fixed(x, key, torch.bfloat16, None) is None
 
 
-@pytest.mark.parametrize("batch,expected", (
-    (64, (128, 64, 2, 64)), (128, (128, 64, 2, 64)), (256, (128, 64, 2, 64)),
-    (320, (128, 128, 2, 64)), (512, (128, 128, 2, 64)), (1024, (128, 128, 2, 64)),
-    (192, None),
-))
-def test_fixed_square_weight_vjp_limits_reduction_and_dtype(monkeypatch, batch, expected):
-    from flashrwkv2._internal import linear as implementation
-
-    monkeypatch.setattr(implementation, "device_class", lambda device: ("test", 8, 9, 128))
-    x = torch.empty(4096, batch, device="meta")
-    weight = torch.empty(batch, 4096, device="meta").t()
-    assert implementation._fixed_projection_config(x, weight, torch.bfloat16, None) == expected
-    assert implementation._fixed_projection_config(x, weight, torch.float32, None) == expected
 
 
 @cuda
@@ -906,3 +859,47 @@ def test_fixed_small_head_preserves_training_gradients(monkeypatch, width, rows)
         tuning._TUNING.reset(token)
     assert torch.equal(actual, expected)
     assert all(torch.equal(a, b) for a, b in zip(actual_grads, expected_grads, strict=True))
+
+
+def test_deterministic_linear_checks_layout_and_device(monkeypatch):
+    from flashrwkv2._internal import linear as implementation
+
+    info = ("test", 8, 9, 128)
+    monkeypatch.setattr(implementation, "device_class", lambda device: info)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: SimpleNamespace(
+        multi_processor_count=info[-1], shared_memory_per_block_optin=99_264,
+    ))
+    x = torch.empty(89, 256, device="meta")
+    w = torch.empty(128, 256, device="meta")
+    assert implementation._fixed_projection_config(x, w, torch.float32, None) is not None
+    assert implementation._fixed_projection_config(x, w[:, ::2], torch.bfloat16, None) is None
+    info = ("test", 12, 0, 188)
+    assert implementation._fixed_projection_config(x, w, torch.bfloat16, None) is not None
+    info = ("other", 8, 9, 114)
+    assert implementation._fixed_projection_config(x, w, torch.bfloat16, None) is None
+
+
+@cuda
+@pytest.mark.cuda
+@pytest.mark.cuda_graph
+def test_dynamic_weight_reduction_preserves_accumulators_and_graph(monkeypatch):
+    from flashrwkv2._internal import linear as implementation
+    from flashrwkv2._internal.tuning import _fixed_strategy_device, device_class
+
+    if not _fixed_strategy_device(device_class(torch.device("cuda"))):
+        pytest.skip("deterministic strategy is qualified on tested devices")
+    torch.manual_seed(801)
+    monkeypatch.setattr(implementation, "_COMPILED_KERNELS", {})
+    for reduction in (1, 17, 31, 32, 33, 63, 64, 65, 89, 90, 100, 127, 128, 129, 1000, 1024, 4096):
+        x = (torch.randn(96, reduction, device="cuda") * .1).bfloat16()
+        weight = (torch.randn(reduction, 128, device="cuda") * .1).bfloat16().t()
+        reference = _forward(x, weight, None, torch.float32, config=(16, 64, 2, 32))
+        for dtype in (torch.float32, torch.bfloat16):
+            assert torch.equal(_forward(x, weight, None, dtype, dynamic_k=True), reference.to(dtype))
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = _forward(x, weight, None, torch.float32, dynamic_k=True)
+        graph.replay()
+        assert torch.equal(captured, reference)
+    keys = [key for key in implementation._COMPILED_KERNELS if len(key) == 11 and key[-2] is True]
+    assert len(keys) == 4

@@ -358,19 +358,12 @@ def test_dynamic_batch_reuses_tokenshift_and_state_kernels(use_status):
 @pytest.mark.cuda_graph
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize(
-    "channels,count,rows,expected_block",
-    [
-        *((channels, 1, rows, block) for channels in (4096, 5120)
-          for rows, block in ((64, 256), (65, 512), (127, 512), (128, 512))),
-        *((channels, 1, rows, 256 if rows <= 128 else 512) for channels in (2048, 2560)
-          for rows in (64, 65, 128, 129, 1024)),
-        *((channels, 6, rows, 256 if channels == 2048 else 128) for channels in (2048, 2560)
-          for rows in (64, 65, 128, 129, 1024)),
-    ],
+    "channels,count,rows",
+    ((2048, 1, 65), (2560, 6, 129), (4096, 1, 1024), (5120, 1, 1)),
 )
 @pytest.mark.parametrize("index_dtype", (torch.int32, torch.int64))
 def test_fixed_tokenshift_preserves_empty_state_and_vjp(
-    monkeypatch, tmp_path, rows, expected_block, channels, count, index_dtype,
+    monkeypatch, tmp_path, rows, channels, count, index_dtype,
 ):
     from flashrwkv2._internal import tuning
     from flashrwkv2.tmix.tokenshift import tilelang as implementation
@@ -409,7 +402,7 @@ def test_fixed_tokenshift_preserves_empty_state_and_vjp(
     for mode in ("inspect", "require", "tune"):
         report = tuning.prepare_tuning([call], mode=mode)
         assert report["complete"] and report["counts"]["fixed"] == 1
-        assert report["records"][0]["config"] == expected_block
+        assert report["records"][0]["config"] == 256
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         captured, captured_final = call()

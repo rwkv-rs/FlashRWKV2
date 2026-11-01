@@ -84,62 +84,20 @@ def test_prepare_prefers_canonical_weight_when_runtime_is_also_supplied():
     assert _original_weight(None, runtime, "w1").stride() == (1, 192)
 
 
-def test_fixed_decode_projection_restricts_models_and_layouts(monkeypatch):
+def test_deterministic_group_projection_checks_layout(monkeypatch):
+    from types import SimpleNamespace
     from flashrwkv2.tmix.wkv_prepare import tilelang as implementation
 
     monkeypatch.setattr(implementation, "device_class", lambda device: ("test", 8, 9, 128))
-    ranks = (96, 96, 256)
-    xs = tuple(torch.empty(1, 2048, device="meta") for _ in ranks)
-    weights = tuple(torch.empty(rank, 2048, device="meta") for rank in ranks)
-    kinds, biases = (1, 0, 2), (None,) * 3
-    fixed = implementation._fixed_projection_config
-    assert fixed(xs, weights, kinds, biases) == (16, 32, 2, 512)
-    assert fixed(tuple(torch.empty(2, 2048, device="meta") for _ in ranks), weights, kinds, biases) == (16, 16, 2, 512)
-    assert fixed(tuple(torch.empty(513, 2048, device="meta") for _ in ranks), weights, kinds, biases) == (32, 32, 2, 128)
-    assert fixed(xs, weights, (0, 0, 0), biases) == fixed(xs, weights, kinds, biases)
-    assert fixed(xs, weights, kinds, (weights[0][0], None, None)) is None
-    mixed_layout = (weights[0].t().contiguous().t(), *weights[1:])
-    assert fixed(xs, mixed_layout, kinds, biases) is None
-    unknown_ranks = (weights[0], weights[1], torch.empty(128, 2048, device="meta"))
-    assert fixed(xs, unknown_ranks, kinds, biases) is None
-    output_xs = tuple(torch.empty(1, rank, device="meta") for rank in ranks)
-    output_weights = tuple(torch.empty(rank, 2048, device="meta").t() for rank in ranks)
-    output_biases = (None, torch.empty(2048, device="meta"), None)
-    assert fixed(output_xs, output_weights, (0, 2, 0), output_biases) == (16, 32, 2, 64)
-    assert fixed(output_xs, tuple(w.contiguous() for w in output_weights), (0, 2, 0), output_biases) == (16, 32, 2, 64)
-    training_biases = (torch.empty(2048, device="meta"), *output_biases[1:])
-    assert fixed(output_xs, output_weights, (0, 2, 0), training_biases) == fixed(
-        output_xs, output_weights, (0, 2, 0), output_biases
-    )
-    assert fixed(output_xs, output_weights, (0, 0, 0), biases) == fixed(
-        output_xs, output_weights, (0, 2, 0), output_biases
-    )
-    assert fixed(output_xs, output_weights, (0, 2, 0), biases) is None
-    dense_weights = tuple(torch.empty(2048, 2048, device="meta") for _ in ranks)
-    assert fixed(xs, dense_weights, (0, 0, 0), biases) == (16, 32, 2, 256)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: SimpleNamespace(
+        multi_processor_count=128, shared_memory_per_block_optin=99_264,
+    ))
+    xs = tuple(torch.empty(89, 256, device="meta") for _ in range(3))
+    weights = tuple(torch.empty(96, 256, device="meta") for _ in range(3))
+    assert implementation._fixed_projection_config(xs, weights, (1, 0, 2), (None,) * 3) is not None
+    mixed = (weights[0].t().contiguous().t(), *weights[1:])
+    assert implementation._fixed_projection_config(xs, mixed, (1, 0, 2), (None,) * 3) is None
 
-    profiles = (
-        (2048, (96, 96, 256, 64)), (2560, (96, 96, 320, 64)),
-        (4096, (128, 128, 480, 96)), (4096, (192, 192, 384, 128)),
-    )
-    for channels, ranks in profiles:
-        for rows in ((1025,) if channels < 4096 else (513, 960, 1025)):
-            input_xs = tuple(torch.empty(rows, channels, device="meta") for _ in ranks)
-            input_weights = tuple(torch.empty(rank, channels, device="meta") for rank in ranks)
-            assert fixed(input_xs, input_weights, (1, 0, 2, 0), (None,) * 4) is None
-            output_xs = tuple(torch.empty(rows, rank, device="meta") for rank in ranks)
-            output_weights = tuple(torch.empty(channels, rank, device="meta") for rank in ranks)
-            output_biases = (None, torch.empty(channels, device="meta"), None, None)
-            assert fixed(output_xs, output_weights, (0, 2, 0, 0), output_biases) is None
-            dense = tuple(torch.empty(channels, channels, device="meta") for _ in range(3))
-            assert fixed(input_xs[:3], dense, (0, 0, 0), (None,) * 3) is None
-
-    ranks = (128, 128, 480, 96)
-    for rows in (320, 512):
-        xs = tuple(torch.empty(rows, rank, device="meta") for rank in ranks)
-        weights = tuple(torch.empty(rank, 4096, device="meta").t() for rank in ranks)
-        biases = (None, torch.empty(4096, device="meta"), None, None)
-        assert fixed(xs, weights, (0, 2, 0, 0), biases) is None
 
 
 @cuda
@@ -1066,6 +1024,7 @@ def test_fixed_group_projection_preserves_accumulators_and_vjp(monkeypatch, tmp_
         fixed = implementation._fixed_projection_config(xs, weights, kinds, biases)
         assert fixed is not None
 
+    fixed = implementation._fixed_projection_config(xs, weights, kinds, biases)
     with torch.no_grad():
         reference, raw = implementation._run_groups(xs, weights, kinds, biases, raw_mode=2, config=(16, 64, 2, 32))
         candidate, candidate_raw = implementation._run_groups(xs, weights, kinds, biases, raw_mode=2, config=fixed)
@@ -1200,7 +1159,7 @@ def test_grouped_training_vjp_preserves_compile_and_graph(monkeypatch, tmp_path,
     assert all(torch.equal(a, b) for a, b in zip(actual, reference, strict=True))
     assert all(torch.equal(a, b) for a, b in zip(actual_grads, reference_grads, strict=True))
     if stage == "output":
-        assert any(len(key) == 11 and key[-1] is True for key in implementation._GROUP_KERNELS)
+        assert any(len(key) == 12 and key[-2] is True for key in implementation._GROUP_KERNELS)
     else:
         assert any(key[1] == (channels,) * 4 and key[3] == (0,) * 4 and key[7] == 0
                    for key in implementation._GROUP_KERNELS)

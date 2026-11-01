@@ -11,6 +11,7 @@ from ..._internal.tuning import (
     _AutogradContext,
     _fixed_strategy_device,
     device_class,
+    prepared_kernel,
     tuning_operation,
     workload_bucket,
 )
@@ -192,15 +193,7 @@ def _readout_group(x, r, k, v, r_k, weight, bias, gate, head_size, eps):
     from ..._internal.tuning import get_config
 
     rows = x.numel() // x.shape[-1]
-    fixed = None
-    if (
-        head_size == 64 and x.shape[-1] in (2048, 2560, 4096, 5120)
-        and _fixed_strategy_device(device_class(x.device))
-    ):
-        if 1 <= rows <= 16:
-            fixed = 4 if rows == 1 else 8
-        elif x.shape[-1] in (2048, 2560, 4096) and rows <= 1024:
-            fixed = 8
+    fixed = (4 if rows == 1 else 8) if head_size == 64 and _fixed_strategy_device(device_class(x.device)) else None
     return get_config(
         _ROW_CONFIGS, "tmix/readout", _config_key(x, head_size),
         1 if fixed is None else fixed,
@@ -214,7 +207,8 @@ class _Readout(torch.autograd.Function):
     def forward(ctx, x, r, k, v, r_k, weight, bias, gate, head_size, eps):
         options = (x.shape[-1], head_size, str(x.dtype).split(".")[-1])
         group = _readout_group(x, r, k, v, r_k, weight, bias, gate, head_size, eps)
-        y, stats = _forward(options[0], head_size, eps, options[2], rows_per_block=group)(
+        y, stats = prepared_kernel("tmix/readout", _forward, (options[0], head_size, eps, options[2], True, group),
+            ((options[0], head_size, eps, options[2], True, g) for g in (4, 8)))(
             x, r, k, v, r_k, weight, bias, gate
         )
         ctx.save_for_backward(x, r, k, v, r_k, weight, bias, gate, stats)
@@ -227,7 +221,8 @@ class _Readout(torch.autograd.Function):
 
         group = min(32, tilelang.next_power_of_2(max(1, dy.shape[0] // 128)))
         needed = ctx.needs_input_grad[4:7]
-        gradients = list(_backward(*ctx.options, group, needed)(dy.contiguous(), *ctx.saved_tensors))
+        gradients = list(prepared_kernel("tmix/readout", _backward, (*ctx.options, group, needed),
+            ((*ctx.options, g, needed) for g in (1, 2, 4, 8, 16, 32)))( dy.contiguous(), *ctx.saved_tensors))
         for i, need in zip((4, 5, 6), needed):
             gradients[i] = sum_partials(gradients[i]) if need else None
         return (*gradients, None, None)
@@ -242,7 +237,8 @@ def _compiled_readout(
     if x.data_ptr() % (2 * x.element_size()) or any(t.data_ptr() % 4 for t in (r, k, v, r_k, weight, bias, gate)):
         raise ValueError("readout inputs must be aligned for two-element vector access")
     group = _readout_group(x, r, k, v, r_k, weight, bias, gate, head_size, eps)
-    return tuple(_forward(x.shape[-1], head_size, eps, str(x.dtype).split(".")[-1], save, group)(x, r, k, v, r_k, weight, bias, gate))
+    return tuple(prepared_kernel("tmix/readout", _forward, (x.shape[-1], head_size, eps, str(x.dtype).split(".")[-1], save, group),
+        ((x.shape[-1], head_size, eps, str(x.dtype).split(".")[-1], save, g) for g in (4, 8)))( x, r, k, v, r_k, weight, bias, gate))
 
 
 @_compiled_readout.register_fake
@@ -320,7 +316,8 @@ def readout(
         output = _Readout.apply(*args, head_size, float(eps))
     else:
         group = _readout_group(*args, head_size, eps)
-        output, _ = _forward(c, head_size, float(eps), str(x.dtype).split(".")[-1], False, group)(*args)
+        output, _ = prepared_kernel("tmix/readout", _forward, (c, head_size, float(eps), str(x.dtype).split(".")[-1], False, group),
+            ((c, head_size, float(eps), str(x.dtype).split(".")[-1], False, g) for g in (4, 8)))( *args)
     return output.view_as(x)
 
 

@@ -13,7 +13,7 @@ from numbers import Real
 import torch
 from torch.autograd.function import once_differentiable
 
-from .tuning import _AutogradContext, _fixed_strategy_device, device_class, tuning_operation, workload_bucket
+from .tuning import _AutogradContext, _fixed_strategy_device, device_class, prepare_variants, tuning_operation, workload_bucket
 
 _PASS_CONFIG = {"tl.disable_wgmma": True, "tl.enable_fast_math": False}
 _DEFAULT_CONFIG = (16, 64, 2, 32)
@@ -184,158 +184,93 @@ def _aligned(tensor):
     return tensor if tensor.data_ptr() % 16 == 0 else tensor.clone()
 
 
-def _one_wave(rows, outputs, block_m, block_n, num_sms):
-    return ((rows + block_m - 1) // block_m) * ((outputs + block_n - 1) // block_n) <= num_sms
+def _projection_tiles(outputs):
+    narrow = max((n + 127) // 128 for n in outputs) <= 4
+    return ((64, 64), (32, 32), (16, 32), (16, 16)) if narrow else (
+        (128, 128), (64, 128), (64, 64), (32, 64)
+    )
+
+
+def _projection_config(rows, channels, outputs, device, *, aligned_k=True):
+    """Choose output tiles by CTA coverage; K MMA groups remain canonical."""
+    props = torch.cuda.get_device_properties(device)
+    tiles = ((16, n) for n in (128, 64, 32, 16)) if rows <= 16 else _projection_tiles(outputs)
+    limit = max(16, 1 << (max(1, rows) - 1).bit_length())
+    legal = tuple((m, n) for m, n in tiles if m <= limit)
+    m, n = next((tile for tile in legal if
+                 math.ceil(rows / tile[0]) * sum(math.ceil(o / tile[1]) for o in outputs)
+                 >= props.multi_processor_count), legal[-1])
+    dynamic = channels is None
+    cap = (64 if aligned_k else 32) if dynamic else (512 if m == 16 else 64 if m * n >= 8192 else 128)
+    stages = 1 if dynamic else 2
+    span = next(k for k in (512, 256, 128, 64, 32)
+                if k <= cap and (dynamic or k == 32 or all(c % k == 0 for c in channels))
+                and (m + n) * stages * k * 2 <= props.shared_memory_per_block_optin)
+    return m, n, stages, span
+
+
+def _projection_variants(channels, outputs, device, *, rows=None):
+    if channels is None:
+        return tuple(dict.fromkeys(_projection_config(rows, None, outputs, device, aligned_k=a)
+                                   for a in (False, True)))
+    sms = torch.cuda.get_device_properties(device).multi_processor_count
+    boundaries = {1, 16, 17}
+    for m, n in _projection_tiles(outputs):
+        threshold = (math.ceil(sms / sum(math.ceil(o / n) for o in outputs)) - 1) * m + 1
+        for point in (m // 2 + 1, threshold):
+            boundaries.update((max(1, point - 1), max(1, point), max(1, point + 1)))
+    return tuple(dict.fromkeys(_projection_config(r, channels, outputs, device)
+                               for r in sorted(boundaries)))
 
 
 def _fixed_projection_config(x, weight, output_dtype, bias):
-    info = device_class(x.device)
-    channels, outputs = x.shape[1], weight.shape[0]
-    if bias is not None or not _fixed_strategy_device(info):
-        return None
-    num_sms, rows = info[-1], x.shape[0]
-    if (rows == 4096 and channels in (64, 128, 256, 320, 512, 1024) and outputs == 4096
-            and output_dtype in (torch.bfloat16, torch.float32) and weight.stride() == (1, outputs)):
-        return (128, 64, 2, 64) if channels <= 256 else (128, 128, 2, 64)
-    if 512 < rows <= 1024 and output_dtype == torch.bfloat16:
-        output_major = weight.stride() == (channels, 1)
-        input_major = weight.stride() == (1, outputs)
-        if channels in (2048, 2560) and outputs == 4 * channels and output_major:
-            if channels == 2560 and rows <= 576:
-                return (64, 128, 2, 64)
-            return (128, 128, 2, 64)
-        if outputs in (2048, 2560) and (
-            (channels == outputs and output_major)
-            or (channels == 4 * outputs and input_major)
-        ):
-            if not _one_wave(rows, outputs, 128, 128, num_sms):
-                return (128, 64, 2, 32)
-            if channels == outputs and rows <= (704 if outputs == 2048 else 576):
-                return (64, 128, 2, 64)
-            return (128, 128, 2, 64)
-    if rows > 16:
-        if not (rows <= 512 or 960 < rows <= 1024):
-            return None
-        input_major = weight.stride() == (1, outputs)
-        output_major = weight.stride() == (channels, 1)
-        if output_major and (
-            (channels == 4096 and output_dtype == torch.bfloat16 and outputs == 4 * channels)
-            or (channels in (2048, 2560, 4096) and output_dtype == torch.float32
-                and outputs == 65536 and (channels == 4096 or rows <= 512))
-        ):
-            if rows <= 32:
-                return (32, 64, 2, 128)
-            if rows <= 64:
-                return (64, 64, 2, 128)
-            if rows <= 128:
-                return (128, 64, 2, 128)
-            return (256, 64, 2, 64)
-        if rows <= 512 and output_dtype == torch.bfloat16:
-            if channels in (2048, 2560) and outputs == 4 * channels and output_major:
-                if rows <= 32:
-                    return (32, 64, 2, 128)
-                if rows <= 64:
-                    return (64, 64, 2, 128 if channels == 2048 else 64)
-                if rows <= 128:
-                    return (128, 64, 2, 128) if channels == 2048 else (64, 64, 2, 64)
-                if rows <= 192:
-                    return (64, 128, 2, 64)
-                return (128, 128, 2, 64)
-            if outputs in (2048, 2560) and (
-                (channels == outputs and output_major)
-                or (channels == 4 * outputs and input_major)
-            ):
-                if _one_wave(rows, outputs, 32, 32, num_sms):
-                    return (32, 32, 2, 128)
-                if rows <= 96:
-                    return (32, 64, 2, 64)
-                if _one_wave(rows, outputs, 64, 64, num_sms):
-                    return (64, 64, 2, 64)
-                if channels == 4 * outputs and not _one_wave(rows, outputs, 64, 128, num_sms):
-                    return (128, 128, 2, 64)
-                return (64, 128, 2, 64)
-        if output_dtype == torch.bfloat16 and outputs == 4096 and (
-            (channels == 4096 and output_major)
-            or (channels in (4096, 16384) and input_major)
-        ):
-            if rows <= 32 or (rows <= 64 and channels == 16384):
-                return (32, 64, 2, 64)
-            if rows <= 128:
-                return (64, 64, 2, 64)
-            if rows <= 256 or (rows <= 320 and output_major):
-                return (64, 128, 2, 64)
-            return (128, 128, 2, 64)
-        return None
-    if weight.stride() == (channels, 1) and channels in (2048, 2560, 4096):
-        if output_dtype == torch.bfloat16 and outputs == channels:
-            return (16, 32, 2, 512 if channels == 4096 else 256)
-        if output_dtype == torch.bfloat16 and outputs == 4 * channels:
-            if channels == 2048:
-                return (16, 64, 2, 256)
-            if channels == 2560:
-                return (16, 128, 2, 128)
-            return (16, 64, 2, 128)
-        if output_dtype == torch.float32 and outputs == 65536:
-            return (16, 64, 2, 128)
-    if (
-        output_dtype == torch.bfloat16 and outputs in (2048, 2560, 4096)
-        and channels == 4 * outputs and weight.stride() == (1, outputs)
-    ):
-        if outputs < 4096:
-            return (16, 32, 2, 256)
-        return (16, 64, 2, 128)
+    if (_fixed_strategy_device(device_class(x.device))
+            and weight.stride() in ((x.shape[1], 1), (1, weight.shape[0]))):
+        return _projection_config(x.shape[0], (x.shape[1],), (weight.shape[0],), x.device)
     return None
 
 
 def _forward(x, weight, bias, output_dtype, config=None, *, dynamic_k=False):
     x, weight = _aligned(x), _aligned(weight)
     bias = None if bias is None else _aligned(bias)
+    info = device_class(x.device)
+    dynamic_k = dynamic_k and _fixed_strategy_device(info)
     aligned_k = x.shape[1] % 32 == 0
-    if dynamic_k and config is None:
-        config = (64, 64, 1, 64 if aligned_k else 32)
-    if config is None:
+    fixed = _projection_config(x.shape[0], None, (weight.shape[0],), x.device,
+                               aligned_k=aligned_k) if dynamic_k else _fixed_projection_config(x, weight, output_dtype, bias)
+    automatic = config is None
+    if automatic:
         from .tuning import get_config
 
-        fixed = _fixed_projection_config(x, weight, output_dtype, bias)
+        selection_key = _key(x, weight, output_dtype, bias)
+        if dynamic_k:
+            selection_key = (*selection_key[:3], 0, *selection_key[4:], "dynamic_k", aligned_k)
         config = get_config(
-            _TUNED_CONFIGS, "linear", _key(x, weight, output_dtype, bias), fixed,
+            _TUNED_CONFIGS, "linear", selection_key, fixed,
             tune=lambda: tune_linear(x, weight, output_dtype, bias=bias),
             fixed=fixed is not None,
         )
         if config is None:
-            block_m = 16
-            rows = workload_bucket(x.shape[0])
-            if rows > 16:
-                max_m = min(128, rows)
-                block_n = _DEFAULT_CONFIG[1]
-                blocks_n = (weight.shape[0] + block_n - 1) // block_n
-                multiprocessors = torch.cuda.get_device_properties(
-                    x.device
-                ).multi_processor_count
-                for candidate in (32, 64, 128):
-                    # Keep a full CTA wave while capping row padding.
-                    blocks = ((rows + candidate - 1) // candidate) * blocks_n
-                    if candidate > max_m or blocks < multiprocessors:
-                        break
-                    block_m = candidate
-            config = (block_m, *_DEFAULT_CONFIG[1:])
-    major, minor = torch.cuda.get_device_capability(x.device)
+            config = _projection_config(x.shape[0], (x.shape[1],), (weight.shape[0],), x.device)
     input_major = weight.stride(0) == 1
     physical_weight = weight.t() if input_major else weight
     key = (
-        weight.shape[0],
-        0 if dynamic_k else x.shape[1],
-        _dtype_name(output_dtype),
-        _dtype_name(bias.dtype) if bias is not None else "bfloat16",
-        bias is not None,
-        config,
-        None if dynamic_k else physical_weight.stride(),
-        input_major,
-        major * 10 + minor,
+        weight.shape[0], 0 if dynamic_k else x.shape[1], _dtype_name(output_dtype),
+        _dtype_name(bias.dtype) if bias is not None else "bfloat16", bias is not None,
+        config, None if dynamic_k else physical_weight.stride(), input_major,
+        info[1] * 10 + info[2],
     ) + ((True, aligned_k) if dynamic_k else ())
+    if automatic and fixed is not None:
+        family = key[:5] + key[6:9] + ((True, x.shape[0]) if dynamic_k else ())
+        def variants():
+            if dynamic_k:
+                return tuple(key[:5] + (_projection_config(x.shape[0], None, (weight.shape[0],), x.device,
+                                                           aligned_k=a),) + key[6:9] + (True, a)
+                             for a in (False, True))
+            return tuple(key[:5] + (c,) + key[6:] for c in
+                         _projection_variants((x.shape[1],), (weight.shape[0],), x.device))
+        prepare_variants("linear", family, variants, _COMPILED_KERNELS, _compile_spec)
     kernel = _compiled(*key)
-    # The bias-free specialization has no bias loads; reusing W avoids allocating
-    # a dummy device tensor on every projection.
     return kernel(x, physical_weight, physical_weight if bias is None else bias)
 
 

@@ -11,6 +11,7 @@ from .._internal.tuning import (
     _AutogradContext,
     _fixed_strategy_device,
     device_class,
+    prepared_kernel,
     tuning_operation,
     workload_bucket,
 )
@@ -24,8 +25,7 @@ def _config_key(x, has_res):
 
 
 def _fixed_rows(x):
-    # These model widths use one row per CTA on the qualified device.
-    return x.shape[-1] in (2048, 2560, 4096, 5120) and _fixed_strategy_device(device_class(x.device))
+    return _fixed_strategy_device(device_class(x.device))
 
 
 def _row_layout(channels, rows_per_block):
@@ -196,7 +196,7 @@ class _Norm(torch.autograd.Function):
             _ROW_CONFIGS, "post_norm", _config_key(x, res is not None), 1,
             tune=lambda: tune_norm(x, weight, bias, eps, res), fixed=_fixed_rows(x),
         )
-        y, mean, rstd = _forward(x.shape[-1], eps, res is not None, rows_per_block=rows_per_block)(
+        y, mean, rstd = prepared_kernel("post_norm", _forward, (x.shape[-1], eps, res is not None, True, True, rows_per_block))(
             x, res if res is not None else x, weight, bias, total
         )
         ctx.save_for_backward(total, weight, mean, rstd)
@@ -214,7 +214,9 @@ class _Norm(torch.autograd.Function):
 
         group = min(32, tilelang.next_power_of_2(max(1, total.shape[0] // 128)))
         need_weight, need_bias = ctx.needs_input_grad[1:3]
-        dx, dw, db = _backward(total.shape[-1], dsum is not None, group, need_weight, need_bias)(
+        dx, dw, db = prepared_kernel("post_norm", _backward,
+            (total.shape[-1], dsum is not None, group, need_weight, need_bias),
+            ((total.shape[-1], dsum is not None, g, need_weight, need_bias) for g in (1, 2, 4, 8, 16, 32)))(
             dy, dsum.contiguous() if dsum is not None else dy, weight, total, mean, rstd
         )
         return (
@@ -236,7 +238,7 @@ def _compiled_norm(x, weight, bias, res, eps, save, return_res):
         _ROW_CONFIGS, "post_norm", _config_key(x, res is not None), 1,
         tune=lambda: tune_norm(x, weight, bias, eps, res), fixed=_fixed_rows(x),
     )
-    y, mean, rstd = _forward(x.shape[-1], eps, res is not None, save, store, group)(
+    y, mean, rstd = prepared_kernel("post_norm", _forward, (x.shape[-1], eps, res is not None, save, store, group))(
         x, x if res is None else res, weight, bias, total,
     )
     result_sum = total if store else x.clone() if return_res else None
@@ -338,7 +340,7 @@ def norm(
             _ROW_CONFIGS, "post_norm", _config_key(flat, res is not None), 1,
             tune=lambda: tune_norm(x, weight, bias, eps, res), fixed=_fixed_rows(flat),
         )
-        y, _, _ = _forward(x.shape[-1], float(eps), res is not None, False, store_res, rows_per_block)(
+        y, _, _ = prepared_kernel("post_norm", _forward, (x.shape[-1], float(eps), res is not None, False, store_res, rows_per_block))(
             flat, flat_res if flat_res is not None else flat, weight, bias, buffer
         )
     return (y.view_as(x), total.view_as(x)) if return_res else y.view_as(x)

@@ -108,7 +108,7 @@ def test_fixed_strategy_is_qualified_by_architecture_and_sm_count():
     from flashrwkv2._internal.tuning import _fixed_strategy_device
 
     assert _fixed_strategy_device(("4090", 8, 9, 128))
-    assert not _fixed_strategy_device(("PRO 6000", 12, 0, 188))
+    assert _fixed_strategy_device(("PRO 6000", 12, 0, 188))
     assert not _fixed_strategy_device(("4090 D", 8, 9, 114))
     assert not _fixed_strategy_device(("other", 12, 0, 170))
 
@@ -725,3 +725,68 @@ def test_projection_search_keeps_both_sides_of_sm_coverage(monkeypatch):
     monkeypatch.setattr(tuning.torch.cuda, "get_device_properties", lambda _: props)
     configs = tuning.projection_configs(100, (2048,), (2048,), "cuda")
     assert {m for m, n, _, _ in configs if n == 64} == {64, 128}
+
+
+@pytest.mark.parametrize("sms", (128, 188))
+@pytest.mark.parametrize("channels,outputs", (
+    ((2048,), (65536,)), ((4096,) * 3, (4096,) * 3),
+    ((2048,) * 4, (96, 96, 256, 64)), ((4096,) * 4, (128, 128, 480, 96)),
+    ((4096,) * 4, (192, 192, 384, 128)), ((96, 96, 256, 64), (2048,) * 4),
+))
+def test_projection_variants_cover_dynamic_rows(monkeypatch, sms, channels, outputs):
+    import torch
+    from flashrwkv2._internal.linear import _projection_config, _projection_variants
+
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: SimpleNamespace(
+        multi_processor_count=sms, shared_memory_per_block_optin=99_264,
+    ))
+    variants = _projection_variants(channels, outputs, "cuda")
+    assert len(variants) <= 5
+    for rows in range(1, 4097):
+        config = _projection_config(rows, channels, outputs, "cuda")
+        assert config in variants, (rows, config, variants)
+        m, n, stages, span = config
+        assert (m + n) * stages * span * 2 <= 99_264
+
+
+def test_preparation_compiles_family_once_and_reports_variants(tuning_cache, monkeypatch):
+    cache, calls = {}, []
+    def compile_candidates(keys, result, spec):
+        calls.extend(keys)
+        result.update((key, object()) for key in keys)
+    monkeypatch.setattr(tuning_cache, "compile_candidates", compile_candidates)
+    def run():
+        tuning_cache.get_config({}, "linear", ("family",), (16, 64, 2, 32), fixed=True)
+        tuning_cache.prepare_variants("linear", ("shape",), lambda: ((1,), (2,)), cache, None)
+    report = tuning_cache.prepare_tuning([run, run])
+    assert calls == [(1,), (2,)]
+    assert report["complete"]
+    assert report["compilation"] == {"families": 1, "required_variants": 2,
+                                     "available_variants": 2, "complete": True}
+
+
+def test_preparation_rejects_failed_required_variant(tuning_cache, monkeypatch):
+    monkeypatch.setattr(tuning_cache, "compile_candidates", lambda *args: None)
+    def spec(*key):
+        raise RuntimeError("required kernel failed")
+    def run():
+        tuning_cache.get_config({}, "linear", ("family",), (16, 64, 2, 32), fixed=True)
+        tuning_cache.prepare_variants("linear", ("shape",), lambda: ((1,),), {}, spec)
+    with pytest.raises(RuntimeError, match="required kernel failed"):
+        tuning_cache.prepare_tuning([run])
+    assert tuning_cache._SESSION is None
+
+
+def test_candidate_batches_preserve_distinct_compiler_options(monkeypatch):
+    import tilelang
+    from flashrwkv2._internal.tuning import compile_candidates
+
+    calls, cache = [], {}
+    def compile_batch(programs, **options):
+        calls.append((programs, options))
+        return [object() for _ in programs]
+    monkeypatch.setattr(tilelang, "par_compile", compile_batch)
+    compile_candidates(((0,), (1,)), cache,
+                       lambda k: (k, {"pass_configs": {"tl.enable_async_copy": bool(k)}}))
+    assert len(calls) == 2 and len(cache) == 2
+    assert {call[1]["pass_configs"]["tl.enable_async_copy"] for call in calls} == {False, True}

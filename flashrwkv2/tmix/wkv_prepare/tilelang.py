@@ -7,11 +7,14 @@ import torch
 from torch.autograd.function import once_differentiable
 
 from ..._internal.elementwise import _activation_kernel, activation, sum_partials
-from ..._internal.linear import _aligned, _forward, adapter_linear, linear_input_vjp
+from ..._internal.linear import (
+    _aligned, _forward, _projection_config, _projection_variants, adapter_linear, linear_input_vjp,
+)
 from ..._internal.tuning import (
     _AutogradContext,
     _fixed_strategy_device,
     device_class,
+    prepare_variants,
     tuning_operation,
     workload_bucket,
 )
@@ -400,141 +403,12 @@ def _group_key(xs, weights, kinds, biases):
 
 
 def _fixed_projection_config(xs, weights, kinds, biases):
-    if not _fixed_strategy_device(device_class(xs[0].device)):
-        return None
-    rows, channels = xs[0].shape
-    if kinds == (0, 0, 0) and all(bias is None for bias in biases):
-        if channels in (2048, 2560, 4096) and all(
-            x.shape[1] == channels and weight.shape == (channels, channels)
-            and weight.stride() == (channels, 1)
-            for x, weight in zip(xs, weights, strict=True)
-        ):
-            if rows <= 16:
-                return (16, 32, 2, 256) if channels < 4096 else (16, 64, 2, 128)
-            if channels < 4096:
-                if rows <= 64:
-                    return (32, 64, 2, 128)
-                if rows <= (160 if channels == 2048 else 192):
-                    return (64, 64, 2, 64)
-                if rows <= 1024:
-                    return (64, 128, 2, 64)
-                return None
-            if rows <= 32:
-                return (32, 64, 2, 128)
-            if 192 < rows <= 256:
-                return (128, 64, 2, 64)
-            if channels == 4096 and (
-                32 < rows <= 192 or 256 < rows <= 512 or 960 < rows <= 1024
-            ):
-                return (64, 128, 2, 64)
-    profiles = (
-        (2048, (96, 96, 256, 64)),
-        (2560, (96, 96, 320, 64)),
-        (4096, (128, 128, 480, 96)),
-        (4096, (192, 192, 384, 128)),
-    )
-    ranks = tuple(weight.shape[0] for weight in weights)
-    if kinds in ((1, 0, 2), (1, 0, 2, 0), (0, 0, 0), (0, 0, 0, 0)) and all(
-        bias is None for bias in biases
-    ) and any(channels == width and ranks == profile[:len(ranks)] for width, profile in profiles):
-        if any(x.shape[1] != channels for x in xs) or any(weight.shape[1] != channels for weight in weights):
-            return None
-        output_major = all(weight.stride() == (channels, 1) for weight in weights)
-        input_major = all(weight.stride() == (1, weight.shape[0]) for weight in weights)
-        model_13b = channels == 4096 and ranks == (192, 192, 384, 128)[:len(ranks)]
-        model_72b = channels == 4096 and ranks == (128, 128, 480, 96)[:len(ranks)]
-        if rows <= 16:
-            if output_major or input_major:
-                return (16, 32 if input_major or (rows == 1 and channels < 4096) else 16, 2, 512)
-            return None
-        if channels in (2048, 2560) and (input_major or output_major):
-            if rows <= 512:
-                # Keep each narrow N tile within the first 128-SM wave when possible.
-                wave_16 = 16 * (128 // sum((rank + 15) // 16 for rank in ranks))
-                wave_32 = 16 * (128 // sum((rank + 31) // 32 for rank in ranks))
-                if output_major and rows <= wave_16:
-                    return (16, 16, 2, 512)
-                if rows <= wave_32:
-                    return (16, 32, 2, 512)
-                wide = channels == 2560 and len(ranks) == 4 and input_major and rows > 448
-                return (32, 64 if wide else 32, 2, 128)
-            if rows <= 1024:
-                # Compare N=32 and N=64 at their last full CTA waves.
-                waves = 2 if channels == 2048 and len(ranks) == 3 else 3
-                wave_32 = 32 * (128 * waves // sum((rank + 31) // 32 for rank in ranks))
-                if channels == 2560 and input_major:
-                    wave_32 = 576 if len(ranks) == 3 else 0
-                if rows <= wave_32:
-                    return (32, 32, 2, 128)
-                wave_64 = 32 * (256 // sum((rank + 63) // 64 for rank in ranks))
-                return (32, 64, 2, 128) if rows <= wave_64 else (64, 64, 2, 64)
-        if rows > 512 and not 960 < rows <= 1024:
-            return None
-        if channels == 4096 and rows <= 64 and (input_major or output_major):
-            return (16, 16 if output_major and rows <= 32 else 32, 2, 512)
-        if (model_13b or (model_72b and rows <= 512)) and (input_major or output_major):
-            if rows <= 512:
-                # N=32 gives 24/28 CTA columns; M=16 fits one 128-SM wave through 80/64 rows.
-                if rows <= (80 if len(ranks) == 3 else 64):
-                    return (16, 32, 2, 512)
-                # Later crossovers depend on weight layout as well as CTA waves.
-                if model_72b:
-                    wave_limit = 384 if len(ranks) == 4 and output_major else 352
-                else:
-                    wave_limit = (288 if len(ranks) == 3 else 384) if output_major else (
-                        320 if len(ranks) == 3 else 288
-                    )
-                return (32, 32 if rows <= wave_limit else 64, 2, 128)
-            return (64, 128, 2, 64) if len(ranks) == 3 else (128, 64, 2, 64)
-    if (
-        kinds in ((0, 2, 0), (0, 2, 0, 0)) and biases[1] is not None
-        and all(bias is None for bias in biases[2:])
-    ) or (kinds in ((0, 0, 0), (0, 0, 0, 0)) and all(bias is None for bias in biases)):
-        channels = weights[0].shape[0]
-        ranks = tuple(x.shape[1] for x in xs)
-        if not any(channels == width and ranks == profile[:len(ranks)] for width, profile in profiles):
-            return None
-        input_major = all(weight.shape == (channels, rank) and weight.stride() == (1, channels)
-                          for weight, rank in zip(weights, ranks, strict=True))
-        output_major = all(weight.shape == (channels, rank) and weight.stride() == (rank, 1)
-                           for weight, rank in zip(weights, ranks, strict=True))
-        model_13b = channels == 4096 and ranks == (192, 192, 384, 128)[:len(ranks)]
-        if rows <= 16 and (input_major or output_major):
-            return (16, 32, 2, 64)
-        if channels in (2048, 2560) and (input_major or output_major):
-            if rows <= 512:
-                limit = (352 if len(ranks) == 3 else 320) if channels == 2048 else 96
-                return (32 if rows <= limit else 64, 64, 2, 64)
-            if rows <= 1024:
-                return (64, 64, 2, 64)
-        if rows > 512 and not 960 < rows <= 1024:
-            return None
-        if channels == 4096 and rows <= 63 and (input_major or output_major):
-            return (32, 64, 2, 64)
-        model_72b = channels == 4096 and ranks == (128, 128, 480, 96)[:len(ranks)]
-        if model_72b and (input_major or output_major):
-            if rows == 64:
-                return (32, 64, 2, 64)
-            if rows <= 96:
-                return (64, 64, 2, 64) if len(ranks) == 3 else (32, 64, 2, 64)
-            if rows <= 128:
-                return (128, 32, 2, 32) if len(ranks) == 4 else (64, 64, 2, 64)
-            if len(ranks) == 4 and rows <= 192:
-                return (64, 64, 2, 64)
-            if rows <= 160:
-                return (32, 64, 2, 64)
-            if rows <= 256:
-                return (128, 64, 2, 32)
-            if 256 < rows <= 512 and (len(ranks) == 3 or output_major):
-                return (64, 128 if len(ranks) == 4 else 64, 2, 64)
-        if model_13b and (input_major or output_major):
-            if rows <= 512:
-                if len(ranks) == 3 and 128 < rows <= 256:
-                    return (128, 64, 2, 32)
-                if output_major and len(ranks) == 4 and 192 < rows <= 256:
-                    return (128, 128, 2, 32)
-                return (64, 64, 2, 64)
-            return (64, 128, 2, 64) if output_major else (128, 128, 2, 32)
+    if (_fixed_strategy_device(device_class(xs[0].device)) and (
+        all(w.stride() == (w.shape[1], 1) for w in weights)
+        or all(w.stride() == (1, w.shape[0]) for w in weights)
+    )):
+        return _projection_config(xs[0].shape[0], tuple(x.shape[1] for x in xs),
+                                  tuple(w.shape[0] for w in weights), xs[0].device)
     return None
 
 
@@ -550,11 +424,12 @@ def _group_spec(
     arch,
     count,
     dynamic_k=False,
+    aligned_k=True,
 ):
     flags = {"tl.disable_wgmma": True, "tl.enable_fast_math": False}
     if arch // 10 == 12:
         flags["tl.disable_warp_specialized"] = True
-    if any(
+    if not aligned_k or any(
         c % 2 or (n if input_major else c) % 2 or stride[0] % 2 or stride[1] != 1
         for c, n, stride in zip(channels, outputs, strides, strict=True)
     ):
@@ -590,26 +465,21 @@ def _compiled_group(*key):
 
 def _group_call(xs, weights, kinds, biases, raw_mode, config, dynamic_k=False):
     count = len(xs)
-    if config is None:
+    automatic = config is None
+    aligned_k = xs[0].shape[1] % 32 == 0
+    fixed = _projection_config(xs[0].shape[0], None, tuple(w.shape[0] for w in weights),
+                               xs[0].device, aligned_k=aligned_k) if dynamic_k else _fixed_projection_config(xs, weights, kinds, biases)
+    if automatic:
         from ..._internal.tuning import get_config
 
-        fixed = _fixed_projection_config(xs, weights, kinds, biases)
         config = get_config(
             _GROUP_CONFIGS, "tmix/wkv_prepare", _group_key(xs, weights, kinds, biases),
             fixed, tune=lambda: _tune_grouped_linear(xs, weights, kinds, biases),
             fixed=fixed is not None,
         )
         if config is None:
-            narrow = max(w.shape[0] for w in weights) <= 128
-            copy_k = next(
-                (
-                    span
-                    for span in ((512, 128, 64) if narrow else (128, 64))
-                    if all(x.shape[1] % span == 0 for x in xs)
-                ),
-                32,
-            )
-            config = (16, 8 if narrow else 64, 2, copy_k)
+            config = _projection_config(xs[0].shape[0], tuple(x.shape[1] for x in xs),
+                                         tuple(w.shape[0] for w in weights), xs[0].device)
     input_major = all(w.stride(0) == 1 for w in weights)
     physical = tuple(w.t() if input_major else w for w in weights)
     channels = tuple(x.shape[1] for x in xs)
@@ -636,7 +506,17 @@ def _group_call(xs, weights, kinds, biases, raw_mode, config, dynamic_k=False):
         raw_mode,
         major * 10 + minor,
         count,
-    ) + ((True,) if dynamic_k else ())
+    ) + ((True, aligned_k) if dynamic_k else ())
+    if automatic and fixed is not None:
+        family = key[:5] + key[6:10] + ((True, xs[0].shape[0]) if dynamic_k else ())
+        def variants():
+            if dynamic_k:
+                return tuple(key[:5] + (_projection_config(xs[0].shape[0], None, outputs[:count],
+                                                           xs[0].device, aligned_k=a),) + key[6:10] + (True, a)
+                             for a in (False, True))
+            return tuple(key[:5] + (c,) + key[6:] for c in
+                         _projection_variants(channels[:count], outputs[:count], xs[0].device))
+        prepare_variants("tmix/wkv_prepare", family, variants, _GROUP_KERNELS, _group_spec)
     empty = xs[0].new_empty(0)
     bias_args = tuple(empty if bias is None else bias for bias in biases)
     args = (
@@ -683,18 +563,14 @@ class _GroupedLinear(torch.autograd.Function):
         raw = saved[-1]
         dxs, dws, dbs = [None] * count, [None] * count, [None] * count
         identity_kinds, no_bias = (0,) * count, (None,) * count
-        grouped_weights, grouped_config = None, None
-        if (
-            ctx.kinds in ((0, 2, 0), (0, 2, 0, 0), (1, 0, 2), (1, 0, 2, 0))
-            and all(gradient is not None for gradient in gradients)
-            and all(ctx.needs_input_grad[1 : 1 + 2 * count])
-            and xs[0].shape[0] >= 32 and xs[0].shape[0] % 32 == 0
-        ):
-            grouped_weights = tuple(weight.t() for weight in weights)
-            grouped_config = _fixed_projection_config(
-                gradients, grouped_weights, identity_kinds, no_bias
-            )
-        grouped_weight_vjp = all(weight.shape[0] == weights[0].shape[0] for weight in weights)
+        present = (_fixed_strategy_device(device_class(xs[0].device))
+                   and all(gradient is not None for gradient in gradients))
+        grouped_weights = tuple(weight.t() for weight in weights)
+        layout = (all(w.stride() == (w.shape[1], 1) for w in grouped_weights)
+                  or all(w.stride() == (1, w.shape[0]) for w in grouped_weights))
+        grouped_input_vjp = present and layout and all(ctx.needs_input_grad[1 : 1 + count])
+        grouped_weight_vjp = (present and all(ctx.needs_input_grad[1 + count : 1 + 2 * count])
+                              and all(w.shape[0] == weights[0].shape[0] for w in weights))
         dys = []
         position = 0
         for i, (x, weight, bias, kind, gradient) in enumerate(
@@ -737,24 +613,19 @@ class _GroupedLinear(torch.autograd.Function):
                 dy = dlinear
                 if need_bias:
                     dbs[i] = sum_partials(partial)
-            if grouped_config is not None:
+            if grouped_input_vjp or grouped_weight_vjp:
                 dys.append(dy)
-                if not grouped_weight_vjp:
-                    dws[i] = _forward(dy.t().contiguous(), x.t(), None, weight.dtype)
-            else:
-                if ctx.needs_input_grad[1 + i]:
-                    dxs[i] = linear_input_vjp(dy, weight)
-                if ctx.needs_input_grad[1 + count + i]:
-                    dws[i] = _forward(dy.t().contiguous(), x.t(), None, weight.dtype)
-        if grouped_config is not None:
-            dxs = _run_groups(
-                tuple(dys), grouped_weights, identity_kinds, no_bias, config=grouped_config
+            if not grouped_input_vjp and ctx.needs_input_grad[1 + i]:
+                dxs[i] = linear_input_vjp(dy, weight)
+            if not grouped_weight_vjp and ctx.needs_input_grad[1 + count + i]:
+                dws[i] = _forward(dy.t().contiguous(), x.t(), None, weight.dtype, dynamic_k=True)
+        if grouped_input_vjp:
+            dxs = _run_groups(tuple(dys), grouped_weights, identity_kinds, no_bias)[0]
+        if grouped_weight_vjp:
+            dws = _run_groups(
+                tuple(dy.t().contiguous() for dy in dys), tuple(x.t() for x in xs),
+                identity_kinds, no_bias, dynamic_k=True,
             )[0]
-            if grouped_weight_vjp:
-                dws = _run_groups(
-                    tuple(dy.t().contiguous() for dy in dys), tuple(x.t() for x in xs),
-                    identity_kinds, no_bias, config=(64, 64, 1, 64), dynamic_k=True,
-                )[0]
         return None, *dxs, *dws, *dbs
 
 

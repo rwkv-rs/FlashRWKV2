@@ -68,8 +68,7 @@ def device_class(device):
 
 
 def _fixed_strategy_device(info):
-    # Fixed strategies are qualified on the RTX 4090 debug machine.
-    return info[1:] == (8, 9, 128)
+    return info[1:] in ((8, 9, 128), (12, 0, 188))
 
 
 @cache
@@ -299,7 +298,7 @@ def prepare_tuning(calls, *, mode="require", legacy_dir=None):
         legacy_dir = Path(legacy_dir).expanduser().resolve()
         if not legacy_dir.is_dir():
             raise NotADirectoryError(f"legacy tuning namespace does not exist: {legacy_dir}")
-    session = {"mode": mode, "legacy_dir": legacy_dir, "records": {}}
+    session = {"mode": mode, "legacy_dir": legacy_dir, "records": {}, "compilation": {}}
     # Autograd executes CUDA backward nodes on engine threads. Preparation is
     # an exclusive process phase, so those dispatches share the same report.
     if not _PREPARATION_LOCK.acquire(blocking=False):
@@ -314,8 +313,13 @@ def prepare_tuning(calls, *, mode="require", legacy_dir=None):
     records = list(session["records"].values())
     if not records:
         raise RuntimeError("prepare_tuning observed no configurable kernel dispatches")
+    variants = tuple(session["compilation"].values())
+    compilation = {"families": len(variants),
+                   "required_variants": sum(len(keys) for keys in variants),
+                   "available_variants": sum(len(keys) for keys in variants), "complete": True}
     return {"cache_root": str(get_tuning_cache_dir()), "schema": _SCHEMA,
             "complete": all(row["status"] != "missing" for row in records),
+            "compilation": compilation,
             "counts": {status: sum(row["status"] == status for row in records)
                        for status in ("fixed", "hit", "missing", "tuned", "revalidated")},
             "records": records}
@@ -347,30 +351,54 @@ def revalidation_config():
     return _REVALIDATE.get()
 
 
+def prepare_variants(owner, family, variants, cache, spec):
+    """Prepare every reachable variant of an observed deterministic family."""
+    session = _SESSION
+    if session is None or _TUNING.get() or (owner, family) in session["compilation"]:
+        return
+    keys = tuple(dict.fromkeys(variants()))
+    compile_candidates(keys, cache, spec)
+    for key in keys:
+        if key not in cache:
+            import tilelang
+
+            program, options = spec(*key)
+            cache[key] = tilelang.compile(program, **options)
+    session["compilation"][(owner, family)] = keys
+
+
+def prepared_kernel(owner, compiler, args, variants=()):
+    """Compile bounded JIT alternatives only during explicit preparation."""
+    session = _SESSION
+    if session is not None and not _TUNING.get():
+        keys = tuple(variants) or (args,)
+        family = owner, compiler.func.__name__, keys
+        if family not in session["compilation"]:
+            for key in keys:
+                compiler(*key)
+            session["compilation"][family] = keys
+    return compiler(*args)
+
+
 def compile_candidates(keys, cache, spec):
-    """Compile candidates sharing compiler options after serial TIR elaboration."""
+    """Elaborate serially, then batch only kernels with identical options."""
     import tilelang
 
-    pending, programs = [], []
+    batches = {}
     for key in dict.fromkeys(keys):
         if key in cache:
             continue
         try:
             program, options = spec(*key)
         except RuntimeError:
-            # The owner records individual errors through its normal launcher.
             continue
-        pending.append(key)
-        programs.append(program)
-    if programs:
-        kernels = tilelang.par_compile(
-            programs, **options, ignore_error=True
-        )
-        cache.update(
-            (key, kernel)
-            for key, kernel in zip(pending, kernels, strict=True)
-            if kernel is not None
-        )
+        batch = batches.setdefault(_encode(options), (options, [], []))
+        batch[1].append(key)
+        batch[2].append(program)
+    for options, pending, programs in batches.values():
+        kernels = tilelang.par_compile(programs, **options, ignore_error=True)
+        cache.update((key, kernel) for key, kernel in zip(pending, kernels, strict=True)
+                     if kernel is not None)
 
 
 def workload_bucket(size):
