@@ -68,8 +68,8 @@ def device_class(device):
 
 
 def _fixed_strategy_device(info):
-    # These SM counts were measured on RTX 4090 and RTX PRO 6000.
-    return info[1:] in ((8, 9, 128), (12, 0, 188))
+    # Fixed strategies are qualified on the RTX 4090 debug machine.
+    return info[1:] == (8, 9, 128)
 
 
 @cache

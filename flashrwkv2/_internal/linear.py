@@ -194,7 +194,7 @@ def _fixed_decode_config(x, weight, output_dtype, bias):
     ):
         if outputs < 4096:
             return (16, 32, 2, 256)
-        return (16, 64, 2, 128) if info[1] == 8 else (16, 32, 2, 512)
+        return (16, 64, 2, 128)
     return None
 
 

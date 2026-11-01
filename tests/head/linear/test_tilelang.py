@@ -694,8 +694,7 @@ def test_fixed_decode_linear_limits_models_devices_and_layouts(monkeypatch, chan
     assert fixed(torch.empty(2, channels, device="meta"), key, torch.bfloat16, None) is None
     assert fixed(value_x, value.contiguous(), torch.bfloat16, None) is None
     info = ("test", 12, 0, 188)
-    if channels == 4096:
-        assert fixed(value_x, value, torch.bfloat16, None) == (16, 32, 2, 512)
+    assert fixed(value_x, value, torch.bfloat16, None) is None
     info = ("other", 8, 9, 114)
     assert fixed(x, key, torch.bfloat16, None) is None
 

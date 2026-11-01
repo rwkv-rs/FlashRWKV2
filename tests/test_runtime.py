@@ -108,7 +108,7 @@ def test_fixed_strategy_is_qualified_by_architecture_and_sm_count():
     from flashrwkv2._internal.tuning import _fixed_strategy_device
 
     assert _fixed_strategy_device(("4090", 8, 9, 128))
-    assert _fixed_strategy_device(("PRO 6000", 12, 0, 188))
+    assert not _fixed_strategy_device(("PRO 6000", 12, 0, 188))
     assert not _fixed_strategy_device(("4090 D", 8, 9, 114))
     assert not _fixed_strategy_device(("other", 12, 0, 170))
 

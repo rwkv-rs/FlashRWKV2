@@ -113,7 +113,7 @@ def test_fixed_decode_projection_preserves_accumulators_and_graph(
     from flashrwkv2.tmix.wkv_prepare import tilelang as implementation
 
     if not tuning._fixed_strategy_device(tuning.device_class(torch.device("cuda"))):
-        pytest.skip("fixed grouped strategy is qualified on SM89 and SM120")
+        pytest.skip("fixed grouped strategy is qualified on RTX 4090")
     torch.manual_seed(716)
     channels, ranks = 2048, (96, 96, 256, 64)[:count]
     xs = tuple(torch.randn(1, channels, device="cuda", dtype=torch.bfloat16) * .03 for _ in ranks)
@@ -162,7 +162,7 @@ def test_fixed_grouped_operator_benchmark_uses_its_candidate(monkeypatch):
     from flashrwkv2.tmix.wkv_prepare import tilelang as implementation
 
     if not tuning._fixed_strategy_device(tuning.device_class(torch.device("cuda"))):
-        pytest.skip("fixed grouped strategy is qualified on SM89 and SM120")
+        pytest.skip("fixed grouped strategy is qualified on RTX 4090")
     channels, ranks = 2048, (96, 96, 256)
     xs = tuple(torch.randn(1, channels, device="cuda", dtype=torch.bfloat16) for _ in ranks)
     weights = tuple(torch.randn(rank, channels, device="cuda", dtype=torch.bfloat16) for rank in ranks)
@@ -182,7 +182,7 @@ def test_fixed_grouped_operator_benchmark_uses_its_candidate(monkeypatch):
         return select_config(*args, **kwargs)
 
     monkeypatch.setattr(implementation, "_GROUP_CONFIGS", {})
-    monkeypatch.setattr(tuning, "projection_configs", lambda *args: [candidate] if not args[-1] else [])
+    monkeypatch.setattr(tuning, "projection_configs", lambda *args: [candidate] if not list(args[-1]) else [])
     monkeypatch.setattr(tuning, "projection_finalists", lambda *args: [candidate])
     monkeypatch.setattr(tuning, "select_config", select_short)
     monkeypatch.setattr(tuning, "save_config", lambda *args: None)
@@ -199,7 +199,7 @@ def test_fixed_decode_projection_preserves_training_gradients(monkeypatch):
     from flashrwkv2.tmix.wkv_prepare import tilelang as implementation
 
     if not tuning._fixed_strategy_device(tuning.device_class(torch.device("cuda"))):
-        pytest.skip("fixed grouped strategy is qualified on SM89 and SM120")
+        pytest.skip("fixed grouped strategy is qualified on RTX 4090")
     torch.manual_seed(717)
     channels, ranks = 2048, (96, 96, 256)
     xs = tuple(
