@@ -731,3 +731,59 @@ def test_block_independent_torch_vjp_and_optimizer_step(mode):
         assert any(
             not torch.equal(before[parameter_names.index(name)], params[name]) for name in names
         ), f"{names}: optimizer did not update this block stage"
+
+
+@pytest.mark.cuda_graph
+@pytest.mark.parametrize("later_layer", (False, True))
+def test_real_decode_block_needs_no_tuning_profile(monkeypatch, tmp_path, later_layer):
+    from flashrwkv2._internal import tuning
+
+    if not tuning._fixed_strategy_device(tuning.device_class(torch.device("cuda"))):
+        pytest.skip("fixed decode strategy is qualified on tested devices")
+    torch.manual_seed(723)
+    channels, head_size = 2048, 64
+    ranks = (96, 96, 256, 64)
+    params = parameters(channels, rank=ranks[0], vocab=65536)
+    for name, rank in zip(("w", "a", "g", "v"), ranks, strict=True):
+        params[name + "1"] = (torch.randn(channels, rank, device="cuda") * .02).bfloat16()
+        params[name + "2"] = (torch.randn(rank, channels, device="cuda") * .02).bfloat16()
+    params["cmix_v"] = params["cmix_v"].t().contiguous().t()
+    x = torch.randn(1, channels, device="cuda", dtype=torch.bfloat16) * .1
+    res = torch.randn_like(x) * .1
+    initial = torch.randn(1, channels // head_size, head_size, head_size, device="cuda") * .01
+    shifts = [torch.randn_like(x) * .1 for _ in range(2)]
+    slots = torch.zeros(1, device="cuda", dtype=torch.int32)
+    cu = torch.tensor((0, 1), device="cuda", dtype=torch.int32)
+    targets = torch.tensor((42,), device="cuda", dtype=torch.int64)
+    v_first = torch.randn_like(x) * .1 if later_layer else None
+    state, pools = state_pools(initial, shifts, slots, 1)
+    monkeypatch.setattr(tuning, "_profile_root", lambda: tmp_path)
+    monkeypatch.setattr(tuning, "_read_profile", lambda *args: pytest.fail("read a profile"))
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        ticket = fr.prepare_tmix_wkv7_recurrent_metadata(
+            cu, slots, total_tokens=1, state_pool_size=1, max_seqlen=1,
+        )
+
+        def call():
+            state._components()[0].copy_(initial)
+            for pool, shift in zip(pools, shifts, strict=True):
+                pool.copy_(shift)
+            return infer_block(x, res, params, state, pools, cu, slots, targets, head_size, v_first, ticket=ticket)
+
+        for mode in ("inspect", "require", "tune"):
+            report = tuning.prepare_tuning([call], mode=mode)
+            assert report["complete"] and report["counts"]["fixed"] == 12
+            assert not any(report["counts"][status] for status in ("hit", "missing", "tuned", "revalidated"))
+        expected = tuple(t.clone() for t in (*call(), state._components()[0], *pools))
+        stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            actual = call()
+        graph.replay()
+        stream.synchronize()
+        for value, reference in zip((*actual, state._components()[0], *pools), expected, strict=True):
+            assert torch.equal(value, reference)
+    assert not tuple(tmp_path.iterdir())

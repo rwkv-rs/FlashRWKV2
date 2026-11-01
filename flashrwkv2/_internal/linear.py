@@ -182,6 +182,8 @@ def _fixed_decode_config(x, weight, output_dtype, bias):
     if x.shape[0] != 1 or bias is not None or not _fixed_strategy_device(info):
         return None
     if weight.stride() == (channels, 1) and channels in (2048, 2560, 4096):
+        if output_dtype == torch.bfloat16 and outputs == channels:
+            return (16, 32, 2, 256)
         if (output_dtype == torch.bfloat16 and outputs == 4 * channels) or (
             output_dtype == torch.float32 and outputs == 65536
         ):

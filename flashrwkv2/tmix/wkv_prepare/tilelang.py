@@ -396,27 +396,43 @@ def _group_key(xs, weights, kinds, biases):
 
 
 def _fixed_decode_config(xs, weights, kinds, biases):
-    channels = xs[0].shape[1]
+    if xs[0].shape[0] != 1 or not _fixed_strategy_device(device_class(xs[0].device)):
+        return None
     profiles = (
         (2048, (96, 96, 256, 64)),
         (2560, (96, 96, 320, 64)),
         (4096, (128, 128, 480, 96)),
         (4096, (192, 192, 384, 128)),
     )
-    if (
-        xs[0].shape[0] != 1
-        or kinds not in ((1, 0, 2), (1, 0, 2, 0))
-        or any(bias is not None for bias in biases)
-        or any(x.shape[1] != channels for x in xs)
-        or not _fixed_strategy_device(device_class(xs[0].device))
-    ):
-        return None
-    ranks = tuple(weight.shape[0] for weight in weights)
-    if not any(channels == width and ranks == profile[:len(ranks)] for width, profile in profiles):
-        return None
-    output_major = all(weight.stride() == (channels, 1) for weight in weights)
-    input_major = all(weight.stride() == (1, weight.shape[0]) for weight in weights)
-    return (16, 16, 2, 512) if output_major or input_major else None
+    if kinds in ((1, 0, 2), (1, 0, 2, 0)) and all(bias is None for bias in biases):
+        channels = xs[0].shape[1]
+        ranks = tuple(weight.shape[0] for weight in weights)
+        if not any(channels == width and ranks == profile[:len(ranks)] for width, profile in profiles):
+            return None
+        if any(x.shape[1] != channels for x in xs) or any(weight.shape[1] != channels for weight in weights):
+            return None
+        output_major = all(weight.stride() == (channels, 1) for weight in weights)
+        input_major = all(weight.stride() == (1, weight.shape[0]) for weight in weights)
+        return (16, 16, 2, 512) if output_major or input_major else None
+    if kinds in ((0, 2, 0), (0, 2, 0, 0)) and tuple(
+        bias is not None for bias in biases
+    ) == (False, True, False) + (False,) * (len(kinds) - 3):
+        channels = weights[0].shape[0]
+        ranks = tuple(x.shape[1] for x in xs)
+        if not any(channels == width and ranks == profile[:len(ranks)] for width, profile in profiles):
+            return None
+        if all(weight.shape == (channels, rank) and weight.stride() == (1, channels)
+               for weight, rank in zip(weights, ranks, strict=True)):
+            return (16, 32, 2, 64)
+    if kinds == (0, 0, 0) and all(bias is None for bias in biases):
+        channels = xs[0].shape[1]
+        if channels in (2048, 2560, 4096) and all(
+            x.shape[1] == channels and weight.shape == (channels, channels)
+            and weight.stride() == (channels, 1)
+            for x, weight in zip(xs, weights, strict=True)
+        ):
+            return (16, 32, 2, 256) if channels < 4096 else (16, 64, 2, 128)
+    return None
 
 
 def _group_spec(

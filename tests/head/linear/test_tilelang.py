@@ -674,11 +674,13 @@ def test_fixed_decode_linear_limits_models_devices_and_layouts(monkeypatch, chan
     monkeypatch.setattr(implementation, "device_class", lambda device: info)
     x = torch.empty(1, channels, device="meta")
     key = torch.empty(4 * channels, channels, device="meta")
+    output = torch.empty(channels, channels, device="meta")
     head = torch.empty(65536, channels, device="meta")
     value = torch.empty(4 * channels, channels, device="meta").t()
     value_x = torch.empty(1, 4 * channels, device="meta")
     fixed = implementation._fixed_decode_config
     assert fixed(x, key, torch.bfloat16, None) == (16, 64, 2, 128)
+    assert fixed(x, output, torch.bfloat16, None) == (16, 32, 2, 256)
     assert fixed(x, head, torch.float32, None) == (16, 64, 2, 128)
     assert fixed(value_x, value, torch.bfloat16, None) == (
         (16, 32, 2, 256) if channels < 4096 else (16, 64, 2, 128)
@@ -697,7 +699,7 @@ def test_fixed_decode_linear_limits_models_devices_and_layouts(monkeypatch, chan
 @cuda
 @pytest.mark.cuda
 @pytest.mark.cuda_graph
-@pytest.mark.parametrize("kind", ("cmix_key", "cmix_value", "head"))
+@pytest.mark.parametrize("kind", ("cmix_key", "cmix_value", "attention_output", "head"))
 def test_fixed_decode_linear_preserves_fp32_and_graph(monkeypatch, tmp_path, kind):
     from flashrwkv2._internal import linear as implementation
     from flashrwkv2._internal import tuning

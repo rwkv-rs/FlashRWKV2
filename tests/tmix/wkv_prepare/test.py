@@ -92,6 +92,13 @@ def test_fixed_decode_projection_restricts_models_and_layouts(monkeypatch):
     assert fixed(xs, mixed_layout, kinds, biases) is None
     unknown_ranks = (weights[0], weights[1], torch.empty(128, 2048, device="meta"))
     assert fixed(xs, unknown_ranks, kinds, biases) is None
+    output_xs = tuple(torch.empty(1, rank, device="meta") for rank in ranks)
+    output_weights = tuple(torch.empty(rank, 2048, device="meta").t() for rank in ranks)
+    output_biases = (None, torch.empty(2048, device="meta"), None)
+    assert fixed(output_xs, output_weights, (0, 2, 0), output_biases) == (16, 32, 2, 64)
+    assert fixed(output_xs, output_weights, (0, 2, 0), biases) is None
+    dense_weights = tuple(torch.empty(2048, 2048, device="meta") for _ in ranks)
+    assert fixed(xs, dense_weights, (0, 0, 0), biases) == (16, 32, 2, 256)
 
 
 @cuda
@@ -669,3 +676,70 @@ def test_fullgraph_grouped_projection_preserves_unused_gradients():
         assert (value.grad is None) == (reference is None)
         if reference is not None:
             assert torch.equal(value.grad, reference)
+
+
+@cuda
+@pytest.mark.cuda
+@pytest.mark.cuda_graph
+@pytest.mark.parametrize("stage", ("dense", "lowrank_output"))
+def test_fixed_decode_remaining_groups_preserve_accumulators_and_vjp(monkeypatch, tmp_path, stage):
+    from flashrwkv2._internal import tuning
+    from flashrwkv2.tmix.wkv_prepare import tilelang as implementation
+
+    if not tuning._fixed_strategy_device(tuning.device_class(torch.device("cuda"))):
+        pytest.skip("fixed grouped strategy is qualified on tested devices")
+    torch.manual_seed(722)
+    channels = 2048
+    if stage == "dense":
+        ranks, kinds, fixed = (channels,) * 3, (0, 0, 0), (16, 32, 2, 256)
+        xs = tuple(torch.randn(1, channels, device="cuda", dtype=torch.bfloat16).requires_grad_() for _ in ranks)
+        weights = tuple(torch.randn(channels, channels, device="cuda", dtype=torch.bfloat16).requires_grad_() for _ in ranks)
+        biases = (None,) * 3
+    else:
+        ranks, kinds, fixed = (96, 96, 256, 64), (0, 2, 0, 0), (16, 32, 2, 64)
+        xs = tuple(torch.randn(1, rank, device="cuda", dtype=torch.bfloat16).requires_grad_() for rank in ranks)
+        weights = tuple(torch.randn(rank, channels, device="cuda", dtype=torch.bfloat16).t().detach().requires_grad_() for rank in ranks)
+        biases = (None, torch.randn(channels, device="cuda", dtype=torch.bfloat16).requires_grad_(), None, None)
+
+    with torch.no_grad():
+        reference, raw = implementation._run_groups(xs, weights, kinds, biases, raw_mode=2, config=(16, 64, 2, 32))
+        candidate, candidate_raw = implementation._run_groups(xs, weights, kinds, biases, raw_mode=2, config=fixed)
+        assert all(torch.equal(a.view(torch.int16), b.view(torch.int16)) for a, b in zip(candidate, reference))
+        assert torch.equal(candidate_raw.view(torch.int32), raw.view(torch.int32))
+
+    variables = (*xs, *weights, *(bias for bias in biases if bias is not None))
+    upstream = tuple(torch.randn_like(value) for value in reference)
+    key = implementation._group_key(xs, weights, kinds, biases)
+    token = tuning._TUNING.set(True)
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(implementation, "_fixed_decode_config", lambda *args: None)
+            patch.setattr(implementation, "_GROUP_CONFIGS", {key: (16, 64, 2, 32)})
+            expected = implementation._grouped_linear(xs, weights, kinds, biases)
+            expected_grads = torch.autograd.grad(expected, variables, upstream)
+        actual = implementation._grouped_linear(xs, weights, kinds, biases)
+        actual_grads = torch.autograd.grad(actual, variables, upstream)
+    finally:
+        tuning._TUNING.reset(token)
+    assert all(torch.equal(a.view(torch.int16), b.view(torch.int16)) for a, b in zip(actual, expected))
+    assert all(torch.equal(a.view(torch.int16), b.view(torch.int16)) for a, b in zip(actual_grads, expected_grads))
+
+    monkeypatch.setattr(tuning, "_profile_root", lambda: tmp_path)
+    monkeypatch.setattr(tuning, "_read_profile", lambda *args: pytest.fail("read a profile"))
+    monkeypatch.setattr(implementation, "_tune_grouped_linear", lambda *args: pytest.fail("tuned a fixed configuration"))
+    monkeypatch.setattr(implementation, "_GROUP_CONFIGS", {})
+
+    def call():
+        with torch.no_grad():
+            return implementation._grouped_linear(xs, weights, kinds, biases)
+
+    for mode in ("inspect", "require", "tune"):
+        report = tuning.prepare_tuning([call], mode=mode)
+        assert report["complete"] and report["counts"]["fixed"] == 1
+        assert report["records"][0]["config"] == fixed
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = call()
+    graph.replay()
+    assert all(torch.equal(a.view(torch.int16), b.view(torch.int16)) for a, b in zip(captured, reference))
+    assert not tuple(tmp_path.iterdir())
