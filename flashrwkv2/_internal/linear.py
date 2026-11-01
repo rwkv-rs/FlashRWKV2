@@ -185,7 +185,7 @@ def _fixed_projection_config(x, weight, output_dtype, bias):
     if (rows == 4096 and channels in (256, 1024) and outputs == 4096
             and output_dtype == torch.bfloat16 and weight.stride() == (1, outputs)):
         return (128, 64, 2, 64) if channels == 256 else (128, 128, 2, 64)
-    if rows != 1:
+    if rows != 1 and not (rows <= 16 and (channels == 4096 or (channels, outputs) == (16384, 4096))):
         if 192 < rows <= 256:
             square = (64, 128, 2, 64)
         elif 960 < rows <= 1024:
@@ -205,7 +205,7 @@ def _fixed_projection_config(x, weight, output_dtype, bias):
         return None
     if weight.stride() == (channels, 1) and channels in (2048, 2560, 4096):
         if output_dtype == torch.bfloat16 and outputs == channels:
-            return (16, 32, 2, 256)
+            return (16, 32, 2, 512 if channels == 4096 else 256)
         if (output_dtype == torch.bfloat16 and outputs == 4 * channels) or (
             output_dtype == torch.float32 and outputs == 65536
         ):
