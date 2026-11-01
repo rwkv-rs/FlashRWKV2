@@ -752,6 +752,25 @@ def test_fixed_square_weight_vjp_limits_reduction_and_dtype(monkeypatch, batch, 
     assert implementation._fixed_projection_config(x, weight, torch.float32, None) == expected
 
 
+@pytest.mark.parametrize("width", (2048, 2560))
+@pytest.mark.parametrize("rows,expected", (
+    (17, (32, 64, 2, 128)), (32, (32, 64, 2, 128)),
+    (33, (64, 64, 2, 128)), (64, (64, 64, 2, 128)),
+    (65, (128, 64, 2, 128)), (128, (128, 64, 2, 128)),
+    (129, (256, 64, 2, 64)), (512, (256, 64, 2, 64)),
+    (513, None), (961, None),
+))
+def test_fixed_small_head_row_wave_boundaries(monkeypatch, width, rows, expected):
+    from flashrwkv2._internal import linear as implementation
+
+    monkeypatch.setattr(implementation, "device_class", lambda device: ("test", 8, 9, 128))
+    x = torch.empty(rows, width, device="meta")
+    weight = torch.empty(65536, width, device="meta")
+    assert implementation._fixed_projection_config(x, weight, torch.float32, None) == expected
+    assert implementation._fixed_projection_config(x, weight.t().contiguous().t(), torch.float32, None) is None
+    assert implementation._fixed_projection_config(x, weight, torch.bfloat16, None) is None
+
+
 @cuda
 @pytest.mark.cuda
 @pytest.mark.cuda_graph
@@ -764,7 +783,9 @@ def test_fixed_square_weight_vjp_limits_reduction_and_dtype(monkeypatch, batch, 
         (4096, 256), (4096, 320), (4096, 512), (4096, 1024),
     )
 ) + tuple(("attention_input_vjp", 4096, rows) for rows in (64, 128, 256, 320, 512, 1024))
-  + tuple((kind, 4096, rows) for kind in ("cmix_key", "head") for rows in (33, 65)))
+  + tuple((kind, 4096, rows) for kind in ("cmix_key", "head") for rows in (33, 65))
+  + tuple(("head", width, rows) for width in (2048, 2560)
+          for rows in (17, 32, 33, 64, 65, 128, 129, 256, 320, 512)))
 def test_fixed_decode_linear_preserves_fp32_and_graph(monkeypatch, tmp_path, kind, width, rows):
     from flashrwkv2._internal import linear as implementation
     from flashrwkv2._internal import tuning
@@ -888,3 +909,32 @@ def test_fixed_decode_linear_preserves_training_gradients(monkeypatch, width, ro
         tuning._TUNING.reset(token)
     assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
     assert all(torch.equal(a.view(torch.int16), b.view(torch.int16)) for a, b in zip(actual_grads, expected_grads))
+
+
+@cuda
+@pytest.mark.cuda
+@pytest.mark.parametrize("width,rows", ((2048, 64), (2560, 128)))
+def test_fixed_small_head_preserves_training_gradients(monkeypatch, width, rows):
+    from flashrwkv2._internal import linear as implementation
+    from flashrwkv2._internal import tuning
+
+    if not tuning._fixed_strategy_device(tuning.device_class(torch.device("cuda"))):
+        pytest.skip("fixed linear strategy is qualified on RTX 4090")
+    torch.manual_seed(867)
+    x = (torch.randn(rows, width, device="cuda", dtype=torch.bfloat16) * .03).requires_grad_()
+    weight = (torch.randn(65536, width, device="cuda", dtype=torch.bfloat16) * .03).requires_grad_()
+    upstream = torch.randn(rows, 65536, device="cuda", dtype=torch.float32)
+    key = implementation._key(x, weight, torch.float32)
+    token = tuning._TUNING.set(True)
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(implementation, "_fixed_projection_config", lambda *args: None)
+            patch.setattr(implementation, "_TUNED_CONFIGS", {key: (16, 64, 2, 32)})
+            expected = linear(x, weight, output_dtype=torch.float32)
+            expected_grads = torch.autograd.grad(expected, (x, weight), upstream)
+        actual = linear(x, weight, output_dtype=torch.float32)
+        actual_grads = torch.autograd.grad(actual, (x, weight), upstream)
+    finally:
+        tuning._TUNING.reset(token)
+    assert torch.equal(actual, expected)
+    assert all(torch.equal(a, b) for a, b in zip(actual_grads, expected_grads, strict=True))

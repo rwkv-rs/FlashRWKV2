@@ -190,9 +190,10 @@ def _fixed_projection_config(x, weight, output_dtype, bias):
             return None
         input_major = weight.stride() == (1, outputs)
         output_major = weight.stride() == (channels, 1)
-        if channels == 4096 and output_major and (
-            (output_dtype == torch.bfloat16 and outputs == 4 * channels)
-            or (output_dtype == torch.float32 and outputs == 65536)
+        if output_major and (
+            (channels == 4096 and output_dtype == torch.bfloat16 and outputs == 4 * channels)
+            or (channels in (2048, 2560, 4096) and output_dtype == torch.float32
+                and outputs == 65536 and (channels == 4096 or rows <= 512))
         ):
             if rows <= 32:
                 return (32, 64, 2, 128)
