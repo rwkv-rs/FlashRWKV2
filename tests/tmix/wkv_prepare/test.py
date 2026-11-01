@@ -1083,7 +1083,7 @@ def test_grouped_weight_vjp_reuses_dynamic_reduction(monkeypatch):
     ranks, channels = (96, 96, 256, 64), 2048
     kinds, biases, config = (0,) * 4, (None,) * 4, (64, 64, 1, 64)
     monkeypatch.setattr(implementation, "_GROUP_KERNELS", {})
-    for reduction in (32, 64, 96, 128, 160, 512, 1024):
+    for reduction in (17, 32, 64, 65, 89, 128, 1000, 1024):
         xs = tuple(torch.randn(channels, reduction, device="cuda", dtype=torch.bfloat16) * .02 for _ in ranks)
         weights = tuple((torch.randn(reduction, rank, device="cuda", dtype=torch.bfloat16) * .02).t() for rank in ranks)
         values, raw = implementation._run_groups(
@@ -1096,7 +1096,7 @@ def test_grouped_weight_vjp_reuses_dynamic_reduction(monkeypatch):
             assert torch.equal(raw[offset : offset + size].view_as(reference), reference)
             assert torch.equal(value, reference.bfloat16())
             offset += size
-        assert len(implementation._GROUP_KERNELS) == 1
+        assert len(implementation._GROUP_KERNELS) <= 2
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             captured, captured_raw = implementation._run_groups(

@@ -438,8 +438,6 @@ def test_compile_boundary_accepts_homogeneous_sm89() -> None:
 
 
 def _mock_runtime_build(monkeypatch, tmp_path, *, fail_once: bool = False):
-    import torch
-
     from flashrwkv2 import compile as compiler
     from flashrwkv2._internal import tuning
 
@@ -790,3 +788,17 @@ def test_candidate_batches_preserve_distinct_compiler_options(monkeypatch):
                        lambda k: (k, {"pass_configs": {"tl.enable_async_copy": bool(k)}}))
     assert len(calls) == 2 and len(cache) == 2
     assert {call[1]["pass_configs"]["tl.enable_async_copy"] for call in calls} == {False, True}
+
+
+def test_jit_preparation_includes_observed_configuration(tuning_cache):
+    calls = []
+    def compiler(*args):
+        calls.append(args)
+        return object()
+    compiler.func = SimpleNamespace(__name__="test_kernel")
+    def run():
+        tuning_cache.get_config({}, "linear", ("family",), 1, fixed=True)
+        tuning_cache.prepared_kernel("test", compiler, (128, 1), ((128, 4), (128, 8)))
+    report = tuning_cache.prepare_tuning([run])
+    assert report["compilation"]["required_variants"] == 3
+    assert calls[:3] == [(128, 1), (128, 4), (128, 8)]

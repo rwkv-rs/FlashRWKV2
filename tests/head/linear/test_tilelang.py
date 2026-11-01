@@ -903,3 +903,51 @@ def test_dynamic_weight_reduction_preserves_accumulators_and_graph(monkeypatch):
         assert torch.equal(captured, reference)
     keys = [key for key in implementation._COMPILED_KERNELS if len(key) == 11 and key[-2] is True]
     assert len(keys) == 4
+
+
+@cuda
+@pytest.mark.cuda
+@pytest.mark.cuda_graph
+@pytest.mark.parametrize("dynamic_k", (False, True))
+def test_prepared_projection_rejects_any_late_compilation(monkeypatch, dynamic_k):
+    import random
+    import tilelang
+    from flashrwkv2._internal import linear as implementation
+    from flashrwkv2._internal import tuning
+
+    if not tuning._fixed_strategy_device(tuning.device_class(torch.device("cuda"))):
+        pytest.skip("deterministic strategy is qualified on tested devices")
+    monkeypatch.setattr(implementation, "_COMPILED_KERNELS", {})
+    torch.manual_seed(802)
+    def inputs(size):
+        if dynamic_k:
+            return (torch.randn(96, size, device="cuda").bfloat16(),
+                    torch.randn(size, 128, device="cuda").bfloat16().t())
+        return (torch.randn(size, 256, device="cuda").bfloat16(),
+                torch.randn(128, 256, device="cuda").bfloat16())
+    def call(x, w):
+        return implementation._forward(x, w, None, torch.bfloat16, dynamic_k=dynamic_k)
+    x, w = inputs(32 if dynamic_k else 1)
+    report = tuning.prepare_tuning([lambda: call(x, w)])
+    assert report["complete"] and report["compilation"]["complete"]
+    assert report["compilation"]["families"] == 1
+    def forbidden(*args, **kwargs):
+        pytest.fail("prepared projection reached code generation, compilation, or profiles")
+    monkeypatch.setattr(implementation, "_compile_spec", forbidden)
+    monkeypatch.setattr(tilelang, "compile", forbidden)
+    monkeypatch.setattr(tilelang, "par_compile", forbidden)
+    monkeypatch.setattr(tuning, "_read_profile", forbidden)
+    sizes = (1, 17, 31, 32, 33, 64, 65, 89, 90, 100, 128, 257, 512, 1000, 4096)
+    sizes += tuple(random.Random(803).sample(range(1, 4097), 20))
+    for size in sizes:
+        x, w = inputs(size)
+        expected = call(x, w)
+        assert expected.shape == (x.shape[0], w.shape[0])
+        assert torch.equal(call(x, w), expected)
+    x, w = inputs(89)
+    expected = call(x, w)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = call(x, w)
+    graph.replay()
+    assert torch.equal(captured, expected)

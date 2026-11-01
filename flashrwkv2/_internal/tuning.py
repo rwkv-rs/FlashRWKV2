@@ -362,8 +362,11 @@ def prepare_variants(owner, family, variants, cache, spec):
         if key not in cache:
             import tilelang
 
-            program, options = spec(*key)
-            cache[key] = tilelang.compile(program, **options)
+            try:
+                program, options = spec(*key)
+                cache[key] = tilelang.compile(program, **options)
+            except Exception as error:
+                raise RuntimeError(f"failed to prepare {owner} variant {key}: {error}") from error
     session["compilation"][(owner, family)] = keys
 
 
@@ -371,11 +374,14 @@ def prepared_kernel(owner, compiler, args, variants=()):
     """Compile bounded JIT alternatives only during explicit preparation."""
     session = _SESSION
     if session is not None and not _TUNING.get():
-        keys = tuple(variants) or (args,)
+        keys = tuple(sorted(set((args, *variants))))
         family = owner, compiler.func.__name__, keys
         if family not in session["compilation"]:
             for key in keys:
-                compiler(*key)
+                try:
+                    compiler(*key)
+                except Exception as error:
+                    raise RuntimeError(f"failed to prepare {owner} variant {key}: {error}") from error
             session["compilation"][family] = keys
     return compiler(*args)
 
