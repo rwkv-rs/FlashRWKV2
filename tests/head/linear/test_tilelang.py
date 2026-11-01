@@ -687,6 +687,8 @@ def test_fixed_decode_linear_limits_models_devices_and_layouts(monkeypatch, chan
     assert fixed(x, key, torch.bfloat16, None) == key_config
     assert fixed(x, output, torch.bfloat16, None) == (16, 32, 2, 512 if channels == 4096 else 256)
     assert fixed(x, head, torch.float32, None) == (16, 64, 2, 128)
+    assert fixed(x, head, torch.bfloat16, None) is None
+    assert fixed(x, head.t().contiguous().t(), torch.float32, None) is None
     assert fixed(value_x, value, torch.bfloat16, None) == (
         (16, 32, 2, 256) if channels < 4096 else (16, 64, 2, 128)
     )
@@ -704,40 +706,6 @@ def test_fixed_decode_linear_limits_models_devices_and_layouts(monkeypatch, chan
     assert fixed(x, key, torch.bfloat16, None) is None
 
 
-@pytest.mark.parametrize("kind", ("cmix_key", "cmix_value", "attention_output", "head"))
-@pytest.mark.parametrize("rows", (32, 33, 64, 65, 128, 129, 192, 193, 256, 257, 320, 321, 512, 513, 960, 961, 1024, 1025))
-def test_fixed_4096_linear_row_wave_boundaries(monkeypatch, kind, rows):
-    from flashrwkv2._internal import linear as implementation
-
-    monkeypatch.setattr(implementation, "device_class", lambda device: ("test", 8, 9, 128))
-    width = 4096
-    channels = 4 * width if kind == "cmix_value" else width
-    outputs = 65536 if kind == "head" else (4 * width if kind == "cmix_key" else width)
-    x = torch.empty(rows, channels, device="meta")
-    weight = torch.empty(channels, outputs, device="meta").t() if kind == "cmix_value" else torch.empty(outputs, channels, device="meta")
-    dtype = torch.float32 if kind == "head" else torch.bfloat16
-    if rows <= 512 or 960 < rows <= 1024:
-        if kind in ("cmix_key", "head"):
-            expected = ((32, 64, 2, 128) if rows <= 32 else (64, 64, 2, 128) if rows <= 64
-                        else (128, 64, 2, 128) if rows <= 128 else (256, 64, 2, 64))
-        elif rows <= 32 or (kind == "cmix_value" and rows <= 64):
-            expected = (32, 64, 2, 64)
-        elif rows <= 128:
-            expected = (64, 64, 2, 64)
-        elif rows <= 256 or (kind == "attention_output" and rows <= 320):
-            expected = (64, 128, 2, 64)
-        else:
-            expected = (128, 128, 2, 64)
-    else:
-        expected = None
-    assert implementation._fixed_projection_config(x, weight, dtype, None) == expected
-    if kind == "attention_output":
-        transposed = torch.empty(channels, outputs, device="meta").t()
-        input_expected = (128, 128, 2, 64) if 256 < rows <= 320 else expected
-        assert implementation._fixed_projection_config(x, transposed, dtype, None) == input_expected
-    assert implementation._fixed_projection_config(x, weight, dtype, weight[0]) is None
-
-
 @pytest.mark.parametrize("batch,expected", (
     (64, (128, 64, 2, 64)), (128, (128, 64, 2, 64)), (256, (128, 64, 2, 64)),
     (320, (128, 128, 2, 64)), (512, (128, 128, 2, 64)), (1024, (128, 128, 2, 64)),
@@ -751,67 +719,6 @@ def test_fixed_square_weight_vjp_limits_reduction_and_dtype(monkeypatch, batch, 
     weight = torch.empty(batch, 4096, device="meta").t()
     assert implementation._fixed_projection_config(x, weight, torch.bfloat16, None) == expected
     assert implementation._fixed_projection_config(x, weight, torch.float32, None) == expected
-
-
-@pytest.mark.parametrize("width", (2048, 2560))
-@pytest.mark.parametrize("rows,expected", (
-    (17, (32, 64, 2, 128)), (32, (32, 64, 2, 128)),
-    (33, (64, 64, 2, 128)), (64, (64, 64, 2, 128)),
-    (65, (128, 64, 2, 128)), (128, (128, 64, 2, 128)),
-    (129, (256, 64, 2, 64)), (512, (256, 64, 2, 64)),
-    (513, None), (961, None),
-))
-def test_fixed_small_head_row_wave_boundaries(monkeypatch, width, rows, expected):
-    from flashrwkv2._internal import linear as implementation
-
-    monkeypatch.setattr(implementation, "device_class", lambda device: ("test", 8, 9, 128))
-    x = torch.empty(rows, width, device="meta")
-    weight = torch.empty(65536, width, device="meta")
-    assert implementation._fixed_projection_config(x, weight, torch.float32, None) == expected
-    assert implementation._fixed_projection_config(x, weight.t().contiguous().t(), torch.float32, None) is None
-    assert implementation._fixed_projection_config(x, weight, torch.bfloat16, None) is None
-
-
-@pytest.mark.parametrize("kind,width,rows,expected", (
-    ("cmix_key", 2048, 32, (32, 64, 2, 128)), ("cmix_key", 2048, 33, (64, 64, 2, 128)),
-    ("cmix_key", 2048, 64, (64, 64, 2, 128)), ("cmix_key", 2048, 65, (128, 64, 2, 128)),
-    ("cmix_key", 2048, 128, (128, 64, 2, 128)), ("cmix_key", 2048, 129, (64, 128, 2, 64)),
-    ("cmix_key", 2048, 192, (64, 128, 2, 64)), ("cmix_key", 2048, 193, (128, 128, 2, 64)),
-    ("cmix_key", 2560, 64, (64, 64, 2, 64)), ("cmix_key", 2560, 128, (64, 64, 2, 64)),
-    ("cmix_key", 2560, 129, (64, 128, 2, 64)), ("cmix_key", 2560, 193, (128, 64, 2, 128)),
-    ("cmix_key", 2560, 224, (128, 64, 2, 128)), ("cmix_key", 2560, 225, (128, 128, 2, 64)),
-    ("attention_output", 2048, 64, (32, 32, 2, 128)), ("attention_output", 2048, 65, (32, 64, 2, 64)),
-    ("attention_output", 2048, 96, (32, 64, 2, 64)), ("attention_output", 2048, 97, (64, 64, 2, 64)),
-    ("attention_output", 2048, 256, (64, 64, 2, 64)), ("attention_output", 2048, 257, (64, 128, 2, 64)),
-    ("attention_output", 2560, 32, (32, 32, 2, 128)), ("attention_output", 2560, 33, (32, 64, 2, 64)),
-    ("attention_output", 2560, 192, (64, 64, 2, 64)), ("attention_output", 2560, 193, (64, 128, 2, 64)),
-    ("cmix_value", 2560, 384, (64, 128, 2, 64)), ("cmix_value", 2560, 385, (128, 128, 2, 64)),
-    ("cmix_value", 2560, 512, (128, 128, 2, 64)),
-    ("cmix_key", 2048, 513, (128, 128, 2, 64)), ("cmix_key", 2048, 1024, (128, 128, 2, 64)),
-    ("cmix_key", 2048, 1025, None), ("cmix_key", 2560, 513, (64, 128, 2, 64)),
-    ("cmix_key", 2560, 576, (64, 128, 2, 64)), ("cmix_key", 2560, 577, (128, 128, 2, 64)),
-    ("cmix_key", 2560, 1024, (128, 128, 2, 64)), ("cmix_key", 2560, 1025, None),
-    ("attention_output", 2048, 513, (64, 128, 2, 64)), ("attention_output", 2048, 704, (64, 128, 2, 64)),
-    ("attention_output", 2048, 705, (128, 128, 2, 64)), ("attention_output", 2048, 1024, (128, 128, 2, 64)),
-    ("attention_output", 2048, 1025, None), ("attention_output", 2560, 513, (64, 128, 2, 64)),
-    ("attention_output", 2560, 576, (64, 128, 2, 64)), ("attention_output", 2560, 577, (128, 128, 2, 64)),
-    ("attention_output", 2560, 768, (128, 128, 2, 64)), ("attention_output", 2560, 769, (128, 64, 2, 32)),
-    ("attention_output", 2560, 1024, (128, 64, 2, 32)), ("attention_output", 2560, 1025, None),
-    ("cmix_value", 2048, 513, (128, 128, 2, 64)), ("cmix_value", 2048, 1024, (128, 128, 2, 64)),
-    ("cmix_value", 2048, 1025, None), ("cmix_value", 2560, 513, (128, 128, 2, 64)),
-    ("cmix_value", 2560, 768, (128, 128, 2, 64)), ("cmix_value", 2560, 769, (128, 64, 2, 32)),
-    ("cmix_value", 2560, 1024, (128, 64, 2, 32)), ("cmix_value", 2560, 1025, None),
-))
-def test_fixed_small_dense_row_wave_boundaries(monkeypatch, kind, width, rows, expected):
-    from flashrwkv2._internal import linear as implementation
-
-    monkeypatch.setattr(implementation, "device_class", lambda device: ("test", 8, 9, 128))
-    channels = 4 * width if kind == "cmix_value" else width
-    outputs = 4 * width if kind == "cmix_key" else width
-    x = torch.empty(rows, channels, device="meta")
-    weight = torch.empty(channels, outputs, device="meta").t() if kind == "cmix_value" else torch.empty(outputs, channels, device="meta")
-    assert implementation._fixed_projection_config(x, weight, torch.bfloat16, None) == expected
-    assert implementation._fixed_projection_config(x, weight, torch.float32, None) is None
 
 
 @cuda

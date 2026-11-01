@@ -176,12 +176,16 @@ def _aligned(tensor):
     return tensor if tensor.data_ptr() % 16 == 0 else tensor.clone()
 
 
+def _one_wave(rows, outputs, block_m, block_n, num_sms):
+    return ((rows + block_m - 1) // block_m) * ((outputs + block_n - 1) // block_n) <= num_sms
+
+
 def _fixed_projection_config(x, weight, output_dtype, bias):
     info = device_class(x.device)
     channels, outputs = x.shape[1], weight.shape[0]
     if bias is not None or not _fixed_strategy_device(info):
         return None
-    rows = x.shape[0]
+    num_sms, rows = info[-1], x.shape[0]
     if (rows == 4096 and channels in (64, 128, 256, 320, 512, 1024) and outputs == 4096
             and output_dtype in (torch.bfloat16, torch.float32) and weight.stride() == (1, outputs)):
         return (128, 64, 2, 64) if channels <= 256 else (128, 128, 2, 64)
@@ -196,8 +200,7 @@ def _fixed_projection_config(x, weight, output_dtype, bias):
             (channels == outputs and output_major)
             or (channels == 4 * outputs and input_major)
         ):
-            # At width 2560, 128-row tiles fill one 128-SM wave through row 768.
-            if outputs == 2560 and rows > 768:
+            if not _one_wave(rows, outputs, 128, 128, num_sms):
                 return (128, 64, 2, 32)
             if channels == outputs and rows <= (704 if outputs == 2048 else 576):
                 return (64, 128, 2, 64)
@@ -229,20 +232,18 @@ def _fixed_projection_config(x, weight, output_dtype, bias):
                     return (128, 64, 2, 128) if channels == 2048 else (64, 64, 2, 64)
                 if rows <= 192:
                     return (64, 128, 2, 64)
-                if channels == 2560 and rows <= 224:
-                    return (128, 64, 2, 128)
                 return (128, 128, 2, 64)
             if outputs in (2048, 2560) and (
                 (channels == outputs and output_major)
                 or (channels == 4 * outputs and input_major)
             ):
-                if rows <= 32 or (outputs == 2048 and rows <= 64):
+                if _one_wave(rows, outputs, 32, 32, num_sms):
                     return (32, 32, 2, 128)
                 if rows <= 96:
                     return (32, 64, 2, 64)
-                if rows <= (256 if outputs == 2048 else 192):
+                if _one_wave(rows, outputs, 64, 64, num_sms):
                     return (64, 64, 2, 64)
-                if outputs == 2560 and channels == 4 * outputs and rows > 384:
+                if channels == 4 * outputs and not _one_wave(rows, outputs, 64, 128, num_sms):
                     return (128, 128, 2, 64)
                 return (64, 128, 2, 64)
         if output_dtype == torch.bfloat16 and outputs == 4096 and (

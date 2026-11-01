@@ -799,6 +799,15 @@ logprobs、FP32 state 和两个 shift pool 摘要一致。100 ms 遥测记录测
 状态摘要一致；100 ms 遥测记录测试卡温度 41–57°C，其他三张 GPU 的采样
 利用率均为 0%。该比例针对这两个实测负载及旧版候选集。
 
+在 `6e6dba4` 上将 dense 投影的若干行数阈值统一为网格 CTA 数是否超过设备
+SM 数，并删除 2560 宽 CMix key 在 193–224 行的单独配置。用同一调试机的
+2.9B 合成后续层和 65536 Head 比较修改前后：每次调用重置 state 与两个 shift，
+旧/新/新/旧和新/旧/旧/新各执行一轮，每轮记录 7 组各 10 次 Graph 重放。
+B193 的四轮中位数再取中位数为 1349.68 与 1369.77 微秒（+1.49%），B224
+为 1470.00 与 1479.19 微秒（+0.63%）。输出及状态逐位一致，两种策略均报告
+12 个固定分派、0 个缺失。该修改保留数值与 Graph 回归，删除复述固定配置表的
+静态测试；这些结果是单层及 Head 的延迟。
+
 在同一调试机对 `28c583b` 的 13.3B 后续层和 65536 Head 做独立编译缓存试验：
 使用专属空 TileLang 缓存，在同一进程依次准备 B1、4、16、64、128、320、512，
 再由新进程按同样顺序读取该缓存。计时覆盖 `prepare_tuning(mode="tune")` 和
@@ -975,6 +984,22 @@ Head 线性基准的 `--compare-torch` 用相同 BF16 输入，对照输出 FP32
 该配置参考 vLLM 的 batch-invariant 初始化，仍须验证本项目 BF16/FP32 输出契约。
 CI 的 `tuned_multisize` workload 在六种模型宽度和 M=1/27/256 共 18 种形状下，
 同时记录 TileLang 调优结果与 cuBLASLt 原生对照。
+
+NVIDIA 的 [cuBLASLt 文档](https://docs.nvidia.com/cuda/cublas/index.html#heuristics-cache)
+描述了按矩阵尺寸及 GPU 选择 kernel 的启发式与缓存；这不需要应用自行枚举 tile。
+[PyTorch CUDA 文档](https://docs.pytorch.org/docs/stable/notes/cuda.html)说明可分别
+关闭 BF16 的低精度归约和 split-K；固定精度并不规定不同形状使用同一算法。
+
+在 RTX 4090、PyTorch 2.14.1+cu130 和基于 `6e6dba4`、含单波次简化的验证快照上，以 seed
+`20260804` 比较宽度 2048、词表 65536 的 Head。相同 BF16 输入分别以单行和
+复制为 17 行调用，cuBLASLt 使用上述 workspace 设置，并关闭 BF16 低精度归约和
+split-K。单行与 17 行首行的 FP32 输出有 64949/65536 个值不同，最大绝对差为
+2.15e-5；对应 BF16 输出有 91/65536 个值不同。TileLang 的 FP32 和 BF16 输出
+均逐位一致；17 行首行的原生输出与 TileLang 一致。cuBLASLt 调用日志显示
+两种行数选择了不同算法。这个工作量的单行 FP32 Head 在 CUDA Graph 下分别
+测得原生 281.68 微秒、TileLang 283.20 微秒，均为 10 批、每批 1000 次调用的
+平均值；两条路径分别计时。此结果说明一般 GEMM 可交由库选择 kernel，但在
+保持现有跨 batch 归约契约时，不能直接以此原生路径替换共享投影。
 
 CI 基准结果同时保留每个 workload 的完整 JSON records 和延迟 profiles。JSONL
 尺寸 sweep 的全部记录、调优配置、原生库对照与显存数据均进入上传的基准 artifact。
