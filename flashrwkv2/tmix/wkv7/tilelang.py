@@ -834,10 +834,10 @@ def tmix_wkv7_recurrent(
     State is functional: the caller-owned initial state is never mutated.
 
     ``block_values`` chooses independent value columns per CTA, leaving the
-    key reduction unchanged. ``None`` uses an explicitly tuned configuration,
-    or 64 columns until tuning has run for this device and shape. Likewise,
-    ``prefetch_tokens`` selects one or four input tokens per shared-memory load;
-    it defaults to one until explicit tuning.
+    key reduction unchanged. ``prefetch_tokens`` selects one or four tokens
+    per shared-memory load. The validated SM89/SM120 head-size-64 FP32-state
+    path uses 64 columns and selects prefetch by workload; other paths use a
+    verified profile or the default of 64 columns and one token.
     """
     batch = initial_state.shape[0] if initial_state.ndim else 0
     _check_inputs(

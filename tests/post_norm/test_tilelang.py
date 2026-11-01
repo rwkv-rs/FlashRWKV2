@@ -92,6 +92,49 @@ def test_norm_bitwise_batch_and_grad_mode(channels, has_res):
 
 
 @pytest.mark.cuda
+@pytest.mark.cuda_graph
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("channels", (2048, 2560, 4096, 5120))
+@pytest.mark.parametrize("has_res", (False, True))
+def test_fixed_norm_needs_no_profile_and_captures(monkeypatch, channels, has_res):
+    from flashrwkv2._internal import tuning
+    from flashrwkv2.post_norm import tilelang as implementation
+
+    if torch.cuda.get_device_capability() not in ((8, 9), (12, 0)):
+        pytest.skip("fixed norm strategy is qualified on SM89 and SM120")
+    torch.manual_seed(703)
+    x = torch.randn(17, channels, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(channels, device="cuda", dtype=torch.bfloat16)
+    bias = torch.randn_like(weight)
+    res = torch.randn_like(x) if has_res else None
+    summed = torch.empty_like(x) if has_res else x
+    expected, _, _ = _forward(channels, 1e-5, has_res)(
+        x, x if res is None else res, weight, bias, summed,
+    )
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("fixed norm dispatch must not load profiles or tune")
+
+    monkeypatch.setattr(tuning, "_read_profile", unexpected)
+    monkeypatch.setattr(implementation, "tune_norm", unexpected)
+    outputs = []
+    report = tuning.prepare_tuning(
+        [lambda: outputs.append(norm(x, weight, bias, res=res, return_res=True))],
+        mode="tune",
+    )
+    assert report["complete"] and report["counts"]["fixed"] == 1
+    assert report["records"][0]["config"] == 1
+    assert torch.equal(outputs[0][0].view(torch.int16), expected.view(torch.int16))
+    assert torch.equal(outputs[0][1].view(torch.int16), summed.view(torch.int16))
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = norm(x, weight, bias, res=res, return_res=True)
+    graph.replay()
+    assert torch.equal(captured[0].view(torch.int16), expected.view(torch.int16))
+    assert torch.equal(captured[1].view(torch.int16), summed.view(torch.int16))
+
+
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("channels", (257, 4096))
 def test_norm_independent_vjp(channels):

@@ -278,6 +278,7 @@ def prepare_tuning(calls, *, mode="require", legacy_dir=None):
     scratch model state and valid metadata; it executes once, so reset state as
     needed before serving. Modes: ``inspect`` reports defaults, ``require`` fails
     at the first missing key, ``tune`` verifies and times only missing keys.
+    Validated fixed configurations do not load profiles or run tuning.
     ``legacy_dir`` is one explicit legacy namespace, revalidated without timing.
     The returned JSON-compatible report describes every actual tuned dispatch.
     """

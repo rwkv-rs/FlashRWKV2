@@ -22,6 +22,11 @@ def _config_key(x, has_res):
     return (device_class(x.device), (rows, x.shape[-1]), has_res)
 
 
+def _fixed_rows(x):
+    # These model widths use one row per CTA on both qualified architectures.
+    return x.shape[-1] in (2048, 2560, 4096, 5120) and device_class(x.device)[1:3] in ((8, 9), (12, 0))
+
+
 def _row_layout(channels, rows_per_block):
     block = max(64, tilelang.next_power_of_2(channels))
     threads = min(256, max(32, block // 8))
@@ -186,7 +191,10 @@ class _Norm(torch.autograd.Function):
     def forward(ctx, x, weight, bias, res, eps):
         total = torch.empty_like(x) if res is not None else x
         from .._internal.tuning import get_config
-        rows_per_block = get_config(_ROW_CONFIGS, "post_norm", _config_key(x, res is not None), 1, tune=lambda: tune_norm(x, weight, bias, eps, res))
+        rows_per_block = get_config(
+            _ROW_CONFIGS, "post_norm", _config_key(x, res is not None), 1,
+            tune=lambda: tune_norm(x, weight, bias, eps, res), fixed=_fixed_rows(x),
+        )
         y, mean, rstd = _forward(x.shape[-1], eps, res is not None, rows_per_block=rows_per_block)(
             x, res if res is not None else x, weight, bias, total
         )
@@ -223,8 +231,10 @@ def _compiled_norm(x, weight, bias, res, eps, save, return_res):
     _check_inputs(x, weight, bias, res, eps)
     store = res is not None and (save or return_res)
     total = torch.empty_like(x) if store else x.new_empty((0, x.shape[-1]))
-    group = get_config(_ROW_CONFIGS, "post_norm", _config_key(x, res is not None), 1,
-                       tune=lambda: tune_norm(x, weight, bias, eps, res))
+    group = get_config(
+        _ROW_CONFIGS, "post_norm", _config_key(x, res is not None), 1,
+        tune=lambda: tune_norm(x, weight, bias, eps, res), fixed=_fixed_rows(x),
+    )
     y, mean, rstd = _forward(x.shape[-1], eps, res is not None, save, store, group)(
         x, x if res is None else res, weight, bias, total,
     )
@@ -323,7 +333,10 @@ def norm(
         total = torch.empty_like(flat) if store_res else flat
         buffer = total if store_res else flat.new_empty((0, x.shape[-1]))
         from .._internal.tuning import get_config
-        rows_per_block = get_config(_ROW_CONFIGS, "post_norm", _config_key(flat, res is not None), 1, tune=lambda: tune_norm(x, weight, bias, eps, res))
+        rows_per_block = get_config(
+            _ROW_CONFIGS, "post_norm", _config_key(flat, res is not None), 1,
+            tune=lambda: tune_norm(x, weight, bias, eps, res), fixed=_fixed_rows(flat),
+        )
         y, _, _ = _forward(x.shape[-1], float(eps), res is not None, False, store_res, rows_per_block)(
             flat, flat_res if flat_res is not None else flat, weight, bias, buffer
         )

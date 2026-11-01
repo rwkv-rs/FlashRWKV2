@@ -201,6 +201,10 @@ decode 为 `(block_values=64, prefetch_tokens=1)`，多 token 工作量为
 这些路径不读取 verified profile，也不执行运行时调优。内部 WKV tuner 仍可用于
 离线比较候选，但测得的选择不会覆盖上述固定分派。
 
+同样在 SM89/SM120 上，模型宽度 2048、2560、4096、5120 的 PostNorm 使用
+每 CTA 一行；训练、推理及残差变体共用此规则，不依赖 profile。离线比较中
+个别形状的两行配置更快，验收记录同时保留相对和绝对耗时差异。
+
 内部 `tune_linear`、`tune_norm`、`tune_tokenshift`、`tune_readout` 与 WKV tuner
 按设备及实际 shape 选择配置。先与固定数值基准逐位比较，再用 CUDA Graph 计时；
 候选只能改变输出 tiling、pipeline 或每 CTA 的独立行数。验收覆盖 RTX 4090
