@@ -114,8 +114,10 @@ def test_readout_bitwise_batch_grad_and_vjp(head_size, channels):
 
 
 @pytest.mark.parametrize("channels,rows,fixed", (
-    (2048, 17, True), (2048, 512, True), (2048, 513, False),
-    (2560, 17, True), (2560, 512, True), (2560, 513, False),
+    (2048, 17, True), (2048, 512, True), (2048, 513, True),
+    (2048, 1024, True), (2048, 1025, False),
+    (2560, 17, True), (2560, 512, True), (2560, 513, True),
+    (2560, 1024, True), (2560, 1025, False),
     (4096, 17, True), (4096, 192, True), (4096, 193, True), (4096, 256, True),
     (4096, 961, True), (4096, 1024, True), (4096, 1025, False), (5120, 17, False),
 ))
@@ -134,8 +136,9 @@ def test_fixed_readout_batch_boundaries(monkeypatch, channels, rows, fixed):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("channels,rows", (
     (2048, 1), (2048, 4), (2048, 16), (2048, 17), (2048, 64), (2048, 128),
-    (2048, 193), (2048, 320), (2048, 512), (2560, 17), (2560, 64), (2560, 128),
-    (2560, 193), (2560, 320), (2560, 512), (4096, 17), (4096, 64), (4096, 128),
+    (2048, 193), (2048, 320), (2048, 512), (2048, 513), (2048, 768), (2048, 1024),
+    (2560, 17), (2560, 64), (2560, 128), (2560, 193), (2560, 320), (2560, 512),
+    (2560, 513), (2560, 768), (2560, 1024), (4096, 17), (4096, 64), (4096, 128),
     (4096, 192), (4096, 193), (4096, 256), (4096, 961), (4096, 1024),
 ))
 @pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float32))
