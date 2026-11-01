@@ -56,6 +56,7 @@ def _matmul_program(
         Y: T.Tensor((rows, outputs), output_dtype),
     ):
         if dynamic_k and aligned_k and copy_k == 32:
+            # Preserve vectorized row loads when the reduction stride is dynamic.
             T.assume(channels % 32 == 0)
         with T.Kernel(
             T.ceildiv(outputs, block_n),
@@ -188,11 +189,11 @@ def _aligned(tensor):
     return tensor if tensor.data_ptr() % 16 == 0 else tensor.clone()
 
 
-def _projection_tiles(outputs, num_sms):
+def _projection_tiles(outputs, num_sms, *, dynamic_k=False):
     columns = max((n + 127) // 128 for n in outputs)
     if columns <= 4:
         tiles = ((64, 64), (32, 32), (16, 32), (16, 16))
-    elif columns >= num_sms:
+    elif columns >= num_sms and not dynamic_k:
         # Columns alone fill the device: reuse each weight across more rows.
         tiles = ((256, 64), (128, 64), (64, 64), (32, 64))
     else:
@@ -207,7 +208,7 @@ def _projection_config(rows, channels, outputs, device, *, aligned_k=True):
     tiles = (
         ((16, n) for n in (128, 64, 32, 16))
         if rows <= 16
-        else _projection_tiles(outputs, props.multi_processor_count)
+        else _projection_tiles(outputs, props.multi_processor_count, dynamic_k=channels is None)
     )
     limit = max(16, 1 << (max(1, rows) - 1).bit_length())
     legal = tuple((m, n) for m, n in tiles if m <= limit)
@@ -223,14 +224,15 @@ def _projection_config(rows, channels, outputs, device, *, aligned_k=True):
     dynamic = channels is None
     columns = max((o + 127) // 128 for o in outputs)
     if dynamic:
-        cap = 64 if aligned_k else 32
+        # A copy covers one canonical MMA group, including the final group.
+        cap = 32
     elif m == 16:
         cap = 512 if columns <= 4 else 256
     elif columns >= props.multi_processor_count and m <= 128:
         cap = 128
     else:
         cap = 64 if m * n >= 4096 else 128
-    stages = 1 if dynamic else 2
+    stages = 1 if dynamic and not aligned_k else 2
     span = next(
         k
         for k in (512, 256, 128, 64, 32)
