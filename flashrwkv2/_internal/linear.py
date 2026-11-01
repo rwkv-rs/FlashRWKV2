@@ -31,10 +31,13 @@ def _matmul_program(
     weight_strides=None,
     input_major=False,
     no_set_max_nreg=False,
+    dynamic_k=False,
 ):
     import tilelang.language as T
 
     rows = T.dynamic("rows")
+    if dynamic_k:
+        channels = T.dynamic("reduction")
     block_m, block_n, stages, copy_k = config
     block_k = 32
     weight_shape = (channels, outputs) if input_major else (outputs, channels)
@@ -72,21 +75,22 @@ def _matmul_program(
                     T.copy(W[bn * block_n, k * copy_k], ws)
                 # Each copy contains consecutive canonical 32-K MMA groups.
                 for inner in T.unroll(copy_k // block_k):
-                    if input_major:
-                        T.gemm(
-                            xs[:, inner * block_k : (inner + 1) * block_k],
-                            ws[inner * block_k : (inner + 1) * block_k, :],
-                            acc,
-                            policy=T.GemmWarpPolicy.FullCol,
-                        )
-                    else:
-                        T.gemm(
-                            xs[:, inner * block_k : (inner + 1) * block_k],
-                            ws[:, inner * block_k : (inner + 1) * block_k],
-                            acc,
-                            transpose_B=True,
-                            policy=T.GemmWarpPolicy.FullCol,
-                        )
+                    if not dynamic_k or k * copy_k + inner * block_k < channels:
+                        if input_major:
+                            T.gemm(
+                                xs[:, inner * block_k : (inner + 1) * block_k],
+                                ws[inner * block_k : (inner + 1) * block_k, :],
+                                acc,
+                                policy=T.GemmWarpPolicy.FullCol,
+                            )
+                        else:
+                            T.gemm(
+                                xs[:, inner * block_k : (inner + 1) * block_k],
+                                ws[:, inner * block_k : (inner + 1) * block_k],
+                                acc,
+                                transpose_B=True,
+                                policy=T.GemmWarpPolicy.FullCol,
+                            )
             for i, j in T.Parallel(block_m, block_n):
                 if bm * block_m + i < rows and bn * block_n + j < outputs:
                     if has_bias:
@@ -109,13 +113,16 @@ def _compile_spec(
     weight_strides,
     input_major,
     arch,
+    dynamic_k=False,
+    aligned_k=True,
 ):
     pass_configs = _PASS_CONFIG
     if arch // 10 == 12:
         # Keep SM12x copies and MMA consumers in one CTA synchronization domain.
         pass_configs = {**pass_configs, "tl.disable_warp_specialized": True}
     weight_width = outputs if input_major else channels
-    if channels % 2 or weight_width % 2 or weight_strides[0] % 2 or weight_strides[1] != 1:
+    strides = weight_strides or (weight_width, 1)
+    if not aligned_k or channels % 2 or weight_width % 2 or strides[0] % 2 or strides[1] != 1:
         # cp.async requires at least two adjacent BF16 elements. Scalar tails
         # and odd/noncontiguous strides use synchronous copies in the same
         # pipeline; disable both automatic injection and pipeline planning.
@@ -136,6 +143,7 @@ def _compile_spec(
             input_major,
             # SM12x supports TMA but not CTA register reconfiguration.
             no_set_max_nreg=arch // 10 == 12,
+            dynamic_k=dynamic_k,
         ),
         {
             "out_idx": [3],
@@ -279,9 +287,12 @@ def _fixed_projection_config(x, weight, output_dtype, bias):
     return None
 
 
-def _forward(x, weight, bias, output_dtype, config=None):
+def _forward(x, weight, bias, output_dtype, config=None, *, dynamic_k=False):
     x, weight = _aligned(x), _aligned(weight)
     bias = None if bias is None else _aligned(bias)
+    aligned_k = x.shape[1] % 32 == 0
+    if dynamic_k and config is None:
+        config = (64, 64, 1, 64 if aligned_k else 32)
     if config is None:
         from .tuning import get_config
 
@@ -311,17 +322,18 @@ def _forward(x, weight, bias, output_dtype, config=None):
     major, minor = torch.cuda.get_device_capability(x.device)
     input_major = weight.stride(0) == 1
     physical_weight = weight.t() if input_major else weight
-    kernel = _compiled(
+    key = (
         weight.shape[0],
-        x.shape[1],
+        0 if dynamic_k else x.shape[1],
         _dtype_name(output_dtype),
         _dtype_name(bias.dtype) if bias is not None else "bfloat16",
         bias is not None,
         config,
-        physical_weight.stride(),
+        None if dynamic_k else physical_weight.stride(),
         input_major,
         major * 10 + minor,
-    )
+    ) + ((True, aligned_k) if dynamic_k else ())
+    kernel = _compiled(*key)
     # The bias-free specialization has no bias loads; reusing W avoids allocating
     # a dummy device tensor on every projection.
     return kernel(x, physical_weight, physical_weight if bias is None else bias)
@@ -335,7 +347,7 @@ def linear_weight_vjp_fp32(dy, x, *, out=None):
     accumulates into an FP32 buffer; FP32 GEMMs then avoid a full-size temporary.
     """
     if dy.dtype == torch.bfloat16:
-        partial = _forward(dy.t().contiguous(), x.t(), None, torch.float32)
+        partial = _forward(dy.t().contiguous(), x.t(), None, torch.float32, dynamic_k=True)
         return partial if out is None else out.add_(partial)
     if out is None:
         return torch.mm(dy.t(), x.float())
@@ -368,7 +380,7 @@ class _Linear(torch.autograd.Function):
         if ctx.needs_input_grad[1]:
             if dy.dtype == torch.bfloat16:
                 # Preserve the fused BF16 store for an ordinary unchunked VJP.
-                dw = _forward(dy.t().contiguous(), x.t(), None, weight.dtype)
+                dw = _forward(dy.t().contiguous(), x.t(), None, weight.dtype, dynamic_k=True)
             else:
                 dw = linear_weight_vjp_fp32(dy, x).to(weight.dtype)
         if ctx.needs_input_grad[2]:
