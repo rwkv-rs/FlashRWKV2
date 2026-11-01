@@ -267,7 +267,14 @@ def test_fixed_13b_projection_restricts_row_wave_and_layout(monkeypatch, stage, 
 @pytest.mark.parametrize("count,rows,canonical,input_config,output_config", (
     (3, 64, True, (16, 32, 2, 512), (32, 64, 2, 64)),
     (4, 64, False, (16, 32, 2, 512), (32, 64, 2, 64)),
-    (3, 256, True, None, None),
+    (3, 96, True, None, None),
+    (3, 97, True, (32, 32, 2, 128), (64, 64, 2, 64)),
+    (4, 128, False, (32, 32, 2, 128), (64, 64, 2, 64)),
+    (3, 129, True, (32, 32, 2, 128), None),
+    (4, 129, True, (32, 32, 2, 128), (64, 64, 2, 64)),
+    (4, 192, False, (32, 32, 2, 128), (64, 64, 2, 64)),
+    (3, 193, False, (32, 32, 2, 128), (128, 64, 2, 32)),
+    (4, 256, True, (32, 32, 2, 128), (128, 64, 2, 32)),
     (3, 257, False, (32, 32, 2, 128), (64, 64, 2, 64)),
     (4, 320, True, (32, 32, 2, 128), (64, 128, 2, 64)),
     (4, 320, False, (32, 32, 2, 128), None),
@@ -314,13 +321,30 @@ def test_fixed_72b_projection_covers_measured_layouts(monkeypatch, count, rows, 
 ))
 @pytest.mark.parametrize("canonical", (False, True))
 def test_fixed_13b_projection_preserves_accumulators_and_graph(monkeypatch, tmp_path, stage, count, rows, canonical):
+    _check_fixed_projection(monkeypatch, tmp_path, stage, count, rows, canonical, (192, 192, 384, 128))
+
+
+@cuda
+@pytest.mark.cuda
+@pytest.mark.cuda_graph
+@pytest.mark.parametrize("stage,count,rows", (
+    ("in", 3, 97), ("in", 4, 128), ("in", 4, 193), ("in", 3, 256),
+    ("out", 3, 97), ("out", 4, 128), ("out", 4, 129), ("out", 4, 192),
+    ("out", 3, 193), ("out", 4, 256),
+))
+@pytest.mark.parametrize("canonical", (False, True))
+def test_fixed_72b_projection_preserves_accumulators_and_graph(monkeypatch, tmp_path, stage, count, rows, canonical):
+    _check_fixed_projection(monkeypatch, tmp_path, stage, count, rows, canonical, (128, 128, 480, 96))
+
+
+def _check_fixed_projection(monkeypatch, tmp_path, stage, count, rows, canonical, ranks4):
     from flashrwkv2._internal import tuning
     from flashrwkv2.tmix.wkv_prepare import tilelang as implementation
 
     if not tuning._fixed_strategy_device(tuning.device_class(torch.device("cuda"))):
         pytest.skip("fixed grouped strategy is qualified on RTX 4090")
     torch.manual_seed(849)
-    channels, ranks = 4096, (192, 192, 384, 128)[:count]
+    channels, ranks = 4096, ranks4[:count]
     if stage == "in":
         xs = tuple(torch.randn(rows, channels, device="cuda", dtype=torch.bfloat16) * .02 for _ in ranks)
         weights = tuple(
