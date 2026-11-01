@@ -403,12 +403,16 @@ def _group_key(xs, weights, kinds, biases):
 
 
 def _fixed_projection_config(xs, weights, kinds, biases):
-    if (_fixed_strategy_device(device_class(xs[0].device)) and (
+    if _fixed_strategy_device(device_class(xs[0].device)) and (
         all(w.stride() == (w.shape[1], 1) for w in weights)
         or all(w.stride() == (1, w.shape[0]) for w in weights)
-    )):
-        return _projection_config(xs[0].shape[0], tuple(x.shape[1] for x in xs),
-                                  tuple(w.shape[0] for w in weights), xs[0].device)
+    ):
+        return _projection_config(
+            xs[0].shape[0],
+            tuple(x.shape[1] for x in xs),
+            tuple(w.shape[0] for w in weights),
+            xs[0].device,
+        )
     return None
 
 
@@ -467,19 +471,35 @@ def _group_call(xs, weights, kinds, biases, raw_mode, config, dynamic_k=False):
     count = len(xs)
     automatic = config is None
     aligned_k = xs[0].shape[1] % 32 == 0
-    fixed = _projection_config(xs[0].shape[0], None, tuple(w.shape[0] for w in weights),
-                               xs[0].device, aligned_k=aligned_k) if dynamic_k else _fixed_projection_config(xs, weights, kinds, biases)
+    fixed = (
+        _projection_config(
+            xs[0].shape[0],
+            None,
+            tuple(w.shape[0] for w in weights),
+            xs[0].device,
+            aligned_k=aligned_k,
+        )
+        if dynamic_k
+        else _fixed_projection_config(xs, weights, kinds, biases)
+    )
     if automatic:
         from ..._internal.tuning import get_config
 
         config = get_config(
-            _GROUP_CONFIGS, "tmix/wkv_prepare", _group_key(xs, weights, kinds, biases),
-            fixed, tune=lambda: _tune_grouped_linear(xs, weights, kinds, biases),
+            _GROUP_CONFIGS,
+            "tmix/wkv_prepare",
+            _group_key(xs, weights, kinds, biases),
+            fixed,
+            tune=lambda: _tune_grouped_linear(xs, weights, kinds, biases),
             fixed=fixed is not None,
         )
         if config is None:
-            config = _projection_config(xs[0].shape[0], tuple(x.shape[1] for x in xs),
-                                         tuple(w.shape[0] for w in weights), xs[0].device)
+            config = _projection_config(
+                xs[0].shape[0],
+                tuple(x.shape[1] for x in xs),
+                tuple(w.shape[0] for w in weights),
+                xs[0].device,
+            )
     input_major = all(w.stride(0) == 1 for w in weights)
     physical = tuple(w.t() if input_major else w for w in weights)
     channels = tuple(x.shape[1] for x in xs)
@@ -509,14 +529,34 @@ def _group_call(xs, weights, kinds, biases, raw_mode, config, dynamic_k=False):
     ) + ((True, aligned_k) if dynamic_k else ())
     if automatic and fixed is not None:
         family = key[:5] + key[6:10] + ((True, xs[0].shape[0]) if dynamic_k else ())
+
         def variants():
             if dynamic_k:
-                return tuple(key[:5] + (_projection_config(xs[0].shape[0], None, outputs[:count],
-                                                           xs[0].device, aligned_k=a),) + key[6:10] + (True, a)
-                             for a in (False, True))
-            return tuple(key[:5] + (c,) + key[6:] for c in
-                         _projection_variants(channels[:count], outputs[:count], xs[0].device))
-        prepare_variants("tmix/wkv_prepare", family, variants, _GROUP_KERNELS, _group_spec)
+                return tuple(
+                    key[:5]
+                    + (
+                        _projection_config(
+                            xs[0].shape[0],
+                            None,
+                            outputs[:count],
+                            xs[0].device,
+                            aligned_k=a,
+                        ),
+                    )
+                    + key[6:10]
+                    + (True, a)
+                    for a in (False, True)
+                )
+            return tuple(
+                key[:5] + (c,) + key[6:]
+                for c in _projection_variants(
+                    channels[:count], outputs[:count], xs[0].device
+                )
+            )
+
+        prepare_variants(
+            "tmix/wkv_prepare", family, variants, _GROUP_KERNELS, _group_spec
+        )
     empty = xs[0].new_empty(0)
     bias_args = tuple(empty if bias is None else bias for bias in biases)
     args = (

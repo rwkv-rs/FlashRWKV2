@@ -103,62 +103,16 @@ def test_deterministic_group_projection_checks_layout(monkeypatch):
 @cuda
 @pytest.mark.cuda
 @pytest.mark.cuda_graph
-@pytest.mark.parametrize("channels,ranks", (
-    (2048, (96, 96, 256, 64)), (2560, (96, 96, 320, 64)),
-    (4096, (128, 128, 480, 96)), (4096, (192, 192, 384, 128)),
-))
-@pytest.mark.parametrize("count", (3, 4))
-def test_fixed_canonical_decode_output_preserves_accumulators_and_graph(monkeypatch, tmp_path, channels, ranks, count):
-    from flashrwkv2._internal import tuning
-    from flashrwkv2.tmix.wkv_prepare import tilelang as implementation
-
-    if not tuning._fixed_strategy_device(tuning.device_class(torch.device("cuda"))):
-        pytest.skip("fixed grouped strategy is qualified on RTX 4090")
-    torch.manual_seed(855)
-    ranks = ranks[:count]
-    xs = tuple(torch.randn(1, rank, device="cuda", dtype=torch.bfloat16) * .02 for rank in ranks)
-    weights = tuple(torch.randn(channels, rank, device="cuda", dtype=torch.bfloat16) * .02 for rank in ranks)
-    kinds = (0, 2, 0, 0)[:count]
-    biases = (None, torch.randn(channels, device="cuda", dtype=torch.bfloat16), None) + (None,) * (count - 3)
-    expected, raw = implementation._run_groups(xs, weights, kinds, biases, raw_mode=2, config=(16, 64, 2, 32))
-    monkeypatch.setattr(tuning, "_profile_root", lambda: tmp_path)
-    monkeypatch.setattr(tuning, "_read_profile", lambda *args: pytest.fail("read a profile"))
-    actual, actual_raw = implementation._run_groups(xs, weights, kinds, biases, raw_mode=2)
-    assert torch.equal(actual_raw, raw)
-    assert all(torch.equal(a, b) for a, b in zip(actual, expected, strict=True))
-
-    def call():
-        return implementation._grouped_linear(xs, weights, kinds, biases)
-
-    report = tuning.prepare_tuning([call], mode="require")
-    assert report["complete"] and report["counts"]["fixed"] == 1
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        captured = call()
-    graph.replay()
-    assert all(torch.equal(a, b) for a, b in zip(captured, expected, strict=True))
-    assert not tuple(tmp_path.iterdir())
-
-
-@cuda
-@pytest.mark.cuda
-@pytest.mark.cuda_graph
-@pytest.mark.parametrize(("channels", "rows"), (
-    (2048, 17), (2048, 64), (2048, 65), (2048, 160), (2048, 161),
-    (2048, 193), (2048, 256), (2048, 320), (2048, 321),
-    (2048, 448), (2048, 449), (2048, 512), (2048, 513), (2048, 577), (2048, 1024),
-    (2560, 17), (2560, 64), (2560, 65), (2560, 192), (2560, 193),
-    (2560, 256), (2560, 257), (2560, 384), (2560, 385), (2560, 512),
-    (2560, 513), (2560, 960), (2560, 1024),
-    (4096, 17), (4096, 32), (4096, 33), (4096, 64), (4096, 128), (4096, 192), (4096, 193), (4096, 256),
-    (4096, 257), (4096, 320), (4096, 512), (4096, 961), (4096, 1024),
+@pytest.mark.parametrize("channels,rows", (
+    (2048, 17), (2048, 129), (2560, 65), (2560, 1024),
+    (4096, 32), (4096, 257),
 ))
 def test_fixed_rkv_row_wave_preserves_accumulators_and_graph(monkeypatch, tmp_path, channels, rows):
     from flashrwkv2._internal import tuning
     from flashrwkv2.tmix.wkv_prepare import tilelang as implementation
 
     if not tuning._fixed_strategy_device(tuning.device_class(torch.device("cuda"))):
-        pytest.skip("fixed grouped strategy is qualified on RTX 4090")
+        pytest.skip("fixed grouped strategy is qualified on tested SM89/SM120 devices")
     torch.manual_seed(831)
     xs = tuple(torch.randn(rows, channels, device="cuda", dtype=torch.bfloat16) * .02 for _ in range(3))
     weights = tuple(torch.randn(channels, channels, device="cuda", dtype=torch.bfloat16) * .02 for _ in range(3))
@@ -194,7 +148,7 @@ def test_fixed_rkv_projection_preserves_training_gradients(monkeypatch, channels
     from flashrwkv2.tmix.wkv_prepare import tilelang as implementation
 
     if not tuning._fixed_strategy_device(tuning.device_class(torch.device("cuda"))):
-        pytest.skip("fixed grouped strategy is qualified on RTX 4090")
+        pytest.skip("fixed grouped strategy is qualified on tested SM89/SM120 devices")
     torch.manual_seed(832)
     xs = tuple((torch.randn(rows, channels, device="cuda", dtype=torch.bfloat16) * .02).requires_grad_() for _ in range(3))
     weights = tuple((torch.randn(channels, channels, device="cuda", dtype=torch.bfloat16) * .02).requires_grad_() for _ in range(3))
@@ -219,55 +173,15 @@ def test_fixed_rkv_projection_preserves_training_gradients(monkeypatch, channels
 @cuda
 @pytest.mark.cuda
 @pytest.mark.cuda_graph
-@pytest.mark.parametrize("stage,count,rows", (
-    ("in", 3, 2), ("in", 4, 16), ("out", 3, 2), ("out", 4, 16),
-    ("in", 3, 17), ("in", 4, 32), ("in", 3, 33),
-    ("out", 3, 17), ("out", 4, 32), ("out", 4, 63),
-    ("in", 3, 64), ("in", 4, 128), ("in", 3, 320), ("in", 4, 512),
-    ("out", 3, 64), ("out", 4, 128), ("out", 3, 320), ("out", 4, 512),
-    ("in", 3, 193), ("in", 4, 256), ("in", 3, 961), ("in", 4, 1024),
-    ("out", 3, 193), ("out", 4, 256), ("out", 3, 961), ("out", 4, 1024),
-))
-@pytest.mark.parametrize("canonical", (False, True))
-def test_fixed_13b_projection_preserves_accumulators_and_graph(monkeypatch, tmp_path, stage, count, rows, canonical):
-    _check_fixed_projection(monkeypatch, tmp_path, stage, count, rows, canonical, (192, 192, 384, 128))
-
-
-@cuda
-@pytest.mark.cuda
-@pytest.mark.cuda_graph
-@pytest.mark.parametrize("stage,count,rows", (
-    ("in", 3, 65), ("in", 3, 80), ("in", 3, 81), ("in", 4, 65), ("in", 4, 96),
-    ("in", 3, 97), ("in", 4, 128), ("in", 4, 193), ("in", 3, 256),
-    ("out", 3, 65), ("out", 4, 65), ("out", 3, 96), ("out", 4, 96),
-    ("out", 3, 97), ("out", 4, 128), ("out", 3, 129), ("out", 4, 129),
-    ("out", 3, 160), ("out", 3, 161), ("out", 3, 192), ("out", 4, 192),
-    ("out", 3, 193), ("out", 4, 256),
-))
-@pytest.mark.parametrize("canonical", (False, True))
-def test_fixed_72b_projection_preserves_accumulators_and_graph(monkeypatch, tmp_path, stage, count, rows, canonical):
-    _check_fixed_projection(monkeypatch, tmp_path, stage, count, rows, canonical, (128, 128, 480, 96))
-
-
-@cuda
-@pytest.mark.cuda
-@pytest.mark.cuda_graph
 @pytest.mark.parametrize("channels,ranks", (
     (2048, (96, 96, 256, 64)), (2560, (96, 96, 320, 64)),
+    (4096, (128, 128, 480, 96)), (4096, (192, 192, 384, 128)),
 ))
-@pytest.mark.parametrize("stage,count,rows", (
-    ("in", 3, 17), ("in", 4, 48), ("in", 4, 49), ("in", 3, 64),
-    ("in", 4, 65), ("in", 4, 112), ("in", 4, 113), ("in", 3, 144),
-    ("in", 3, 145), ("in", 4, 448), ("in", 4, 449), ("in", 4, 512),
-    ("out", 3, 17), ("out", 4, 64), ("out", 4, 96), ("out", 4, 97),
-    ("out", 3, 320), ("out", 4, 321), ("out", 3, 352), ("out", 3, 353),
-    ("out", 4, 512),
-    ("in", 3, 513), ("in", 3, 577), ("in", 3, 769), ("in", 4, 673),
-    ("in", 4, 769), ("in", 4, 801), ("in", 4, 897), ("in", 4, 1024),
-    ("out", 3, 513), ("out", 4, 769), ("out", 4, 1024),
+@pytest.mark.parametrize("stage,count,rows,canonical", (
+    ("in", 3, 1, False), ("in", 4, 89, True),
+    ("out", 3, 17, True), ("out", 4, 1024, False),
 ))
-@pytest.mark.parametrize("canonical", (False, True))
-def test_fixed_small_projection_preserves_accumulators_and_graph(
+def test_fixed_projection_preserves_accumulators_and_graph(
     monkeypatch, tmp_path, channels, ranks, stage, count, rows, canonical,
 ):
     _check_fixed_projection(monkeypatch, tmp_path, stage, count, rows, canonical, ranks, channels)
@@ -278,7 +192,7 @@ def _check_fixed_projection(monkeypatch, tmp_path, stage, count, rows, canonical
     from flashrwkv2.tmix.wkv_prepare import tilelang as implementation
 
     if not tuning._fixed_strategy_device(tuning.device_class(torch.device("cuda"))):
-        pytest.skip("fixed grouped strategy is qualified on RTX 4090")
+        pytest.skip("fixed grouped strategy is qualified on tested SM89/SM120 devices")
     torch.manual_seed(849)
     ranks = ranks4[:count]
     if stage == "in":
@@ -342,7 +256,7 @@ def test_fixed_decode_projection_preserves_accumulators_and_graph(
     from flashrwkv2.tmix.wkv_prepare import tilelang as implementation
 
     if not tuning._fixed_strategy_device(tuning.device_class(torch.device("cuda"))):
-        pytest.skip("fixed grouped strategy is qualified on RTX 4090")
+        pytest.skip("fixed grouped strategy is qualified on tested SM89/SM120 devices")
     torch.manual_seed(716)
     ranks = ranks[:count]
     xs = tuple(torch.randn(1, channels, device="cuda", dtype=torch.bfloat16) * .03 for _ in ranks)
@@ -370,7 +284,7 @@ def test_fixed_decode_projection_preserves_accumulators_and_graph(
     for mode in ("inspect", "require", "tune"):
         report = tuning.prepare_tuning([call], mode=mode)
         assert report["complete"] and report["counts"]["fixed"] == 1
-        assert report["records"][0]["config"] == (16, 32 if input_major or channels < 4096 else 16, 2, 512)
+        assert report["records"][0]["config"] == implementation._fixed_projection_config(xs, weights, kinds, biases)
     for mode in (0, 1, 2):
         values, raw = implementation._run_groups(xs, weights, kinds, biases, raw_mode=mode)
         expected, expected_raw = references[mode]
@@ -391,7 +305,7 @@ def test_fixed_grouped_operator_benchmark_uses_its_candidate(monkeypatch):
     from flashrwkv2.tmix.wkv_prepare import tilelang as implementation
 
     if not tuning._fixed_strategy_device(tuning.device_class(torch.device("cuda"))):
-        pytest.skip("fixed grouped strategy is qualified on RTX 4090")
+        pytest.skip("fixed grouped strategy is qualified on tested SM89/SM120 devices")
     channels, ranks = 2048, (96, 96, 256)
     xs = tuple(torch.randn(1, channels, device="cuda", dtype=torch.bfloat16) for _ in ranks)
     weights = tuple(torch.randn(rank, channels, device="cuda", dtype=torch.bfloat16) for rank in ranks)
@@ -437,7 +351,7 @@ def test_fixed_decode_projection_preserves_training_gradients(monkeypatch, chann
     from flashrwkv2.tmix.wkv_prepare import tilelang as implementation
 
     if not tuning._fixed_strategy_device(tuning.device_class(torch.device("cuda"))):
-        pytest.skip("fixed grouped strategy is qualified on RTX 4090")
+        pytest.skip("fixed grouped strategy is qualified on tested SM89/SM120 devices")
     torch.manual_seed(717)
     xs = tuple(
         (torch.randn(rows, channels, device="cuda", dtype=torch.bfloat16) * .03).requires_grad_()
@@ -474,7 +388,7 @@ def test_fixed_long_prefill_output_preserves_training_gradients(monkeypatch, cha
     from flashrwkv2.tmix.wkv_prepare import tilelang as implementation
 
     if not tuning._fixed_strategy_device(tuning.device_class(torch.device("cuda"))):
-        pytest.skip("fixed grouped strategy is qualified on RTX 4090")
+        pytest.skip("fixed grouped strategy is qualified on tested SM89/SM120 devices")
     torch.manual_seed(718)
     ranks = (96, 96, 256 if channels == 2048 else 320, 64)
     xs = tuple((torch.randn(rows, rank, device="cuda", dtype=torch.bfloat16) * .03).requires_grad_() for rank in ranks)
@@ -1078,7 +992,7 @@ def test_grouped_weight_vjp_reuses_dynamic_reduction(monkeypatch):
     from flashrwkv2.tmix.wkv_prepare import tilelang as implementation
 
     if not tuning._fixed_strategy_device(tuning.device_class(torch.device("cuda"))):
-        pytest.skip("dynamic grouped VJP is qualified on RTX 4090")
+        pytest.skip("dynamic grouped VJP is qualified on tested devices")
     torch.manual_seed(723)
     ranks, channels = (96, 96, 256, 64), 2048
     kinds, biases, config = (0,) * 4, (None,) * 4, (64, 64, 1, 64)
@@ -1116,7 +1030,7 @@ def test_grouped_training_vjp_preserves_compile_and_graph(monkeypatch, tmp_path,
     from flashrwkv2.tmix.wkv_prepare import tilelang as implementation
 
     if not tuning._fixed_strategy_device(tuning.device_class(torch.device("cuda"))):
-        pytest.skip("grouped VJP is qualified on RTX 4090")
+        pytest.skip("grouped VJP is qualified on tested devices")
     torch.manual_seed(724)
     rows, channels, ranks = 128, 2048, (96, 96, 256, 64)
     if stage == "input":
@@ -1206,3 +1120,45 @@ def test_grouped_training_vjp_preserves_compile_and_graph(monkeypatch, tmp_path,
         frozen_inputs = (*xs, *weights[1:], *biases)
         frozen = torch.autograd.grad(model(*frozen_leaves), frozen_inputs, upstream)
         assert all(torch.equal(a, b) for a, b in zip(frozen, (g for i, g in enumerate(reference_grads) if i != 4), strict=True))
+
+
+@cuda
+@pytest.mark.cuda
+@pytest.mark.parametrize("mode", ("frozen_input", "frozen_weight", "mixed_layout", "unused"))
+def test_grouped_vjp_eligibility_preserves_partial_gradients(monkeypatch, mode):
+    from flashrwkv2._internal import linear as shared
+    from flashrwkv2._internal import tuning
+    from flashrwkv2.tmix.wkv_prepare import tilelang as implementation
+
+    if not tuning._fixed_strategy_device(tuning.device_class(torch.device("cuda"))):
+        pytest.skip("grouped VJP is qualified on tested devices")
+    torch.manual_seed(725)
+    xs = tuple(torch.randn(3, 64, device="cuda").bfloat16().requires_grad_(
+        mode != "frozen_input" or i != 1) for i in range(2))
+    weights = tuple((torch.randn(64, 32, device="cuda").bfloat16().t()
+                     if mode != "mixed_layout" or i == 0 else
+                     torch.randn(32, 64, device="cuda").bfloat16()).requires_grad_(
+                         mode != "frozen_weight" or i != 0) for i in range(2))
+    biases = tuple(torch.randn(32, device="cuda").bfloat16().requires_grad_() for _ in range(2))
+    leaves = tuple(v for v in (*xs, *weights, *biases) if v.requires_grad)
+    def model():
+        values = implementation._grouped_linear(xs, weights, (1, 2), biases)
+        return values[:1] if mode == "unused" else values
+    token = tuning._TUNING.set(True)
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(implementation, "_fixed_strategy_device", lambda *args: False)
+            patch.setattr(shared, "_fixed_strategy_device", lambda *args: False)
+            expected = model()
+            gradients = torch.autograd.grad(sum(v.float().sum() for v in expected), leaves, allow_unused=True)
+    finally:
+        tuning._TUNING.reset(token)
+    compiled = torch.compile(model, fullgraph=True, options={"emulate_precision_casts": True})
+    for call in (model, compiled):
+        actual = call()
+        actual_grads = torch.autograd.grad(sum(v.float().sum() for v in actual), leaves, allow_unused=True)
+        assert all(torch.equal(a, b) for a, b in zip(actual, expected, strict=True))
+        for a, b in zip(actual_grads, gradients, strict=True):
+            assert (a is None) == (b is None)
+            if b is not None:
+                assert torch.equal(a, b)

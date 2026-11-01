@@ -366,7 +366,9 @@ def prepare_variants(owner, family, variants, cache, spec):
                 program, options = spec(*key)
                 cache[key] = tilelang.compile(program, **options)
             except Exception as error:
-                raise RuntimeError(f"failed to prepare {owner} variant {key}: {error}") from error
+                raise RuntimeError(
+                    f"failed to prepare {owner} variant {key}: {error}"
+                ) from error
     session["compilation"][(owner, family)] = keys
 
 
@@ -381,7 +383,9 @@ def prepared_kernel(owner, compiler, args, variants=()):
                 try:
                     compiler(*key)
                 except Exception as error:
-                    raise RuntimeError(f"failed to prepare {owner} variant {key}: {error}") from error
+                    raise RuntimeError(
+                        f"failed to prepare {owner} variant {key}: {error}"
+                    ) from error
             session["compilation"][family] = keys
     return compiler(*args)
 
@@ -403,8 +407,11 @@ def compile_candidates(keys, cache, spec):
         batch[2].append(program)
     for options, pending, programs in batches.values():
         kernels = tilelang.par_compile(programs, **options, ignore_error=True)
-        cache.update((key, kernel) for key, kernel in zip(pending, kernels, strict=True)
-                     if kernel is not None)
+        cache.update(
+            (key, kernel)
+            for key, kernel in zip(pending, kernels, strict=True)
+            if kernel is not None
+        )
 
 
 def workload_bucket(size):

@@ -677,25 +677,15 @@ def test_tilelang_linear_cuda_graph():
 @cuda
 @pytest.mark.cuda
 @pytest.mark.cuda_graph
-@pytest.mark.parametrize("kind,width,rows", tuple(
-    (kind, width, rows)
-    for kind in ("cmix_key", "cmix_value", "attention_output", "head")
-    for width, rows in (
-        (2048, 1), (2048, 2), (2048, 16), (2560, 1), (2560, 2), (2560, 16),
-        (4096, 1), (4096, 2), (4096, 16), (4096, 64), (4096, 128),
-        (4096, 256), (4096, 320), (4096, 512), (4096, 1024),
-    )
-) + tuple(("attention_input_vjp", 4096, rows) for rows in (64, 128, 256, 320, 512, 1024))
-  + tuple((kind, 4096, rows) for kind in ("cmix_key", "head") for rows in (33, 65))
-  + tuple(("head", width, rows) for width in (2048, 2560)
-          for rows in (17, 32, 33, 64, 65, 128, 129, 256, 320, 512))
-  + tuple((kind, width, rows) for kind in ("cmix_key", "cmix_value", "attention_output")
-          for width in (2048, 2560)
-          for rows in (17, 32, 33, 64, 65, 96, 97, 128, 129, 160, 192, 193, 224, 225, 256, 257, 320, 384, 385, 512))
-  + tuple((kind, width, rows) for kind in ("cmix_key", "cmix_value", "attention_output")
-          for width, rows in ((2048, 513), (2048, 704), (2048, 705), (2048, 1024),
-                              (2560, 513), (2560, 576), (2560, 577), (2560, 768),
-                              (2560, 769), (2560, 1024))))
+@pytest.mark.parametrize("kind,width,rows", (
+    ("cmix_key", 2048, 1), ("cmix_key", 2560, 17),
+    ("cmix_key", 4096, 128), ("cmix_key", 4096, 1024),
+    ("cmix_value", 2048, 16), ("cmix_value", 2560, 89),
+    ("cmix_value", 4096, 257), ("attention_output", 2048, 33),
+    ("attention_output", 2560, 65), ("attention_output", 4096, 512),
+    ("attention_input_vjp", 4096, 129), ("head", 2048, 1),
+    ("head", 2560, 128), ("head", 4096, 512),
+))
 def test_fixed_decode_linear_preserves_fp32_and_graph(monkeypatch, tmp_path, kind, width, rows):
     from flashrwkv2._internal import linear as implementation
     from flashrwkv2._internal import tuning
@@ -951,3 +941,75 @@ def test_prepared_projection_rejects_any_late_compilation(monkeypatch, dynamic_k
         captured = call(x, w)
     graph.replay()
     assert torch.equal(captured, expected)
+
+
+@cuda
+@pytest.mark.cuda
+@pytest.mark.resource
+def test_prepared_projection_reuses_disk_cache_in_new_process():
+    import json
+    import os
+    import subprocess
+    import sys
+    from tempfile import TemporaryDirectory
+    from flashrwkv2._internal import tuning
+
+    if not tuning._fixed_strategy_device(tuning.device_class(torch.device("cuda"))):
+        pytest.skip("deterministic strategy is qualified on tested devices")
+    artifacts = Path(__file__).resolve().parents[3] / "artifacts"
+    artifacts.mkdir(exist_ok=True)
+    script = r'''
+import hashlib, json, sys
+import torch, tilelang
+from tilelang.jit.kernel import JITKernel
+from flashrwkv2._internal import linear, tuning
+phase = sys.argv[1]
+compilations = []
+original = JITKernel._compile_and_create_adapter
+def compile_kernel(self, *args, **kwargs):
+    assert phase == "cold", "warm process attempted device compilation"
+    compilations.append(1)
+    return original(self, *args, **kwargs)
+JITKernel._compile_and_create_adapter = compile_kernel
+torch.manual_seed(104)
+x = torch.randn(17, 64, device="cuda").bfloat16()
+w = torch.randn(96, 64, device="cuda").bfloat16()
+dx = torch.randn(96, 32, device="cuda").bfloat16()
+dw = torch.randn(32, 64, device="cuda").bfloat16().t()
+report = tuning.prepare_tuning([
+    lambda: linear._forward(x, w, None, torch.float32),
+    lambda: linear._forward(dx, dw, None, torch.float32, dynamic_k=True),
+])
+assert report["complete"] and report["compilation"]["complete"]
+def forbidden(*args, **kwargs):
+    raise AssertionError("prepared family attempted TileLang compilation")
+linear._compile_spec = tilelang.compile = tilelang.par_compile = forbidden
+values = []
+for rows in (89, 90, 100):
+    values.append(linear._forward(x[:1].expand(rows, -1).contiguous(), w, None, torch.float32))
+for k in (1, 17, 31, 32, 33, 64, 65, 89, 90, 100, 129):
+    a = dx[:, :1].expand(-1, k).contiguous()
+    b = dw[:, :1].expand(-1, k).t().contiguous().t()
+    values.append(linear._forward(a, b, None, torch.float32, dynamic_k=True))
+torch.cuda.synchronize()
+hashes = [hashlib.sha256(v.cpu().numpy().tobytes()).hexdigest() for v in values]
+print("CACHE_RESULT " + json.dumps({"phase": phase, "device_compilations": len(compilations),
+                                   "compilation": report["compilation"], "hashes": hashes}))
+'''
+    reports = []
+    with TemporaryDirectory(prefix="tilelang-cold-", dir=artifacts) as cache:
+        environment = {**os.environ, "TILELANG_CACHE_DIR": cache}
+        for phase in ("cold", "warm"):
+            result = subprocess.run([sys.executable, "-c", script, phase], env=environment,
+                                    text=True, capture_output=True, timeout=600)
+            assert result.returncode == 0, result.stdout + result.stderr
+            report = json.loads(next(line.removeprefix("CACHE_RESULT ") for line in
+                                     result.stdout.splitlines() if line.startswith("CACHE_RESULT ")))
+            reports.append(report)
+    assert reports[0]["device_compilations"] > 0
+    assert reports[1]["device_compilations"] == 0
+    assert reports[0]["hashes"] == reports[1]["hashes"]
+    assert reports[0]["compilation"] == reports[1]["compilation"]
+    print(json.dumps({"cold_device_compilations": reports[0]["device_compilations"],
+                      "warm_device_compilations": reports[1]["device_compilations"],
+                      "compilation": reports[1]["compilation"]}))

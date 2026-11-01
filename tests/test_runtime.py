@@ -732,6 +732,7 @@ def test_projection_search_keeps_both_sides_of_sm_coverage(monkeypatch):
     ((4096,) * 4, (192, 192, 384, 128)), ((96, 96, 256, 64), (2048,) * 4),
 ))
 def test_projection_variants_cover_dynamic_rows(monkeypatch, sms, channels, outputs):
+    import random
     import torch
     from flashrwkv2._internal.linear import _projection_config, _projection_variants
 
@@ -740,7 +741,8 @@ def test_projection_variants_cover_dynamic_rows(monkeypatch, sms, channels, outp
     ))
     variants = _projection_variants(channels, outputs, "cuda")
     assert len(variants) <= 5
-    for rows in range(1, 4097):
+    probes = (*range(1, 4097), *random.Random(804).sample(range(4097, 1 << 20), 20))
+    for rows in probes:
         config = _projection_config(rows, channels, outputs, "cuda")
         assert config in variants, (rows, config, variants)
         m, n, stages, span = config

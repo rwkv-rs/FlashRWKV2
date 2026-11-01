@@ -198,11 +198,13 @@ report = prepare_tuning(warmup_calls, mode="require")  # before graph capture
 
 `inspect` reports workload-bucket dispatch coverage; `require` loads verified selections
 and fails on missing keys; `tune` verifies output/state before timing candidates.
-Validated fixed strategies report `fixed` and need neither a profile nor runtime
-tuning. On RTX 4090, the supported single-token paths and selected R/K/V row
-ranges use fixed strategies; other workloads and devices continue
-to use verified profiles. See the
-[tuning contract](docs/kernel_api.md#tuning-and-acceptance) for exact coverage.
+Validated deterministic strategies report `fixed` and need neither a profile nor runtime
+tuning. RTX 4090 (SM89/128 SM) and PRO 6000 (SM120/188 SM) use a shared bounded
+projection policy and dynamic token reductions. Explicit preparation compiles all
+reachable variants of observed deterministic families; `report["compilation"]` gives
+their coverage. Include real decode, prefill, training-backward, layouts and gradient
+requirements in the warmup calls. Other paths retain verified profiles. See the
+[tuning contract](docs/kernel_api.md#tuning-and-acceptance) for scope and validation.
 Token counts and batch sizes share power-of-two workload buckets capped at 512
 (plus a separate empty bucket); model widths, weight layouts and dtypes remain
 exact. Same-shape weight replacements reuse the same profiles. TokenShift and

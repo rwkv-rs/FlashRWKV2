@@ -864,20 +864,23 @@ def test_prepared_block_has_no_tilelang_compilation_for_new_tokens(monkeypatch, 
     params = parameters(128, rank=32, vocab=257)
     initial = torch.randn(1, 2, 64, 64, device="cuda") * .01
     shifts = tuple(torch.randn(1, 128, device="cuda").bfloat16() * .1 for _ in range(2))
-    def inputs(length):
-        x = (torch.randn(1, length, 128, device="cuda") * .1).bfloat16()
+    def inputs(length, batch=1):
+        x = (torch.randn(batch, length, 128, device="cuda") * .1).bfloat16()
         res = torch.randn_like(x) * .1
-        targets = torch.randint(257, (1, length), device="cuda")
+        targets = torch.randint(257, (batch, length), device="cuda")
         return x, res, targets
     def call(data):
         x, res, targets = data
+        batch = x.shape[0]
+        current = initial.expand(batch, -1, -1, -1).contiguous()
+        previous = tuple(s.expand(batch, -1).contiguous() for s in shifts)
         if training:
             values = train_block(x.requires_grad_(), res.requires_grad_(), params,
-                                 initial, shifts, targets, 64, None)
+                                 current, previous, targets, 64, None)
             return torch.autograd.grad(-values[0].sum(), (x, res, *params.values()), allow_unused=True)
-        slots = torch.zeros(1, device="cuda", dtype=torch.int32)
-        cu = slots.new_tensor((0, x.shape[1]))
-        state, pools = state_pools(initial, shifts, slots, 1)
+        slots = torch.arange(batch, device="cuda", dtype=torch.int32)
+        cu = torch.arange(batch + 1, device="cuda", dtype=torch.int32) * x.shape[1]
+        state, pools = state_pools(current, previous, slots, batch + 7)
         return infer_block(x.flatten(0, 1), res.flatten(0, 1), params, state, pools,
                            cu, slots, targets.flatten(), 64, None)
     warmups = [inputs(32)] if training else [inputs(1), inputs(32)]
@@ -892,4 +895,6 @@ def test_prepared_block_has_no_tilelang_compilation_for_new_tokens(monkeypatch, 
     monkeypatch.setattr(tuning, "_read_profile", forbidden)
     for length in (1, 17, 31, 64, 65, 89, 90, 100, 129, 257, 513, 1024):
         call(inputs(length))
+    for batch in (89, 90, 100):
+        call(inputs(1, batch))
     torch.cuda.synchronize()

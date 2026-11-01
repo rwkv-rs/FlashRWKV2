@@ -184,49 +184,84 @@ def _aligned(tensor):
     return tensor if tensor.data_ptr() % 16 == 0 else tensor.clone()
 
 
-def _projection_tiles(outputs):
-    narrow = max((n + 127) // 128 for n in outputs) <= 4
-    return ((64, 64), (32, 32), (16, 32), (16, 16)) if narrow else (
-        (128, 128), (64, 128), (64, 64), (32, 64)
-    )
+def _projection_tiles(outputs, num_sms):
+    columns = max((n + 127) // 128 for n in outputs)
+    if columns <= 4:
+        tiles = ((64, 64), (32, 32), (16, 32), (16, 16))
+    elif columns >= num_sms:
+        # Columns alone fill the device: reuse each weight across more rows.
+        tiles = ((256, 64), (128, 64), (64, 64), (32, 64))
+    else:
+        tiles = ((128, 128), (64, 128), (64, 64), (32, 64))
+    # Bound the accumulator footprint across grouped projection branches.
+    return tuple((m, n) for m, n in tiles if len(outputs) == 1 or m * n <= 8192)
 
 
 def _projection_config(rows, channels, outputs, device, *, aligned_k=True):
     """Choose output tiles by CTA coverage; K MMA groups remain canonical."""
     props = torch.cuda.get_device_properties(device)
-    tiles = ((16, n) for n in (128, 64, 32, 16)) if rows <= 16 else _projection_tiles(outputs)
+    tiles = (
+        ((16, n) for n in (128, 64, 32, 16))
+        if rows <= 16
+        else _projection_tiles(outputs, props.multi_processor_count)
+    )
     limit = max(16, 1 << (max(1, rows) - 1).bit_length())
     legal = tuple((m, n) for m, n in tiles if m <= limit)
-    m, n = next((tile for tile in legal if
-                 math.ceil(rows / tile[0]) * sum(math.ceil(o / tile[1]) for o in outputs)
-                 >= props.multi_processor_count), legal[-1])
+    m, n = next(
+        (
+            tile
+            for tile in legal
+            if math.ceil(rows / tile[0]) * sum(math.ceil(o / tile[1]) for o in outputs)
+            >= props.multi_processor_count
+        ),
+        legal[-1],
+    )
     dynamic = channels is None
-    cap = (64 if aligned_k else 32) if dynamic else (512 if m == 16 else 64 if m * n >= 8192 else 128)
+    columns = max((o + 127) // 128 for o in outputs)
+    if dynamic:
+        cap = 64 if aligned_k else 32
+    elif m == 16:
+        cap = 512 if columns <= 4 else 256
+    elif columns >= props.multi_processor_count and m <= 128:
+        cap = 128
+    else:
+        cap = 64 if m * n >= 4096 else 128
     stages = 1 if dynamic else 2
-    span = next(k for k in (512, 256, 128, 64, 32)
-                if k <= cap and (dynamic or k == 32 or all(c % k == 0 for c in channels))
-                and (m + n) * stages * k * 2 <= props.shared_memory_per_block_optin)
+    span = next(
+        k
+        for k in (512, 256, 128, 64, 32)
+        if k <= cap
+        and (dynamic or k == 32 or all(c % k == 0 for c in channels))
+        and (m + n) * stages * k * 2 <= props.shared_memory_per_block_optin
+    )
     return m, n, stages, span
 
 
-def _projection_variants(channels, outputs, device, *, rows=None):
-    if channels is None:
-        return tuple(dict.fromkeys(_projection_config(rows, None, outputs, device, aligned_k=a)
-                                   for a in (False, True)))
+def _projection_variants(channels, outputs, device):
+    """Evaluate static-K selection at every possible row transition."""
     sms = torch.cuda.get_device_properties(device).multi_processor_count
     boundaries = {1, 16, 17}
-    for m, n in _projection_tiles(outputs):
-        threshold = (math.ceil(sms / sum(math.ceil(o / n) for o in outputs)) - 1) * m + 1
+    for m, n in _projection_tiles(outputs, sms):
+        threshold = (
+            math.ceil(sms / sum(math.ceil(o / n) for o in outputs)) - 1
+        ) * m + 1
         for point in (m // 2 + 1, threshold):
             boundaries.update((max(1, point - 1), max(1, point), max(1, point + 1)))
-    return tuple(dict.fromkeys(_projection_config(r, channels, outputs, device)
-                               for r in sorted(boundaries)))
+    return tuple(
+        dict.fromkeys(
+            _projection_config(r, channels, outputs, device) for r in sorted(boundaries)
+        )
+    )
 
 
 def _fixed_projection_config(x, weight, output_dtype, bias):
-    if (_fixed_strategy_device(device_class(x.device))
-            and weight.stride() in ((x.shape[1], 1), (1, weight.shape[0]))):
-        return _projection_config(x.shape[0], (x.shape[1],), (weight.shape[0],), x.device)
+    if _fixed_strategy_device(device_class(x.device)) and weight.stride() in (
+        (x.shape[1], 1),
+        (1, weight.shape[0]),
+    ):
+        return _projection_config(
+            x.shape[0], (x.shape[1],), (weight.shape[0],), x.device
+        )
     return None
 
 
@@ -236,39 +271,74 @@ def _forward(x, weight, bias, output_dtype, config=None, *, dynamic_k=False):
     info = device_class(x.device)
     dynamic_k = dynamic_k and _fixed_strategy_device(info)
     aligned_k = x.shape[1] % 32 == 0
-    fixed = _projection_config(x.shape[0], None, (weight.shape[0],), x.device,
-                               aligned_k=aligned_k) if dynamic_k else _fixed_projection_config(x, weight, output_dtype, bias)
+    fixed = (
+        _projection_config(
+            x.shape[0], None, (weight.shape[0],), x.device, aligned_k=aligned_k
+        )
+        if dynamic_k
+        else _fixed_projection_config(x, weight, output_dtype, bias)
+    )
     automatic = config is None
     if automatic:
         from .tuning import get_config
 
         selection_key = _key(x, weight, output_dtype, bias)
         if dynamic_k:
-            selection_key = (*selection_key[:3], 0, *selection_key[4:], "dynamic_k", aligned_k)
+            selection_key = (
+                *selection_key[:3],
+                0,
+                *selection_key[4:],
+                "dynamic_k",
+                aligned_k,
+            )
         config = get_config(
-            _TUNED_CONFIGS, "linear", selection_key, fixed,
+            _TUNED_CONFIGS,
+            "linear",
+            selection_key,
+            fixed,
             tune=lambda: tune_linear(x, weight, output_dtype, bias=bias),
             fixed=fixed is not None,
         )
         if config is None:
-            config = _projection_config(x.shape[0], (x.shape[1],), (weight.shape[0],), x.device)
+            config = _projection_config(
+                x.shape[0], (x.shape[1],), (weight.shape[0],), x.device
+            )
     input_major = weight.stride(0) == 1
     physical_weight = weight.t() if input_major else weight
     key = (
-        weight.shape[0], 0 if dynamic_k else x.shape[1], _dtype_name(output_dtype),
-        _dtype_name(bias.dtype) if bias is not None else "bfloat16", bias is not None,
-        config, None if dynamic_k else physical_weight.stride(), input_major,
+        weight.shape[0],
+        0 if dynamic_k else x.shape[1],
+        _dtype_name(output_dtype),
+        _dtype_name(bias.dtype) if bias is not None else "bfloat16",
+        bias is not None,
+        config,
+        None if dynamic_k else physical_weight.stride(),
+        input_major,
         info[1] * 10 + info[2],
     ) + ((True, aligned_k) if dynamic_k else ())
     if automatic and fixed is not None:
         family = key[:5] + key[6:9] + ((True, x.shape[0]) if dynamic_k else ())
+
         def variants():
             if dynamic_k:
-                return tuple(key[:5] + (_projection_config(x.shape[0], None, (weight.shape[0],), x.device,
-                                                           aligned_k=a),) + key[6:9] + (True, a)
-                             for a in (False, True))
-            return tuple(key[:5] + (c,) + key[6:] for c in
-                         _projection_variants((x.shape[1],), (weight.shape[0],), x.device))
+                return tuple(
+                    key[:5]
+                    + (
+                        _projection_config(
+                            x.shape[0], None, (weight.shape[0],), x.device, aligned_k=a
+                        ),
+                    )
+                    + key[6:9]
+                    + (True, a)
+                    for a in (False, True)
+                )
+            return tuple(
+                key[:5] + (c,) + key[6:]
+                for c in _projection_variants(
+                    (x.shape[1],), (weight.shape[0],), x.device
+                )
+            )
+
         prepare_variants("linear", family, variants, _COMPILED_KERNELS, _compile_spec)
     kernel = _compiled(*key)
     return kernel(x, physical_weight, physical_weight if bias is None else bias)
