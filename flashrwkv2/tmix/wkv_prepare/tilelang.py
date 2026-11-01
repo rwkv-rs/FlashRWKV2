@@ -394,6 +394,30 @@ def _group_key(xs, weights, kinds, biases):
     )
 
 
+def _fixed_decode_config(xs, weights, kinds, biases):
+    channels = xs[0].shape[1]
+    profiles = (
+        (2048, (96, 96, 256, 64)),
+        (2560, (96, 96, 320, 64)),
+        (4096, (128, 128, 480, 96)),
+        (4096, (192, 192, 384, 128)),
+    )
+    if (
+        xs[0].shape[0] != 1
+        or kinds not in ((1, 0, 2), (1, 0, 2, 0))
+        or any(bias is not None for bias in biases)
+        or any(x.shape[1] != channels for x in xs)
+        or device_class(xs[0].device)[1:3] not in ((8, 9), (12, 0))
+    ):
+        return None
+    ranks = tuple(weight.shape[0] for weight in weights)
+    if not any(channels == width and ranks == profile[:len(ranks)] for width, profile in profiles):
+        return None
+    output_major = all(weight.stride() == (channels, 1) for weight in weights)
+    input_major = all(weight.stride() == (1, weight.shape[0]) for weight in weights)
+    return (16, 16, 2, 512) if output_major or input_major else None
+
+
 def _group_spec(
     channels,
     outputs,
@@ -447,7 +471,12 @@ def _group_call(xs, weights, kinds, biases, raw_mode, config):
     if config is None:
         from ..._internal.tuning import get_config
 
-        config = get_config(_GROUP_CONFIGS, "tmix/wkv_prepare", _group_key(xs, weights, kinds, biases), tune=lambda: _tune_grouped_linear(xs, weights, kinds, biases))
+        fixed = _fixed_decode_config(xs, weights, kinds, biases)
+        config = get_config(
+            _GROUP_CONFIGS, "tmix/wkv_prepare", _group_key(xs, weights, kinds, biases),
+            fixed, tune=lambda: _tune_grouped_linear(xs, weights, kinds, biases),
+            fixed=fixed is not None,
+        )
         if config is None:
             narrow = max(w.shape[0] for w in weights) <= 128
             copy_k = next(

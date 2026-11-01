@@ -210,6 +210,20 @@ decode 为 `(block_values=64, prefetch_tokens=1)`，多 token 工作量为
 宽度 5120 和更大 batch 暂保留原来的 profile 选择：实测部分工作量的两行或
 四行配置更快，且不同架构的拐点不同。
 
+WKV Prepare 的单 token 低秩输入投影，在上述两种架构的下列模型维度上使用
+`(block_m=16, block_n=16, stages=2, copy_k=512)`；首层只使用前三个 rank，
+后续层使用四个 rank。输入主序和输出主序的连续权重均适用：
+
+| 隐藏宽度 | W/A/G/V rank |
+| --- | --- |
+| 2048 | 96/96/256/64 |
+| 2560 | 96/96/320/64 |
+| 4096 | 128/128/480/96 或 192/192/384/128 |
+
+小 N tile 为低秩输出提供更多 CTA，较长的复制跨度减少大 K 维循环次数；
+MMA 仍按连续 32 元素累加。其他 rank、混合权重布局和多 token 工作量沿用
+profile 选择。
+
 内部 `tune_linear`、`tune_norm`、`tune_tokenshift`、`tune_readout` 与 WKV tuner
 按设备及实际 shape 选择配置。先与固定数值基准逐位比较，再用 CUDA Graph 计时；
 候选只能改变输出 tiling、pipeline 或每 CTA 的独立行数。验收覆盖 RTX 4090
