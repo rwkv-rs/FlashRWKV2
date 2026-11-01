@@ -220,6 +220,8 @@ def test_prepare_tuning_migration_preserves_block_state_logits_and_logprobs(monk
                  "tmix/tokenshift/fused": 1, "post_norm": 1, "tmix/readout": 1}
     legacy = tmp_path / "legacy"
     for record in before["records"]:
+        if record["status"] == "fixed":
+            continue
         key = [record["key"][0][0], *record["key"][1:]]
         encoded = json.dumps(key, separators=(",", ":"))
         path = legacy / record["owner"] / (hashlib.sha256(encoded.encode()).hexdigest() + ".json")
@@ -227,10 +229,12 @@ def test_prepare_tuning_migration_preserves_block_state_logits_and_logprobs(monk
         path.write_text(json.dumps({"key": key, "config": canonical[record["owner"]], "bitwise_equal": True}))
     prepared = fr.prepare_tuning([call], mode="tune", legacy_dir=legacy)
     assert prepared["complete"]
-    assert prepared["counts"]["revalidated"] == len(before["records"])
+    assert prepared["counts"]["revalidated"] == before["counts"]["missing"]
+    assert prepared["counts"]["fixed"] == before["counts"]["fixed"]
     tuning._LOADED.clear()
     loaded = fr.prepare_tuning([call])
-    assert loaded["counts"]["hit"] == len(before["records"])
+    assert loaded["counts"]["hit"] == before["counts"]["missing"]
+    assert loaded["counts"]["fixed"] == before["counts"]["fixed"]
     assert all(value.dtype == torch.float32 for value in snapshots[0][:3])
     for actual in snapshots[1:]:
         for value, reference in zip(actual, snapshots[0], strict=True):

@@ -171,11 +171,18 @@ def _legacy_config(directory, owner, key):
         return None
 
 
-def get_config(configs, owner, key, default=None, *, tune=None):
+def get_config(configs, owner, key, default=None, *, tune=None, fixed=False):
+    session = _SESSION
+    if fixed:
+        if session is not None and not _TUNING.get():
+            session["records"][(owner, key)] = {
+                "owner": owner, "key": json.loads(_encode(key)),
+                "fingerprint": None, "status": "fixed", "config": default, "path": None,
+            }
+        return default
     # Owner benchmarks deliberately inject candidates into their process cache.
     if _TUNING.get():
         return configs.get(key, default)
-    session = _SESSION
     identity = (str(_profile_root()), owner, key)
     # Explicit preparation reloads each key once, including files published or
     # removed by another process after an earlier eager call.
@@ -303,7 +310,7 @@ def prepare_tuning(calls, *, mode="require", legacy_dir=None):
     return {"cache_root": str(get_tuning_cache_dir()), "schema": _SCHEMA,
             "complete": all(row["status"] != "missing" for row in records),
             "counts": {status: sum(row["status"] == status for row in records)
-                       for status in ("hit", "missing", "tuned", "revalidated")},
+                       for status in ("fixed", "hit", "missing", "tuned", "revalidated")},
             "records": records}
 
 

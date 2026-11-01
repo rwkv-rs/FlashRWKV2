@@ -164,13 +164,50 @@ output, final_state = statetune_tmix_wkv7_recurrent_fp32io16(
 
 ## Tuning and acceptance
 
+### 配置设计和验收目标
+
+- 以 SM89 RTX 4090 和 SM120 PRO6000 的真实 RWKV 训练、prefill、decode
+  工作负载为范围；覆盖常用模型宽度和低秩维度、首层与后续层、权重布局、
+  BF16/FP32 输出、batch 边界、长序列与 CUDA Graph。
+- 部署时从少量已验证的配置和算子局部规则确定执行方式，不逐 shape 搜索或计时；
+  仅在研发和验收阶段比较更宽的离线参考集。可变 token、batch 使用动态维度，
+  不因精确 batch 重复编译。首编译、编译缓存和执行配置分别统计。
+- 对 dense、异构低秩投影、Head、PostNorm、TokenShift、WKV Prepare、
+  recurrent、Readout 和 CMix，按计算量、最少数据搬运量、实际缓存层次、
+  CTA 波次及寄存器/共享内存分析瓶颈；记录推导依据和实测计数器。
+  候选在编译前剔除硬件资源、对齐或归约约束不满足的配置。
+- 相同输入上先逐位核对 BF16 输出、FP32 累加/统计与 WKV state，再比较性能；
+  保持每个输出的 K 归约次序和现有舍入边界，不使用 split-K。
+- 将既有实现、固定策略和更宽离线候选在相同设备与环境下配对比较。
+  分别测量单算子热缓存、跨层权重工作集、CUDA Graph 与实际调用阶段；
+  记录各次耗时、中位数和波动，并检查分派边界及大于 512 的输入。
+  固定策略的目标是保留至少 95% 的可调延迟收益，通常距离离线参考最优
+  不超过 2%；超过 5% 的退化须分析。收益接近测量噪声时同时比较绝对延迟。
+- 精简执行路径、缓存和准备接口，并检验现有训练与 serving 调用兼容性；
+  测量从冷缓存到可服务的准备成本，避免用调用方新增状态或外部配置替代
+  库内部可确定的策略。
+
+分析和测量方法参考 [TileLang 配置指南](https://www.tilelang.com/programming_guides/autotuning.html#configuration-spaces-and-best-practices)、
+[NVIDIA 矩阵乘性能指南](https://docs.nvidia.com/deeplearning/performance/dl-performance-matrix-multiplication/)、
+[Nsight Compute 分析指南](https://docs.nvidia.com/nsight-compute/ProfilingGuide/) 和
+[FlashInfer 的部署测量设计](https://github.com/flashinfer-ai/flashinfer/blob/main/docs/design_docs/autotuner_v2.md)。
+参考最优值只针对实际验证的离线候选集。
+
+### 当前调优接口
+
+SM89/SM120 的 head size 64、FP32 state WKV recurrence 使用确定性配置：
+decode 为 `(block_values=64, prefetch_tokens=1)`，多 token 工作量为
+`(64, 4)`。functional 和 indexed 路径共享该规则；显式传入的配置仍优先。
+这些路径不读取 verified profile，也不执行运行时调优。内部 WKV tuner 仍可用于
+离线比较候选，但测得的选择不会覆盖上述固定分派。
+
 内部 `tune_linear`、`tune_norm`、`tune_tokenshift`、`tune_readout` 与 WKV tuner
 按设备及实际 shape 选择配置。先与固定数值基准逐位比较，再用 CUDA Graph 计时；
 候选只能改变输出 tiling、pipeline 或每 CTA 的独立行数。验收覆盖 RTX 4090
 SM89 与 PRO6000 SM120 的 decode、小 batch、prefill 和训练形状。
 调优用首批 device 耗时估算约 10 ms 的重放次数，预热后测量三批并取中位数。
 各候选保留 `raw_milliseconds` 三批单次延迟及 `launches_per_graph`。
-投影按拷贝跨度各保留三个已通过逐位验证的候选，再使用每图 1000 次调用重新比较；
+投影在两轮筛选后最多保留三个已通过逐位验证的候选，再使用每图 1000 次调用重新比较；
 正式基准的 10000 次计时保持独立。
 
 公开接口 `get_tuning_cache_dir()` 返回固定根 `~/.cache/flashrwkv2`；唯一覆盖项
@@ -220,9 +257,10 @@ assert loaded["complete"]
 WKV 调优调用需要该 capture shape 全部 token/sequence 均处于 active 状态；
 不能用零 active 的图预热占位输入进行逐位验证。
 报告逐项列出 `owner/key/fingerprint/config/path/status`，其中 key 包含设备类别；
-`counts` 区分 `hit/missing/tuned/revalidated`，`complete` 要求实际观察到的全部
-配置命中，未观察到任何可配置 dispatch 会报错。调用方负责提供完整工作负载集合，
-不能用目录内记录总数代替覆盖证明。固定配置算子不产生可调 key。
+`counts` 区分 `fixed/hit/missing/tuned/revalidated`，`fixed` 表示库内固定配置，
+其 `fingerprint` 和 `path` 为 null；`complete` 要求实际观察到的全部配置均可用，
+未观察到任何可配置 dispatch 会报错。调用方负责提供完整工作负载集合，
+不能用目录内记录总数代替覆盖证明。
 `inspect` 可用默认配置收集缺口，`require` 在第一项缺失时中止；普通 forward
 按 owner 首次警告未调优默认配置，不自动启动调优。
 

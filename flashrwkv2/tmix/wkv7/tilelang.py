@@ -637,6 +637,15 @@ def _config_key(r, batch, bias, *, indexed=False, state_dtype=torch.float32):
     )
 
 
+def _fixed_recurrent_config(r, batch, state_dtype):
+    # Each value column retains the same key reduction and FP32 update order.
+    # Multi-token prefetch overlaps input loads; decode needs no prefetch.
+    device = device_class(r.device)
+    if device[1:3] not in ((8, 9), (12, 0)) or r.shape[-1] != 64 or state_dtype != torch.float32:
+        return None
+    return 64, 4 if r.shape[0] > batch else 1
+
+
 def _infer_recurrent(
     r,
     decay_logits,
@@ -684,15 +693,18 @@ def _infer_recurrent(
 
     config = (64, 1)
     if block_values is None or prefetch_tokens is None:
+        fixed = _fixed_recurrent_config(r, batch, state_pool.dtype)
         config = get_config(
             _TUNED_CONFIGS, "tmix/wkv7",
-            _config_key(r, batch, decay_bias, indexed=True, state_dtype=state_pool.dtype), (64, 1),
+            _config_key(r, batch, decay_bias, indexed=True, state_dtype=state_pool.dtype),
+            fixed or config,
             tune=lambda: tune_tmix_wkv7_recurrent(
                 r, decay_logits, k, v, a, b,
                 state_pool, cu_seqlens,
                 scale=scale, decay_bias=decay_bias, indexed=True,
                 state_indices=state_indices, status=status,
             ),
+            fixed=fixed is not None,
         )
     block_values = config[0] if block_values is None else block_values
     prefetch_tokens = config[1] if prefetch_tokens is None else prefetch_tokens
@@ -785,10 +797,13 @@ def _functional_config(r, decay_logits, k, v, a, b, initial_state, cu_seqlens, s
     from ..._internal.tuning import get_config
     config = (64, 1)
     if block_values is None or prefetch_tokens is None:
+        fixed = _fixed_recurrent_config(r, initial_state.shape[0], initial_state.dtype)
         config = get_config(
-            _TUNED_CONFIGS, "tmix/wkv7", _config_key(r, initial_state.shape[0], decay_bias), (64, 1),
+            _TUNED_CONFIGS, "tmix/wkv7", _config_key(r, initial_state.shape[0], decay_bias),
+            fixed or config,
             tune=lambda: tune_tmix_wkv7_recurrent(r, decay_logits, k, v, a, b, initial_state, cu_seqlens,
                                                  scale=scale, decay_bias=decay_bias),
+            fixed=fixed is not None,
         )
     return config[0] if block_values is None else block_values, config[1] if prefetch_tokens is None else prefetch_tokens
 

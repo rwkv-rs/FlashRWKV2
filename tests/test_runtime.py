@@ -104,6 +104,30 @@ def test_tuning_default_root_ignores_torch_and_xdg(monkeypatch, tmp_path, overri
         tuning.get_tuning_cache_dir.cache_clear()
 
 
+def test_fixed_configuration_skips_profiles_and_search_in_every_mode(tuning_cache, monkeypatch):
+    tuning = tuning_cache
+    key = (("test", 8, 9, 128), 32)
+    config = (64, 4)
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("fixed configurations must not read profiles or tune")
+
+    monkeypatch.setattr(tuning, "_read_profile", unexpected)
+    call = lambda: tuning.get_config({}, "tmix/wkv7", key, config, tune=unexpected, fixed=True)
+    for mode in ("inspect", "require", "tune"):
+        report = tuning.prepare_tuning([call, call], mode=mode)
+        assert report["complete"] and report["counts"]["fixed"] == 1
+        assert report["records"][0]["config"] == config
+        assert report["records"][0]["path"] is None
+    monkeypatch.setattr(tuning, "_capturing", lambda: True)
+    assert call() == config
+    active = tuning._TUNING.set(True)
+    try:
+        assert tuning.get_config({key: (32, 1)}, "tmix/wkv7", key, config, fixed=True) == config
+    finally:
+        tuning._TUNING.reset(active)
+
+
 def test_tuning_missing_then_published_is_visible_in_same_process(tuning_cache):
     tuning = tuning_cache
     key = (("test", 8, 9, 128), 32, "torch.bfloat16")
