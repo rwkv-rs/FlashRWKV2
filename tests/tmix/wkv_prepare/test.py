@@ -158,13 +158,14 @@ def test_fixed_canonical_decode_output_preserves_accumulators_and_graph(monkeypa
     (2048, 160, (64, 64, 2, 64)), (2048, 161, (64, 128, 2, 64)),
     (2048, 320, (64, 128, 2, 64)), (2048, 321, (64, 64, 2, 64)),
     (2048, 448, (64, 64, 2, 64)), (2048, 449, (64, 128, 2, 64)),
-    (2048, 512, (64, 128, 2, 64)), (2048, 513, None),
+    (2048, 512, (64, 128, 2, 64)), (2048, 513, (64, 128, 2, 64)),
+    (2048, 1024, (64, 128, 2, 64)), (2048, 1025, None),
     (2560, 17, (32, 64, 2, 128)), (2560, 64, (32, 64, 2, 128)),
     (2560, 65, (64, 64, 2, 64)), (2560, 192, (64, 64, 2, 64)),
     (2560, 193, (64, 128, 2, 64)), (2560, 256, (64, 128, 2, 64)),
     (2560, 257, (64, 64, 2, 64)), (2560, 384, (64, 64, 2, 64)),
     (2560, 385, (64, 128, 2, 64)), (2560, 512, (64, 128, 2, 64)),
-    (2560, 513, None),
+    (2560, 513, (64, 128, 2, 64)), (2560, 1024, (64, 128, 2, 64)), (2560, 1025, None),
     (4096, 16, (16, 64, 2, 128)), (4096, 17, (32, 64, 2, 128)),
     (4096, 32, (32, 64, 2, 128)), (4096, 33, (64, 128, 2, 64)),
     (4096, 192, (64, 128, 2, 64)), (4096, 193, (128, 64, 2, 64)),
@@ -188,9 +189,10 @@ def test_fixed_rkv_projection_follows_measured_row_wave(monkeypatch, channels, r
 @pytest.mark.parametrize(("channels", "rows"), (
     (2048, 17), (2048, 64), (2048, 65), (2048, 160), (2048, 161),
     (2048, 193), (2048, 256), (2048, 320), (2048, 321),
-    (2048, 448), (2048, 449), (2048, 512),
+    (2048, 448), (2048, 449), (2048, 512), (2048, 513), (2048, 577), (2048, 1024),
     (2560, 17), (2560, 64), (2560, 65), (2560, 192), (2560, 193),
     (2560, 256), (2560, 257), (2560, 384), (2560, 385), (2560, 512),
+    (2560, 513), (2560, 960), (2560, 1024),
     (4096, 17), (4096, 32), (4096, 33), (4096, 64), (4096, 128), (4096, 192), (4096, 193), (4096, 256),
     (4096, 257), (4096, 320), (4096, 512), (4096, 961), (4096, 1024),
 ))
@@ -225,6 +227,37 @@ def test_fixed_rkv_row_wave_preserves_accumulators_and_graph(monkeypatch, tmp_pa
     graph.replay()
     assert all(torch.equal(a, b) for a, b in zip(actual, expected, strict=True))
     assert not tuple(tmp_path.iterdir())
+
+
+@cuda
+@pytest.mark.cuda
+@pytest.mark.parametrize("channels", (2048, 2560))
+def test_fixed_rkv_long_prefill_preserves_training_gradients(monkeypatch, channels):
+    from flashrwkv2._internal import tuning
+    from flashrwkv2.tmix.wkv_prepare import tilelang as implementation
+
+    if not tuning._fixed_strategy_device(tuning.device_class(torch.device("cuda"))):
+        pytest.skip("fixed grouped strategy is qualified on RTX 4090")
+    torch.manual_seed(832)
+    rows = 1024
+    xs = tuple((torch.randn(rows, channels, device="cuda", dtype=torch.bfloat16) * .02).requires_grad_() for _ in range(3))
+    weights = tuple((torch.randn(channels, channels, device="cuda", dtype=torch.bfloat16) * .02).requires_grad_() for _ in range(3))
+    kinds, biases = (0, 0, 0), (None,) * 3
+    upstream = tuple(torch.randn_like(x) for x in xs)
+    key = implementation._group_key(xs, weights, kinds, biases)
+    token = tuning._TUNING.set(True)
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(implementation, "_fixed_projection_config", lambda *args: None)
+            patch.setattr(implementation, "_GROUP_CONFIGS", {key: (16, 64, 2, 32)})
+            expected = implementation._grouped_linear(xs, weights, kinds, biases)
+            expected_grads = torch.autograd.grad(expected, (*xs, *weights), upstream)
+        actual = implementation._grouped_linear(xs, weights, kinds, biases)
+        actual_grads = torch.autograd.grad(actual, (*xs, *weights), upstream)
+    finally:
+        tuning._TUNING.reset(token)
+    assert all(torch.equal(a, b) for a, b in zip(actual, expected, strict=True))
+    assert all(torch.equal(a, b) for a, b in zip(actual_grads, expected_grads, strict=True))
 
 
 @pytest.mark.parametrize("stage,count", (("in", 3), ("in", 4), ("out", 3), ("out", 4)))
