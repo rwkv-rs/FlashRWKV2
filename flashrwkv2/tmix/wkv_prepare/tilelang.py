@@ -409,6 +409,8 @@ def _fixed_decode_config(xs, weights, kinds, biases):
                 return (16, 32, 2, 256) if channels < 4096 else (16, 64, 2, 128)
             if 192 < rows <= 256:
                 return (64, 128, 2, 64) if channels < 4096 else (128, 64, 2, 64)
+            if channels == 4096 and 960 < rows <= 1024:
+                return (64, 128, 2, 64)
         return None
     if rows != 1:
         return None

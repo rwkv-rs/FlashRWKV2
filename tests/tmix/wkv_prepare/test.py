@@ -114,11 +114,25 @@ def test_fixed_rkv_projection_follows_measured_row_wave(monkeypatch, channels, r
     assert fixed == (expected if 192 < rows <= 256 else None)
 
 
+@pytest.mark.parametrize("channels", (2048, 2560, 4096))
+@pytest.mark.parametrize("rows", (960, 961, 992, 1024, 1025))
+def test_fixed_rkv_projection_follows_large_row_wave(monkeypatch, channels, rows):
+    from flashrwkv2.tmix.wkv_prepare import tilelang as implementation
+
+    monkeypatch.setattr(implementation, "device_class", lambda device: ("test", 8, 9, 128))
+    xs = tuple(torch.empty(rows, channels, device="meta") for _ in range(3))
+    weights = tuple(torch.empty(channels, channels, device="meta") for _ in range(3))
+    fixed = implementation._fixed_decode_config(xs, weights, (0, 0, 0), (None,) * 3)
+    assert fixed == ((64, 128, 2, 64) if channels == 4096 and 960 < rows <= 1024 else None)
+
+
 @cuda
 @pytest.mark.cuda
 @pytest.mark.cuda_graph
-@pytest.mark.parametrize("channels", (2048, 2560, 4096))
-@pytest.mark.parametrize("rows", (193, 256))
+@pytest.mark.parametrize(("channels", "rows"), (
+    (2048, 193), (2048, 256), (2560, 193), (2560, 256),
+    (4096, 193), (4096, 256), (4096, 961), (4096, 1024),
+))
 def test_fixed_rkv_row_wave_preserves_accumulators_and_graph(monkeypatch, tmp_path, channels, rows):
     from flashrwkv2._internal import tuning
     from flashrwkv2.tmix.wkv_prepare import tilelang as implementation
