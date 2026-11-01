@@ -137,6 +137,37 @@ def test_fixed_configuration_skips_profiles_and_search_in_every_mode(tuning_cach
         tuning._TUNING.reset(active)
 
 
+
+def test_fixed_and_profiled_dispatches_with_shared_bucket_are_reported(tuning_cache):
+    tuning = tuning_cache
+    key = (("test", 8, 9, 128), 512)
+    fixed = lambda: tuning.get_config({}, "linear", key, (64, 128, 2, 64), fixed=True)
+    profiled = lambda: tuning.get_config({}, "linear", key, (16, 64, 2, 32))
+    for calls in ((fixed, profiled), (profiled, fixed)):
+        report = tuning.prepare_tuning(calls, mode="inspect")
+        assert not report["complete"]
+        assert report["counts"]["fixed"] == report["counts"]["missing"] == 1
+        assert {record["status"] for record in report["records"]} == {"fixed", "missing"}
+
+    tuning.save_config("linear", key, (32, 64, 2, 64))
+    assert tuning.prepare_tuning([profiled])["counts"]["hit"] == 1
+    tuning._profile_path("linear", tuning._encode(key)).unlink()
+    report = tuning.prepare_tuning([fixed, profiled], mode="inspect")
+    assert not report["complete"]
+    assert report["counts"]["fixed"] == report["counts"]["missing"] == 1
+
+
+def test_distinct_fixed_configs_in_one_bucket_are_reported(tuning_cache):
+    tuning = tuning_cache
+    key = (("test", 8, 9, 128), 512)
+    def fixed(config):
+        return lambda: tuning.get_config({}, "linear", key, config, fixed=True)
+
+    first, second = (64, 128, 2, 64), (128, 128, 2, 64)
+    report = tuning.prepare_tuning([fixed(first), fixed(second), fixed(first)], mode="inspect")
+    assert report["complete"] and report["counts"]["fixed"] == 2
+    assert {record["config"] for record in report["records"]} == {first, second}
+
 def test_fixed_benchmark_overrides_only_its_target_and_restores_it(tuning_cache):
     tuning = tuning_cache
     key = (("test", 8, 9, 128), 1)

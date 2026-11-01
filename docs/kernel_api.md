@@ -399,7 +399,8 @@ WKV 调优调用需要该 capture shape 全部 token/sequence 均处于 active �
 不能用零 active 的图预热占位输入进行逐位验证。
 报告逐项列出 `owner/key/fingerprint/config/path/status`，其中 key 包含设备类别；
 `counts` 区分 `fixed/hit/missing/tuned/revalidated`，`fixed` 表示库内固定配置，
-其 `fingerprint` 和 `path` 为 null；`complete` 要求实际观察到的全部配置均可用，
+其 `fingerprint` 和 `path` 为 null；同一工作量桶中的固定配置、不同固定选择与
+profile 配置分别报告。`complete` 要求实际观察到的全部配置均可用，
 未观察到任何可配置 dispatch 会报错。调用方负责提供完整工作负载集合，
 不能用目录内记录总数代替覆盖证明。
 `inspect` 可用默认配置收集缺口，`require` 在第一项缺失时中止；普通 forward

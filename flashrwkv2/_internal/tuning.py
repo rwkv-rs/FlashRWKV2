@@ -181,7 +181,7 @@ def get_config(configs, owner, key, default=None, *, tune=None, fixed=False):
     session = _SESSION
     if fixed and (not _TUNING.get() or _TUNING_TARGET.get() != (owner, key)):
         if session is not None and not _TUNING.get():
-            session["records"][(owner, key)] = {
+            session["records"][(owner, key, "fixed", _encode(default))] = {
                 "owner": owner, "key": json.loads(_encode(key)),
                 "fingerprint": None, "status": "fixed", "config": default, "path": None,
             }
