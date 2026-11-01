@@ -396,7 +396,21 @@ def _group_key(xs, weights, kinds, biases):
 
 
 def _fixed_decode_config(xs, weights, kinds, biases):
-    if xs[0].shape[0] != 1 or not _fixed_strategy_device(device_class(xs[0].device)):
+    if not _fixed_strategy_device(device_class(xs[0].device)):
+        return None
+    rows, channels = xs[0].shape
+    if kinds == (0, 0, 0) and all(bias is None for bias in biases):
+        if channels in (2048, 2560, 4096) and all(
+            x.shape[1] == channels and weight.shape == (channels, channels)
+            and weight.stride() == (channels, 1)
+            for x, weight in zip(xs, weights, strict=True)
+        ):
+            if rows == 1:
+                return (16, 32, 2, 256) if channels < 4096 else (16, 64, 2, 128)
+            if 192 < rows <= 256:
+                return (64, 128, 2, 64) if channels < 4096 else (128, 64, 2, 64)
+        return None
+    if rows != 1:
         return None
     profiles = (
         (2048, (96, 96, 256, 64)),
@@ -424,14 +438,6 @@ def _fixed_decode_config(xs, weights, kinds, biases):
         if all(weight.shape == (channels, rank) and weight.stride() == (1, channels)
                for weight, rank in zip(weights, ranks, strict=True)):
             return (16, 32, 2, 64)
-    if kinds == (0, 0, 0) and all(bias is None for bias in biases):
-        channels = xs[0].shape[1]
-        if channels in (2048, 2560, 4096) and all(
-            x.shape[1] == channels and weight.shape == (channels, channels)
-            and weight.stride() == (channels, 1)
-            for x, weight in zip(xs, weights, strict=True)
-        ):
-            return (16, 32, 2, 256) if channels < 4096 else (16, 64, 2, 128)
     return None
 
 

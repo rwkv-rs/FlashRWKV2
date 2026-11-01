@@ -199,8 +199,9 @@ report = prepare_tuning(warmup_calls, mode="require")  # before graph capture
 `inspect` reports workload-bucket dispatch coverage; `require` loads verified selections
 and fails on missing keys; `tune` verifies output/state before timing candidates.
 Validated fixed strategies report `fixed` and need neither a profile nor runtime
-tuning. On RTX 4090, the supported single-token model paths use fixed strategies;
-other devices and workloads continue to use verified profiles. See the
+tuning. On RTX 4090, the supported single-token paths and R/K/V projections
+with 193–256 rows use fixed strategies; other workloads and devices continue
+to use verified profiles. See the
 [tuning contract](docs/kernel_api.md#tuning-and-acceptance) for exact coverage.
 Token counts and batch sizes share power-of-two workload buckets capped at 512
 (plus a separate empty bucket); model widths, weight layouts and dtypes remain

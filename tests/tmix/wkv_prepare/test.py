@@ -101,6 +101,57 @@ def test_fixed_decode_projection_restricts_models_and_layouts(monkeypatch):
     assert fixed(xs, dense_weights, (0, 0, 0), biases) == (16, 32, 2, 256)
 
 
+@pytest.mark.parametrize("channels", (2048, 2560, 4096))
+@pytest.mark.parametrize("rows", (192, 193, 224, 256, 257))
+def test_fixed_rkv_projection_follows_measured_row_wave(monkeypatch, channels, rows):
+    from flashrwkv2.tmix.wkv_prepare import tilelang as implementation
+
+    monkeypatch.setattr(implementation, "device_class", lambda device: ("test", 8, 9, 128))
+    xs = tuple(torch.empty(rows, channels, device="meta") for _ in range(3))
+    weights = tuple(torch.empty(channels, channels, device="meta") for _ in range(3))
+    fixed = implementation._fixed_decode_config(xs, weights, (0, 0, 0), (None,) * 3)
+    expected = (64, 128, 2, 64) if channels < 4096 else (128, 64, 2, 64)
+    assert fixed == (expected if 192 < rows <= 256 else None)
+
+
+@cuda
+@pytest.mark.cuda
+@pytest.mark.cuda_graph
+@pytest.mark.parametrize("channels", (2048, 2560, 4096))
+@pytest.mark.parametrize("rows", (193, 256))
+def test_fixed_rkv_row_wave_preserves_accumulators_and_graph(monkeypatch, tmp_path, channels, rows):
+    from flashrwkv2._internal import tuning
+    from flashrwkv2.tmix.wkv_prepare import tilelang as implementation
+
+    if not tuning._fixed_strategy_device(tuning.device_class(torch.device("cuda"))):
+        pytest.skip("fixed grouped strategy is qualified on RTX 4090")
+    torch.manual_seed(831)
+    xs = tuple(torch.randn(rows, channels, device="cuda", dtype=torch.bfloat16) * .02 for _ in range(3))
+    weights = tuple(torch.randn(channels, channels, device="cuda", dtype=torch.bfloat16) * .02 for _ in range(3))
+    kinds, biases = (0, 0, 0), (None,) * 3
+    expected, raw = implementation._run_groups(
+        xs, weights, kinds, biases, raw_mode=2, config=(16, 64, 2, 32),
+    )
+    monkeypatch.setattr(tuning, "_profile_root", lambda: tmp_path)
+    monkeypatch.setattr(tuning, "_read_profile", lambda *args: pytest.fail("read a profile"))
+    values, actual_raw = implementation._run_groups(xs, weights, kinds, biases, raw_mode=2)
+    assert torch.equal(actual_raw, raw)
+    assert all(torch.equal(a, b) for a, b in zip(values, expected, strict=True))
+
+    def call():
+        return implementation._grouped_linear(xs, weights, kinds, biases)
+
+    for mode in ("inspect", "require", "tune"):
+        report = tuning.prepare_tuning([call], mode=mode)
+        assert report["complete"] and report["counts"]["fixed"] == 1
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = call()
+    graph.replay()
+    assert all(torch.equal(a, b) for a, b in zip(actual, expected, strict=True))
+    assert not tuple(tmp_path.iterdir())
+
+
 @cuda
 @pytest.mark.cuda
 @pytest.mark.cuda_graph
