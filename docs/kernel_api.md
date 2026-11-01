@@ -24,7 +24,9 @@ y[v] = scale * sum_k r[k] * state[k,v]
 
 `head_size` 支持 64、128、256。前向一致性按位比较输出、state 和所选 token 的
 logprob；梯度使用独立 FP32 参考与相对误差验证。WKV 反向从保存的 chunk 起始状态
-重放前向，并在短片段内逆序求 VJP。只有需要梯度时才保存 checkpoint。
+重放前向，并在短片段内逆序求 VJP；不同 value tile 的部分梯度通过 FP32 原子加累积，
+调度顺序会造成极小的舍入差异。前向输出和 state 逐位比较，反向沿用独立 VJP 测试的
+`atol=2e-5, rtol=2e-2` 容差。只有需要梯度时才保存 checkpoint。
 
 ## Inference
 
