@@ -427,8 +427,6 @@ def _fixed_projection_config(xs, weights, kinds, biases):
             ):
                 return (64, 128, 2, 64)
         return None
-    if rows > 512 and not 960 < rows <= 1024:
-        return None
     profiles = (
         (2048, (96, 96, 256, 64)),
         (2560, (96, 96, 320, 64)),
@@ -450,16 +448,29 @@ def _fixed_projection_config(xs, weights, kinds, biases):
             if output_major or input_major:
                 return (16, 32 if input_major or (rows == 1 and channels < 4096) else 16, 2, 512)
             return None
-        if channels in (2048, 2560) and rows <= 512 and (input_major or output_major):
-            # Keep each narrow N tile within the first 128-SM wave when possible.
-            wave_16 = 16 * (128 // sum((rank + 15) // 16 for rank in ranks))
-            wave_32 = 16 * (128 // sum((rank + 31) // 32 for rank in ranks))
-            if output_major and rows <= wave_16:
-                return (16, 16, 2, 512)
-            if rows <= wave_32:
-                return (16, 32, 2, 512)
-            wide = channels == 2560 and len(ranks) == 4 and input_major and rows > 448
-            return (32, 64 if wide else 32, 2, 128)
+        if channels in (2048, 2560) and (input_major or output_major):
+            if rows <= 512:
+                # Keep each narrow N tile within the first 128-SM wave when possible.
+                wave_16 = 16 * (128 // sum((rank + 15) // 16 for rank in ranks))
+                wave_32 = 16 * (128 // sum((rank + 31) // 32 for rank in ranks))
+                if output_major and rows <= wave_16:
+                    return (16, 16, 2, 512)
+                if rows <= wave_32:
+                    return (16, 32, 2, 512)
+                wide = channels == 2560 and len(ranks) == 4 and input_major and rows > 448
+                return (32, 64 if wide else 32, 2, 128)
+            if rows <= 1024:
+                # Compare N=32 and N=64 at their last full CTA waves.
+                waves = 2 if channels == 2048 and len(ranks) == 3 else 3
+                wave_32 = 32 * (128 * waves // sum((rank + 31) // 32 for rank in ranks))
+                if channels == 2560 and input_major:
+                    wave_32 = 576 if len(ranks) == 3 else 0
+                if rows <= wave_32:
+                    return (32, 32, 2, 128)
+                wave_64 = 32 * (256 // sum((rank + 63) // 64 for rank in ranks))
+                return (32, 64, 2, 128) if rows <= wave_64 else (64, 64, 2, 64)
+        if rows > 512 and not 960 < rows <= 1024:
+            return None
         if channels == 4096 and rows <= 64 and (input_major or output_major):
             return (16, 16 if output_major and rows <= 32 else 32, 2, 512)
         if (model_13b or (model_72b and rows <= 512)) and (input_major or output_major):
@@ -490,9 +501,14 @@ def _fixed_projection_config(xs, weights, kinds, biases):
         model_13b = channels == 4096 and ranks == (192, 192, 384, 128)[:len(ranks)]
         if rows <= 16 and (input_major or output_major):
             return (16, 32, 2, 64)
-        if channels in (2048, 2560) and rows <= 512 and (input_major or output_major):
-            limit = (352 if len(ranks) == 3 else 320) if channels == 2048 else 96
-            return (32 if rows <= limit else 64, 64, 2, 64)
+        if channels in (2048, 2560) and (input_major or output_major):
+            if rows <= 512:
+                limit = (352 if len(ranks) == 3 else 320) if channels == 2048 else 96
+                return (32 if rows <= limit else 64, 64, 2, 64)
+            if rows <= 1024:
+                return (64, 64, 2, 64)
+        if rows > 512 and not 960 < rows <= 1024:
+            return None
         if channels == 4096 and rows <= 63 and (input_major or output_major):
             return (32, 64, 2, 64)
         model_72b = channels == 4096 and ranks == (128, 128, 480, 96)[:len(ranks)]
