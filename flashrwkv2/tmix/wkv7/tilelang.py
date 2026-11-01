@@ -441,9 +441,10 @@ def _backward_kernel(
     return kernel
 
 
-def _prepared_forward_kernel(*options):
+def _prepared_forward_kernel(device, *options):
     variants = (options[:9] + (prefetch,) + options[10:] for prefetch in (1, 4)) if (
         options[1] == 64 and options[-1] == "float32"
+        and _fixed_strategy_device(device_class(device))
     ) else (options,)
     return prepared_kernel("tmix/wkv7", _forward_kernel, options, variants)
 
@@ -474,7 +475,7 @@ def _forward(
         device=r.device,
     )
     _prepared_forward_kernel(
-        heads,
+        r.device, heads,
         dim,
         scale,
         bias.numel() != 0,
@@ -722,7 +723,7 @@ def _infer_recurrent(
     output = torch.empty_like(v)
     empty = torch.empty((0, heads, dim, dim), dtype=state_pool.dtype, device=r.device)
     _prepared_forward_kernel(
-        heads,
+        r.device, heads,
         dim,
         float(scale),
         bias.numel() != 0,

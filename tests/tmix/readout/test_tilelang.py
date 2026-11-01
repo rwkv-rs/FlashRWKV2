@@ -189,3 +189,23 @@ def test_fixed_decode_readout_preserves_stats_vjp_and_graph(monkeypatch, tmp_pat
     graph.replay()
     assert torch.equal(captured.view(torch.int16), expected.view(torch.int16))
     assert not tuple(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("qualified,head_size,groups", (
+    (False, 64, ()), (True, 128, ()), (True, 64, (4, 8)),
+))
+def test_preparation_enumerates_only_qualified_readout_families(monkeypatch, qualified, head_size, groups):
+    from types import SimpleNamespace
+    from flashrwkv2.tmix.readout import tilelang as implementation
+    calls = []
+    def prepare(owner, compiler, options, variants):
+        calls.append((options, tuple(variants)))
+        return "kernel"
+    monkeypatch.setattr(implementation, "device_class", lambda device: "test")
+    monkeypatch.setattr(implementation, "_fixed_strategy_device", lambda info: qualified)
+    monkeypatch.setattr(implementation, "prepared_kernel", prepare)
+    x = SimpleNamespace(shape=(17, 256), dtype=torch.bfloat16, device="cuda")
+    assert implementation._prepared_forward(x, head_size, 64e-5, False, 2) == "kernel"
+    options, variants = calls[0]
+    assert options[-1] == 2
+    assert tuple(key[-1] for key in variants) == groups

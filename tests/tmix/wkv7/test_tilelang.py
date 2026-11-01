@@ -518,3 +518,21 @@ def test_recurrent_cuda_graph_replay_matches_eager():
     graph.replay()
     for replayed, eager in zip(actual, expected, strict=True):
         assert torch.equal(replayed, eager)
+
+
+@pytest.mark.parametrize("qualified,dim,state_dtype,prefetches", (
+    (True, 64, "float32", (1, 4)), (False, 64, "float32", (1,)),
+    (True, 128, "float32", (1,)), (True, 64, "float16", (1,)),
+))
+def test_preparation_enumerates_only_qualified_wkv_families(monkeypatch, qualified, dim, state_dtype, prefetches):
+    from flashrwkv2.tmix.wkv7 import tilelang as implementation
+    calls = []
+    def prepare(owner, compiler, options, variants):
+        calls.append((options, tuple(variants)))
+        return "kernel"
+    monkeypatch.setattr(implementation, "device_class", lambda device: "test")
+    monkeypatch.setattr(implementation, "_fixed_strategy_device", lambda info: qualified)
+    monkeypatch.setattr(implementation, "prepared_kernel", prepare)
+    options = (2, dim, 1.0, False, False, 64, False, False, "float32", 1, state_dtype)
+    assert implementation._prepared_forward_kernel("cuda", *options) == "kernel"
+    assert tuple(key[9] for key in calls[0][1]) == prefetches

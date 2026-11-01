@@ -216,7 +216,8 @@ class _Norm(torch.autograd.Function):
         need_weight, need_bias = ctx.needs_input_grad[1:3]
         dx, dw, db = prepared_kernel("post_norm", _backward,
             (total.shape[-1], dsum is not None, group, need_weight, need_bias),
-            ((total.shape[-1], dsum is not None, g, need_weight, need_bias) for g in (1, 2, 4, 8, 16, 32)))(
+            ((total.shape[-1], dsum is not None, g, need_weight, need_bias) for g in (1, 2, 4, 8, 16, 32))
+            if _fixed_rows(total) else ())(
             dy, dsum.contiguous() if dsum is not None else dy, weight, total, mean, rstd
         )
         return (

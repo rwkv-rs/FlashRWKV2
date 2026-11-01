@@ -350,7 +350,8 @@ class _TokenShift(torch.autograd.Function):
         group = min(32, tilelang.next_power_of_2(max(1, x.shape[0] // 128)))
         need_mix = ctx.needs_input_grad[1]
         dx, dm, di = prepared_kernel("tmix/tokenshift", _backward, (*ctx.options, group, need_mix),
-            ((*ctx.options, g, need_mix) for g in (1, 2, 4, 8, 16, 32)))(
+            ((*ctx.options, g, need_mix) for g in (1, 2, 4, 8, 16, 32))
+            if ctx.options[1] in (1, 6) and _fixed_rows(x) else ())(
             dy.contiguous(), dfinal.contiguous(), x, mixes, cu, initial
         )
         gradient = sum_partials(dm.flatten(1)).view_as(mixes) if need_mix else None
