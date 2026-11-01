@@ -152,6 +152,12 @@ def test_fixed_decode_readout_preserves_stats_vjp_and_graph(monkeypatch, tmp_pat
     actual_grads = torch.autograd.grad(trained, variables, upstream)
     assert torch.equal(trained.view(torch.int16), baseline.view(torch.int16))
     assert all(torch.equal(a, b) for a, b in zip(actual_grads, expected_grads))
+    if rows == 4 and dtype == torch.bfloat16:
+        compiled = torch.compile(readout, backend="eager", fullgraph=True)
+        compiled_output = compiled(*variables)
+        compiled_grads = torch.autograd.grad(compiled_output, variables, upstream)
+        assert torch.equal(compiled_output.view(torch.int16), baseline.view(torch.int16))
+        assert all(torch.equal(a, b) for a, b in zip(compiled_grads, expected_grads))
 
     def call():
         with torch.no_grad():
