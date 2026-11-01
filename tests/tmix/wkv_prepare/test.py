@@ -175,8 +175,16 @@ def test_fixed_grouped_operator_benchmark_uses_its_candidate(monkeypatch):
         seen.append(key[5])
         return implementation._grouped_linear(xs, weights, kinds, biases)
 
+    select_config = tuning.select_config
+
+    def select_short(*args, **kwargs):
+        kwargs["repeat"] = 2
+        return select_config(*args, **kwargs)
+
     monkeypatch.setattr(implementation, "_GROUP_CONFIGS", {})
-    monkeypatch.setattr(tuning, "revalidation_config", lambda: candidate)
+    monkeypatch.setattr(tuning, "projection_configs", lambda *args: [candidate] if not args[-1] else [])
+    monkeypatch.setattr(tuning, "projection_finalists", lambda *args: [candidate])
+    monkeypatch.setattr(tuning, "select_config", select_short)
     monkeypatch.setattr(tuning, "save_config", lambda *args: None)
     result = implementation._tune_grouped_linear(xs, weights, kinds, biases, benchmark=benchmark)
     assert result["config"] == candidate and seen and set(seen) == {candidate}
