@@ -95,7 +95,7 @@ def test_fixed_decode_projection_restricts_models_and_layouts(monkeypatch):
     fixed = implementation._fixed_projection_config
     assert fixed(xs, weights, kinds, biases) == (16, 32, 2, 512)
     assert fixed(tuple(torch.empty(2, 2048, device="meta") for _ in ranks), weights, kinds, biases) == (16, 16, 2, 512)
-    assert fixed(tuple(torch.empty(17, 2048, device="meta") for _ in ranks), weights, kinds, biases) is None
+    assert fixed(tuple(torch.empty(513, 2048, device="meta") for _ in ranks), weights, kinds, biases) is None
     assert fixed(xs, weights, (0, 0, 0), biases) is None
     assert fixed(xs, weights, kinds, (weights[0][0], None, None)) is None
     mixed_layout = (weights[0].t().contiguous().t(), *weights[1:])
@@ -349,14 +349,60 @@ def test_fixed_72b_projection_preserves_accumulators_and_graph(monkeypatch, tmp_
     _check_fixed_projection(monkeypatch, tmp_path, stage, count, rows, canonical, (128, 128, 480, 96))
 
 
-def _check_fixed_projection(monkeypatch, tmp_path, stage, count, rows, canonical, ranks4):
+@pytest.mark.parametrize("channels,count,rows,canonical,expected", (
+    (2048, 3, 144, True, (16, 32, 2, 512)),
+    (2048, 3, 145, True, (32, 32, 2, 128)),
+    (2560, 4, 48, True, (16, 16, 2, 512)),
+    (2560, 4, 49, True, (16, 32, 2, 512)),
+    (2560, 4, 112, False, (16, 32, 2, 512)),
+    (2560, 4, 113, False, (32, 32, 2, 128)),
+    (2560, 4, 448, False, (32, 32, 2, 128)),
+    (2560, 4, 449, False, (32, 64, 2, 128)),
+))
+def test_fixed_small_input_projection_follows_cta_waves(monkeypatch, channels, count, rows, canonical, expected):
+    from flashrwkv2.tmix.wkv_prepare import tilelang as implementation
+
+    monkeypatch.setattr(implementation, "device_class", lambda device: ("test", 8, 9, 128))
+    ranks = ((96, 96, 256, 64) if channels == 2048 else (96, 96, 320, 64))[:count]
+    xs = tuple(torch.empty(rows, channels, device="meta") for _ in ranks)
+    weights = tuple(
+        torch.empty(rank, channels, device="meta") if canonical else
+        torch.empty(channels, rank, device="meta").t() for rank in ranks
+    )
+    assert implementation._fixed_projection_config(
+        xs, weights, (1, 0, 2, 0)[:count], (None,) * count,
+    ) == expected
+
+
+@cuda
+@pytest.mark.cuda
+@pytest.mark.cuda_graph
+@pytest.mark.parametrize("channels,ranks", (
+    (2048, (96, 96, 256, 64)), (2560, (96, 96, 320, 64)),
+))
+@pytest.mark.parametrize("stage,count,rows", (
+    ("in", 3, 17), ("in", 4, 48), ("in", 4, 49), ("in", 3, 64),
+    ("in", 4, 65), ("in", 4, 112), ("in", 4, 113), ("in", 3, 144),
+    ("in", 3, 145), ("in", 4, 448), ("in", 4, 449), ("in", 4, 512),
+    ("out", 3, 17), ("out", 4, 64), ("out", 4, 96), ("out", 4, 97),
+    ("out", 3, 320), ("out", 4, 321), ("out", 3, 352), ("out", 3, 353),
+    ("out", 4, 512),
+))
+@pytest.mark.parametrize("canonical", (False, True))
+def test_fixed_small_projection_preserves_accumulators_and_graph(
+    monkeypatch, tmp_path, channels, ranks, stage, count, rows, canonical,
+):
+    _check_fixed_projection(monkeypatch, tmp_path, stage, count, rows, canonical, ranks, channels)
+
+
+def _check_fixed_projection(monkeypatch, tmp_path, stage, count, rows, canonical, ranks4, channels=4096):
     from flashrwkv2._internal import tuning
     from flashrwkv2.tmix.wkv_prepare import tilelang as implementation
 
     if not tuning._fixed_strategy_device(tuning.device_class(torch.device("cuda"))):
         pytest.skip("fixed grouped strategy is qualified on RTX 4090")
     torch.manual_seed(849)
-    channels, ranks = 4096, ranks4[:count]
+    ranks = ranks4[:count]
     if stage == "in":
         xs = tuple(torch.randn(rows, channels, device="cuda", dtype=torch.bfloat16) * .02 for _ in ranks)
         weights = tuple(
