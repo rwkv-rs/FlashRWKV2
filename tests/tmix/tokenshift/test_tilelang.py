@@ -218,7 +218,7 @@ def test_fixed_fused_tokenshift_preserves_state_without_tuning(monkeypatch, tmp_
     from flashrwkv2.tmix.tokenshift import tilelang as implementation
 
     if not tuning._fixed_strategy_device(tuning.device_class(torch.device("cuda"))):
-        pytest.skip("fixed fused strategy is qualified on SM89 and SM120")
+        pytest.skip("fixed fused strategy is qualified on RTX 4090")
 
     torch.manual_seed(714)
     rows, channels = 5, 2048
@@ -367,7 +367,7 @@ def test_fixed_single_mix_tokenshift_preserves_empty_state_and_vjp(
     from flashrwkv2.tmix.tokenshift import tilelang as implementation
 
     if not tuning._fixed_strategy_device(tuning.device_class(torch.device("cuda"))):
-        pytest.skip("fixed TokenShift strategy is qualified on SM89 and SM120")
+        pytest.skip("fixed TokenShift strategy is qualified on RTX 4090")
     torch.manual_seed(718)
     batch = 3
     x = torch.randn(rows, channels, device="cuda", dtype=torch.bfloat16).requires_grad_()

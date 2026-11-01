@@ -836,7 +836,7 @@ def tmix_wkv7_recurrent(
 
     ``block_values`` chooses independent value columns per CTA, leaving the
     key reduction unchanged. ``prefetch_tokens`` selects one or four tokens
-    per shared-memory load. The validated SM89/SM120 head-size-64 FP32-state
+    per shared-memory load. The validated RTX 4090 head-size-64 FP32-state
     path uses 64 columns and selects prefetch by workload; other paths use a
     verified profile or the default of 64 columns and one token.
     """
