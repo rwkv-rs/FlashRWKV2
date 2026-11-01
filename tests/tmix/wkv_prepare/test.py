@@ -152,40 +152,45 @@ def test_fixed_canonical_decode_output_preserves_accumulators_and_graph(monkeypa
     assert not tuple(tmp_path.iterdir())
 
 
-@pytest.mark.parametrize("channels", (2048, 2560, 4096))
-@pytest.mark.parametrize("rows", (192, 193, 224, 256, 257))
-def test_fixed_rkv_projection_follows_measured_row_wave(monkeypatch, channels, rows):
+@pytest.mark.parametrize("channels,rows,expected", (
+    (2048, 16, (16, 32, 2, 256)), (2048, 17, (32, 64, 2, 128)),
+    (2048, 64, (32, 64, 2, 128)), (2048, 65, (64, 64, 2, 64)),
+    (2048, 160, (64, 64, 2, 64)), (2048, 161, (64, 128, 2, 64)),
+    (2048, 320, (64, 128, 2, 64)), (2048, 321, (64, 64, 2, 64)),
+    (2048, 448, (64, 64, 2, 64)), (2048, 449, (64, 128, 2, 64)),
+    (2048, 512, (64, 128, 2, 64)), (2048, 513, None),
+    (2560, 17, (32, 64, 2, 128)), (2560, 64, (32, 64, 2, 128)),
+    (2560, 65, (64, 64, 2, 64)), (2560, 192, (64, 64, 2, 64)),
+    (2560, 193, (64, 128, 2, 64)), (2560, 256, (64, 128, 2, 64)),
+    (2560, 257, (64, 64, 2, 64)), (2560, 384, (64, 64, 2, 64)),
+    (2560, 385, (64, 128, 2, 64)), (2560, 512, (64, 128, 2, 64)),
+    (2560, 513, None),
+    (4096, 16, (16, 64, 2, 128)), (4096, 17, (32, 64, 2, 128)),
+    (4096, 32, (32, 64, 2, 128)), (4096, 33, (64, 128, 2, 64)),
+    (4096, 192, (64, 128, 2, 64)), (4096, 193, (128, 64, 2, 64)),
+    (4096, 256, (128, 64, 2, 64)), (4096, 257, (64, 128, 2, 64)),
+    (4096, 512, (64, 128, 2, 64)), (4096, 513, None),
+    (4096, 960, None), (4096, 961, (64, 128, 2, 64)),
+    (4096, 1024, (64, 128, 2, 64)), (4096, 1025, None),
+))
+def test_fixed_rkv_projection_follows_measured_row_wave(monkeypatch, channels, rows, expected):
     from flashrwkv2.tmix.wkv_prepare import tilelang as implementation
 
     monkeypatch.setattr(implementation, "device_class", lambda device: ("test", 8, 9, 128))
     xs = tuple(torch.empty(rows, channels, device="meta") for _ in range(3))
     weights = tuple(torch.empty(channels, channels, device="meta") for _ in range(3))
-    fixed = implementation._fixed_projection_config(xs, weights, (0, 0, 0), (None,) * 3)
-    expected = (64, 128, 2, 64) if channels < 4096 else (128, 64, 2, 64)
-    boundary = channels == 4096 and rows in (192, 257)
-    if boundary:
-        expected = (64, 128, 2, 64)
-    assert fixed == (expected if 192 < rows <= 256 or boundary else None)
-
-
-@pytest.mark.parametrize("channels", (2048, 2560, 4096))
-@pytest.mark.parametrize("rows", (33, 63, 64, 128, 192, 257, 320, 512, 513, 960, 961, 992, 1024, 1025))
-def test_fixed_rkv_projection_follows_large_row_wave(monkeypatch, channels, rows):
-    from flashrwkv2.tmix.wkv_prepare import tilelang as implementation
-
-    monkeypatch.setattr(implementation, "device_class", lambda device: ("test", 8, 9, 128))
-    xs = tuple(torch.empty(rows, channels, device="meta") for _ in range(3))
-    weights = tuple(torch.empty(channels, channels, device="meta") for _ in range(3))
-    fixed = implementation._fixed_projection_config(xs, weights, (0, 0, 0), (None,) * 3)
-    covered = 32 < rows <= 192 or 256 < rows <= 512 or 960 < rows <= 1024
-    assert fixed == ((64, 128, 2, 64) if channels == 4096 and covered else None)
+    assert implementation._fixed_projection_config(xs, weights, (0, 0, 0), (None,) * 3) == expected
 
 
 @cuda
 @pytest.mark.cuda
 @pytest.mark.cuda_graph
 @pytest.mark.parametrize(("channels", "rows"), (
-    (2048, 193), (2048, 256), (2560, 193), (2560, 256),
+    (2048, 17), (2048, 64), (2048, 65), (2048, 160), (2048, 161),
+    (2048, 193), (2048, 256), (2048, 320), (2048, 321),
+    (2048, 448), (2048, 449), (2048, 512),
+    (2560, 17), (2560, 64), (2560, 65), (2560, 192), (2560, 193),
+    (2560, 256), (2560, 257), (2560, 384), (2560, 385), (2560, 512),
     (4096, 17), (4096, 32), (4096, 33), (4096, 64), (4096, 128), (4096, 192), (4096, 193), (4096, 256),
     (4096, 257), (4096, 320), (4096, 512), (4096, 961), (4096, 1024),
 ))

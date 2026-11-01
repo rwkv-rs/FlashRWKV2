@@ -407,10 +407,21 @@ def _fixed_projection_config(xs, weights, kinds, biases):
         ):
             if rows <= 16:
                 return (16, 32, 2, 256) if channels < 4096 else (16, 64, 2, 128)
-            if channels == 4096 and rows <= 32:
+            if channels < 4096:
+                if rows <= 64:
+                    return (32, 64, 2, 128)
+                if rows <= (160 if channels == 2048 else 192):
+                    return (64, 64, 2, 64)
+                if rows <= 256:
+                    return (64, 128, 2, 64)
+                if rows <= 512:
+                    narrow = (320 < rows <= 448) if channels == 2048 else rows <= 384
+                    return (64, 64 if narrow else 128, 2, 64)
+                return None
+            if rows <= 32:
                 return (32, 64, 2, 128)
             if 192 < rows <= 256:
-                return (64, 128, 2, 64) if channels < 4096 else (128, 64, 2, 64)
+                return (128, 64, 2, 64)
             if channels == 4096 and (
                 32 < rows <= 192 or 256 < rows <= 512 or 960 < rows <= 1024
             ):
