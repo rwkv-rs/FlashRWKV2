@@ -195,9 +195,12 @@ def _readout_group(x, r, k, v, r_k, weight, bias, gate, head_size, eps):
     fixed = None
     if (
         head_size == 64 and x.shape[-1] in (2048, 2560, 4096, 5120)
-        and 1 <= rows <= 16 and _fixed_strategy_device(device_class(x.device))
+        and _fixed_strategy_device(device_class(x.device))
     ):
-        fixed = 4 if rows == 1 else 8
+        if 1 <= rows <= 16:
+            fixed = 4 if rows == 1 else 8
+        elif x.shape[-1] == 4096 and 193 <= rows <= 1024:
+            fixed = 8
     return get_config(
         _ROW_CONFIGS, "tmix/readout", _config_key(x, head_size),
         1 if fixed is None else fixed,

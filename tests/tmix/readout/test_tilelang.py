@@ -113,19 +113,29 @@ def test_readout_bitwise_batch_grad_and_vjp(head_size, channels):
         torch.testing.assert_close(gradient, ref, atol=0.03, rtol=0.02)
 
 
+@pytest.mark.parametrize("rows,fixed", ((192, False), (193, True), (256, True), (961, True), (1024, True), (1025, False)))
+def test_fixed_readout_batch_boundaries(monkeypatch, rows, fixed):
+    from flashrwkv2._internal import tuning
+    from flashrwkv2.tmix.readout import tilelang as implementation
+
+    monkeypatch.setattr(implementation, "device_class", lambda device: ("test", 8, 9, 128))
+    monkeypatch.setattr(tuning, "get_config", lambda configs, owner, key, default, *, tune, fixed: (fixed, default))
+    x = torch.empty(rows, 4096, device="meta", dtype=torch.bfloat16)
+    assert implementation._readout_group(x, x, x, x, x, x, x, x, 64, 64e-5) == (fixed, 8 if fixed else 1)
+
+
 @pytest.mark.cuda
 @pytest.mark.cuda_graph
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.parametrize("rows", (1, 4, 16))
+@pytest.mark.parametrize("channels,rows", ((2048, 1), (2048, 4), (2048, 16), (4096, 193), (4096, 256), (4096, 961), (4096, 1024)))
 @pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float32))
-def test_fixed_decode_readout_preserves_stats_vjp_and_graph(monkeypatch, tmp_path, rows, dtype):
+def test_fixed_decode_readout_preserves_stats_vjp_and_graph(monkeypatch, tmp_path, channels, rows, dtype):
     from flashrwkv2._internal import tuning
     from flashrwkv2.tmix.readout import tilelang as implementation
 
     if not tuning._fixed_strategy_device(tuning.device_class(torch.device("cuda"))):
         pytest.skip("fixed readout strategy is qualified on tested devices")
     torch.manual_seed(721)
-    channels = 2048
     x = torch.randn(rows, channels, device="cuda", dtype=dtype)
     bf = tuple(torch.randn(rows, channels, device="cuda", dtype=torch.bfloat16) for _ in range(4))
     vectors = tuple(torch.randn(channels, device="cuda", dtype=torch.bfloat16) for _ in range(3))
