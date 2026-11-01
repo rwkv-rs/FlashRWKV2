@@ -179,7 +179,26 @@ def _aligned(tensor):
 def _fixed_decode_config(x, weight, output_dtype, bias):
     info = device_class(x.device)
     channels, outputs = x.shape[1], weight.shape[0]
-    if x.shape[0] != 1 or bias is not None or not _fixed_strategy_device(info):
+    if bias is not None or not _fixed_strategy_device(info):
+        return None
+    rows = x.shape[0]
+    if rows != 1:
+        if 192 < rows <= 256:
+            square = (64, 128, 2, 64)
+        elif 960 < rows <= 1024:
+            square = (128, 128, 2, 64)
+        else:
+            return None
+        if channels == 4096 and weight.stride() == (channels, 1):
+            if output_dtype == torch.bfloat16 and outputs == channels:
+                return square
+            if (output_dtype == torch.bfloat16 and outputs == 4 * channels) or (
+                output_dtype == torch.float32 and outputs == 65536
+            ):
+                return (256, 64, 2, 64)
+        if (output_dtype == torch.bfloat16 and channels == 16384 and outputs == 4096
+                and weight.stride() == (1, outputs)):
+            return square
         return None
     if weight.stride() == (channels, 1) and channels in (2048, 2560, 4096):
         if output_dtype == torch.bfloat16 and outputs == channels:
