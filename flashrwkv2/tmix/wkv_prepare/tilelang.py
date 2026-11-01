@@ -8,7 +8,12 @@ from torch.autograd.function import once_differentiable
 
 from ..._internal.elementwise import _activation_kernel, activation, sum_partials
 from ..._internal.linear import (
-    _aligned, _forward, _projection_config, _projection_variants, adapter_linear, linear_input_vjp,
+    _aligned,
+    _forward,
+    _projection_config,
+    _projection_variants,
+    adapter_linear,
+    linear_input_vjp,
 )
 from ..._internal.tuning import (
     _AutogradContext,

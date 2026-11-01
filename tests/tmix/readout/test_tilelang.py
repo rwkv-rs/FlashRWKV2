@@ -196,6 +196,7 @@ def test_fixed_decode_readout_preserves_stats_vjp_and_graph(monkeypatch, tmp_pat
 ))
 def test_preparation_enumerates_only_qualified_readout_families(monkeypatch, qualified, head_size, groups):
     from types import SimpleNamespace
+
     from flashrwkv2.tmix.readout import tilelang as implementation
     calls = []
     def prepare(owner, compiler, options, variants):

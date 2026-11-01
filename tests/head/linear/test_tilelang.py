@@ -906,7 +906,9 @@ def test_dynamic_weight_reduction_preserves_accumulators_and_graph(monkeypatch, 
                                                     (True, 128), (True, 1024)))
 def test_prepared_projection_rejects_any_late_compilation(monkeypatch, dynamic_k, outputs):
     import random
+
     import tilelang
+
     from flashrwkv2._internal import linear as implementation
     from flashrwkv2._internal import tuning
 
@@ -965,6 +967,7 @@ def test_prepared_projection_reuses_disk_cache_in_new_process():
     import subprocess
     import sys
     from tempfile import TemporaryDirectory
+
     from flashrwkv2._internal import tuning
 
     if not tuning._fixed_strategy_device(tuning.device_class(torch.device("cuda"))):
@@ -1018,7 +1021,7 @@ print("CACHE_RESULT " + json.dumps({"phase": phase, "device_compilations": len(c
         environment = {**os.environ, "TILELANG_CACHE_DIR": cache}
         for phase in ("cold", "warm"):
             result = subprocess.run([sys.executable, "-c", script, phase], env=environment,
-                                    text=True, capture_output=True, timeout=600)
+                                    text=True, capture_output=True, check=False, timeout=600)
             assert result.returncode == 0, result.stdout + result.stderr
             report = json.loads(next(line.removeprefix("CACHE_RESULT ") for line in
                                      result.stdout.splitlines() if line.startswith("CACHE_RESULT ")))

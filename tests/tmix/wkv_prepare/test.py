@@ -87,6 +87,7 @@ def test_prepare_prefers_canonical_weight_when_runtime_is_also_supplied():
 
 def test_deterministic_group_projection_checks_layout(monkeypatch):
     from types import SimpleNamespace
+
     from flashrwkv2.tmix.wkv_prepare import tilelang as implementation
 
     monkeypatch.setattr(implementation, "device_class", lambda device: ("test", 8, 9, 128))

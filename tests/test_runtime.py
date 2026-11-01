@@ -733,7 +733,9 @@ def test_projection_search_keeps_both_sides_of_sm_coverage(monkeypatch):
 ))
 def test_projection_variants_cover_dynamic_rows(monkeypatch, sms, channels, outputs):
     import random
+
     import torch
+
     from flashrwkv2._internal.linear import _projection_config, _projection_variants
 
     monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: SimpleNamespace(
@@ -779,6 +781,7 @@ def test_preparation_rejects_failed_required_variant(tuning_cache, monkeypatch):
 
 def test_candidate_batches_preserve_distinct_compiler_options(monkeypatch):
     import tilelang
+
     from flashrwkv2._internal.tuning import compile_candidates
 
     calls, cache = [], {}

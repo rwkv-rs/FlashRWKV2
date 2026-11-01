@@ -856,6 +856,7 @@ def test_real_decode_block_needs_no_tuning_profile(monkeypatch, tmp_path, later_
 def test_prepared_block_has_no_tilelang_compilation_for_new_tokens(monkeypatch, training):
     import tilelang
     from tilelang.jit import JITImpl
+
     from flashrwkv2._internal import tuning
 
     if not tuning._fixed_strategy_device(tuning.device_class(torch.device("cuda"))):
