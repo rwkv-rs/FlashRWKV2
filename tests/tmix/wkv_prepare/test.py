@@ -29,7 +29,7 @@ def test_real_model_rank_profile_is_loaded_for_decode_graph(monkeypatch, tmp_pat
     monkeypatch.setattr(implementation, "_GROUP_CONFIGS", {})
     generator = torch.Generator(device="cuda").manual_seed(20261022)
     ranks = (128, 128, 480, 96)
-    channels, rows = 4096, 320
+    channels, rows = 4096, 513
 
     def random(*shape, dtype=torch.bfloat16):
         return torch.randn(shape, generator=generator, device="cuda", dtype=dtype) * 0.03
