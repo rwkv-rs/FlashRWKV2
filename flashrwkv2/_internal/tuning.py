@@ -23,6 +23,7 @@ _SCHEMA = 2
 _SESSION = None
 _PREPARATION_LOCK = Lock()
 _TUNING = ContextVar("flashrwkv2_tuning_active", default=False)
+_TUNING_TARGET = ContextVar("flashrwkv2_tuning_target", default=None)
 _REVALIDATE = ContextVar("flashrwkv2_revalidate", default=None)
 _LOADED = {}
 _WARNED = set()
@@ -178,7 +179,7 @@ def _legacy_config(directory, owner, key):
 
 def get_config(configs, owner, key, default=None, *, tune=None, fixed=False):
     session = _SESSION
-    if fixed:
+    if fixed and (not _TUNING.get() or _TUNING_TARGET.get() != (owner, key)):
         if session is not None and not _TUNING.get():
             session["records"][(owner, key)] = {
                 "owner": owner, "key": json.loads(_encode(key)),
@@ -331,6 +332,15 @@ def tuning_operation(function):
         finally:
             _TUNING.reset(token)
     return wrapped
+
+
+def benchmark_config(owner, key, benchmark):
+    """Temporarily apply a candidate only to the operator being benchmarked."""
+    token = _TUNING_TARGET.set((owner, key))
+    try:
+        return benchmark()
+    finally:
+        _TUNING_TARGET.reset(token)
 
 
 def revalidation_config():

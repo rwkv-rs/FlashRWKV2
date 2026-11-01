@@ -105,6 +105,10 @@ def test_tilelang_linear_tuning_checks_production_and_skips_compile_failures(
         assert config != rejected
         if output_dtype == torch.bfloat16:
             assert config != wrong_bf16
+        key = implementation._key(x, weight, output_dtype, bias)
+        assert tuning.get_config(
+            implementation._TUNED_CONFIGS, "linear", key, (16, 64, 2, 32), fixed=True
+        ) == config
         benchmark_configs.append(config)
 
     def compile_kernel(

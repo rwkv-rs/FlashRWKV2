@@ -157,6 +157,35 @@ def test_fixed_decode_projection_preserves_accumulators_and_graph(
 
 @cuda
 @pytest.mark.cuda
+def test_fixed_grouped_operator_benchmark_uses_its_candidate(monkeypatch):
+    from flashrwkv2._internal import tuning
+    from flashrwkv2.tmix.wkv_prepare import tilelang as implementation
+
+    if not tuning._fixed_strategy_device(tuning.device_class(torch.device("cuda"))):
+        pytest.skip("fixed grouped strategy is qualified on SM89 and SM120")
+    channels, ranks = 2048, (96, 96, 256)
+    xs = tuple(torch.randn(1, channels, device="cuda", dtype=torch.bfloat16) for _ in ranks)
+    weights = tuple(torch.randn(rank, channels, device="cuda", dtype=torch.bfloat16) for rank in ranks)
+    kinds, biases = (1, 0, 2), (None,) * len(ranks)
+    fixed, candidate = (16, 16, 2, 512), (16, 32, 2, 256)
+    seen = []
+
+    def benchmark():
+        key, _ = implementation._group_call(xs, weights, kinds, biases, 0, None)
+        seen.append(key[5])
+        return implementation._grouped_linear(xs, weights, kinds, biases)
+
+    monkeypatch.setattr(implementation, "_GROUP_CONFIGS", {})
+    monkeypatch.setattr(tuning, "revalidation_config", lambda: candidate)
+    monkeypatch.setattr(tuning, "save_config", lambda *args: None)
+    result = implementation._tune_grouped_linear(xs, weights, kinds, biases, benchmark=benchmark)
+    assert result["config"] == candidate and seen and set(seen) == {candidate}
+    key, _ = implementation._group_call(xs, weights, kinds, biases, 0, None)
+    assert key[5] == fixed
+
+
+@cuda
+@pytest.mark.cuda
 def test_fixed_decode_projection_preserves_training_gradients(monkeypatch):
     from flashrwkv2._internal import tuning
     from flashrwkv2.tmix.wkv_prepare import tilelang as implementation

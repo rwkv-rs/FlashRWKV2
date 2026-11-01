@@ -654,6 +654,7 @@ def tune_linear(x, weight, output_dtype=None, *, bias=None, benchmark=None):
     its dispatch cache, preserving the operator's working set during tuning.
     """
     from .tuning import (
+        benchmark_config,
         compile_candidates,
         projection_configs,
         projection_finalists,
@@ -686,8 +687,9 @@ def tune_linear(x, weight, output_dtype=None, *, bias=None, benchmark=None):
     def run(config):
         if benchmark is None:
             return _forward(x, weight, bias, output_dtype, config)
-        _TUNED_CONFIGS[_key(x, weight, output_dtype, bias)] = config
-        return benchmark()
+        key = _key(x, weight, output_dtype, bias)
+        _TUNED_CONFIGS[key] = config
+        return benchmark_config("linear", key, benchmark)
 
     imported = revalidation_config()
     if imported is not None:

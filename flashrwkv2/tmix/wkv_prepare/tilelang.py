@@ -729,6 +729,7 @@ def _grouped_linear(xs, weights, kinds, biases):
 def _tune_grouped_linear(xs, weights, kinds, biases, *, benchmark=None):
     """Verify independent FP32 accumulators and BF16 epilogues before timing."""
     from ..._internal.tuning import (
+        benchmark_config,
         compile_candidates,
         projection_configs,
         projection_finalists,
@@ -758,7 +759,7 @@ def _tune_grouped_linear(xs, weights, kinds, biases, *, benchmark=None):
         if benchmark is None:
             return _run_groups(xs, weights, kinds, biases, config=config)[0]
         _GROUP_CONFIGS[cache_key] = config
-        return benchmark()
+        return benchmark_config("tmix/wkv_prepare", cache_key, benchmark)
 
     def check(config):
         values, _ = _run_groups(xs, weights, kinds, biases, config=config)

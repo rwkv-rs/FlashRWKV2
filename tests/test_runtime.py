@@ -137,6 +137,39 @@ def test_fixed_configuration_skips_profiles_and_search_in_every_mode(tuning_cach
         tuning._TUNING.reset(active)
 
 
+def test_fixed_benchmark_overrides_only_its_target_and_restores_it(tuning_cache):
+    tuning = tuning_cache
+    key = (("test", 8, 9, 128), 1)
+    other = (("test", 8, 9, 128), 2)
+    fixed = (16, 64, 2, 128)
+    candidate = (16, 32, 2, 256)
+    configs = {key: candidate, other: candidate}
+
+    def dispatch(owner, workload):
+        return tuning.get_config(configs, owner, workload, fixed, fixed=True)
+
+    def benchmark():
+        assert dispatch("linear", key) == candidate
+        assert dispatch("linear", other) == fixed
+        assert dispatch("tmix/wkv_prepare", key) == fixed
+        return 42
+
+    assert tuning.benchmark_config("linear", key, lambda: dispatch("linear", key)) == fixed
+    active = tuning._TUNING.set(True)
+    try:
+        assert tuning.benchmark_config("linear", key, benchmark) == 42
+        assert dispatch("linear", key) == fixed
+        with pytest.raises(RuntimeError, match="benchmark failed"):
+            def fail():
+                assert dispatch("linear", key) == candidate
+                raise RuntimeError("benchmark failed")
+
+            tuning.benchmark_config("linear", key, fail)
+        assert dispatch("linear", key) == fixed
+    finally:
+        tuning._TUNING.reset(active)
+
+
 def test_tuning_missing_then_published_is_visible_in_same_process(tuning_cache):
     tuning = tuning_cache
     key = (("test", 8, 9, 128), 32, "torch.bfloat16")
