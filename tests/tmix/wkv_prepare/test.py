@@ -223,15 +223,14 @@ def test_fixed_rkv_row_wave_preserves_accumulators_and_graph(monkeypatch, tmp_pa
 
 @cuda
 @pytest.mark.cuda
-@pytest.mark.parametrize("channels", (2048, 2560))
-def test_fixed_rkv_long_prefill_preserves_training_gradients(monkeypatch, channels):
+@pytest.mark.parametrize("channels,rows", ((2048, 384), (2048, 1024), (2560, 320), (2560, 1024)))
+def test_fixed_rkv_projection_preserves_training_gradients(monkeypatch, channels, rows):
     from flashrwkv2._internal import tuning
     from flashrwkv2.tmix.wkv_prepare import tilelang as implementation
 
     if not tuning._fixed_strategy_device(tuning.device_class(torch.device("cuda"))):
         pytest.skip("fixed grouped strategy is qualified on RTX 4090")
     torch.manual_seed(832)
-    rows = 1024
     xs = tuple((torch.randn(rows, channels, device="cuda", dtype=torch.bfloat16) * .02).requires_grad_() for _ in range(3))
     weights = tuple((torch.randn(channels, channels, device="cuda", dtype=torch.bfloat16) * .02).requires_grad_() for _ in range(3))
     kinds, biases = (0, 0, 0), (None,) * 3
