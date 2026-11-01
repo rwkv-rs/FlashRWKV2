@@ -197,9 +197,9 @@ def _fixed_projection_config(x, weight, output_dtype, bias):
             if rows <= 32:
                 return (32, 64, 2, 128)
             if rows <= 64:
-                return (64, 64, 2, 64)
+                return (64, 64, 2, 128)
             if rows <= 128:
-                return (128, 64, 2, 64)
+                return (128, 64, 2, 128)
             return (256, 64, 2, 64)
         if output_dtype == torch.bfloat16 and outputs == 4096 and (
             (channels == 4096 and output_major)

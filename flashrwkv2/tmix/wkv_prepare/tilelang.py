@@ -475,7 +475,9 @@ def _fixed_projection_config(xs, weights, kinds, biases):
         if model_72b and (input_major or output_major):
             if rows == 64:
                 return (32, 64, 2, 64)
-            if 96 < rows <= (192 if len(ranks) == 4 else 128):
+            if 96 < rows <= 128:
+                return (128, 32, 2, 32) if len(ranks) == 4 else (64, 64, 2, 64)
+            if len(ranks) == 4 and 128 < rows <= 192:
                 return (64, 64, 2, 64)
             if 192 < rows <= 256:
                 return (128, 64, 2, 32)

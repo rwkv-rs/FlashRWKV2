@@ -717,8 +717,8 @@ def test_fixed_4096_linear_row_wave_boundaries(monkeypatch, kind, rows):
     dtype = torch.float32 if kind == "head" else torch.bfloat16
     if rows <= 512 or 960 < rows <= 1024:
         if kind in ("cmix_key", "head"):
-            expected = ((32, 64, 2, 128) if rows <= 32 else (64, 64, 2, 64) if rows <= 64
-                        else (128, 64, 2, 64) if rows <= 128 else (256, 64, 2, 64))
+            expected = ((32, 64, 2, 128) if rows <= 32 else (64, 64, 2, 128) if rows <= 64
+                        else (128, 64, 2, 128) if rows <= 128 else (256, 64, 2, 64))
         elif rows <= 32 or (kind == "cmix_value" and rows <= 64):
             expected = (32, 64, 2, 64)
         elif rows <= 128:
@@ -763,7 +763,8 @@ def test_fixed_square_weight_vjp_limits_reduction_and_dtype(monkeypatch, batch, 
         (4096, 1), (4096, 2), (4096, 16), (4096, 64), (4096, 128),
         (4096, 256), (4096, 320), (4096, 512), (4096, 1024),
     )
-) + tuple(("attention_input_vjp", 4096, rows) for rows in (64, 128, 256, 320, 512, 1024)))
+) + tuple(("attention_input_vjp", 4096, rows) for rows in (64, 128, 256, 320, 512, 1024))
+  + tuple((kind, 4096, rows) for kind in ("cmix_key", "head") for rows in (33, 65)))
 def test_fixed_decode_linear_preserves_fp32_and_graph(monkeypatch, tmp_path, kind, width, rows):
     from flashrwkv2._internal import linear as implementation
     from flashrwkv2._internal import tuning
