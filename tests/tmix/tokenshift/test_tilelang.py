@@ -210,6 +210,60 @@ def test_tokenshift_independent_vjp_with_empty_sequences():
 
 
 @pytest.mark.cuda
+@pytest.mark.cuda_graph
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("count", (1, 6))
+def test_fixed_fused_tokenshift_preserves_state_without_tuning(monkeypatch, tmp_path, count):
+    from flashrwkv2._internal import tuning
+    from flashrwkv2.tmix.tokenshift import tilelang as implementation
+
+    if torch.cuda.get_device_capability() not in ((8, 9), (12, 0)):
+        pytest.skip("fixed fused strategy is qualified on SM89 and SM120")
+
+    torch.manual_seed(714)
+    rows, channels = 5, 2048
+    x = torch.randn(rows, channels, device="cuda", dtype=torch.bfloat16)
+    res = torch.randn_like(x)
+    weight = torch.randn(channels, device="cuda", dtype=torch.bfloat16)
+    bias = torch.randn_like(weight)
+    mixes = tuple(torch.randn_like(weight) for _ in range(count))
+    initial = torch.randn_like(x)
+    pool = initial.clone()
+    indices = torch.arange(rows, device="cuda", dtype=torch.int32)
+    status = torch.tensor((0, rows, rows), device="cuda", dtype=torch.int32)
+    mix_args = mixes + (mixes[-1],) * (6 - count)
+    expected_total, expected_output = implementation._fused_forward(channels, count, 1e-5, 1)(
+        x, res, weight, bias, *mix_args, pool, indices, status,
+    )
+    expected_pool = pool.clone()
+
+    monkeypatch.setattr(tuning, "_profile_root", lambda: tmp_path)
+    monkeypatch.setattr(tuning, "_read_profile", lambda *args: pytest.fail("read a profile"))
+    monkeypatch.setattr(
+        implementation, "tune_fused_tokenshift", lambda *args: pytest.fail("tuned a fixed configuration"),
+    )
+    monkeypatch.setattr(implementation, "_FUSED_CONFIGS", {})
+
+    def call():
+        pool.copy_(initial)
+        return fused_post_norm_tokenshift(x, res, weight, bias, mixes, pool, indices, status)
+
+    for mode in ("inspect", "require", "tune"):
+        report = tuning.prepare_tuning([call], mode=mode)
+        assert report["complete"] and report["counts"]["fixed"] == 1
+        assert report["records"][0]["config"] == 1
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual_total, actual_output = call()
+    graph.replay()
+    assert torch.equal(actual_total.view(torch.int16), expected_total.view(torch.int16))
+    assert torch.equal(torch.stack(actual_output).view(torch.int16), expected_output.view(torch.int16))
+    assert torch.equal(pool.view(torch.int16), expected_pool.view(torch.int16))
+    assert not tuple(tmp_path.iterdir())
+
+
+@pytest.mark.cuda
 @pytest.mark.memcheck
 @pytest.mark.racecheck
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

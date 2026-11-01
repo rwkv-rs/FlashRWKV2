@@ -14,7 +14,7 @@ from ..._internal.tuning import (
     workload_bucket,
 )
 from ...post_norm.tilelang import _check_inputs as _check_norm
-from ...post_norm.tilelang import _normalize, _row_layout
+from ...post_norm.tilelang import _fixed_rows, _normalize, _row_layout
 
 _BLOCK_CONFIGS = {}
 _FUSED_CONFIGS = {}
@@ -135,7 +135,14 @@ def fused_post_norm_tokenshift(x, res, weight, bias, mixes, pool, indices, statu
     if x.shape[1] % 2 == 0 and pool.data_ptr() % 4:
         raise ValueError("fused TokenShift state and parameters must be 4-byte aligned")
     from ..._internal.tuning import get_config
-    group = get_config(_FUSED_CONFIGS, "tmix/tokenshift/fused", _config_key(x, mixes, x.shape[0]), 1, tune=lambda: tune_fused_tokenshift(x, res, weight, bias, mixes, pool, indices, status, eps))
+    group = get_config(
+        _FUSED_CONFIGS, "tmix/tokenshift/fused", _config_key(x, mixes, x.shape[0]), 1,
+        tune=lambda: tune_fused_tokenshift(x, res, weight, bias, mixes, pool, indices, status, eps),
+        fixed=(
+            x.shape[0] <= 1024 and x.shape[1] in (2048, 2560, 4096)
+            and len(mixes) in (1, 6) and _fixed_rows(x)
+        ),
+    )
     # CMix reuses its pointer for the unused TMix parameter arguments.
     mix_args = mixes + (mixes[-1],) * (6 - len(mixes))
     total, output = _fused_forward(x.shape[1], len(mixes), float(eps), group)(
