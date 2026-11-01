@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 import torch
 
+from flashrwkv2._internal import linear as shared_linear
 from flashrwkv2.tmix.wkv_prepare import (
     infer_tmix_wkv_prepare_forward_varlen,
     pretrain_tmix_wkv_prepare_bf16,
@@ -159,6 +160,8 @@ def test_fixed_rkv_projection_preserves_training_gradients(monkeypatch, channels
     try:
         with monkeypatch.context() as patch:
             patch.setattr(implementation, "_fixed_projection_config", lambda *args: None)
+            patch.setattr(implementation, "_fixed_strategy_device", lambda *args: False)
+            patch.setattr(shared_linear, "_fixed_strategy_device", lambda *args: False)
             patch.setattr(implementation, "_GROUP_CONFIGS", {key: (16, 64, 2, 32)})
             expected = implementation._grouped_linear(xs, weights, kinds, biases)
             expected_grads = torch.autograd.grad(expected, (*xs, *weights), upstream)
@@ -368,6 +371,8 @@ def test_fixed_decode_projection_preserves_training_gradients(monkeypatch, chann
     try:
         with monkeypatch.context() as patch:
             patch.setattr(implementation, "_fixed_projection_config", lambda *args: None)
+            patch.setattr(implementation, "_fixed_strategy_device", lambda *args: False)
+            patch.setattr(shared_linear, "_fixed_strategy_device", lambda *args: False)
             patch.setattr(implementation, "_GROUP_CONFIGS", {key: (16, 64, 2, 32)})
             expected = implementation._grouped_linear(xs, weights, kinds, biases)
             expected_grads = torch.autograd.grad(expected, (*xs, *weights), upstream)
@@ -405,6 +410,8 @@ def test_fixed_long_prefill_output_preserves_training_gradients(monkeypatch, cha
     try:
         with monkeypatch.context() as patch:
             patch.setattr(implementation, "_fixed_projection_config", lambda *args: None)
+            patch.setattr(implementation, "_fixed_strategy_device", lambda *args: False)
+            patch.setattr(shared_linear, "_fixed_strategy_device", lambda *args: False)
             patch.setattr(implementation, "_GROUP_CONFIGS", {key: (16, 64, 2, 32)})
             expected = implementation._grouped_linear(xs, weights, kinds, biases)
             expected_grads = torch.autograd.grad(expected, (*xs, *weights, bias), upstream)
@@ -952,6 +959,8 @@ def test_fixed_group_projection_preserves_accumulators_and_vjp(monkeypatch, tmp_
     try:
         with monkeypatch.context() as patch:
             patch.setattr(implementation, "_fixed_projection_config", lambda *args: None)
+            patch.setattr(implementation, "_fixed_strategy_device", lambda *args: False)
+            patch.setattr(shared_linear, "_fixed_strategy_device", lambda *args: False)
             patch.setattr(implementation, "_GROUP_CONFIGS", {key: (16, 64, 2, 32)})
             expected = implementation._grouped_linear(xs, weights, kinds, biases)
             expected_grads = torch.autograd.grad(expected, variables, upstream)
@@ -1055,6 +1064,8 @@ def test_grouped_training_vjp_preserves_compile_and_graph(monkeypatch, tmp_path,
     try:
         with monkeypatch.context() as patch:
             patch.setattr(implementation, "_fixed_projection_config", lambda *args: None)
+            patch.setattr(implementation, "_fixed_strategy_device", lambda *args: False)
+            patch.setattr(shared_linear, "_fixed_strategy_device", lambda *args: False)
             patch.setattr(implementation, "_GROUP_CONFIGS", {key: (16, 64, 2, 32)})
             reference = model(*leaves)
             reference_grads = torch.autograd.grad(reference, leaves, upstream)

@@ -898,8 +898,9 @@ def test_dynamic_weight_reduction_preserves_accumulators_and_graph(monkeypatch):
 @cuda
 @pytest.mark.cuda
 @pytest.mark.cuda_graph
-@pytest.mark.parametrize("dynamic_k", (False, True))
-def test_prepared_projection_rejects_any_late_compilation(monkeypatch, dynamic_k):
+@pytest.mark.parametrize("dynamic_k,outputs", ((False, 128), (False, 1024), (False, 65536),
+                                                    (True, 128), (True, 1024)))
+def test_prepared_projection_rejects_any_late_compilation(monkeypatch, dynamic_k, outputs):
     import random
     import tilelang
     from flashrwkv2._internal import linear as implementation
@@ -912,9 +913,9 @@ def test_prepared_projection_rejects_any_late_compilation(monkeypatch, dynamic_k
     def inputs(size):
         if dynamic_k:
             return (torch.randn(96, size, device="cuda").bfloat16(),
-                    torch.randn(size, 128, device="cuda").bfloat16().t())
+                    torch.randn(size, outputs, device="cuda").bfloat16().t())
         return (torch.randn(size, 256, device="cuda").bfloat16(),
-                torch.randn(128, 256, device="cuda").bfloat16())
+                torch.randn(outputs, 256, device="cuda").bfloat16())
     def call(x, w):
         return implementation._forward(x, w, None, torch.bfloat16, dynamic_k=dynamic_k)
     x, w = inputs(32 if dynamic_k else 1)
@@ -929,6 +930,14 @@ def test_prepared_projection_rejects_any_late_compilation(monkeypatch, dynamic_k
     monkeypatch.setattr(tuning, "_read_profile", forbidden)
     sizes = (1, 17, 31, 32, 33, 64, 65, 89, 90, 100, 128, 257, 512, 1000, 4096)
     sizes += tuple(random.Random(803).sample(range(1, 4097), 20))
+    if not dynamic_k:
+        last = implementation._projection_config(1, (256,), (outputs,), x.device)
+        for rows in range(2, 8193):
+            current = implementation._projection_config(rows, (256,), (outputs,), x.device)
+            if current != last:
+                sizes += (rows - 1, rows, rows + 1)
+            last = current
+    sizes = tuple(dict.fromkeys(sizes))
     for size in sizes:
         x, w = inputs(size)
         expected = call(x, w)
