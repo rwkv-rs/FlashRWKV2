@@ -357,10 +357,11 @@ def test_dynamic_batch_reuses_tokenshift_and_state_kernels(use_status):
 @pytest.mark.cuda
 @pytest.mark.cuda_graph
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.parametrize("rows, expected_block", ((64, 256), (128, 512)))
+@pytest.mark.parametrize("rows, expected_block", ((64, 256), (65, 512), (127, 512), (128, 512)))
+@pytest.mark.parametrize("channels", (4096, 5120))
 @pytest.mark.parametrize("index_dtype", (torch.int32, torch.int64))
 def test_fixed_single_mix_tokenshift_preserves_empty_state_and_vjp(
-    monkeypatch, tmp_path, rows, expected_block, index_dtype,
+    monkeypatch, tmp_path, rows, expected_block, channels, index_dtype,
 ):
     from flashrwkv2._internal import tuning
     from flashrwkv2.tmix.tokenshift import tilelang as implementation
@@ -368,7 +369,7 @@ def test_fixed_single_mix_tokenshift_preserves_empty_state_and_vjp(
     if not tuning._fixed_strategy_device(tuning.device_class(torch.device("cuda"))):
         pytest.skip("fixed TokenShift strategy is qualified on SM89 and SM120")
     torch.manual_seed(718)
-    channels, batch = 4096, 3
+    batch = 3
     x = torch.randn(rows, channels, device="cuda", dtype=torch.bfloat16).requires_grad_()
     mixes = torch.randn(1, channels, device="cuda", dtype=torch.bfloat16).requires_grad_()
     initial = torch.randn(batch, channels, device="cuda", dtype=torch.bfloat16).requires_grad_()

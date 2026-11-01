@@ -325,7 +325,7 @@ def _tokenshift_block(x, mixes, cu, initial, status=None):
     if mixes.shape[0] == 1 and _fixed_rows(x):
         if x.shape[0] <= 64:
             fixed = 256
-        elif x.shape[1] in (4096, 5120) and 128 <= x.shape[0] <= 4096:
+        elif x.shape[1] in (4096, 5120) and x.shape[0] <= 4096:
             fixed = 512
     return get_config(
         _BLOCK_CONFIGS, "tmix/tokenshift", _config_key(x, mixes, initial.shape[0]),

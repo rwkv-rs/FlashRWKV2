@@ -407,14 +407,16 @@ def _fixed_projection_config(xs, weights, kinds, biases):
         ):
             if rows <= 16:
                 return (16, 32, 2, 256) if channels < 4096 else (16, 64, 2, 128)
+            if channels == 4096 and rows <= 32:
+                return (32, 64, 2, 128)
             if 192 < rows <= 256:
                 return (64, 128, 2, 64) if channels < 4096 else (128, 64, 2, 64)
             if channels == 4096 and (
-                64 <= rows <= 192 or 256 < rows <= 512 or 960 < rows <= 1024
+                32 < rows <= 192 or 256 < rows <= 512 or 960 < rows <= 1024
             ):
                 return (64, 128, 2, 64)
         return None
-    if rows > 16 and not (64 <= rows <= 512 or 960 < rows <= 1024):
+    if rows > 512 and not 960 < rows <= 1024:
         return None
     profiles = (
         (2048, (96, 96, 256, 64)),
@@ -432,19 +434,25 @@ def _fixed_projection_config(xs, weights, kinds, biases):
         output_major = all(weight.stride() == (channels, 1) for weight in weights)
         input_major = all(weight.stride() == (1, weight.shape[0]) for weight in weights)
         model_13b = channels == 4096 and ranks == (192, 192, 384, 128)[:len(ranks)]
+        model_72b = channels == 4096 and ranks == (128, 128, 480, 96)[:len(ranks)]
         if rows <= 16:
             if output_major or input_major:
                 return (16, 32 if input_major or (rows == 1 and channels < 4096) else 16, 2, 512)
             return None
-        if model_13b and (input_major or output_major):
+        if channels == 4096 and rows <= 64 and (input_major or output_major):
+            return (16, 16 if output_major and rows <= 32 else 32, 2, 512)
+        if (model_13b or (model_72b and 256 < rows <= 512)) and (input_major or output_major):
             if rows <= 512:
                 # N=32 gives 24/28 CTA columns; M=16 fits one 128-SM wave through 80/64 rows.
                 if rows <= (80 if len(ranks) == 3 else 64):
                     return (16, 32, 2, 512)
                 # Later crossovers depend on weight layout as well as CTA waves.
-                wave_limit = (288 if len(ranks) == 3 else 384) if output_major else (
-                    320 if len(ranks) == 3 else 288
-                )
+                if model_72b:
+                    wave_limit = 384 if len(ranks) == 4 and output_major else 352
+                else:
+                    wave_limit = (288 if len(ranks) == 3 else 384) if output_major else (
+                        320 if len(ranks) == 3 else 288
+                    )
                 return (32, 32 if rows <= wave_limit else 64, 2, 128)
             return (64, 128, 2, 64) if len(ranks) == 3 else (128, 64, 2, 64)
     if kinds in ((0, 2, 0), (0, 2, 0, 0)) and tuple(
@@ -461,6 +469,14 @@ def _fixed_projection_config(xs, weights, kinds, biases):
         model_13b = channels == 4096 and ranks == (192, 192, 384, 128)[:len(ranks)]
         if rows <= 16 and (input_major or output_major):
             return (16, 32, 2, 64)
+        if channels == 4096 and rows <= 63 and (input_major or output_major):
+            return (32, 64, 2, 64)
+        model_72b = channels == 4096 and ranks == (128, 128, 480, 96)[:len(ranks)]
+        if model_72b and (input_major or output_major):
+            if rows == 64:
+                return (32, 64, 2, 64)
+            if 256 < rows <= 512 and (len(ranks) == 3 or output_major):
+                return (64, 128 if len(ranks) == 4 else 64, 2, 64)
         if model_13b and (input_major or output_major):
             if rows <= 512:
                 if len(ranks) == 3 and 128 < rows <= 256:

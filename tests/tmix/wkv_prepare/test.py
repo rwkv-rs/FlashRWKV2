@@ -169,7 +169,7 @@ def test_fixed_rkv_projection_follows_measured_row_wave(monkeypatch, channels, r
 
 
 @pytest.mark.parametrize("channels", (2048, 2560, 4096))
-@pytest.mark.parametrize("rows", (63, 64, 128, 192, 257, 320, 512, 513, 960, 961, 992, 1024, 1025))
+@pytest.mark.parametrize("rows", (33, 63, 64, 128, 192, 257, 320, 512, 513, 960, 961, 992, 1024, 1025))
 def test_fixed_rkv_projection_follows_large_row_wave(monkeypatch, channels, rows):
     from flashrwkv2.tmix.wkv_prepare import tilelang as implementation
 
@@ -177,7 +177,7 @@ def test_fixed_rkv_projection_follows_large_row_wave(monkeypatch, channels, rows
     xs = tuple(torch.empty(rows, channels, device="meta") for _ in range(3))
     weights = tuple(torch.empty(channels, channels, device="meta") for _ in range(3))
     fixed = implementation._fixed_projection_config(xs, weights, (0, 0, 0), (None,) * 3)
-    covered = 64 <= rows <= 192 or 256 < rows <= 512 or 960 < rows <= 1024
+    covered = 32 < rows <= 192 or 256 < rows <= 512 or 960 < rows <= 1024
     assert fixed == ((64, 128, 2, 64) if channels == 4096 and covered else None)
 
 
@@ -186,7 +186,7 @@ def test_fixed_rkv_projection_follows_large_row_wave(monkeypatch, channels, rows
 @pytest.mark.cuda_graph
 @pytest.mark.parametrize(("channels", "rows"), (
     (2048, 193), (2048, 256), (2560, 193), (2560, 256),
-    (4096, 64), (4096, 128), (4096, 192), (4096, 193), (4096, 256),
+    (4096, 17), (4096, 32), (4096, 33), (4096, 64), (4096, 128), (4096, 192), (4096, 193), (4096, 256),
     (4096, 257), (4096, 320), (4096, 512), (4096, 961), (4096, 1024),
 ))
 def test_fixed_rkv_row_wave_preserves_accumulators_and_graph(monkeypatch, tmp_path, channels, rows):
@@ -223,7 +223,7 @@ def test_fixed_rkv_row_wave_preserves_accumulators_and_graph(monkeypatch, tmp_pa
 
 
 @pytest.mark.parametrize("stage,count", (("in", 3), ("in", 4), ("out", 3), ("out", 4)))
-@pytest.mark.parametrize("rows,band", ((1, 3), (2, 3), (16, 3), (17, 0), (64, 4), (192, 4), (193, 1), (256, 1), (257, 4), (512, 4), (513, 0), (960, 0), (961, 2), (1024, 2), (1025, 0)))
+@pytest.mark.parametrize("rows,band", ((1, 3), (2, 3), (16, 3), (17, 5), (32, 5), (33, 5), (63, 5), (64, 4), (192, 4), (193, 1), (256, 1), (257, 4), (512, 4), (513, 0), (960, 0), (961, 2), (1024, 2), (1025, 0)))
 def test_fixed_13b_projection_restricts_row_wave_and_layout(monkeypatch, stage, count, rows, band):
     from flashrwkv2.tmix.wkv_prepare import tilelang as implementation
 
@@ -240,7 +240,9 @@ def test_fixed_13b_projection_restricts_row_wave_and_layout(monkeypatch, stage, 
         kinds = (0, 2, 0, 0)[:count]
         biases = (None, torch.empty(channels, device="meta"), None) + (None,) * (count - 3)
         configs = (None, (128, 64, 2, 32) if count == 3 else (128, 128, 2, 32), (128, 128, 2, 32), (16, 32, 2, 64))
-    if band == 4:
+    if band == 5:
+        expected = (16, 32, 2, 512) if stage == "in" else (32, 64, 2, 64)
+    elif band == 4:
         if stage == "in":
             expected = (16, 32, 2, 512) if rows == 64 else (32, 32 if rows < 512 else 64, 2, 128)
         elif count == 3 and rows == 192:
@@ -255,11 +257,47 @@ def test_fixed_13b_projection_restricts_row_wave_and_layout(monkeypatch, stage, 
     canonical = expected
     if stage == "out" and (band == 2 or (band == 1 and count == 4)):
         canonical = (64, 128, 2, 64) if band == 2 else (128, 128, 2, 32)
-    elif stage == "in" and band == 3:
+    elif stage == "in" and (band == 3 or (band == 5 and rows <= 32)):
         canonical = (16, 16, 2, 512)
     assert implementation._fixed_projection_config(
         xs, tuple(weight.contiguous() for weight in weights), kinds, biases
     ) == canonical
+
+
+@pytest.mark.parametrize("count,rows,canonical,input_config,output_config", (
+    (3, 64, True, (16, 32, 2, 512), (32, 64, 2, 64)),
+    (4, 64, False, (16, 32, 2, 512), (32, 64, 2, 64)),
+    (3, 256, True, None, None),
+    (3, 257, False, (32, 32, 2, 128), (64, 64, 2, 64)),
+    (4, 320, True, (32, 32, 2, 128), (64, 128, 2, 64)),
+    (4, 320, False, (32, 32, 2, 128), None),
+    (3, 352, True, (32, 32, 2, 128), (64, 64, 2, 64)),
+    (3, 353, True, (32, 64, 2, 128), (64, 64, 2, 64)),
+    (4, 384, True, (32, 32, 2, 128), (64, 128, 2, 64)),
+    (4, 385, True, (32, 64, 2, 128), (64, 128, 2, 64)),
+    (4, 512, False, (32, 64, 2, 128), None),
+    (4, 513, True, None, None),
+))
+def test_fixed_72b_projection_covers_measured_layouts(monkeypatch, count, rows, canonical, input_config, output_config):
+    from flashrwkv2.tmix.wkv_prepare import tilelang as implementation
+
+    monkeypatch.setattr(implementation, "device_class", lambda device: ("test", 8, 9, 128))
+    channels, ranks = 4096, (128, 128, 480, 96)[:count]
+    def weight(output, in_features):
+        if canonical:
+            return torch.empty(output, in_features, device="meta")
+        return torch.empty(in_features, output, device="meta").t()
+    input_xs = tuple(torch.empty(rows, channels, device="meta") for _ in ranks)
+    input_weights = tuple(weight(rank, channels) for rank in ranks)
+    assert implementation._fixed_projection_config(
+        input_xs, input_weights, (1, 0, 2, 0)[:count], (None,) * count,
+    ) == input_config
+    output_xs = tuple(torch.empty(rows, rank, device="meta") for rank in ranks)
+    output_weights = tuple(weight(channels, rank) for rank in ranks)
+    biases = (None, torch.empty(channels, device="meta"), None) + (None,) * (count - 3)
+    assert implementation._fixed_projection_config(
+        output_xs, output_weights, (0, 2, 0, 0)[:count], biases,
+    ) == output_config
 
 
 @cuda
@@ -267,6 +305,8 @@ def test_fixed_13b_projection_restricts_row_wave_and_layout(monkeypatch, stage, 
 @pytest.mark.cuda_graph
 @pytest.mark.parametrize("stage,count,rows", (
     ("in", 3, 2), ("in", 4, 16), ("out", 3, 2), ("out", 4, 16),
+    ("in", 3, 17), ("in", 4, 32), ("in", 3, 33),
+    ("out", 3, 17), ("out", 4, 32), ("out", 4, 63),
     ("in", 3, 64), ("in", 4, 128), ("in", 3, 320), ("in", 4, 512),
     ("out", 3, 64), ("out", 4, 128), ("out", 3, 320), ("out", 4, 512),
     ("in", 3, 193), ("in", 4, 256), ("in", 3, 961), ("in", 4, 1024),
