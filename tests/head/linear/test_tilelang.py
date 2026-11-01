@@ -863,7 +863,7 @@ def test_fixed_square_weight_vjp_fp32_preserves_accumulation_and_graph(monkeypat
 
 @cuda
 @pytest.mark.cuda
-@pytest.mark.parametrize("width,rows", ((2048, 1), (4096, 256), (4096, 1024)))
+@pytest.mark.parametrize("width,rows", ((2048, 1), (4096, 64), (4096, 128), (4096, 256), (4096, 1024)))
 def test_fixed_decode_linear_preserves_training_gradients(monkeypatch, width, rows):
     from flashrwkv2._internal import linear as implementation
     from flashrwkv2._internal import tuning
