@@ -980,6 +980,10 @@ def compile_kernel(self, *args, **kwargs):
     compilations.append(1)
     return original(self, *args, **kwargs)
 JITKernel._compile_and_create_adapter = compile_kernel
+import pytest
+status = pytest.main(["-q", "-p", "no:cacheprovider",
+    "tests/tmix/wkv7/test_block.py::test_prepared_block_has_no_tilelang_compilation_for_new_tokens"])
+assert status == 0, "full inference/training block disk-cache reuse failed"
 torch.manual_seed(104)
 x = torch.randn(17, 64, device="cuda").bfloat16()
 w = torch.randn(96, 64, device="cuda").bfloat16()
