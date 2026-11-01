@@ -619,3 +619,12 @@ def test_tuning_buckets_reuse_profiles_for_unseen_batches(tuning_cache, monkeypa
     assert len({tuning.workload_bucket(n) for n in range(8193)}) == 11
     assert keys(129) != baseline
     assert wkv._config_key(torch.empty(100, 1, 64), 90, None, indexed=True) != baseline["tmix/wkv7"]
+
+
+def test_projection_search_keeps_both_sides_of_sm_coverage(monkeypatch):
+    from flashrwkv2._internal import tuning
+
+    props = SimpleNamespace(multi_processor_count=48, shared_memory_per_block_optin=101376)
+    monkeypatch.setattr(tuning.torch.cuda, "get_device_properties", lambda _: props)
+    configs = tuning.projection_configs(100, (2048,), (2048,), "cuda")
+    assert {m for m, n, _, _ in configs if n == 64} == {64, 128}

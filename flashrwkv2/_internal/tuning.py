@@ -358,7 +358,7 @@ def workload_bucket(size):
 def projection_configs(rows, channels, outputs, device, measurements=()):
     """At most 12 tiles followed by 12 copy variants of two verified tiles.
 
-    Keep the two largest row tiles that fill an SM wave. Copy spans must divide
+    Keep adjacent row tiles on either side of a full SM wave. Copy spans divide
     every input width and fit shared memory before any TIR is constructed.
     """
     props = torch.cuda.get_device_properties(device)
@@ -392,12 +392,13 @@ def projection_configs(rows, channels, outputs, device, measurements=()):
             if n > max(32, 1 << (max(outputs) - 1).bit_length()):
                 continue
             blocks_n = sum(math.ceil(width / n) for width in outputs)
-            row_tiles = [16]
-            row_tiles.extend(
-                m for m in (32, 64, 128, 256)
-                if m <= rows and math.ceil(rows / m) * blocks_n >= props.multi_processor_count
-            )
-            candidates.extend((m, n, stages, 32) for m in row_tiles[-2:] for stages in (2, 3))
+            limit = min(256, max(16, 1 << (max(1, rows) - 1).bit_length()))
+            row_tiles = [m for m in (16, 32, 64, 128, 256) if m <= limit]
+            full_wave = [m for m in row_tiles
+                         if math.ceil(rows / m) * blocks_n >= props.multi_processor_count]
+            center = row_tiles.index(full_wave[-1]) if full_wave else 0
+            start = min(center, max(0, len(row_tiles) - 2))
+            candidates.extend((m, n, stages, 32) for m in row_tiles[start:start + 2] for stages in (2, 3))
     return tuple(
         config for config in candidates
         if config not in measured
