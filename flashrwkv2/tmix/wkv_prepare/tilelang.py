@@ -484,9 +484,8 @@ def _fixed_projection_config(xs, weights, kinds, biases):
                     )
                 return (32, 32 if rows <= wave_limit else 64, 2, 128)
             return (64, 128, 2, 64) if len(ranks) == 3 else (128, 64, 2, 64)
-    if kinds in ((0, 2, 0), (0, 2, 0, 0)) and tuple(
-        bias is not None for bias in biases
-    ) == (False, True, False) + (False,) * (len(kinds) - 3):
+    if (kinds in ((0, 2, 0), (0, 2, 0, 0)) and biases[1] is not None
+            and all(bias is None for bias in biases[2:])):
         channels = weights[0].shape[0]
         ranks = tuple(x.shape[1] for x in xs)
         if not any(channels == width and ranks == profile[:len(ranks)] for width, profile in profiles):

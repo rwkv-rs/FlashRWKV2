@@ -107,6 +107,10 @@ def test_fixed_decode_projection_restricts_models_and_layouts(monkeypatch):
     output_biases = (None, torch.empty(2048, device="meta"), None)
     assert fixed(output_xs, output_weights, (0, 2, 0), output_biases) == (16, 32, 2, 64)
     assert fixed(output_xs, tuple(w.contiguous() for w in output_weights), (0, 2, 0), output_biases) == (16, 32, 2, 64)
+    training_biases = (torch.empty(2048, device="meta"), *output_biases[1:])
+    assert fixed(output_xs, output_weights, (0, 2, 0), training_biases) == fixed(
+        output_xs, output_weights, (0, 2, 0), output_biases
+    )
     assert fixed(output_xs, output_weights, (0, 2, 0), biases) is None
     dense_weights = tuple(torch.empty(2048, 2048, device="meta") for _ in ranks)
     assert fixed(xs, dense_weights, (0, 0, 0), biases) == (16, 32, 2, 256)
@@ -1025,8 +1029,8 @@ def test_fullgraph_grouped_projection_preserves_unused_gradients():
 @cuda
 @pytest.mark.cuda
 @pytest.mark.cuda_graph
-@pytest.mark.parametrize("stage", ("dense", "lowrank_output"))
-def test_fixed_decode_remaining_groups_preserve_accumulators_and_vjp(monkeypatch, tmp_path, stage):
+@pytest.mark.parametrize("stage", ("dense", "lowrank_output", "training_output"))
+def test_fixed_group_projection_preserves_accumulators_and_vjp(monkeypatch, tmp_path, stage):
     from flashrwkv2._internal import tuning
     from flashrwkv2.tmix.wkv_prepare import tilelang as implementation
 
@@ -1040,10 +1044,13 @@ def test_fixed_decode_remaining_groups_preserve_accumulators_and_vjp(monkeypatch
         weights = tuple(torch.randn(channels, channels, device="cuda", dtype=torch.bfloat16).requires_grad_() for _ in ranks)
         biases = (None,) * 3
     else:
-        ranks, kinds, fixed = (96, 96, 256, 64), (0, 2, 0, 0), (16, 32, 2, 64)
-        xs = tuple(torch.randn(1, rank, device="cuda", dtype=torch.bfloat16).requires_grad_() for rank in ranks)
+        ranks, kinds = (96, 96, 256, 64), (0, 2, 0, 0)
+        rows = 128 if stage == "training_output" else 1
+        fixed = (32, 64, 2, 64) if rows == 128 else (16, 32, 2, 64)
+        xs = tuple(torch.randn(rows, rank, device="cuda", dtype=torch.bfloat16).requires_grad_() for rank in ranks)
         weights = tuple(torch.randn(rank, channels, device="cuda", dtype=torch.bfloat16).t().detach().requires_grad_() for rank in ranks)
-        biases = (None, torch.randn(channels, device="cuda", dtype=torch.bfloat16).requires_grad_(), None, None)
+        first_bias = torch.randn(channels, device="cuda", dtype=torch.bfloat16).requires_grad_() if stage == "training_output" else None
+        biases = (first_bias, torch.randn(channels, device="cuda", dtype=torch.bfloat16).requires_grad_(), None, None)
 
     with torch.no_grad():
         reference, raw = implementation._run_groups(xs, weights, kinds, biases, raw_mode=2, config=(16, 64, 2, 32))
