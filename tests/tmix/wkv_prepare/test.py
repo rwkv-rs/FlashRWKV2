@@ -379,6 +379,16 @@ def _check_fixed_projection(monkeypatch, tmp_path, stage, count, rows, canonical
         captured = call()
     graph.replay()
     assert all(torch.equal(a, b) for a, b in zip(captured, expected, strict=True))
+
+    for weight in weights:
+        weight.copy_(torch.randn_like(weight) * .02)
+    replacement, replacement_raw = implementation._run_groups(
+        xs, weights, kinds, biases, raw_mode=2, config=(16, 64, 2, 32),
+    )
+    _, actual_raw = implementation._run_groups(xs, weights, kinds, biases, raw_mode=2)
+    graph.replay()
+    assert torch.equal(actual_raw, replacement_raw)
+    assert all(torch.equal(a, b) for a, b in zip(captured, replacement, strict=True))
     assert not tuple(tmp_path.iterdir())
 
 
