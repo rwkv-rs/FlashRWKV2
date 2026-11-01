@@ -751,7 +751,11 @@ def test_block_independent_torch_vjp_and_optimizer_step(mode):
     (4, 4096, (192, 192, 384, 128), True),
     (8, 4096, (192, 192, 384, 128), True),
     (16, 4096, (192, 192, 384, 128), True),
+    (64, 4096, (192, 192, 384, 128), True),
+    (128, 4096, (192, 192, 384, 128), True),
     (256, 4096, (192, 192, 384, 128), True),
+    (320, 4096, (192, 192, 384, 128), True),
+    (512, 4096, (192, 192, 384, 128), True),
     (1024, 4096, (192, 192, 384, 128), True),
 ))
 def test_real_decode_block_needs_no_tuning_profile(monkeypatch, tmp_path, later_layer, batch, channels, ranks, canonical):

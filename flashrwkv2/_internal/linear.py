@@ -182,26 +182,36 @@ def _fixed_projection_config(x, weight, output_dtype, bias):
     if bias is not None or not _fixed_strategy_device(info):
         return None
     rows = x.shape[0]
-    if (rows == 4096 and channels in (256, 1024) and outputs == 4096
-            and output_dtype == torch.bfloat16 and weight.stride() == (1, outputs)):
-        return (128, 64, 2, 64) if channels == 256 else (128, 128, 2, 64)
+    if (rows == 4096 and channels in (64, 128, 256, 320, 512, 1024) and outputs == 4096
+            and output_dtype in (torch.bfloat16, torch.float32) and weight.stride() == (1, outputs)):
+        return (128, 64, 2, 64) if channels <= 256 else (128, 128, 2, 64)
     if rows > 16:
-        if 192 < rows <= 256:
-            square = (64, 128, 2, 64)
-        elif 960 < rows <= 1024:
-            square = (128, 128, 2, 64)
-        else:
+        if not (rows <= 512 or 960 < rows <= 1024):
             return None
-        if channels == 4096 and weight.stride() == (channels, 1):
-            if output_dtype == torch.bfloat16 and outputs == channels:
-                return square
-            if (output_dtype == torch.bfloat16 and outputs == 4 * channels) or (
-                output_dtype == torch.float32 and outputs == 65536
-            ):
-                return (256, 64, 2, 64)
-        if (output_dtype == torch.bfloat16 and channels in (4096, 16384) and outputs == 4096
-                and weight.stride() == (1, outputs)):
-            return square
+        input_major = weight.stride() == (1, outputs)
+        output_major = weight.stride() == (channels, 1)
+        if channels == 4096 and output_major and (
+            (output_dtype == torch.bfloat16 and outputs == 4 * channels)
+            or (output_dtype == torch.float32 and outputs == 65536)
+        ):
+            if rows <= 32:
+                return (32, 64, 2, 128)
+            if rows <= 64:
+                return (64, 64, 2, 64)
+            if rows <= 128:
+                return (128, 64, 2, 64)
+            return (256, 64, 2, 64)
+        if output_dtype == torch.bfloat16 and outputs == 4096 and (
+            (channels == 4096 and output_major)
+            or (channels in (4096, 16384) and input_major)
+        ):
+            if rows <= 32 or (rows <= 64 and channels == 16384):
+                return (32, 64, 2, 64)
+            if rows <= 128:
+                return (64, 64, 2, 64)
+            if rows <= 256 or (rows <= 320 and output_major):
+                return (64, 128, 2, 64)
+            return (128, 128, 2, 64)
         return None
     if weight.stride() == (channels, 1) and channels in (2048, 2560, 4096):
         if output_dtype == torch.bfloat16 and outputs == channels:

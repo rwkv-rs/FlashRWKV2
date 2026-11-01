@@ -409,10 +409,12 @@ def _fixed_projection_config(xs, weights, kinds, biases):
                 return (16, 32, 2, 256) if channels < 4096 else (16, 64, 2, 128)
             if 192 < rows <= 256:
                 return (64, 128, 2, 64) if channels < 4096 else (128, 64, 2, 64)
-            if channels == 4096 and 960 < rows <= 1024:
+            if channels == 4096 and (
+                64 <= rows <= 192 or 256 < rows <= 512 or 960 < rows <= 1024
+            ):
                 return (64, 128, 2, 64)
         return None
-    if rows > 16 and not (192 < rows <= 256 or 960 < rows <= 1024):
+    if rows > 16 and not (64 <= rows <= 512 or 960 < rows <= 1024):
         return None
     profiles = (
         (2048, (96, 96, 256, 64)),
@@ -435,8 +437,15 @@ def _fixed_projection_config(xs, weights, kinds, biases):
                 return (16, 32 if input_major or (rows == 1 and channels < 4096) else 16, 2, 512)
             return None
         if model_13b and (input_major or output_major):
-            if rows <= 256:
-                return (32, 32, 2, 128)
+            if rows <= 512:
+                # N=32 gives 24/28 CTA columns; M=16 fits one 128-SM wave through 80/64 rows.
+                if rows <= (80 if len(ranks) == 3 else 64):
+                    return (16, 32, 2, 512)
+                # Later crossovers depend on weight layout as well as CTA waves.
+                wave_limit = (288 if len(ranks) == 3 else 384) if output_major else (
+                    320 if len(ranks) == 3 else 288
+                )
+                return (32, 32 if rows <= wave_limit else 64, 2, 128)
             return (64, 128, 2, 64) if len(ranks) == 3 else (128, 64, 2, 64)
     if kinds in ((0, 2, 0), (0, 2, 0, 0)) and tuple(
         bias is not None for bias in biases
@@ -453,11 +462,13 @@ def _fixed_projection_config(xs, weights, kinds, biases):
         if rows <= 16 and (input_major or output_major):
             return (16, 32, 2, 64)
         if model_13b and (input_major or output_major):
-            if rows <= 256 and len(ranks) == 3:
-                return (128, 64, 2, 32)
-            if rows > 256 and output_major:
-                return (64, 128, 2, 64)
-            return (128, 128, 2, 32)
+            if rows <= 512:
+                if len(ranks) == 3 and 128 < rows <= 256:
+                    return (128, 64, 2, 32)
+                if output_major and len(ranks) == 4 and 192 < rows <= 256:
+                    return (128, 128, 2, 32)
+                return (64, 64, 2, 64)
+            return (64, 128, 2, 64) if output_major else (128, 128, 2, 32)
     return None
 
 

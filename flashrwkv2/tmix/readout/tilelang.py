@@ -199,7 +199,7 @@ def _readout_group(x, r, k, v, r_k, weight, bias, gate, head_size, eps):
     ):
         if 1 <= rows <= 16:
             fixed = 4 if rows == 1 else 8
-        elif x.shape[-1] == 4096 and 193 <= rows <= 1024:
+        elif x.shape[-1] == 4096 and rows <= 1024:
             fixed = 8
     return get_config(
         _ROW_CONFIGS, "tmix/readout", _config_key(x, head_size),

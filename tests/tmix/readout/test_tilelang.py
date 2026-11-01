@@ -113,7 +113,7 @@ def test_readout_bitwise_batch_grad_and_vjp(head_size, channels):
         torch.testing.assert_close(gradient, ref, atol=0.03, rtol=0.02)
 
 
-@pytest.mark.parametrize("rows,fixed", ((192, False), (193, True), (256, True), (961, True), (1024, True), (1025, False)))
+@pytest.mark.parametrize("rows,fixed", ((17, True), (192, True), (193, True), (256, True), (961, True), (1024, True), (1025, False)))
 def test_fixed_readout_batch_boundaries(monkeypatch, rows, fixed):
     from flashrwkv2._internal import tuning
     from flashrwkv2.tmix.readout import tilelang as implementation
@@ -127,7 +127,7 @@ def test_fixed_readout_batch_boundaries(monkeypatch, rows, fixed):
 @pytest.mark.cuda
 @pytest.mark.cuda_graph
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.parametrize("channels,rows", ((2048, 1), (2048, 4), (2048, 16), (4096, 193), (4096, 256), (4096, 961), (4096, 1024)))
+@pytest.mark.parametrize("channels,rows", ((2048, 1), (2048, 4), (2048, 16), (4096, 17), (4096, 64), (4096, 128), (4096, 192), (4096, 193), (4096, 256), (4096, 961), (4096, 1024)))
 @pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float32))
 def test_fixed_decode_readout_preserves_stats_vjp_and_graph(monkeypatch, tmp_path, channels, rows, dtype):
     from flashrwkv2._internal import tuning

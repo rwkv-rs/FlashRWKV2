@@ -162,11 +162,14 @@ def test_fixed_rkv_projection_follows_measured_row_wave(monkeypatch, channels, r
     weights = tuple(torch.empty(channels, channels, device="meta") for _ in range(3))
     fixed = implementation._fixed_projection_config(xs, weights, (0, 0, 0), (None,) * 3)
     expected = (64, 128, 2, 64) if channels < 4096 else (128, 64, 2, 64)
-    assert fixed == (expected if 192 < rows <= 256 else None)
+    boundary = channels == 4096 and rows in (192, 257)
+    if boundary:
+        expected = (64, 128, 2, 64)
+    assert fixed == (expected if 192 < rows <= 256 or boundary else None)
 
 
 @pytest.mark.parametrize("channels", (2048, 2560, 4096))
-@pytest.mark.parametrize("rows", (960, 961, 992, 1024, 1025))
+@pytest.mark.parametrize("rows", (63, 64, 128, 192, 257, 320, 512, 513, 960, 961, 992, 1024, 1025))
 def test_fixed_rkv_projection_follows_large_row_wave(monkeypatch, channels, rows):
     from flashrwkv2.tmix.wkv_prepare import tilelang as implementation
 
@@ -174,7 +177,8 @@ def test_fixed_rkv_projection_follows_large_row_wave(monkeypatch, channels, rows
     xs = tuple(torch.empty(rows, channels, device="meta") for _ in range(3))
     weights = tuple(torch.empty(channels, channels, device="meta") for _ in range(3))
     fixed = implementation._fixed_projection_config(xs, weights, (0, 0, 0), (None,) * 3)
-    assert fixed == ((64, 128, 2, 64) if channels == 4096 and 960 < rows <= 1024 else None)
+    covered = 64 <= rows <= 192 or 256 < rows <= 512 or 960 < rows <= 1024
+    assert fixed == ((64, 128, 2, 64) if channels == 4096 and covered else None)
 
 
 @cuda
@@ -182,7 +186,8 @@ def test_fixed_rkv_projection_follows_large_row_wave(monkeypatch, channels, rows
 @pytest.mark.cuda_graph
 @pytest.mark.parametrize(("channels", "rows"), (
     (2048, 193), (2048, 256), (2560, 193), (2560, 256),
-    (4096, 193), (4096, 256), (4096, 961), (4096, 1024),
+    (4096, 64), (4096, 128), (4096, 192), (4096, 193), (4096, 256),
+    (4096, 257), (4096, 320), (4096, 512), (4096, 961), (4096, 1024),
 ))
 def test_fixed_rkv_row_wave_preserves_accumulators_and_graph(monkeypatch, tmp_path, channels, rows):
     from flashrwkv2._internal import tuning
@@ -218,7 +223,7 @@ def test_fixed_rkv_row_wave_preserves_accumulators_and_graph(monkeypatch, tmp_pa
 
 
 @pytest.mark.parametrize("stage,count", (("in", 3), ("in", 4), ("out", 3), ("out", 4)))
-@pytest.mark.parametrize("rows,band", ((1, 3), (2, 3), (16, 3), (17, 0), (192, 0), (193, 1), (256, 1), (257, 0), (960, 0), (961, 2), (1024, 2), (1025, 0)))
+@pytest.mark.parametrize("rows,band", ((1, 3), (2, 3), (16, 3), (17, 0), (64, 4), (192, 4), (193, 1), (256, 1), (257, 4), (512, 4), (513, 0), (960, 0), (961, 2), (1024, 2), (1025, 0)))
 def test_fixed_13b_projection_restricts_row_wave_and_layout(monkeypatch, stage, count, rows, band):
     from flashrwkv2.tmix.wkv_prepare import tilelang as implementation
 
@@ -235,10 +240,21 @@ def test_fixed_13b_projection_restricts_row_wave_and_layout(monkeypatch, stage, 
         kinds = (0, 2, 0, 0)[:count]
         biases = (None, torch.empty(channels, device="meta"), None) + (None,) * (count - 3)
         configs = (None, (128, 64, 2, 32) if count == 3 else (128, 128, 2, 32), (128, 128, 2, 32), (16, 32, 2, 64))
-    assert implementation._fixed_projection_config(xs, weights, kinds, biases) == configs[band]
-    canonical = configs[band]
-    if stage == "out" and band == 2:
-        canonical = (64, 128, 2, 64)
+    if band == 4:
+        if stage == "in":
+            expected = (16, 32, 2, 512) if rows == 64 else (32, 32 if rows < 512 else 64, 2, 128)
+        elif count == 3 and rows == 192:
+            expected = (128, 64, 2, 32)
+        else:
+            expected = (64, 64, 2, 64)
+    elif stage == "out" and count == 4 and band == 1:
+        expected = (64, 64, 2, 64)
+    else:
+        expected = configs[band]
+    assert implementation._fixed_projection_config(xs, weights, kinds, biases) == expected
+    canonical = expected
+    if stage == "out" and (band == 2 or (band == 1 and count == 4)):
+        canonical = (64, 128, 2, 64) if band == 2 else (128, 128, 2, 32)
     elif stage == "in" and band == 3:
         canonical = (16, 16, 2, 512)
     assert implementation._fixed_projection_config(
@@ -251,6 +267,8 @@ def test_fixed_13b_projection_restricts_row_wave_and_layout(monkeypatch, stage, 
 @pytest.mark.cuda_graph
 @pytest.mark.parametrize("stage,count,rows", (
     ("in", 3, 2), ("in", 4, 16), ("out", 3, 2), ("out", 4, 16),
+    ("in", 3, 64), ("in", 4, 128), ("in", 3, 320), ("in", 4, 512),
+    ("out", 3, 64), ("out", 4, 128), ("out", 3, 320), ("out", 4, 512),
     ("in", 3, 193), ("in", 4, 256), ("in", 3, 961), ("in", 4, 1024),
     ("out", 3, 193), ("out", 4, 256), ("out", 3, 961), ("out", 4, 1024),
 ))
