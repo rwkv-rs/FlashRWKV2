@@ -322,11 +322,15 @@ def _tokenshift_block(x, mixes, cu, initial, status=None):
     from ..._internal.tuning import get_config
 
     fixed = None
-    if mixes.shape[0] == 1 and _fixed_rows(x):
-        if x.shape[0] <= 64:
-            fixed = 256
-        elif x.shape[1] in (4096, 5120) and x.shape[0] <= 4096:
-            fixed = 512
+    if mixes.shape[0] in (1, 6) and _fixed_rows(x):
+        rows, channels = x.shape
+        if mixes.shape[0] == 1:
+            if rows <= 64 or (channels in (2048, 2560) and rows <= 128):
+                fixed = 256
+            elif rows <= (1024 if channels in (2048, 2560) else 4096):
+                fixed = 512
+        elif channels in (2048, 2560) and 64 <= rows <= 1024:
+            fixed = 256 if channels == 2048 else 128
     return get_config(
         _BLOCK_CONFIGS, "tmix/tokenshift", _config_key(x, mixes, initial.shape[0]),
         256 if fixed is None else fixed,

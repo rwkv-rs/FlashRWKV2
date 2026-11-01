@@ -357,11 +357,20 @@ def test_dynamic_batch_reuses_tokenshift_and_state_kernels(use_status):
 @pytest.mark.cuda
 @pytest.mark.cuda_graph
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.parametrize("rows, expected_block", ((64, 256), (65, 512), (127, 512), (128, 512)))
-@pytest.mark.parametrize("channels", (4096, 5120))
+@pytest.mark.parametrize(
+    "channels,count,rows,expected_block",
+    [
+        *((channels, 1, rows, block) for channels in (4096, 5120)
+          for rows, block in ((64, 256), (65, 512), (127, 512), (128, 512))),
+        *((channels, 1, rows, 256 if rows <= 128 else 512) for channels in (2048, 2560)
+          for rows in (64, 65, 128, 129, 1024)),
+        *((channels, 6, rows, 256 if channels == 2048 else 128) for channels in (2048, 2560)
+          for rows in (64, 65, 128, 129, 1024)),
+    ],
+)
 @pytest.mark.parametrize("index_dtype", (torch.int32, torch.int64))
-def test_fixed_single_mix_tokenshift_preserves_empty_state_and_vjp(
-    monkeypatch, tmp_path, rows, expected_block, channels, index_dtype,
+def test_fixed_tokenshift_preserves_empty_state_and_vjp(
+    monkeypatch, tmp_path, rows, expected_block, channels, count, index_dtype,
 ):
     from flashrwkv2._internal import tuning
     from flashrwkv2.tmix.tokenshift import tilelang as implementation
@@ -371,17 +380,17 @@ def test_fixed_single_mix_tokenshift_preserves_empty_state_and_vjp(
     torch.manual_seed(718)
     batch = 3
     x = torch.randn(rows, channels, device="cuda", dtype=torch.bfloat16).requires_grad_()
-    mixes = torch.randn(1, channels, device="cuda", dtype=torch.bfloat16).requires_grad_()
+    mixes = torch.randn(count, channels, device="cuda", dtype=torch.bfloat16).requires_grad_()
     initial = torch.randn(batch, channels, device="cuda", dtype=torch.bfloat16).requires_grad_()
     cu = torch.tensor((0, 0, rows // 2, rows), device="cuda", dtype=index_dtype)
     status = torch.tensor((0, rows, batch), device="cuda", dtype=index_dtype)
-    upstream = (torch.randn_like(x), torch.randn_like(initial))
+    upstream = (*(torch.randn_like(x) for _ in range(count)), torch.randn_like(initial))
 
     with monkeypatch.context() as patch:
         patch.setattr(implementation, "_tokenshift_block", lambda *args: 256)
         expected, expected_final = tokenshift(x, mixes, cu, initial)
         expected_grads = torch.autograd.grad((*expected, expected_final), (x, mixes, initial), upstream)
-    expected = expected[0].detach()
+    expected = tuple(output.detach() for output in expected)
     expected_final = expected_final.detach()
 
     monkeypatch.setattr(tuning, "_profile_root", lambda: tmp_path)
@@ -390,7 +399,7 @@ def test_fixed_single_mix_tokenshift_preserves_empty_state_and_vjp(
     monkeypatch.setattr(implementation, "_BLOCK_CONFIGS", {})
     actual, actual_final = tokenshift(x, mixes, cu, initial)
     actual_grads = torch.autograd.grad((*actual, actual_final), (x, mixes, initial), upstream)
-    assert torch.equal(actual[0].view(torch.int16), expected.view(torch.int16))
+    assert all(torch.equal(a.view(torch.int16), b.view(torch.int16)) for a, b in zip(actual, expected, strict=True))
     assert torch.equal(actual_final.view(torch.int16), expected_final.view(torch.int16))
     assert all(torch.equal(a.view(torch.int16), b.view(torch.int16)) for a, b in zip(actual_grads, expected_grads))
 
@@ -405,6 +414,6 @@ def test_fixed_single_mix_tokenshift_preserves_empty_state_and_vjp(
     with torch.cuda.graph(graph):
         captured, captured_final = call()
     graph.replay()
-    assert torch.equal(captured[0].view(torch.int16), expected.view(torch.int16))
+    assert all(torch.equal(a.view(torch.int16), b.view(torch.int16)) for a, b in zip(captured, expected, strict=True))
     assert torch.equal(captured_final.view(torch.int16), expected_final.view(torch.int16))
     assert not tuple(tmp_path.iterdir())
