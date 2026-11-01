@@ -267,11 +267,19 @@ def test_fixed_13b_projection_restricts_row_wave_and_layout(monkeypatch, stage, 
 @pytest.mark.parametrize("count,rows,canonical,input_config,output_config", (
     (3, 64, True, (16, 32, 2, 512), (32, 64, 2, 64)),
     (4, 64, False, (16, 32, 2, 512), (32, 64, 2, 64)),
-    (3, 96, True, None, None),
+    (3, 65, True, (16, 32, 2, 512), (64, 64, 2, 64)),
+    (4, 65, False, (32, 32, 2, 128), (32, 64, 2, 64)),
+    (3, 80, True, (16, 32, 2, 512), (64, 64, 2, 64)),
+    (3, 81, True, (32, 32, 2, 128), (64, 64, 2, 64)),
+    (4, 96, True, (32, 32, 2, 128), (32, 64, 2, 64)),
+    (3, 96, True, (32, 32, 2, 128), (64, 64, 2, 64)),
     (3, 97, True, (32, 32, 2, 128), (64, 64, 2, 64)),
     (4, 128, False, (32, 32, 2, 128), (128, 32, 2, 32)),
     (4, 97, True, (32, 32, 2, 128), (128, 32, 2, 32)),
-    (3, 129, True, (32, 32, 2, 128), None),
+    (3, 129, True, (32, 32, 2, 128), (32, 64, 2, 64)),
+    (3, 160, True, (32, 32, 2, 128), (32, 64, 2, 64)),
+    (3, 161, True, (32, 32, 2, 128), (128, 64, 2, 32)),
+    (3, 192, False, (32, 32, 2, 128), (128, 64, 2, 32)),
     (4, 129, True, (32, 32, 2, 128), (64, 64, 2, 64)),
     (4, 192, False, (32, 32, 2, 128), (64, 64, 2, 64)),
     (3, 193, False, (32, 32, 2, 128), (128, 64, 2, 32)),
@@ -329,8 +337,11 @@ def test_fixed_13b_projection_preserves_accumulators_and_graph(monkeypatch, tmp_
 @pytest.mark.cuda
 @pytest.mark.cuda_graph
 @pytest.mark.parametrize("stage,count,rows", (
+    ("in", 3, 65), ("in", 3, 80), ("in", 3, 81), ("in", 4, 65), ("in", 4, 96),
     ("in", 3, 97), ("in", 4, 128), ("in", 4, 193), ("in", 3, 256),
-    ("out", 3, 97), ("out", 4, 128), ("out", 4, 129), ("out", 4, 192),
+    ("out", 3, 65), ("out", 4, 65), ("out", 3, 96), ("out", 4, 96),
+    ("out", 3, 97), ("out", 4, 128), ("out", 3, 129), ("out", 4, 129),
+    ("out", 3, 160), ("out", 3, 161), ("out", 3, 192), ("out", 4, 192),
     ("out", 3, 193), ("out", 4, 256),
 ))
 @pytest.mark.parametrize("canonical", (False, True))

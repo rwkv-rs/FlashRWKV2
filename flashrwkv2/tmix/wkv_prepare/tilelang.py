@@ -441,7 +441,7 @@ def _fixed_projection_config(xs, weights, kinds, biases):
             return None
         if channels == 4096 and rows <= 64 and (input_major or output_major):
             return (16, 16 if output_major and rows <= 32 else 32, 2, 512)
-        if (model_13b or (model_72b and 96 < rows <= 512)) and (input_major or output_major):
+        if (model_13b or (model_72b and rows <= 512)) and (input_major or output_major):
             if rows <= 512:
                 # N=32 gives 24/28 CTA columns; M=16 fits one 128-SM wave through 80/64 rows.
                 if rows <= (80 if len(ranks) == 3 else 64):
@@ -475,11 +475,15 @@ def _fixed_projection_config(xs, weights, kinds, biases):
         if model_72b and (input_major or output_major):
             if rows == 64:
                 return (32, 64, 2, 64)
-            if 96 < rows <= 128:
+            if rows <= 96:
+                return (64, 64, 2, 64) if len(ranks) == 3 else (32, 64, 2, 64)
+            if rows <= 128:
                 return (128, 32, 2, 32) if len(ranks) == 4 else (64, 64, 2, 64)
-            if len(ranks) == 4 and 128 < rows <= 192:
+            if len(ranks) == 4 and rows <= 192:
                 return (64, 64, 2, 64)
-            if 192 < rows <= 256:
+            if rows <= 160:
+                return (32, 64, 2, 64)
+            if rows <= 256:
                 return (128, 64, 2, 32)
             if 256 < rows <= 512 and (len(ranks) == 3 or output_major):
                 return (64, 128 if len(ranks) == 4 else 64, 2, 64)
