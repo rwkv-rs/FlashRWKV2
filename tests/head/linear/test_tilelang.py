@@ -286,8 +286,9 @@ def test_public_tuning_profile_is_used_by_real_cuda_dispatch_in_a_fresh_process(
     import subprocess
     import sys
     import flashrwkv2 as fr
-    from flashrwkv2._internal import tuning
+    from flashrwkv2._internal import linear, tuning
 
+    monkeypatch.setattr(linear, "_fixed_projection_config", lambda *args, **kwargs: None)
     monkeypatch.setenv("FLASHRWKV2_CACHE_DIR", str(tmp_path / "cache"))
     tuning.get_tuning_cache_dir.cache_clear()
     tuning._profile_root.cache_clear()
@@ -304,6 +305,8 @@ def test_public_tuning_profile_is_used_by_real_cuda_dispatch_in_a_fresh_process(
         subprocess.run([sys.executable, "-c", """
 import sys, torch
 import flashrwkv2 as fr
+from flashrwkv2._internal import linear
+linear._fixed_projection_config = lambda *args, **kwargs: None
 x, weight, expected = torch.load(sys.argv[1], weights_only=True)
 x, weight = x.cuda(), weight.cuda()
 results = []
