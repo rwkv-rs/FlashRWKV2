@@ -186,9 +186,10 @@ def infer_block(
 
 
 @pytest.mark.parametrize("length", [1, 5])
-def test_prepare_tuning_migration_preserves_block_state_logits_and_logprobs(monkeypatch, tmp_path, length):
-    import hashlib
+def test_prepare_tuning_profiles_preserve_block_state_logits_and_logprobs(monkeypatch, tmp_path, length):
     import json
+    from pathlib import Path
+
     from flashrwkv2._internal import tuning
 
     from flashrwkv2._internal import linear as linear_impl
@@ -225,18 +226,19 @@ def test_prepare_tuning_migration_preserves_block_state_logits_and_logprobs(monk
     canonical = {"linear": (16, 64, 2, 32), "tmix/wkv_prepare": (16, 64, 2, 32),
                  "tmix/wkv7": (64, 1), "tmix/tokenshift": 256,
                  "tmix/tokenshift/fused": 1, "post_norm": 1, "tmix/readout": 1}
-    legacy = tmp_path / "legacy"
     for record in before["records"]:
         if record["status"] == "fixed":
             continue
-        key = [record["key"][0][0], *record["key"][1:]]
-        encoded = json.dumps(key, separators=(",", ":"))
-        path = legacy / record["owner"] / (hashlib.sha256(encoded.encode()).hexdigest() + ".json")
+        path = Path(record["path"])
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"key": key, "config": canonical[record["owner"]], "bitwise_equal": True}))
-    prepared = fr.prepare_tuning([call], mode="tune", legacy_dir=legacy)
+        path.write_text(json.dumps({
+            "schema": before["schema"], "owner": record["owner"],
+            "fingerprint": record["fingerprint"], "key": record["key"],
+            "config": canonical[record["owner"]], "bitwise_equal": True,
+        }))
+    prepared = fr.prepare_tuning([call], mode="require")
     assert prepared["complete"]
-    assert prepared["counts"]["revalidated"] == before["counts"]["missing"]
+    assert prepared["counts"]["hit"] == before["counts"]["missing"]
     assert prepared["counts"]["fixed"] == before["counts"]["fixed"]
     tuning._LOADED.clear()
     loaded = fr.prepare_tuning([call])
@@ -839,7 +841,7 @@ def test_real_decode_block_needs_no_tuning_profile(monkeypatch, tmp_path, later_
         for mode in ("inspect", "require", "tune"):
             report = tuning.prepare_tuning([call], mode=mode)
             assert report["complete"] and report["counts"]["fixed"] == 12
-            assert not any(report["counts"][status] for status in ("hit", "missing", "tuned", "revalidated"))
+            assert not any(report["counts"][status] for status in ("hit", "missing", "tuned"))
         expected = tuple(t.clone() for t in (*call(), state._components()[0], *pools))
         stream.synchronize()
         graph = torch.cuda.CUDAGraph()

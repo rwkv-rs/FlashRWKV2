@@ -762,7 +762,6 @@ def tune_linear(x, weight, output_dtype=None, *, bias=None, benchmark=None):
         compile_candidates,
         projection_configs,
         projection_finalists,
-        revalidation_config,
         save_config,
         select_config,
     )
@@ -794,16 +793,6 @@ def tune_linear(x, weight, output_dtype=None, *, bias=None, benchmark=None):
         key = _key(x, weight, output_dtype, bias)
         _TUNED_CONFIGS[key] = config
         return benchmark_config("linear", key, benchmark)
-
-    imported = revalidation_config()
-    if imported is not None:
-        best_config, checked = select_config(
-            (imported,), run,
-            check=lambda config: tuple(_forward(x, weight, bias, dtype, config) for dtype in check_dtypes),
-            reference=reference,
-        )
-        save_config("linear", _key(x, weight, output_dtype, bias), best_config)
-        return {"config": best_config, "candidates": checked}
 
     for _ in range(2):
         eligible = projection_configs(

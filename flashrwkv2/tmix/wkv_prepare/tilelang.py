@@ -791,7 +791,6 @@ def _tune_grouped_linear(xs, weights, kinds, biases, *, benchmark=None):
         compile_candidates,
         projection_configs,
         projection_finalists,
-        revalidation_config,
         save_config,
         select_config,
     )
@@ -832,12 +831,6 @@ def _tune_grouped_linear(xs, weights, kinds, biases, *, benchmark=None):
             result.append(value.view(torch.int32))
             position += size
         return tuple(result)
-
-    imported = revalidation_config()
-    if imported is not None:
-        best, checked = select_config((imported,), run, check=check, reference=reference)
-        save_config("tmix/wkv_prepare", cache_key, best)
-        return {"config": best, "candidates": checked}
 
     measurements = {}
     for _ in range(2):

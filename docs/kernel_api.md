@@ -483,7 +483,7 @@ assert loaded["complete"]
 WKV 调优调用需要该 capture shape 全部 token/sequence 均处于 active 状态；
 不能用零 active 的图预热占位输入进行逐位验证。
 报告逐项列出 `owner/key/fingerprint/config/path/status`，其中 key 包含设备类别；
-`counts` 区分 `fixed/hit/missing/tuned/revalidated`，`fixed` 表示库内固定配置，
+`counts` 区分 `fixed/hit/missing/tuned`，`fixed` 表示库内固定配置，
 其 `fingerprint` 和 `path` 为 null；同一工作量桶中的固定配置、不同固定选择与
 profile 配置分别报告。`complete` 要求实际观察到的全部配置及确定性编译变体均可用，
 未观察到任何可配置 dispatch 会报错。调用方负责提供完整工作负载集合，
@@ -501,20 +501,9 @@ profile 配置分别报告。`complete` 要求实际观察到的全部配置及�
 单个进程内 prepare 是独占阶段，准备前先结束其他 serving/training 调用；嵌套或
 并发 prepare 会报错。准备报告也覆盖 CUDA autograd worker thread 上的反向 dispatch。
 
-旧缓存迁移显式指定单个旧 namespace，无需改动旧服务目录。路径支持 `~` 展开；
-指定的目录不存在时立即报错，避免路径拼写错误意外触发全量调优：
-
-```python
-prepared = prepare_tuning(
-    warmup_calls, mode="tune",
-    legacy_dir="/home/user/.cache/torch/flashrwkv2/tuning/<old-namespace>",
-)
-print(json.dumps(prepared))
-```
-
-旧记录完整匹配产品名和其余 key 后，只将配置作为候选，在当前算子、实际输入上
-重新核对 BF16 输出、FP32 累加/统计和 WKV state，再发布到新根；迁移不计时。
-逐位复验失败会中止，旧目录不变。没有旧候选的 key 按现有候选集调优。
+升级后使用当前版本重新执行 `prepare_tuning`。确定性形状族在准备阶段编译有限变体；
+仍需 profile 的路径使用 `mode="tune"` 验证并测量缺失配置，再发布当前 fingerprint
+对应的结果。旧版调优记录可直接删除。TileLang 自带编译缓存继续复用。
 跨 release/venv 验证应在目标环境的新进程运行 `mode="require"` 并保存报告；
 修改 Torch/XDG 缓存变量仍应命中相同 profile 路径。
 基准还覆盖真实 7.2B 的 `w/a=128,g=480,v=96` 首层与后续层，以及

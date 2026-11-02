@@ -219,11 +219,12 @@ untuned defaults and never start tuning. A previously missing file is rechecked
 on later eager calls; existing CUDA Graphs must be recaptured after preparation.
 Preparation is an exclusive phase within each process and includes dispatches
 from autograd worker threads. Finish serving/training calls before preparing.
-To migrate a legacy namespace, pass its full directory as `legacy_dir` with
-`mode="tune"`: matching configurations are revalidated on current inputs without
-benchmarking, while missing shapes are tuned normally. See the
-[tuning contract](docs/kernel_api.md#tuning-and-acceptance) for compatibility,
-state ownership and deployment examples.
+After upgrading, run preparation again with the current version. Deterministic
+families compile their bounded variants; paths requiring profiles use
+`mode="tune"` to verify and measure missing configurations. Obsolete tuning
+records can be deleted. TileLang's compilation cache remains reusable.
+See the [tuning contract](docs/kernel_api.md#tuning-and-acceptance) for state
+ownership and deployment examples.
 The historical [0.1.0a9 performance report](docs/performance/wkv7-0.1.0a9.md)
 describes that release's implementation; current results must identify the
 revision, hardware, shapes, and numerical contract.

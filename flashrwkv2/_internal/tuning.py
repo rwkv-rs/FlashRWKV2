@@ -24,7 +24,6 @@ _SESSION = None
 _PREPARATION_LOCK = Lock()
 _TUNING = ContextVar("flashrwkv2_tuning_active", default=False)
 _TUNING_TARGET = ContextVar("flashrwkv2_tuning_target", default=None)
-_REVALIDATE = ContextVar("flashrwkv2_revalidate", default=None)
 _LOADED = {}
 _WARNED = set()
 _WARMED_DEFAULTS = set()
@@ -132,7 +131,7 @@ def _profile_path(owner, encoded_key):
     return _profile_root() / owner / _fingerprint(owner) / name
 
 
-def _validate_record(record, encoded_key, *, owner=None):
+def _validate_record(record, encoded_key, *, owner):
     if not isinstance(record, dict):
         raise ValueError("invalid verified kernel tuning profile")
     config = record.get("config")
@@ -142,11 +141,9 @@ def _validate_record(record, encoded_key, *, owner=None):
         or record.get("bitwise_equal") is not True
         or not values
         or any(type(value) is not int or value <= 0 for value in values)
-        or (owner is not None and (
-            record.get("schema") != _SCHEMA
-            or record.get("fingerprint") != _fingerprint(owner)
-            or record.get("owner") != owner
-        ))
+        or record.get("schema") != _SCHEMA
+        or record.get("fingerprint") != _fingerprint(owner)
+        or record.get("owner") != owner
     ):
         raise ValueError("invalid verified kernel tuning profile")
     return tuple(config) if isinstance(config, list) else config
@@ -162,18 +159,6 @@ def _read_profile(owner, encoded_key):
 
 def _capturing():
     return torch.cuda.is_initialized() and torch.cuda.is_current_stream_capturing()
-
-
-def _legacy_config(directory, owner, key):
-    # Legacy keys used the product name; preserve every remaining shape/dtype field.
-    legacy_key = (key[0][0], *key[1:])
-    encoded = _encode(legacy_key)
-    name = hashlib.sha256(encoded.encode()).hexdigest() + ".json"
-    path = Path(directory) / owner / name
-    try:
-        return _validate_record(json.loads(path.read_text()), encoded)
-    except FileNotFoundError:
-        return None
 
 
 def get_config(configs, owner, key, default=None, *, tune=None, fixed=False):
@@ -210,19 +195,15 @@ def get_config(configs, owner, key, default=None, *, tune=None, fixed=False):
                 fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
                 config = _read_profile(owner, encoded)
                 if config is None:
-                    legacy = session["legacy_dir"]
-                    candidate = None if legacy is None else _legacy_config(legacy, owner, key)
                     active = _TUNING.set(True)
-                    validation = _REVALIDATE.set(candidate)
                     try:
                         tune()
                     finally:
-                        _REVALIDATE.reset(validation)
                         _TUNING.reset(active)
                     config = _read_profile(owner, encoded)
                     if config is None:
                         raise RuntimeError(f"tuner did not publish {owner}")
-                    status = "revalidated" if candidate is not None else "tuned"
+                    status = "tuned"
     if config is not None:
         _LOADED[identity] = config
         _WARMED_DEFAULTS.discard(identity)
@@ -235,7 +216,7 @@ def get_config(configs, owner, key, default=None, *, tune=None, fixed=False):
     if session is not None:
         encoded = _encode(key)
         previous = session["records"].get((owner, key))
-        if previous is not None and previous["status"] in {"tuned", "revalidated"} and status == "hit":
+        if previous is not None and previous["status"] == "tuned" and status == "hit":
             status = previous["status"]
         session["records"][(owner, key)] = {
             "owner": owner, "key": json.loads(encoded),
@@ -276,7 +257,7 @@ def save_config(owner, key, config):
     _LOADED.pop((str(_profile_root()), owner, key), None)
 
 
-def prepare_tuning(calls, *, mode="require", legacy_dir=None):
+def prepare_tuning(calls, *, mode="require"):
     """Execute real model calls before capture, loading or tuning their exact keys.
 
     ``calls`` is an iterable of zero-argument callables. Each callable owns its
@@ -284,7 +265,6 @@ def prepare_tuning(calls, *, mode="require", legacy_dir=None):
     needed before serving. Modes: ``inspect`` reports defaults, ``require`` fails
     at the first missing key, ``tune`` verifies and times only missing keys.
     Validated fixed configurations do not load profiles or run tuning.
-    ``legacy_dir`` is one explicit legacy namespace, revalidated without timing.
     The returned JSON-compatible report describes every actual tuned dispatch.
     """
     global _SESSION
@@ -292,13 +272,7 @@ def prepare_tuning(calls, *, mode="require", legacy_dir=None):
         raise ValueError("mode must be inspect, require, or tune")
     if _capturing():
         raise RuntimeError("prepare_tuning must run outside CUDA Graph capture")
-    if legacy_dir is not None and mode != "tune":
-        raise ValueError("legacy_dir requires mode='tune'")
-    if legacy_dir is not None:
-        legacy_dir = Path(legacy_dir).expanduser().resolve()
-        if not legacy_dir.is_dir():
-            raise NotADirectoryError(f"legacy tuning namespace does not exist: {legacy_dir}")
-    session = {"mode": mode, "legacy_dir": legacy_dir, "records": {}, "compilation": {}}
+    session = {"mode": mode, "records": {}, "compilation": {}}
     # Autograd executes CUDA backward nodes on engine threads. Preparation is
     # an exclusive process phase, so those dispatches share the same report.
     if not _PREPARATION_LOCK.acquire(blocking=False):
@@ -321,7 +295,7 @@ def prepare_tuning(calls, *, mode="require", legacy_dir=None):
             "complete": all(row["status"] != "missing" for row in records),
             "compilation": compilation,
             "counts": {status: sum(row["status"] == status for row in records)
-                       for status in ("fixed", "hit", "missing", "tuned", "revalidated")},
+                       for status in ("fixed", "hit", "missing", "tuned")},
             "records": records}
 
 
@@ -345,10 +319,6 @@ def benchmark_config(owner, key, benchmark):
         return benchmark()
     finally:
         _TUNING_TARGET.reset(token)
-
-
-def revalidation_config():
-    return _REVALIDATE.get()
 
 
 def prepare_variants(owner, family, variants, cache, spec):
@@ -491,9 +461,6 @@ def select_config(candidates, run, *, check=None, reference=None, warmup=3, repe
     check = run if check is None else check
     reference = check(candidates[0]) if reference is None else reference
     expected = (reference,) if isinstance(reference, torch.Tensor) else tuple(reference)
-    imported = revalidation_config()
-    if imported is not None:
-        candidates = (imported,)
     measurements, eligible = [], []
     for config in candidates:
         actual = check(config)
@@ -507,8 +474,6 @@ def select_config(candidates, run, *, check=None, reference=None, warmup=3, repe
             eligible.append((config, record))
     if not eligible:
         raise RuntimeError("no kernel configuration satisfies the bitwise contract")
-    if imported is not None:
-        return eligible[0][0], measurements
     for config, record in eligible:
         for _ in range(warmup):
             run(config)

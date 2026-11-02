@@ -137,7 +137,6 @@ def test_fixed_configuration_skips_profiles_and_search_in_every_mode(tuning_cach
         tuning._TUNING.reset(active)
 
 
-
 def test_fixed_and_profiled_dispatches_with_shared_bucket_are_reported(tuning_cache):
     tuning = tuning_cache
     key = (("test", 8, 9, 128), 512)
@@ -278,41 +277,6 @@ def test_tuning_preparation_includes_worker_thread_dispatch(tuning_cache):
     report = tuning.prepare_tuning([call], mode="inspect")
     assert report["counts"]["missing"] == 2
     assert not report["complete"]
-
-
-def test_tuning_revalidates_legacy_without_timing(tuning_cache, tmp_path, monkeypatch):
-    from pathlib import Path
-
-    import torch
-    tuning = tuning_cache
-    key = (("test", 12, 0, 188), 128)
-    encoded = tuning._encode(("test", 128))
-    legacy = tmp_path / "legacy"
-    path = legacy / "linear" / (tuning.hashlib.sha256(encoded.encode()).hexdigest() + ".json")
-    path.parent.mkdir(parents=True)
-    path.write_text(json.dumps({"key": json.loads(encoded), "config": [32, 64, 2, 64], "bitwise_equal": True}))
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
-    monkeypatch.setattr(torch.cuda, "CUDAGraph", lambda: pytest.fail("migration must not time candidates"))
-    def tune():
-        config, records = tuning.select_config(
-            ((16, 64, 2, 32),), lambda config: torch.ones(1), reference=torch.ones(1)
-        )
-        assert config == (32, 64, 2, 64)
-        assert records == [{"config": config, "bitwise_equal": True}]
-        tuning.save_config("linear", key, config)
-    report = tuning.prepare_tuning(
-        [lambda: tuning.get_config({}, "linear", key, tune=tune)], mode="tune", legacy_dir=legacy,
-    )
-    assert report["counts"]["revalidated"] == 1
-    assert Path(report["records"][0]["path"]).is_file()
-
-
-def test_missing_legacy_directory_stops_before_tuning(tuning_cache, tmp_path):
-    with pytest.raises(NotADirectoryError, match="legacy tuning namespace does not exist"):
-        tuning_cache.prepare_tuning(
-            [lambda: pytest.fail("an invalid migration path must not start model preparation")],
-            mode="tune", legacy_dir=tmp_path / "missing",
-        )
 
 
 @pytest.mark.parametrize("contents", ["{", "[]", '{"bitwise_equal":false}', '{"config":[0]}'])
@@ -593,8 +557,6 @@ def test_root_exports_module_operators_by_identity() -> None:
     assert set(flashrwkv2.__all__) == set(expected)
     for name, operator in expected.items():
         assert getattr(flashrwkv2, name) is operator
-
-
 
 
 def test_wkv7_state_preparation_owns_memory_accounting() -> None:

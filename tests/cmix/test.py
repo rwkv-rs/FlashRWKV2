@@ -709,10 +709,15 @@ def test_cmix_invalid_projection_preserves_t1_shift_state(invalid):
 @pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_prepare_tuning_covers_cmix_forward_and_backward(monkeypatch, tmp_path):
-    import hashlib
     import json
+    from pathlib import Path
+
     import flashrwkv2 as fr
-    from flashrwkv2._internal import tuning
+    from flashrwkv2._internal import linear, tuning
+    from flashrwkv2.post_norm import tilelang as norm
+
+    monkeypatch.setattr(linear, "_fixed_strategy_device", lambda *args: False)
+    monkeypatch.setattr(norm, "_fixed_strategy_device", lambda *args: False)
 
     monkeypatch.setattr(tuning, "_profile_root", lambda: tmp_path / "profiles")
     monkeypatch.setattr(tuning, "_LOADED", {})
@@ -740,23 +745,21 @@ def test_prepare_tuning_covers_cmix_forward_and_backward(monkeypatch, tmp_path):
     observed = {(*row["key"][1:4], tuple(row["key"][4]))
                 for row in before["records"] if row["owner"] == "linear"}
     assert backward_shapes <= observed
-    legacy = tmp_path / "legacy"
     for row in before["records"]:
-        legacy_key = [row["key"][0][0], *row["key"][1:]]
-        encoded = json.dumps(legacy_key, separators=(",", ":"))
-        path = legacy / row["owner"] / (hashlib.sha256(encoded.encode()).hexdigest() + ".json")
+        path = Path(row["path"])
         path.parent.mkdir(parents=True, exist_ok=True)
         config = [16, 64, 2, 32] if row["owner"] == "linear" else 256
-        path.write_text(json.dumps({"key": legacy_key, "config": config, "bitwise_equal": True}))
-    prepared = fr.prepare_tuning([call], mode="tune", legacy_dir=legacy)
-    assert prepared["counts"]["revalidated"] == 7
+        path.write_text(json.dumps({
+            "schema": before["schema"], "owner": row["owner"],
+            "fingerprint": row["fingerprint"], "key": row["key"],
+            "config": config, "bitwise_equal": True,
+        }))
     loaded = fr.prepare_tuning([call], mode="require")
     assert loaded["complete"] and loaded["counts"]["hit"] == 7
     for result in results[1:]:
         assert all(torch.equal(actual, expected) for actual, expected in zip(result, results[0], strict=True))
     backward_record = next(row for row in loaded["records"] if row["owner"] == "linear"
                            and (*row["key"][1:4], tuple(row["key"][4])) in backward_shapes)
-    from pathlib import Path
     Path(backward_record["path"]).unlink()
     with pytest.raises(RuntimeError, match="missing verified tuning profile"):
         fr.prepare_tuning([call], mode="require")
