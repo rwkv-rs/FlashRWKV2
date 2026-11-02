@@ -296,6 +296,8 @@ def test_fullgraph_training_block_preserves_outputs_gradients_and_capture(monkey
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
         fr.prepare_tuning([lambda: step(model)], mode="inspect")
+        for value in leaves:
+            value.grad = None
         outputs, loss = step(model)
         expected = tuple(value.detach().clone() for value in outputs)
         expected_loss = loss.detach().clone()
