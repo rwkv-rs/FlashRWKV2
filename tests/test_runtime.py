@@ -256,6 +256,10 @@ def test_tuning_require_and_capture_fail_before_using_missing_key(tuning_cache, 
         assert call() is None
     config = (32, 64, 2, 64)
     tuning.save_config("linear", key, config)
+    with monkeypatch.context() as patch:
+        patch.setattr(tuning, "_capturing", lambda: True)
+        with pytest.raises(RuntimeError, match="unprepared tuning key"):
+            call()
     assert tuning.prepare_tuning([call])["complete"]
     monkeypatch.setattr(tuning, "_capturing", lambda: True)
     monkeypatch.setattr(tuning, "_read_profile", lambda *args: pytest.fail("capture must use the prepared profile"))
