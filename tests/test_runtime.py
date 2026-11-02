@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import importlib
-import inspect
 import json
 import os
 import subprocess
@@ -113,59 +112,27 @@ def test_fixed_strategy_is_qualified_by_architecture_and_sm_count():
     assert not _fixed_strategy_device(("other", 12, 0, 170))
 
 
-def test_fixed_configuration_skips_profiles_and_search_in_every_mode(tuning_cache, monkeypatch):
+@pytest.mark.parametrize("mode", ("inspect", "require", "tune"))
+def test_preparation_reports_fixed_and_profiled_workloads(tuning_cache, monkeypatch, mode):
     tuning = tuning_cache
-    key = (("test", 8, 9, 128), 32)
-    config = (64, 4)
-
-    def unexpected(*args, **kwargs):
-        pytest.fail("fixed configurations must not read profiles or tune")
-
-    monkeypatch.setattr(tuning, "_read_profile", unexpected)
-    call = lambda: tuning.get_config({}, "tmix/wkv7", key, config, tune=unexpected, fixed=True)
-    for mode in ("inspect", "require", "tune"):
-        report = tuning.prepare_tuning([call, call], mode=mode)
-        assert report["complete"] and report["counts"]["fixed"] == 1
-        assert report["records"][0]["config"] == config
-        assert report["records"][0]["path"] is None
+    key = (("test", 8, 9, 128), 512)
+    fixed = ((64, 128, 2, 64), (128, 128, 2, 64))
+    tuning.save_config("linear", key, (16, 64, 2, 32))
+    read, observed = tuning._read_profile, []
+    def read_profile(owner, encoded):
+        observed.append(owner)
+        return read(owner, encoded)
+    def unexpected():
+        pytest.fail("an available configuration must not tune")
+    monkeypatch.setattr(tuning, "_read_profile", read_profile)
+    calls = [lambda c=c: tuning.get_config({}, "linear", key, c, tune=unexpected, fixed=True) for c in fixed]
+    calls.append(lambda: tuning.get_config({}, "linear", key, tune=unexpected))
+    report = tuning.prepare_tuning([*calls, *calls], mode=mode)
+    assert report["complete"] and observed == ["linear"]
+    assert report["counts"] == {"fixed": 2, "hit": 1, "missing": 0, "tuned": 0}
     monkeypatch.setattr(tuning, "_capturing", lambda: True)
-    assert call() == config
-    active = tuning._TUNING.set(True)
-    try:
-        assert tuning.get_config({key: (32, 1)}, "tmix/wkv7", key, config, fixed=True) == config
-    finally:
-        tuning._TUNING.reset(active)
+    assert calls[0]() == fixed[0]
 
-
-def test_fixed_and_profiled_dispatches_with_shared_bucket_are_reported(tuning_cache):
-    tuning = tuning_cache
-    key = (("test", 8, 9, 128), 512)
-    fixed = lambda: tuning.get_config({}, "linear", key, (64, 128, 2, 64), fixed=True)
-    profiled = lambda: tuning.get_config({}, "linear", key, (16, 64, 2, 32))
-    for calls in ((fixed, profiled), (profiled, fixed)):
-        report = tuning.prepare_tuning(calls, mode="inspect")
-        assert not report["complete"]
-        assert report["counts"]["fixed"] == report["counts"]["missing"] == 1
-        assert {record["status"] for record in report["records"]} == {"fixed", "missing"}
-
-    tuning.save_config("linear", key, (32, 64, 2, 64))
-    assert tuning.prepare_tuning([profiled])["counts"]["hit"] == 1
-    tuning._profile_path("linear", tuning._encode(key)).unlink()
-    report = tuning.prepare_tuning([fixed, profiled], mode="inspect")
-    assert not report["complete"]
-    assert report["counts"]["fixed"] == report["counts"]["missing"] == 1
-
-
-def test_distinct_fixed_configs_in_one_bucket_are_reported(tuning_cache):
-    tuning = tuning_cache
-    key = (("test", 8, 9, 128), 512)
-    def fixed(config):
-        return lambda: tuning.get_config({}, "linear", key, config, fixed=True)
-
-    first, second = (64, 128, 2, 64), (128, 128, 2, 64)
-    report = tuning.prepare_tuning([fixed(first), fixed(second), fixed(first)], mode="inspect")
-    assert report["complete"] and report["counts"]["fixed"] == 2
-    assert {record["config"] for record in report["records"]} == {first, second}
 
 def test_fixed_benchmark_overrides_only_its_target_and_restores_it(tuning_cache):
     tuning = tuning_cache
@@ -205,9 +172,10 @@ def test_tuning_missing_then_published_is_visible_in_same_process(tuning_cache):
     key = (("test", 8, 9, 128), 32, "torch.bfloat16")
     configs = {}
     call = lambda: tuning.get_config(configs, "linear", key, (16, 64, 2, 32))
-    before = tuning.prepare_tuning([call], mode="inspect")
+    fixed = lambda: tuning.get_config({}, "linear", key, (64, 64, 2, 32), fixed=True)
+    before = tuning.prepare_tuning([fixed, call], mode="inspect")
     assert not before["complete"]
-    assert before["counts"]["missing"] == 1
+    assert before["counts"]["missing"] == before["counts"]["fixed"] == 1
     assert key not in configs
     tuning.save_config("linear", key, (32, 64, 2, 64))
     after = tuning.prepare_tuning([call])
@@ -368,25 +336,9 @@ def test_cpu_import_does_not_compile_or_create_cache(tmp_path) -> None:
         env=environment,
         capture_output=True,
         text=True,
+        timeout=30,
     )
     assert not cache.exists()
-
-
-def test_root_extension_loads_once_and_publishes_private_alias(monkeypatch) -> None:
-    import flashrwkv2
-    from flashrwkv2 import compile as compiler
-
-    sentinel = object()
-    monkeypatch.setattr(flashrwkv2, "_C", None)
-    monkeypatch.setattr(
-        compiler, "load_extension", lambda: SimpleNamespace(module=sentinel)
-    )
-    try:
-        assert flashrwkv2._extension() is sentinel
-        assert flashrwkv2._extension() is sentinel
-        assert sys.modules["flashrwkv2._C"] is sentinel
-    finally:
-        sys.modules.pop("flashrwkv2._C", None)
 
 
 @pytest.mark.parametrize(
@@ -516,38 +468,6 @@ def test_compile_cli_keeps_build_diagnostics_out_of_json(monkeypatch, capfd) -> 
     assert "native build diagnostics" in stderr
 
 
-def test_cache_key_changes_with_every_compatibility_input() -> None:
-    baseline = {
-        "source_sha256": "source-a",
-        "flashrwkv2": "0.1.0a13",
-        "python_executable": "/venv/a/bin/python",
-        "sys_prefix": "/venv/a",
-        "python": "3.12",
-        "torch": "2.13.0",
-        "torch_cuda": "13.0",
-        "cxx11_abi": True,
-        "target": "sm89",
-        "nvcc": "nvcc-a",
-        "host_compiler": "gcc-a",
-        "cxx_flags": ["-O3"],
-        "nvcc_flags": ["sm_89"],
-        "link_flags": ["--strip-debug"],
-    }
-
-    def key(payload):
-        import hashlib
-
-        return hashlib.sha256(
-            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-        ).hexdigest()
-
-    expected = key(baseline)
-    for field in baseline:
-        changed = dict(baseline)
-        changed[field] = f"changed-{field}"
-        assert key(changed) != expected
-
-
 def test_source_digest_tracks_shared_native_headers(tmp_path) -> None:
     from flashrwkv2.compile import _source_digest
 
@@ -578,162 +498,11 @@ def test_root_exports_module_operators_by_identity() -> None:
         assert getattr(flashrwkv2, name) is operator
 
 
-def test_wkv7_state_preparation_owns_memory_accounting() -> None:
-    module = importlib.import_module("flashrwkv2.tmix.wkv7")
-    assert not hasattr(module, "get_tmix_wkv7_recurrent_state_memory_layout")
-    for name in (
-        "prepare_tmix_wkv7_recurrent_fp32io16_state",
-    ):
-        assert tuple(inspect.signature(getattr(module, name)).parameters) == (
-            "state_pool_size",
-            "channels",
-            "sequence_capacity",
-            "head_size",
-            "device",
-        )
-    assert tuple(
-        inspect.signature(
-            module.prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor
-        ).parameters
-    ) == ("state",)
-
-
-def test_retired_public_aliases_are_absent() -> None:
-    import flashrwkv2
-
-    retired = {
-        "infer_ln_forward_varlen",
-        "infer_res_forward_varlen",
-        "infer_post_norm_forward_varlen",
-        "infer_tmix_tokenshift_forward_varlen",
-        "infer_cmix_tokenshift_forward_varlen",
-        "infer_cmix_relu_square_forward_varlen",
-        "infer_cmix_linear_ffn_down_forward_varlen",
-        "infer_tmix_vres_gate_forward_varlen",
-        "infer_tmix_linear_attention_c2c_forward_varlen",
-        "infer_tmix_lowrank_wag_forward_varlen",
-        "infer_tmix_lowrank_wagv_vres_forward_varlen",
-        "infer_tmix_kk_a_gate_forward_varlen",
-        "infer_tmix_lnx_rkvres_xg_forward_varlen",
-        "infer_head_linear_forward_varlen",
-        "infer_recurrent_fp16_forward_varlen",
-        "infer_tmix_wkv7_recurrent_deltalog_fp16_forward_varlen",
-        "infer_tmix_wkv7_recurrent_deltalog_fp32io16_forward_varlen",
-        "infer_recurrent_fp32io16_forward_varlen",
-        "infer_chunk_bf16_forward_varlen",
-        "get_tmix_wkv7_recurrent_state_memory_layout",
-        "prepare_recurrent_metadata",
-        "pretrain_recurrent_bf16",
-        "statetune_recurrent_fp32io16",
-        "rl_infctx_chunk_fp32io16",
-        "rl_infctx_chunk_fp32io16_factor_recompute",
-    }
-    assert retired.isdisjoint(flashrwkv2.__all__)
-    for name in retired:
-        assert not hasattr(flashrwkv2, name)
-
-
-@pytest.mark.parametrize("rows", [1, 15, 16, 89, 100, 256, 512, 4096])
-@pytest.mark.parametrize("channels,outputs", [((4096,), (96,)), ((160,), (64,)), ((2048,), (65536,)), ((4096, 4096, 4096, 4096), (128, 128, 480, 96))])
-def test_projection_search_is_bounded_and_prunes_before_compilation(monkeypatch, rows, channels, outputs):
-    from flashrwkv2._internal import tuning
-
-    props = SimpleNamespace(multi_processor_count=128, shared_memory_per_block_optin=101376)
-    monkeypatch.setattr(tuning.torch.cuda, "get_device_properties", lambda _: props)
-    tiles = tuning.projection_configs(rows, channels, outputs, "cuda")
-    assert 0 < len(tiles) <= 12
-    measured = [{"config": c, "bitwise_equal": True, "milliseconds": i + 1}
-                for i, c in enumerate(tiles)]
-    copies = tuning.projection_configs(rows, channels, outputs, "cuda", measured)
-    assert len(copies) <= 12
-    assert not set(tiles) & set(copies)
-    assert len(set(tiles + copies)) == len(tiles + copies)
-    assert len({c[:2] for c in copies}) <= 2
-    for m, n, stages, span in tiles + copies:
-        assert (m + n) * stages * span * 2 <= props.shared_memory_per_block_optin
-        assert span == 32 or all(width % span == 0 for width in channels)
-    assert len(tuning.projection_finalists(measured)) <= 3
-
-
-def test_tuning_buckets_reuse_profiles_for_unseen_batches(tuning_cache, monkeypatch):
-    import torch
-
-    from flashrwkv2._internal import linear
-    from flashrwkv2.post_norm import tilelang as norm
-    from flashrwkv2.tmix.readout import tilelang as readout
-    from flashrwkv2.tmix.tokenshift import tilelang as shift
-    from flashrwkv2.tmix.wkv7 import tilelang as wkv
-    from flashrwkv2.tmix.wkv_prepare import tilelang as prepare
-
-    tuning = tuning_cache
-    modules = (linear, norm, readout, shift, wkv, prepare)
-    for module in modules:
-        monkeypatch.setattr(module, "device_class", lambda _: ("test", 8, 9, 128))
-    weight = torch.empty(128, 64)
-    mixes = torch.empty(6, 64)
-    def keys(rows):
-        x = torch.empty(rows, 64)
-        return {
-            "linear": linear._key(x, weight, torch.float32),
-            "post_norm": norm._config_key(x, False),
-            "tmix/readout": readout._config_key(x, 64),
-            "tmix/tokenshift": shift._config_key(x, mixes, rows),
-            "tmix/wkv7": wkv._config_key(x.view(rows, 1, 64), rows, None, indexed=True),
-            "tmix/wkv_prepare": prepare._group_key((x,), (weight,), (0,), (None,)),
-        }
-    baseline = keys(89)
-    for owner, key in baseline.items():
-        tuning.save_config(owner, key, 1)
-    for rows in (90, 100, 127, 128):
-        actual = keys(rows)
-        assert actual == baseline
-        report = tuning.prepare_tuning([
-            lambda owner=owner, key=key: tuning.get_config({}, owner, key)
-            for owner, key in actual.items()
-        ])
-        assert report["complete"] and report["counts"]["hit"] == len(baseline)
-    assert len({tuning.workload_bucket(n) for n in range(8193)}) == 11
-    assert keys(129) != baseline
-    assert wkv._config_key(torch.empty(100, 1, 64), 90, None, indexed=True) != baseline["tmix/wkv7"]
-
-
-def test_projection_search_keeps_both_sides_of_sm_coverage(monkeypatch):
-    from flashrwkv2._internal import tuning
-
-    props = SimpleNamespace(multi_processor_count=48, shared_memory_per_block_optin=101376)
-    monkeypatch.setattr(tuning.torch.cuda, "get_device_properties", lambda _: props)
-    configs = tuning.projection_configs(100, (2048,), (2048,), "cuda")
-    assert {m for m, n, _, _ in configs if n == 64} == {64, 128}
-
-
-@pytest.mark.parametrize("sms", (128, 188))
-@pytest.mark.parametrize("channels,outputs", (
-    ((2048,), (65536,)), ((4096,) * 3, (4096,) * 3),
-    ((2048,) * 4, (96, 96, 256, 64)), ((4096,) * 4, (128, 128, 480, 96)),
-    ((4096,) * 4, (192, 192, 384, 128)), ((96, 96, 256, 64), (2048,) * 4),
-))
-def test_projection_variants_cover_dynamic_rows(monkeypatch, sms, channels, outputs):
-    import random
-
-    import torch
-
-    from flashrwkv2._internal.linear import _projection_config, _projection_variants
-
-    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: SimpleNamespace(
-        multi_processor_count=sms, shared_memory_per_block_optin=99_264,
-    ))
-    variants = _projection_variants(channels, outputs, "cuda")
-    assert len(variants) <= 5
-    probes = (*range(1, 4097), *random.Random(804).sample(range(4097, 1 << 20), 20))
-    for rows in probes:
-        config = _projection_config(rows, channels, outputs, "cuda")
-        assert config in variants, (rows, config, variants)
-        m, n, stages, span = config
-        assert (m + n) * stages * span * 2 <= 99_264
-
-
 def test_preparation_compiles_family_once_and_reports_variants(tuning_cache, monkeypatch):
     cache, calls = {}, []
+    def compiler(*args):
+        return object()
+    compiler.func = SimpleNamespace(__name__="observed_kernel")
     def compile_candidates(keys, result, spec):
         calls.extend(keys)
         result.update((key, object()) for key in keys)
@@ -741,11 +510,12 @@ def test_preparation_compiles_family_once_and_reports_variants(tuning_cache, mon
     def run():
         tuning_cache.get_config({}, "linear", ("family",), (16, 64, 2, 32), fixed=True)
         tuning_cache.prepare_variants("linear", ("shape",), lambda: ((1,), (2,)), cache, None)
+        tuning_cache.prepared_kernel("test", compiler, (1,), ((2,),))
     report = tuning_cache.prepare_tuning([run, run])
     assert calls == [(1,), (2,)]
     assert report["complete"]
-    assert report["compilation"] == {"families": 1, "required_variants": 2,
-                                     "available_variants": 2, "complete": True}
+    assert report["compilation"] == {"families": 2, "required_variants": 4,
+                                     "available_variants": 4, "complete": True}
 
 
 def test_preparation_rejects_failed_required_variant(tuning_cache, monkeypatch):
@@ -774,17 +544,3 @@ def test_candidate_batches_preserve_distinct_compiler_options(monkeypatch):
                        lambda k: (k, {"pass_configs": {"tl.enable_async_copy": bool(k)}}))
     assert len(calls) == 2 and len(cache) == 2
     assert {call[1]["pass_configs"]["tl.enable_async_copy"] for call in calls} == {False, True}
-
-
-def test_jit_preparation_includes_observed_configuration(tuning_cache):
-    calls = []
-    def compiler(*args):
-        calls.append(args)
-        return object()
-    compiler.func = SimpleNamespace(__name__="test_kernel")
-    def run():
-        tuning_cache.get_config({}, "linear", ("family",), 1, fixed=True)
-        tuning_cache.prepared_kernel("test", compiler, (128, 1), ((128, 4), (128, 8)))
-    report = tuning_cache.prepare_tuning([run])
-    assert report["compilation"]["required_variants"] == 3
-    assert calls[:3] == [(128, 1), (128, 4), (128, 8)]

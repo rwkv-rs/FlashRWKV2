@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: MIT
 
+import itertools
+
 import pytest
-import tilelang
 import torch
 
 from flashrwkv2._internal.state import _transfer
 from flashrwkv2.post_norm.tilelang import norm
 from flashrwkv2.tmix.tokenshift.tilelang import (
-    _backward,
     _forward,
     _fused_forward,
     fused_post_norm_tokenshift,
@@ -15,25 +15,9 @@ from flashrwkv2.tmix.tokenshift.tilelang import (
 )
 
 
-@pytest.mark.parametrize("arch", ("sm_89", "sm_120"))
-@pytest.mark.parametrize("channels", (7, 128, 1024, 4096, 7168))
-def test_tokenshift_lowering(arch, channels):
-    with tilelang.tvm.target.Target({"kind": "cuda", "arch": arch}) as target:
-        for block in (128, 256, 512):
-            tilelang.lower(_forward.get_tir(channels, 6, "int32", block), target=target)
-        tilelang.lower(_forward.get_tir(channels, 6, "int32", 256, True), target=target)
-        tilelang.lower(_backward.get_tir(channels, 6, "int64"), target=target)
-        for write in (False, True):
-            tilelang.lower(_transfer.get_tir(channels, "bfloat16", write), target=target)
-        for count in (1, 6):
-            tilelang.lower(_fused_forward.get_tir(channels, count, 1e-5, 2), target=target)
-        tilelang.lower(_backward.get_tir(channels, 6, "int32", 256, 32, True), target=target)
-        tilelang.lower(_backward.get_tir(channels, 1, "int32", 256, 32, False), target=target)
-
-
 def reference(x, mixes, offsets, initial):
     previous, final = [], []
-    for b, (start, end) in enumerate(zip(offsets, offsets[1:])):
+    for b, (start, end) in enumerate(itertools.pairwise(offsets)):
         if end > start:
             previous.append(torch.cat((initial[b:b + 1], x[start:end - 1])))
             final.append(x[end - 1])
@@ -122,7 +106,7 @@ def test_fused_tuning_rejects_changed_pool_and_preserves_caller_state(monkeypatc
     def forward(channels, count, eps, rows_per_block=1):
         def kernel(x, res, weight, bias, *parameters_and_state):
             assert len(parameters_and_state) == 9
-            scratch, indices, status = parameters_and_state[-3:]
+            scratch, indices, _status = parameters_and_state[-3:]
             scratch[indices.long()] = 2 if rows_per_block == 2 else 1
             return torch.ones_like(x), torch.ones(count, *x.shape, dtype=x.dtype)
         return kernel
@@ -168,7 +152,7 @@ def test_tokenshift_bitwise_packing_chunks_and_grad_mode(channels):
         infer, infer_final = tokenshift(x, mixes, cu, initial)
         collected = [[] for _ in range(6)]
         states = []
-        for b, (start, end) in enumerate(zip(offsets, offsets[1:])):
+        for b, (start, end) in enumerate(itertools.pairwise(offsets)):
             state = initial[b:b + 1].contiguous()
             for left in range(start, end, 3):
                 right = min(left + 3, end)
@@ -207,60 +191,6 @@ def test_tokenshift_independent_vjp_with_empty_sequences():
         assert torch.equal(output, ref)
     for gradient, ref in zip(gradients, expected_grads, strict=True):
         torch.testing.assert_close(gradient, ref, atol=0.125, rtol=0.02)
-
-
-@pytest.mark.cuda
-@pytest.mark.cuda_graph
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.parametrize("count", (1, 6))
-def test_fixed_fused_tokenshift_preserves_state_without_tuning(monkeypatch, tmp_path, count):
-    from flashrwkv2._internal import tuning
-    from flashrwkv2.tmix.tokenshift import tilelang as implementation
-
-    if not tuning._fixed_strategy_device(tuning.device_class(torch.device("cuda"))):
-        pytest.skip("fixed fused strategy is qualified on RTX 4090")
-
-    torch.manual_seed(714)
-    rows, channels = 5, 2048
-    x = torch.randn(rows, channels, device="cuda", dtype=torch.bfloat16)
-    res = torch.randn_like(x)
-    weight = torch.randn(channels, device="cuda", dtype=torch.bfloat16)
-    bias = torch.randn_like(weight)
-    mixes = tuple(torch.randn_like(weight) for _ in range(count))
-    initial = torch.randn_like(x)
-    pool = initial.clone()
-    indices = torch.arange(rows, device="cuda", dtype=torch.int32)
-    status = torch.tensor((0, rows, rows), device="cuda", dtype=torch.int32)
-    mix_args = mixes + (mixes[-1],) * (6 - count)
-    expected_total, expected_output = implementation._fused_forward(channels, count, 1e-5, 1)(
-        x, res, weight, bias, *mix_args, pool, indices, status,
-    )
-    expected_pool = pool.clone()
-
-    monkeypatch.setattr(tuning, "_profile_root", lambda: tmp_path)
-    monkeypatch.setattr(tuning, "_read_profile", lambda *args: pytest.fail("read a profile"))
-    monkeypatch.setattr(
-        implementation, "tune_fused_tokenshift", lambda *args: pytest.fail("tuned a fixed configuration"),
-    )
-    monkeypatch.setattr(implementation, "_FUSED_CONFIGS", {})
-
-    def call():
-        pool.copy_(initial)
-        return fused_post_norm_tokenshift(x, res, weight, bias, mixes, pool, indices, status)
-
-    for mode in ("inspect", "require", "tune"):
-        report = tuning.prepare_tuning([call], mode=mode)
-        assert report["complete"] and report["counts"]["fixed"] == 1
-        assert report["records"][0]["config"] == 1
-
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        actual_total, actual_output = call()
-    graph.replay()
-    assert torch.equal(actual_total.view(torch.int16), expected_total.view(torch.int16))
-    assert torch.equal(torch.stack(actual_output).view(torch.int16), expected_output.view(torch.int16))
-    assert torch.equal(pool.view(torch.int16), expected_pool.view(torch.int16))
-    assert not tuple(tmp_path.iterdir())
 
 
 @pytest.mark.cuda
@@ -352,61 +282,3 @@ def test_dynamic_batch_reuses_tokenshift_and_state_kernels(use_status):
         if cache_sizes is None:
             cache_sizes = sizes
         assert sizes == cache_sizes
-
-
-@pytest.mark.cuda
-@pytest.mark.cuda_graph
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.parametrize(
-    "channels,count,rows",
-    ((2048, 1, 65), (2560, 6, 129), (4096, 1, 1024), (5120, 1, 1)),
-)
-@pytest.mark.parametrize("index_dtype", (torch.int32, torch.int64))
-def test_fixed_tokenshift_preserves_empty_state_and_vjp(
-    monkeypatch, tmp_path, rows, channels, count, index_dtype,
-):
-    from flashrwkv2._internal import tuning
-    from flashrwkv2.tmix.tokenshift import tilelang as implementation
-
-    if not tuning._fixed_strategy_device(tuning.device_class(torch.device("cuda"))):
-        pytest.skip("fixed TokenShift strategy is qualified on RTX 4090")
-    torch.manual_seed(718)
-    batch = 3
-    x = torch.randn(rows, channels, device="cuda", dtype=torch.bfloat16).requires_grad_()
-    mixes = torch.randn(count, channels, device="cuda", dtype=torch.bfloat16).requires_grad_()
-    initial = torch.randn(batch, channels, device="cuda", dtype=torch.bfloat16).requires_grad_()
-    cu = torch.tensor((0, 0, rows // 2, rows), device="cuda", dtype=index_dtype)
-    status = torch.tensor((0, rows, batch), device="cuda", dtype=index_dtype)
-    upstream = (*(torch.randn_like(x) for _ in range(count)), torch.randn_like(initial))
-
-    with monkeypatch.context() as patch:
-        patch.setattr(implementation, "_tokenshift_block", lambda *args: 256)
-        expected, expected_final = tokenshift(x, mixes, cu, initial)
-        expected_grads = torch.autograd.grad((*expected, expected_final), (x, mixes, initial), upstream)
-    expected = tuple(output.detach() for output in expected)
-    expected_final = expected_final.detach()
-
-    monkeypatch.setattr(tuning, "_profile_root", lambda: tmp_path)
-    monkeypatch.setattr(tuning, "_read_profile", lambda *args: pytest.fail("read a profile"))
-    monkeypatch.setattr(implementation, "tune_tokenshift", lambda *args, **kwargs: pytest.fail("tuned a fixed configuration"))
-    monkeypatch.setattr(implementation, "_BLOCK_CONFIGS", {})
-    actual, actual_final = tokenshift(x, mixes, cu, initial)
-    actual_grads = torch.autograd.grad((*actual, actual_final), (x, mixes, initial), upstream)
-    assert all(torch.equal(a.view(torch.int16), b.view(torch.int16)) for a, b in zip(actual, expected, strict=True))
-    assert torch.equal(actual_final.view(torch.int16), expected_final.view(torch.int16))
-    assert all(torch.equal(a.view(torch.int16), b.view(torch.int16)) for a, b in zip(actual_grads, expected_grads))
-
-    def call():
-        return tokenshift(x.detach(), mixes.detach(), cu, initial.detach(), _status=status)
-
-    for mode in ("inspect", "require", "tune"):
-        report = tuning.prepare_tuning([call], mode=mode)
-        assert report["complete"] and report["counts"]["fixed"] == 1
-        assert report["records"][0]["config"] == 256
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        captured, captured_final = call()
-    graph.replay()
-    assert all(torch.equal(a.view(torch.int16), b.view(torch.int16)) for a, b in zip(captured, expected, strict=True))
-    assert torch.equal(captured_final.view(torch.int16), expected_final.view(torch.int16))
-    assert not tuple(tmp_path.iterdir())

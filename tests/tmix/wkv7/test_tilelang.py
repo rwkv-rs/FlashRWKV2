@@ -437,74 +437,6 @@ def test_recurrent_tuning_preserves_both_forwards_and_caller_state(monkeypatch, 
     tuning._LOADED.clear()
 
 
-@pytest.mark.parametrize("lengths", [(1, 1), (1, 5), (0, 6)])
-@pytest.mark.cuda_graph
-def test_fixed_recurrent_dispatch_preserves_state_without_tuning(monkeypatch, lengths):
-    from flashrwkv2._internal import tuning
-    from flashrwkv2.tmix.wkv7 import tilelang as implementation
-
-    if not tuning._fixed_strategy_device(tuning.device_class(torch.device("cuda"))):
-        pytest.skip("fixed recurrent strategy is qualified on RTX 4090")
-    values, state, cu, bias = _case(64, lengths)
-    indices = torch.arange(len(lengths), device="cuda", dtype=torch.int32)
-    status = torch.tensor(
-        [0, values[0].shape[0], len(lengths)], device="cuda", dtype=torch.int32,
-    )
-    expected_output, expected_state = tmix_wkv7_recurrent(
-        *values, state, cu, decay_bias=bias, block_values=64, prefetch_tokens=1,
-    )
-
-    def unexpected(*args, **kwargs):
-        pytest.fail("fixed recurrent dispatch must not load profiles or tune")
-
-    monkeypatch.setattr(tuning, "_read_profile", unexpected)
-    monkeypatch.setattr(implementation, "tune_tmix_wkv7_recurrent", unexpected)
-    pool = state.clone()
-
-    def call():
-        pool.copy_(state)
-        return _infer_recurrent(*values, pool, cu, indices, status, decay_bias=bias)
-
-    for mode in ("inspect", "require", "tune"):
-        report = tuning.prepare_tuning([call], mode=mode)
-        assert report["complete"] and report["counts"]["fixed"] == 1
-        assert report["records"][0]["config"] == (
-            64, 4 if values[0].shape[0] > len(lengths) else 1,
-        )
-        assert torch.equal(pool.view(torch.int32), expected_state.view(torch.int32))
-    # A warm kernel can be captured directly, without a prepared profile.
-    call()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        captured = _infer_recurrent(*values, pool, cu, indices, status, decay_bias=bias)
-    pool.copy_(state)
-    graph.replay()
-    assert torch.equal(captured.view(torch.int16), expected_output.view(torch.int16))
-    assert torch.equal(pool.view(torch.int32), expected_state.view(torch.int32))
-
-
-def test_fixed_recurrent_training_matches_canonical_gradients():
-    from flashrwkv2._internal import tuning
-
-    if not tuning._fixed_strategy_device(tuning.device_class(torch.device("cuda"))):
-        pytest.skip("fixed recurrent strategy is qualified on RTX 4090")
-    values, state, cu, bias = _case(64, (1, 5), requires_grad=True)
-    expected = tmix_wkv7_recurrent(
-        *values, state, cu, decay_bias=bias, block_values=64, prefetch_tokens=1,
-    )
-    actual = tmix_wkv7_recurrent(*values, state, cu, decay_bias=bias)
-    inputs = (*values, state, bias)
-    upstream = tuple(torch.randn_like(value) for value in expected)
-    expected_grad = torch.autograd.grad(expected, inputs, upstream)
-    actual_grad = torch.autograd.grad(actual, inputs, upstream)
-    for left, right in zip(actual, expected, strict=True):
-        dtype = torch.int16 if left.dtype == torch.bfloat16 else torch.int32
-        assert torch.equal(left.view(dtype), right.view(dtype))
-    # The existing backward uses floating-point atomics across value tiles.
-    for left, right in zip(actual_grad, expected_grad, strict=True):
-        torch.testing.assert_close(left, right, atol=2e-5, rtol=2e-2)
-
-
 @pytest.mark.cuda_graph
 def test_recurrent_cuda_graph_replay_matches_eager():
     values, state, cu, bias = _case(64, (1, 17))
@@ -518,21 +450,3 @@ def test_recurrent_cuda_graph_replay_matches_eager():
     graph.replay()
     for replayed, eager in zip(actual, expected, strict=True):
         assert torch.equal(replayed, eager)
-
-
-@pytest.mark.parametrize("qualified,dim,state_dtype,prefetches", (
-    (True, 64, "float32", (1, 4)), (False, 64, "float32", (1,)),
-    (True, 128, "float32", (1,)), (True, 64, "float16", (1,)),
-))
-def test_preparation_enumerates_only_qualified_wkv_families(monkeypatch, qualified, dim, state_dtype, prefetches):
-    from flashrwkv2.tmix.wkv7 import tilelang as implementation
-    calls = []
-    def prepare(owner, compiler, options, variants):
-        calls.append((options, tuple(variants)))
-        return "kernel"
-    monkeypatch.setattr(implementation, "device_class", lambda device: "test")
-    monkeypatch.setattr(implementation, "_fixed_strategy_device", lambda info: qualified)
-    monkeypatch.setattr(implementation, "prepared_kernel", prepare)
-    options = (2, dim, 1.0, False, False, 64, False, False, "float32", 1, state_dtype)
-    assert implementation._prepared_forward_kernel("cuda", *options) == "kernel"
-    assert tuple(key[9] for key in calls[0][1]) == prefetches

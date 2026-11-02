@@ -168,66 +168,23 @@ PYTHONPATH=benchmarks ./.venv/bin/python benchmarks/tmix/wkv7/bench.py \
   --output artifacts/wkv7-recurrent-bf16.json
 ```
 
-Tuning candidates are admitted only after exact-output checks. Performance
-acceptance requires correctness evidence and measurements on both RTX 4090
-(SM89) and PRO6000 (SM120). Operator timing does not establish model latency.
-PostNorm, TMix inference stages, CMix and Head linear benchmarks support
-`--implementation cuda-baseline`
-when `PYTHONPATH` selects the original CUDA package. Run the same benchmark
-script and seed for both revisions; emitted JSON records their actual precision.
-`--timing-mode eager` measures dispatch wall time and `graph` measures a captured
-batch with CUDA events. Compare the two timing modes separately. PostNorm,
-TokenShift and Readout benchmarks also expose `--tune`.
-Verified profiles and native builds use `~/.cache/flashrwkv2`, independent of
-`TORCH_HOME`, `XDG_CACHE_HOME`, virtual environments and release directories.
-Set `FLASHRWKV2_CACHE_DIR` before importing FlashRWKV2 to explicitly relocate it.
-TileLang manages its compiled-kernel cache separately. Native extension cache
-hits describe metadata and sampling, while model tuning coverage is checked by
-running representative calls through the public preparation API:
+Deterministic strategies on RTX 4090 (SM89/128 SM) and PRO 6000 (SM120/188 SM)
+prepare bounded kernel variants for dynamic batch/token workloads. Supply real
+first/later-layer, decode/prefill and training-backward calls with their actual
+layouts and gradient requirements:
 
 ```python
 from flashrwkv2 import prepare_tuning
 
-# Each callable uses valid metadata and disposable/reset model state.
-# Cover each workload bucket, prefill/decode mode and weight layout in service.
-# Training callables also run backward with the actual trainable parameters.
-report = prepare_tuning(warmup_calls, mode="inspect")
-report = prepare_tuning(warmup_calls, mode="tune")  # only missing keys
-report = prepare_tuning(warmup_calls, mode="require")  # before graph capture
+report = prepare_tuning(warmup_calls, mode="tune")
+assert report["complete"]
 ```
 
-`inspect` reports workload-bucket dispatch coverage; `require` loads verified selections
-and fails on missing keys; `tune` verifies output/state before timing candidates.
-Validated deterministic strategies report `fixed` and need neither a profile nor runtime
-tuning. RTX 4090 (SM89/128 SM) and PRO 6000 (SM120/188 SM) use a shared bounded
-projection policy and dynamic token reductions. Explicit preparation compiles all
-reachable variants of observed deterministic families; `report["compilation"]` gives
-their coverage. Include real decode, prefill, training-backward, layouts and gradient
-requirements in the warmup calls. Other paths retain verified profiles. See the
-[tuning contract](docs/kernel_api.md#tuning-and-acceptance) for scope and validation.
-Token counts and batch sizes share power-of-two workload buckets capped at 512
-(plus a separate empty bucket); model widths, weight layouts and dtypes remain
-exact. Same-shape weight replacements reuse the same profiles. TokenShift and
-state transfers use dynamic batch dimensions. Projection tuning checks at most
-24 unique configurations, prunes shared-memory and divisibility constraints
-before compilation, and retimes at most three finalists.
-The report includes each owner, device class, full key, source fingerprint,
-selected configuration and profile path. Same-model GPUs with the same SM count
-reuse selections across GPU ordinals. Concurrent preparation serializes each
-missing key and rechecks after taking its lock. Ordinary forwards warn about
-untuned defaults and never start tuning. A previously missing file is rechecked
-on later eager calls; existing CUDA Graphs must be recaptured after preparation.
-Preparation is an exclusive phase within each process and includes dispatches
-from autograd worker threads. Finish serving/training calls before preparing.
-After upgrading, run preparation again with the current version. Deterministic
-families compile their bounded variants; paths requiring profiles use
-`mode="tune"` to verify and measure missing configurations. Obsolete tuning
-records can be deleted. TileLang's compilation cache remains reusable.
-See the [tuning contract](docs/kernel_api.md#tuning-and-acceptance) for state
-ownership and deployment examples.
-The historical [0.1.0a9 performance report](docs/performance/wkv7-0.1.0a9.md)
-describes that release's implementation; current results must identify the
-revision, hardware, shapes, and numerical contract.
+Prepare before torch.compile specialization and CUDA Graph capture. Other paths
+retain verified profiles and bounded tuning. After upgrading, prepare again;
+compatible TileLang binaries can be reused. See the
+[preparation and cache contract](docs/kernel_api.md#tuning-and-acceptance) for
+coverage, state ownership, validation and performance results.
 
 ## License
 

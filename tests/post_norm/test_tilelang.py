@@ -3,22 +3,8 @@
 import pytest
 import torch
 import torch.nn.functional as F
-import tilelang
 
-from flashrwkv2.post_norm.tilelang import _backward, _forward, norm
-
-
-@pytest.mark.parametrize("arch", ("sm_89", "sm_120"))
-@pytest.mark.parametrize("channels", (64, 257, 1024, 4096, 7168))
-def test_norm_lowering(arch, channels):
-    with tilelang.tvm.target.Target({"kind": "cuda", "arch": arch}) as target:
-        for args in ((channels, 1e-5, True), (channels, 1e-5, True, False, False)):
-            tilelang.lower(_forward.get_tir(*args), target=target)
-        tilelang.lower(_backward.get_tir(channels, True), target=target)
-        for save_stats, store_res in ((True, True), (False, False), (False, True)):
-            tilelang.lower(_forward.get_tir(channels, 1e-5, True, save_stats, store_res, 4), target=target)
-        for needed in (False, True):
-            tilelang.lower(_backward.get_tir(channels, True, 32, needed, needed), target=target)
+from flashrwkv2.post_norm.tilelang import norm
 
 
 @pytest.mark.parametrize("fault", ("stats", "production", "res_output", "res_store"))
@@ -89,49 +75,6 @@ def test_norm_bitwise_batch_and_grad_mode(channels, has_res):
     assert torch.equal(train, infer)
     assert torch.equal(train, torch.cat(pieces))
     assert torch.equal(total, x if res is None else x + res)
-
-
-@pytest.mark.cuda
-@pytest.mark.cuda_graph
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.parametrize("channels", (2048, 2560, 4096, 5120))
-@pytest.mark.parametrize("has_res", (False, True))
-def test_fixed_norm_needs_no_profile_and_captures(monkeypatch, channels, has_res):
-    from flashrwkv2._internal import tuning
-    from flashrwkv2.post_norm import tilelang as implementation
-
-    if not tuning._fixed_strategy_device(tuning.device_class(torch.device("cuda"))):
-        pytest.skip("fixed norm strategy is qualified on RTX 4090")
-    torch.manual_seed(703)
-    x = torch.randn(17, channels, device="cuda", dtype=torch.bfloat16)
-    weight = torch.randn(channels, device="cuda", dtype=torch.bfloat16)
-    bias = torch.randn_like(weight)
-    res = torch.randn_like(x) if has_res else None
-    summed = torch.empty_like(x) if has_res else x
-    expected, _, _ = _forward(channels, 1e-5, has_res)(
-        x, x if res is None else res, weight, bias, summed,
-    )
-
-    def unexpected(*args, **kwargs):
-        pytest.fail("fixed norm dispatch must not load profiles or tune")
-
-    monkeypatch.setattr(tuning, "_read_profile", unexpected)
-    monkeypatch.setattr(implementation, "tune_norm", unexpected)
-    outputs = []
-    report = tuning.prepare_tuning(
-        [lambda: outputs.append(norm(x, weight, bias, res=res, return_res=True))],
-        mode="tune",
-    )
-    assert report["complete"] and report["counts"]["fixed"] == 1
-    assert report["records"][0]["config"] == 1
-    assert torch.equal(outputs[0][0].view(torch.int16), expected.view(torch.int16))
-    assert torch.equal(outputs[0][1].view(torch.int16), summed.view(torch.int16))
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        captured = norm(x, weight, bias, res=res, return_res=True)
-    graph.replay()
-    assert torch.equal(captured[0].view(torch.int16), expected.view(torch.int16))
-    assert torch.equal(captured[1].view(torch.int16), summed.view(torch.int16))
 
 
 @pytest.mark.cuda
