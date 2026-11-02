@@ -1,6 +1,6 @@
 # FlashRWKV2 TileLang operator contract
 
-模型前向统一使用 BF16 激活和权重、FP32 累加与归约。WKV 状态固定为连续
+模型前向统一使用 BF16 激活和权重、FP32 累加与归约。默认 WKV 状态为连续
 FP32 `[slots,H,D,D]`，TokenShift 状态为 BF16 `[slots,C]`。Head 输出 logits、
 `head_logprobs` 与 loss 为 FP32。公共名称保留模块所有者；内部 primitive 不从根包导出。
 
@@ -24,7 +24,9 @@ y[v] = scale * sum_k r[k] * state[k,v]
 
 `head_size` 支持 64、128、256。前向一致性按位比较输出、state 和所选 token 的
 logprob；梯度使用独立 FP32 参考与相对误差验证。WKV 反向从保存的 chunk 起始状态
-重放前向，并在短片段内逆序求 VJP。只有需要梯度时才保存 checkpoint。
+重放前向，并在短片段内逆序求 VJP；不同 value tile 的部分梯度通过 FP32 原子加累积，
+调度顺序会造成极小的舍入差异。前向输出和 state 逐位比较，反向沿用独立 VJP 测试的
+`atol=2e-5, rtol=2e-2` 容差。只有需要梯度时才保存 checkpoint。
 
 ## Inference
 
@@ -87,7 +89,7 @@ slot copy 具有同时复制语义，支持同池重叠 COW；目标 slots 必�
 `memory_layout` 报告实际 bytes per slot 和 total bytes。
 
 静态 `prepare_tmix_wkv7_recurrent_metadata(cu_seqlens, state_indices, *,
-state_pool_size, total_tokens, max_seqlen=None)` 验证非空序列、边界、slot 范围和唯一性，
+state_pool_size, total_tokens, max_seqlen=None)` 验证序列边界、slot 范围和唯一性，
 保存 snapshot，并校验后续调用的 identity、version、shape 和 CUDA stream。
 `cu_seqlens` 与 `state_indices` 为连续 CUDA INT32。
 
@@ -164,189 +166,130 @@ output, final_state = statetune_tmix_wkv7_recurrent_fp32io16(
 
 ## Tuning and acceptance
 
-内部 `tune_linear`、`tune_norm`、`tune_tokenshift`、`tune_readout` 与 WKV tuner
-按设备及实际 shape 选择配置。先与固定数值基准逐位比较，再用 CUDA Graph 计时；
-候选只能改变输出 tiling、pipeline 或每 CTA 的独立行数。验收覆盖 RTX 4090
-SM89 与 PRO6000 SM120 的 decode、小 batch、prefill 和训练形状。
-调优用首批 device 耗时估算约 10 ms 的重放次数，预热后测量三批并取中位数。
-各候选保留 `raw_milliseconds` 三批单次延迟及 `launches_per_graph`。
-投影按拷贝跨度各保留三个已通过逐位验证的候选，再使用每图 1000 次调用重新比较；
-正式基准的 10000 次计时保持独立。
+### Execution and preparation
 
-公开接口 `get_tuning_cache_dir()` 返回固定根 `~/.cache/flashrwkv2`；唯一覆盖项
-为导入包前设置的 `FLASHRWKV2_CACHE_DIR`。`TORCH_HOME`、`XDG_CACHE_HOME`、
-release 路径和 venv 路径不影响 verified profiles。三种缓存有独立边界：
+Validated deterministic strategies cover RTX 4090 (SM89, 128 SMs) and
+PRO 6000 (SM120, 188 SMs), BF16 projections with BF16/FP32 outputs, and
+head-size-64 WKV with FP32 state. Other devices, mixed grouped layouts,
+FP16 state and other head sizes retain verified profiles and bounded tuning.
+The numerical contract above applies to every execution mode.
 
-- `tuning/v2/<owner>/<fingerprint>/<key-hash>.json` 保存经过逐位验证的执行配置。
-  指纹包含该 owner 的实现 AST、递归导入的本包实现依赖、Torch/TileLang/CUDA
-  版本、实际 NVCC/host compiler 版本及显式编译 flags；注释、文档字符串、公共 `__init__` 包装和无关 owner 的变化不会失效全库。
-  修改内核、编译选项或实现依赖会产生新指纹。驱动版本和安装路径不参与配置指纹。
-- `native/` 保存 metadata/sampling 扩展。保留原有 Python/Torch ABI、工具链、
-  native 源码和架构兼容键，包括 venv 身份；配置可跨 venv 复用不代表 native 二进制
-  可以跨 ABI 直接复制。`python -m flashrwkv2.compile` 的 `cached` 仅描述该扩展。
-- TileLang JIT 的二进制缓存由 TileLang 自身管理，保持其编译器兼容性检查与路径。
-  verified profile 命中后仍可能需要首次编译选中的 kernel。
-
-设备类别是 `(product_name, compute_major, compute_minor, SM_count)`，不含 GPU
-ordinal 或 UUID。同类别多卡共享配置，4090、4090D、PRO6000 分开。原有 shape、
-权重 stride、bias dtype、indexed 模式及 state dtype 保留在各 owner 的 key 中。
-
-服务在 capture 前使用自己的真实权重和形状运行以下公开接口：
+Single and grouped projections share a resource-aware tile selector based on
+output geometry, actual SM count, CTA coverage and shared-memory limits.
+BF16 weight gradients use dynamic token reduction: aligned K uses a two-stage
+pipeline, tails use synchronous single-stage copies, and both retain consecutive
+32-element MMA groups. TokenShift uses dynamic batch and 256-column blocks.
+WKV selects one-token prefetch for decode and four-token prefetch for multi-token
+workloads. Norm and Readout preserve their existing statistics/residual semantics.
 
 ```python
-import json
-from flashrwkv2 import get_tuning_cache_dir, prepare_tuning
+from flashrwkv2 import prepare_tuning
 
-# warmup_calls: 可重复调用的零参数函数列表，覆盖所有实际 prefill token 数、
-# decode batch、capture batch、首层/后续层和参数布局。
-# 函数负责使用独立状态或恢复状态；prepare_tuning 会实际执行每个函数一次。
-coverage = prepare_tuning(warmup_calls, mode="inspect")
-print(json.dumps(coverage))
-
-# 管理员显式准备：已有有效 key 直接复用，只调缺失项。
-prepared = prepare_tuning(warmup_calls, mode="tune")
-
-# 新 serving 进程加载配置，缺失立即报出 owner、key 和 cache root。
-loaded = prepare_tuning(warmup_calls, mode="require")
-assert loaded["complete"]
-# 此后恢复 serving state，再进行 CUDA Graph capture。
+# Real calls with disposable/reset state; include backward when training.
+report = prepare_tuning(warmup_calls, mode="tune")
+assert report["complete"]
+# Restore serving state, then specialize torch.compile and capture CUDA Graphs.
 ```
 
-每个函数必须实际执行模型前向，训练函数还须执行反向，使用有效且非空的代表性输入与 metadata。
-WKV 调优调用需要该 capture shape 全部 token/sequence 均处于 active 状态；
-不能用零 active 的图预热占位输入进行逐位验证。
-报告逐项列出 `owner/key/fingerprint/config/path/status`，其中 key 包含设备类别；
-`counts` 区分 `hit/missing/tuned/revalidated`，`complete` 要求实际观察到的全部
-配置命中，未观察到任何可配置 dispatch 会报错。调用方负责提供完整工作负载集合，
-不能用目录内记录总数代替覆盖证明。固定配置算子不产生可调 key。
-`inspect` 可用默认配置收集缺口，`require` 在第一项缺失时中止；普通 forward
-按 owner 首次警告未调优默认配置，不自动启动调优。
+Callers declare all actual shape families: static model dimensions, layouts,
+dtypes, grouped branches, bias/activation forms, output modes and gradient needs.
+Include first/later layers, decode/prefill and training backward. Rows, token counts
+and same-shape weight addresses do not define additional deterministic families.
+New layouts or trainable-parameter/output-use patterns require another preparation.
+Empty calls do not prepare future nonempty workloads.
 
-缺失项不写入进程内选择缓存，后续 eager forward 能看到新发布的文件。
-已加载有效配置在普通 forward 中复用；显式 prepare 每轮对每个 key 重读一次文件，
-因此能观察外部进程的重新发布或删除。准备操作在 capture 内直接拒绝，未预热的缺失 key
-不能在 capture 中加载。准备前已建立的 CUDA Graph 必须重新捕获。
-多个进程对同一 key 通过文件锁竞争；持锁后再次读取，只有一个进程验证/调优并
-用同目录临时文件原子替换发布。无效 JSON、key 或验证标记立即报错；半写入
-临时文件不会被读者视为已发布 profile。
-单个进程内 prepare 是独占阶段，准备前先结束其他 serving/training 调用；嵌套或
-并发 prepare 会报错。准备报告也覆盖 CUDA autograd worker thread 上的反向 dispatch。
+Preparation compiles every reachable variant of the observed deterministic
+families. Afterwards, changing batch/token within those families performs no
+TileLang code generation, device compilation, configuration search or timing.
+Normal eager calls compile only their selected variant. torch.compile specialization
+and CUDA Graph capture shapes are separate initialization responsibilities.
 
-旧缓存迁移显式指定单个旧 namespace，无需改动旧服务目录。路径支持 `~` 展开；
-指定的目录不存在时立即报错，避免路径拼写错误意外触发全量调优：
+| Family | Maximum variants per static geometry/semantic form |
+| --- | ---: |
+| Static-K projection | 5 |
+| Dynamic-K projection, fixed output geometry | 2 alignment classes |
+| PostNorm / TokenShift forward | 1 |
+| PostNorm / TokenShift / Readout backward, per gradient requirement | 6 |
+| Readout / WKV forward, head size 64 and FP32 WKV state | 2 |
+| WKV backward; state transfer per gather/scatter direction | 1 |
 
-```python
-prepared = prepare_tuning(
-    warmup_calls, mode="tune",
-    legacy_dir="/home/user/.cache/torch/flashrwkv2/tuning/<old-namespace>",
-)
-print(json.dumps(prepared))
-```
+Single-variant auxiliary kernels are warmed by the real calls. A required compile
+failure aborts preparation with its owner and key; it is never silently skipped.
+`compilation` reports `families`, `required_variants`, `available_variants` and
+`complete`. Top-level `complete` also requires no missing observed configurations.
 
-旧记录完整匹配产品名和其余 key 后，只将配置作为候选，在当前算子、实际输入上
-重新核对 BF16 输出、FP32 累加/统计和 WKV state，再发布到新根；迁移不计时。
-逐位复验失败会中止，旧目录不变。没有旧候选的 key 按现有候选集调优。
-跨 release/venv 验证应在目标环境的新进程运行 `mode="require"` 并保存报告；
-修改 Torch/XDG 缓存变量仍应命中相同 profile 路径。
-基准还覆盖真实 7.2B 的 `w/a=128,g=480,v=96` 首层与后续层，以及
-`B=1/4/64/320/512` decode，以保证缓存 key 对应实际推理布局。
+### Profiles, caches and graphs
 
-投影先以 32 元素的 K 拷贝跨度选择输出 tile，再为获胜 tile 测量 64/128 元素的跨度。
-同时测量 M 取输入行数向上取整到 2 的幂（限于 16–256）的最佳 tile；超过 128 行时，
-保留该 M tile 的 32/64/128 三种列宽。拷贝阶段分别核对两级和三级 pipeline，
-先按设备共享内存上限排除无法启动的候选。较大的跨度必须整除输入宽度。
-不足 16 行的投影保留全部列宽，
-并额外比较 256/512/1024 元素的拷贝跨度，以减少长 K 维的搬运开销。
-每次拷贝内部仍按连续 32 元素块执行相同的 MMA 序列，
-保持 MMA 次数与 FP32 累加顺序。未显式调优时，默认 M tile 按行数从
-16/32/64/128 中选择；只有 CTA 网格可覆盖设备 SM 时才增大 M tile。
-超过 128 行的投影会测量 256 行 tile，较大的 tile 使用最多 256 个线程复用权重，
-MMA 的 K 序列保持不变。
+`inspect` reports coverage without tuning; `require` fails on the first missing
+profile; `tune` verifies then measures missing profiles. Deterministic paths report
+`fixed` and bypass profiles/search in all modes. Other statuses are `hit`, `missing`
+and `tuned`; records contain owner, device/key, configuration, fingerprint and path.
 
-调优同时核对 FP32 累加或统计量及实际生产输出；ln 是否保存统计量、是否写回
-res 等变体都必须保持相同结果。线性层的 bias presence/dtype 属于调优 key。
-编译不受工具链支持的线性候选会在结果中记录 `compile_error`；运行失败直接报错。
-候选的 staging buffers 超出设备共享内存上限时，记录 `resource_error` 并在启动前排除。
-投影候选先串行生成 TIR，再用 TileLang 按可用 CPU 核心数调度的编译线程构建并复用进程内 kernel cache。
-全部构建结束后才逐一检查输出和计时；编译失败仍在对应候选中保留错误信息。
-`tune_linear` 可通过 `benchmark` 回调测量实际前向阶段，结果用 `timing_scope`
-区分整个阶段与单个投影。Prepare 基准先核对并调优三个分组 kernel，再按完整
-前向重选 R/K/V 分组配置，保持三份 dense weights 的实际工作集；反向基准
-仍独立测量分组投影。分组调优同时核对每路 BF16 结果与激活前的 FP32 累加。
-CMix 前向基准同样按完整阶段重选 key/value 投影，以保留两份权重及 ReLU²
-中间结果共同产生的缓存行为。
-单 token 的 PostNorm+TokenShift 融合路径直接读取独立的 mix 参数，
-避免每次调用都先在 GPU 上打包六路参数；CMix 的单路复用使用同一 kernel。
-调优需在 CUDA Graph capture 前完成，并使用有效、非空的 active workload。
-WKV 的 functional、indexed pool 模式和 state dtype 分别缓存配置；候选同时校验两种模式的
-输出和所选 dtype 的最终状态，按实际调用模式计时。
-WKV 候选组合 32/64 个 value columns 与 1/4 个输入 token 的共享内存预取。
-四 token 预取在 head size 64/128 时展开块内 token 循环；head size 256 保留串行循环。
-预取只改变输入加载与 decay 计算的排布，逐 token 的 state 更新、K 归约、BF16
-舍入和每 16 token 的 FP32 checkpoint 保持原有顺序。未调优时使用单 token
-预取；单步 decode 的调优也只测单 token 配置。
-FP16 state 只能以 `indexed=True` 调优，逐位校验相同 FP16 舍入规则下的 functional
-参考与 indexed 结果；不以降低训练精度作为调优候选。
+The cache root is `~/.cache/flashrwkv2`, overridden only by `FLASHRWKV2_CACHE_DIR`
+set before import. Verified profiles live under `tuning/v2/<owner>/<fingerprint>/`;
+source AST/dependencies, toolchain versions and compile flags determine validity.
+Installation paths, comments and Torch/XDG cache locations do not invalidate them.
+Native extensions and TileLang binaries have separate compatibility/cache checks.
 
-PostNorm、TMix 各推理阶段、CMix 和 Head 线性基准可用
-`--implementation tilelang|cuda-baseline` 标记
-通过 `PYTHONPATH` 选中的包。两次运行复用同一基准脚本、seed、逻辑输入及尺寸，
-WKV 的 `--state-dtype float16` 单独测量可选推理模式；默认仍为 `float32`。
-结果记录实际输入、输出和上游梯度 dtype。WKV 基线使用 owning FP32IO16 handle，
-保留原 CUDA selector 的生产路径；metadata preparation、state reset 和 materialize
-位于计时外。`--timing-mode eager` 测完整 Python dispatch 与末尾同步的 wall time，
-`--timing-mode graph` 用 CUDA events 测包含整批调用的 graph replay；两种结果分别比较。
-Graph replay 与 events 在正式计时前初始化，额外的整批 Graph 预热由
-`graph_warmup_launches` 单独记录；默认正式计时仍为 10 批、每批 1000 次调用。
-Head CE 基准的 `--backward`、`--train-base`、`--chunk-rows` 明确反向范围及工作集，
-并报告单次调用的 peak allocated memory。
+Concurrent processes lock and recheck a missing profile before atomically publishing.
+Eager calls recheck missing files; explicit preparation reloads each observed key.
+Corrupt profiles fail validation. Preparation is exclusive within a process and
+includes autograd worker dispatches; finish serving/training work before preparing.
+Legacy profiles are not migrated: rerun preparation after upgrading. TileLang's
+own compatible compilation cache remains reusable.
 
-Head 线性基准的 `--compare-torch` 用相同 BF16 输入，对照输出 FP32 的原生
-`torch.mm`。对照时关闭 BF16 reduced-precision reduction 与 split-K，记录原生调用在整批、
-单行和七行分块之间的 FP32/BF16 逐位一致性及独立计时，以验证 custom linear
-是否有必要。原生库满足一致性和性能要求时，应优先减少自定义实现。
-样本包含 BF16 有效位和不同指数；单行输入还会扩展到 17 行，核对不同矩阵行数下
-同一行的结果。
+Load profiles and compile before capture. Default-kernel warmup also supports
+capture; publishing a new configuration requires loading and warming it outside
+capture, then recapturing existing graphs. Same-shape weight replacement reuses
+compiled variants; update captured weights with `copy_` on the original storage.
+Tuning samples must contain valid, nonempty active metadata; zero-active graph
+warmup is supported separately and is not a tuning sample.
 
-`--compare-torch` 在首次 CUDA 调用前选择 cuBLASLt，并设置
-`CUBLAS_WORKSPACE_CONFIG=:16:8` 和
-`CUBLASLT_WORKSPACE_SIZE=1`；artifact 记录实际 preferred BLAS 与 workspace 设置。
-该配置参考 vLLM 的 batch-invariant 初始化，仍须验证本项目 BF16/FP32 输出契约。
-CI 的 `tuned_multisize` workload 在六种模型宽度和 M=1/27/256 共 18 种形状下，
-同时记录 TileLang 调优结果与 cuBLASLt 原生对照。
+### Validation and performance
 
-CI 基准结果同时保留每个 workload 的完整 JSON records 和延迟 profiles。JSONL
-尺寸 sweep 的全部记录、调优配置、原生库对照与显存数据均进入上传的基准 artifact。
+CPU runtime/profile checks: 67 passed. SM89/SM120 device-code regressions:
+12 passed.
 
-`tests/tmix/wkv7/test_block.py` 覆盖完整 block 到 selected logprobs 的训练/推理、
-prefill/decode、batch 和 optimizer 更新后一致性。`tests/tmix/wkv7/test.py` 覆盖
-state lifecycle 与 CUDA Graph。设备实测通过前，离线 lowering 不能作为数值或性能
-验收结果。下游模型与 serving 集成应在各自仓库单独接入这一契约。
+Business tests cover train/prefill/decode equivalence, independent VJPs and optimizer
+updates, state ownership, frozen/unused gradients, compiled/Graph execution,
+prepared dynamic workloads and real fresh-process profile/binary-cache reuse.
+Model geometry uses C=2048/2560/4096/4096 and W/A/G/V ranks
+96/96/256/64, 96/96/320/64, 128/128/480/96 and 192/192/384/128.
 
-## 上游实现与实现边界
+| Measured result | SM89 | SM120 |
+| --- | --- | --- |
+| Business GPU suite: complete block, numerics, state, Graph and prepared workloads | 330 passed | 330 passed |
+| Training workloads within 2% of the best measured comparison | 9/9 | 9/9 |
+| Fresh-process disk-cache reuse | 139 cold / 0 warm device compilations | 137 cold / 0 warm device compilations |
 
-2026-10-20 核对 vLLM
-[`005cef040a28`](https://github.com/vllm-project/vllm/tree/005cef040a283aac2b156eccb12a2ab5d10f3157)：
+SM89 T1024 training is 42.20 ms for 7.2B and 42.21 ms for 13.3B
+(−0.39% / +0.33% versus baseline). Remaining performance target deviations are
+SM89 B1 layer latency +2.41%–4.46%, 2.9B T1024 prefill combined latency +2.39%,
+and SM120 1.5B B128 tuning-benefit retention of 93.77% (95% target).
 
-- 普通非量化线性层默认调用 `torch.nn.functional.linear`；开启 batch invariance
-  后改用独立 Triton GEMM。其配置按架构和 `(N,K)` 选择，再按 M 分桶，保持同一
-  shape 的 `BLOCK_K` 不随 batch 改变。见
-  [linear](https://github.com/vllm-project/vllm/blob/005cef040a283aac2b156eccb12a2ab5d10f3157/vllm/model_executor/layers/linear.py) 与
-  [batch-invariant configs](https://github.com/vllm-project/vllm/blob/005cef040a283aac2b156eccb12a2ab5d10f3157/vllm/model_executor/determinism/batch_invariant_configs.py)。
-- Qwen3.5 的 GDN prefill 组合 FLA/Triton、FlashInfer 和可选的 SM100 CuTe DSL；
-  SM120 通过 FlashInfer 的对应实现支持。decode 另有面向 SM80+ 的 fused CUDA。
-  见 [Qwen GDN](https://github.com/vllm-project/vllm/blob/005cef040a283aac2b156eccb12a2ab5d10f3157/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py)。
-- Kimi-K3 的 KDA prefill 使用 FlashKDA CUDA/CUTLASS 或 Triton；decode 有
-  fused CUDA 及 Triton。低延迟 BF16 GEMM 另按设备、shape 和 M 保存实测配置，
-  部分路径在 batch-invariant 模式下禁用。见
-  [KDA](https://github.com/vllm-project/vllm/blob/005cef040a283aac2b156eccb12a2ab5d10f3157/vllm/models/kimi_k3/nvidia/kda.py) 与
-  [low-latency GEMM](https://github.com/vllm-project/vllm/blob/005cef040a283aac2b156eccb12a2ab5d10f3157/vllm/models/kimi_k3/nvidia/low_latency_gemm.py)。
-  可选 `decode_backend=latency_specialized` 进一步使用 CuTe DSL executor，入口
-  限定 SM100/103、TP8/16 等部署条件，见
-  [specialized decode](https://github.com/vllm-project/vllm/blob/005cef040a283aac2b156eccb12a2ab5d10f3157/vllm/models/kimi_k3/nvidia/specialized_decode/runtime/__init__.py)。
+Completed SM120 training acceptance (B1, layer plus Head; forward, backward and
+gradient zeroing, excluding optimizer):
 
-本项目的实现选择以数值契约、实测性能及维护成本决定。普通 GEMM 优先验证原生
-BLAS；自定义实现须由 batch/prefill/decode 一致性或实际融合收益支持。DSL 不消除
-shape 调优；仅保留有测量依据的执行配置。SM100 与 SM120 分别验证，不按 Blackwell
-名称推定指令和资源限制相同。KDA/GDN 与 RWKV7 的递推公式不同，复用应核对数学
-和接口契约。
+| Workload | Best comparison (ms) | Prepared (ms) | Latency change | Retained gain |
+| --- | ---: | ---: | ---: | ---: |
+| 7.2B T1024 eager | 32.786 | 32.196 | -1.80% | 119.77% |
+| 13.3B T128 eager | 7.399 | 7.311 | -1.20% | 114.17% |
+| 13.3B T1024 eager | 32.897 | 32.267 | -1.91% | 121.38% |
+| 1.5B T128 compiled | 3.603 | 3.577 | -0.71% | 109.19% |
+
+All four meet the 2% latency and 95% gain-retention targets. The comparison is the
+fastest of baseline, existing offline reference and previous strategy. Gain retention
+applies when `default - best > max(0.02 * default, 3 * (IQR(default) + IQR(best)))`.
+The four cases used an idle Shanghai PRO 6000 Workstation (188 SMs), Torch
+2.13.0+cu130 and CUDA 13.0; the earlier five used PRO 6000 Server. Each comparison
+uses the same device/toolchain, bitwise output/state checks and ABBA timing
+(7 samples × 5 Graph replays per phase). Preparation and capture are excluded.
+Whole-machine monitoring found no competing GPU processes; all four preparations
+reported 103/103 required variants available across 30 families.
+
+Raw paired samples, references and numerical evidence remain in the existing
+`artifacts/cmix-acceptance-a239bc3.json`,
+`artifacts/sm120-remaining-acceptance-results-07c7913.json` and associated artifacts.
+Performance comparisons require idle hardware, numerical checks and paired timing; unit-test
+time is not performance evidence. Existing benchmarks expose implementation,
+tuning and eager/Graph timing options; run `--help` for their workload arguments.

@@ -13,7 +13,7 @@ from numbers import Real
 import torch
 from torch.autograd.function import once_differentiable
 
-from .tuning import _AutogradContext, device_class, tuning_operation
+from .tuning import _AutogradContext, _fixed_strategy_device, device_class, prepare_variants, tuning_operation, workload_bucket
 
 _PASS_CONFIG = {"tl.disable_wgmma": True, "tl.enable_fast_math": False}
 _DEFAULT_CONFIG = (16, 64, 2, 32)
@@ -31,10 +31,14 @@ def _matmul_program(
     weight_strides=None,
     input_major=False,
     no_set_max_nreg=False,
+    dynamic_k=False,
+    aligned_k=True,
 ):
     import tilelang.language as T
 
     rows = T.dynamic("rows")
+    if dynamic_k:
+        channels = T.dynamic("reduction")
     block_m, block_n, stages, copy_k = config
     block_k = 32
     weight_shape = (channels, outputs) if input_major else (outputs, channels)
@@ -51,6 +55,9 @@ def _matmul_program(
         ),
         Y: T.Tensor((rows, outputs), output_dtype),
     ):
+        if dynamic_k and aligned_k and copy_k == 32:
+            # Preserve vectorized row loads when the reduction stride is dynamic.
+            T.assume(channels % 32 == 0)
         with T.Kernel(
             T.ceildiv(outputs, block_n),
             T.ceildiv(rows, block_m),
@@ -72,21 +79,22 @@ def _matmul_program(
                     T.copy(W[bn * block_n, k * copy_k], ws)
                 # Each copy contains consecutive canonical 32-K MMA groups.
                 for inner in T.unroll(copy_k // block_k):
-                    if input_major:
-                        T.gemm(
-                            xs[:, inner * block_k : (inner + 1) * block_k],
-                            ws[inner * block_k : (inner + 1) * block_k, :],
-                            acc,
-                            policy=T.GemmWarpPolicy.FullCol,
-                        )
-                    else:
-                        T.gemm(
-                            xs[:, inner * block_k : (inner + 1) * block_k],
-                            ws[:, inner * block_k : (inner + 1) * block_k],
-                            acc,
-                            transpose_B=True,
-                            policy=T.GemmWarpPolicy.FullCol,
-                        )
+                    if not dynamic_k or k * copy_k + inner * block_k < channels:
+                        if input_major:
+                            T.gemm(
+                                xs[:, inner * block_k : (inner + 1) * block_k],
+                                ws[inner * block_k : (inner + 1) * block_k, :],
+                                acc,
+                                policy=T.GemmWarpPolicy.FullCol,
+                            )
+                        else:
+                            T.gemm(
+                                xs[:, inner * block_k : (inner + 1) * block_k],
+                                ws[:, inner * block_k : (inner + 1) * block_k],
+                                acc,
+                                transpose_B=True,
+                                policy=T.GemmWarpPolicy.FullCol,
+                            )
             for i, j in T.Parallel(block_m, block_n):
                 if bm * block_m + i < rows and bn * block_n + j < outputs:
                     if has_bias:
@@ -109,13 +117,16 @@ def _compile_spec(
     weight_strides,
     input_major,
     arch,
+    dynamic_k=False,
+    aligned_k=True,
 ):
     pass_configs = _PASS_CONFIG
     if arch // 10 == 12:
         # Keep SM12x copies and MMA consumers in one CTA synchronization domain.
         pass_configs = {**pass_configs, "tl.disable_warp_specialized": True}
     weight_width = outputs if input_major else channels
-    if channels % 2 or weight_width % 2 or weight_strides[0] % 2 or weight_strides[1] != 1:
+    strides = weight_strides or (weight_width, 1)
+    if not aligned_k or channels % 2 or weight_width % 2 or strides[0] % 2 or strides[1] != 1:
         # cp.async requires at least two adjacent BF16 elements. Scalar tails
         # and odd/noncontiguous strides use synchronous copies in the same
         # pipeline; disable both automatic injection and pipeline planning.
@@ -136,6 +147,8 @@ def _compile_spec(
             input_major,
             # SM12x supports TMA but not CTA register reconfiguration.
             no_set_max_nreg=arch // 10 == 12,
+            dynamic_k=dynamic_k,
+            aligned_k=aligned_k,
         ),
         {
             "out_idx": [3],
@@ -161,7 +174,7 @@ def _dtype_name(dtype):
 def _key(x, weight, output_dtype, bias=None):
     return (
         device_class(x.device),
-        x.shape[0],
+        workload_bucket(x.shape[0]),
         weight.shape[0],
         x.shape[1],
         weight.stride(),
@@ -176,48 +189,165 @@ def _aligned(tensor):
     return tensor if tensor.data_ptr() % 16 == 0 else tensor.clone()
 
 
-def _forward(x, weight, bias, output_dtype, config=None):
+def _projection_tiles(outputs, num_sms, *, dynamic_k=False):
+    columns = max((n + 127) // 128 for n in outputs)
+    if columns <= 4:
+        tiles = ((64, 64), (32, 32), (16, 32), (16, 16))
+    elif columns >= num_sms and not dynamic_k:
+        # Columns alone fill the device: reuse each weight across more rows.
+        tiles = ((256, 64), (128, 64), (64, 64), (32, 64))
+    else:
+        tiles = ((128, 128), (64, 128), (64, 64), (32, 64))
+    # Bound the accumulator footprint across grouped projection branches.
+    return tuple((m, n) for m, n in tiles if len(outputs) == 1 or m * n <= 8192)
+
+
+def _projection_config(rows, channels, outputs, device, *, aligned_k=True):
+    """Choose output tiles by CTA coverage; K MMA groups remain canonical."""
+    props = torch.cuda.get_device_properties(device)
+    tiles = (
+        ((16, n) for n in (128, 64, 32, 16))
+        if rows <= 16
+        else _projection_tiles(outputs, props.multi_processor_count, dynamic_k=channels is None)
+    )
+    limit = max(16, 1 << (max(1, rows) - 1).bit_length())
+    legal = tuple((m, n) for m, n in tiles if m <= limit)
+    m, n = next(
+        (
+            tile
+            for tile in legal
+            if math.ceil(rows / tile[0]) * sum(math.ceil(o / tile[1]) for o in outputs)
+            >= props.multi_processor_count
+        ),
+        legal[-1],
+    )
+    dynamic = channels is None
+    columns = max((o + 127) // 128 for o in outputs)
+    if dynamic:
+        # A copy covers one canonical MMA group, including the final group.
+        cap = 32
+    elif m == 16:
+        cap = 512 if columns <= 4 else 256
+    elif columns >= props.multi_processor_count and m <= 128:
+        cap = 128
+    else:
+        cap = 64 if m * n >= 4096 else 128
+    stages = 1 if dynamic and not aligned_k else 2
+    span = next(
+        k
+        for k in (512, 256, 128, 64, 32)
+        if k <= cap
+        and (dynamic or k == 32 or all(c % k == 0 for c in channels))
+        and (m + n) * stages * k * 2 <= props.shared_memory_per_block_optin
+    )
+    return m, n, stages, span
+
+
+def _projection_variants(channels, outputs, device):
+    """Evaluate static-K selection at every possible row transition."""
+    sms = torch.cuda.get_device_properties(device).multi_processor_count
+    boundaries = {1, 16, 17}
+    for m, n in _projection_tiles(outputs, sms):
+        threshold = (
+            math.ceil(sms / sum(math.ceil(o / n) for o in outputs)) - 1
+        ) * m + 1
+        for point in (m // 2 + 1, threshold):
+            boundaries.update((max(1, point - 1), max(1, point), max(1, point + 1)))
+    return tuple(
+        dict.fromkeys(
+            _projection_config(r, channels, outputs, device) for r in sorted(boundaries)
+        )
+    )
+
+
+def _fixed_projection_config(x, weight):
+    if _fixed_strategy_device(device_class(x.device)) and weight.stride() in (
+        (x.shape[1], 1),
+        (1, weight.shape[0]),
+    ):
+        return _projection_config(
+            x.shape[0], (x.shape[1],), (weight.shape[0],), x.device
+        )
+    return None
+
+
+def _forward(x, weight, bias, output_dtype, config=None, *, dynamic_k=False):
     x, weight = _aligned(x), _aligned(weight)
     bias = None if bias is None else _aligned(bias)
-    if config is None:
+    info = device_class(x.device)
+    dynamic_k = dynamic_k and _fixed_strategy_device(info)
+    aligned_k = x.shape[1] % 32 == 0
+    automatic = config is None
+    fixed = None
+    if automatic:
+        fixed = (
+            _projection_config(
+                x.shape[0], None, (weight.shape[0],), x.device, aligned_k=aligned_k
+            )
+            if dynamic_k
+            else _fixed_projection_config(x, weight)
+        )
         from .tuning import get_config
 
+        selection_key = _key(x, weight, output_dtype, bias)
+        if dynamic_k:
+            selection_key = (
+                *selection_key[:3],
+                0,
+                *selection_key[4:],
+                "dynamic_k",
+                aligned_k,
+            )
         config = get_config(
-            _TUNED_CONFIGS, "linear", _key(x, weight, output_dtype, bias),
+            _TUNED_CONFIGS,
+            "linear",
+            selection_key,
+            fixed,
             tune=lambda: tune_linear(x, weight, output_dtype, bias=bias),
+            fixed=fixed is not None,
         )
         if config is None:
-            block_m = 16
-            if x.shape[0] > 16:
-                max_m = min(128, 1 << (x.shape[0] - 1).bit_length())
-                block_n = _DEFAULT_CONFIG[1]
-                blocks_n = (weight.shape[0] + block_n - 1) // block_n
-                multiprocessors = torch.cuda.get_device_properties(
-                    x.device
-                ).multi_processor_count
-                for candidate in (32, 64, 128):
-                    # Keep a full CTA wave while capping row padding.
-                    blocks = ((x.shape[0] + candidate - 1) // candidate) * blocks_n
-                    if candidate > max_m or blocks < multiprocessors:
-                        break
-                    block_m = candidate
-            config = (block_m, *_DEFAULT_CONFIG[1:])
-    major, minor = torch.cuda.get_device_capability(x.device)
+            config = _projection_config(
+                x.shape[0], (x.shape[1],), (weight.shape[0],), x.device
+            )
     input_major = weight.stride(0) == 1
     physical_weight = weight.t() if input_major else weight
-    kernel = _compiled(
+    key = (
         weight.shape[0],
-        x.shape[1],
+        0 if dynamic_k else x.shape[1],
         _dtype_name(output_dtype),
         _dtype_name(bias.dtype) if bias is not None else "bfloat16",
         bias is not None,
         config,
-        physical_weight.stride(),
+        None if dynamic_k else physical_weight.stride(),
         input_major,
-        major * 10 + minor,
-    )
-    # The bias-free specialization has no bias loads; reusing W avoids allocating
-    # a dummy device tensor on every projection.
+        info[1] * 10 + info[2],
+    ) + ((True, aligned_k) if dynamic_k else ())
+    if automatic and fixed is not None:
+        family = key[:5] + key[6:9] + ((True, x.shape[0]) if dynamic_k else ())
+
+        def variants():
+            if dynamic_k:
+                return tuple(
+                    key[:5]
+                    + (
+                        _projection_config(
+                            x.shape[0], None, (weight.shape[0],), x.device, aligned_k=a
+                        ),
+                    )
+                    + key[6:9]
+                    + (True, a)
+                    for a in (False, True)
+                )
+            return tuple(
+                key[:5] + (c,) + key[6:]
+                for c in _projection_variants(
+                    (x.shape[1],), (weight.shape[0],), x.device
+                )
+            )
+
+        prepare_variants("linear", family, variants, _COMPILED_KERNELS, _compile_spec)
+    kernel = _compiled(*key)
     return kernel(x, physical_weight, physical_weight if bias is None else bias)
 
 
@@ -229,7 +359,7 @@ def linear_weight_vjp_fp32(dy, x, *, out=None):
     accumulates into an FP32 buffer; FP32 GEMMs then avoid a full-size temporary.
     """
     if dy.dtype == torch.bfloat16:
-        partial = _forward(dy.t().contiguous(), x.t(), None, torch.float32)
+        partial = _forward(dy.t().contiguous(), x.t(), None, torch.float32, dynamic_k=True)
         return partial if out is None else out.add_(partial)
     if out is None:
         return torch.mm(dy.t(), x.float())
@@ -262,7 +392,7 @@ class _Linear(torch.autograd.Function):
         if ctx.needs_input_grad[1]:
             if dy.dtype == torch.bfloat16:
                 # Preserve the fused BF16 store for an ordinary unchunked VJP.
-                dw = _forward(dy.t().contiguous(), x.t(), None, weight.dtype)
+                dw = _forward(dy.t().contiguous(), x.t(), None, weight.dtype, dynamic_k=True)
             else:
                 dw = linear_weight_vjp_fp32(dy, x).to(weight.dtype)
         if ctx.needs_input_grad[2]:
@@ -519,7 +649,7 @@ def linear(x, weight, bias=None, output_dtype=None):
 
     ``output_dtype`` is BF16 by default; FP32 is available for logits and fused
     adapter epilogues. The first-order VJP uses the same rounded forward weights.
-    Call :func:`tune_linear` before CUDA Graph capture to select a measured tile.
+    Prepare nonfixed configurations before CUDA Graph capture.
     """
     if not x.is_cuda or not weight.is_cuda or weight.device != x.device:
         raise ValueError("linear operands must share a CUDA device")
@@ -629,7 +759,12 @@ def tune_linear(x, weight, output_dtype=None, *, bias=None, benchmark=None):
     its dispatch cache, preserving the operator's working set during tuning.
     """
     from .tuning import (
-        compile_candidates, projection_finalists, revalidation_config, save_config, select_config,
+        benchmark_config,
+        compile_candidates,
+        projection_configs,
+        projection_finalists,
+        save_config,
+        select_config,
     )
 
     output_dtype = torch.bfloat16 if output_dtype is None else output_dtype
@@ -648,84 +783,26 @@ def tune_linear(x, weight, output_dtype=None, *, bias=None, benchmark=None):
         )
         if not torch.equal(reference[0][row : row + 1], single):
             raise RuntimeError("canonical linear failed FP32 batch invariance")
-    block_rows = (16,) if x.shape[0] < 16 else (16, 32, 64, 128)
-    if x.shape[0] > 128:
-        block_rows += (256,)
-    narrow_tiles = x.shape[0] < 16 and weight.shape[0] <= 128
-    block_cols = (8, 16, 32, 64, 128) if narrow_tiles else (32, 64, 128)
-    candidates = (
-        (block_m, block_n, stages, 32)
-        for block_m in block_rows
-        for block_n in block_cols
-        for stages in (2, 3)
-    )
     major, minor = torch.cuda.get_device_capability(x.device)
     input_major = weight.stride(0) == 1
     weight_strides = (weight.t() if input_major else weight).stride()
-    shared_memory_limit = torch.cuda.get_device_properties(
-        x.device
-    ).shared_memory_per_block_optin
     measurements = {}
-    best_config = _DEFAULT_CONFIG
 
     def run(config):
         if benchmark is None:
             return _forward(x, weight, bias, output_dtype, config)
-        _TUNED_CONFIGS[_key(x, weight, output_dtype, bias)] = config
-        return benchmark()
+        key = _key(x, weight, output_dtype, bias)
+        _TUNED_CONFIGS[key] = config
+        return benchmark_config("linear", key, benchmark)
 
-    imported = revalidation_config()
-    if imported is not None:
-        best_config, checked = select_config(
-            (imported,), run,
-            check=lambda config: tuple(_forward(x, weight, bias, dtype, config) for dtype in check_dtypes),
-            reference=reference,
+    for _ in range(2):
+        eligible = projection_configs(
+            x.shape[0], (x.shape[1],), (weight.shape[0],), x.device,
+            measurements.values(),
         )
-        save_config("linear", _key(x, weight, output_dtype, bias), best_config)
-        return {"config": best_config, "candidates": checked}
-
-    for phase in ("tiles", "copies"):
-        if phase == "copies":
-            # Copy spans can change the best column tile and pipeline depth.
-            spans = (64, 128, 256, 512, 1024) if x.shape[0] < 16 else (64, 128)
-            copies = [span for span in spans if x.shape[1] % span == 0]
-            if not copies:
-                break
-            tiles = [best_config]
-            row_tile = min(256, max(16, 1 << (x.shape[0] - 1).bit_length()))
-            matched = [
-                item for item in measurements.values()
-                if item.get("bitwise_equal") and item["config"][0] == row_tile
-            ]
-            if x.shape[0] > 128 or x.shape[0] < 16:
-                tiles.extend(item["config"] for item in matched)
-            elif best_config[0] != row_tile and matched:
-                tiles.append(
-                    min(matched, key=lambda item: item["milliseconds"])["config"]
-                )
-            candidates = tuple(
-                dict.fromkeys(
-                    tile[:2] + (stages, span)
-                    for tile in tiles
-                    for stages in (2, 3)
-                    for span in (32, *copies)
-                )
-            )
-        eligible, rejected = [], []
-        for config in candidates:
-            block_m, block_n, stages, copy_k = config
-            # Both BF16 staging tiles retain one buffer per pipeline stage.
-            shared_memory = (block_m + block_n) * copy_k * stages * 2
-            if shared_memory > shared_memory_limit:
-                rejected.append({
-                    "config": config,
-                    "resource_error": (
-                        f"shared memory requires {shared_memory} bytes; "
-                        f"device limit is {shared_memory_limit} bytes"
-                    ),
-                })
-                continue
-            eligible.append(config)
+        if not eligible:
+            break
+        rejected = []
         keys = (
             (
                 weight.shape[0], x.shape[1], _dtype_name(dtype),
@@ -757,7 +834,7 @@ def tune_linear(x, weight, output_dtype=None, *, bias=None, benchmark=None):
                 rejected.append({"config": config, "compile_error": str(error)})
             else:
                 compiled.append(config)
-        best_config, checked = select_config(
+        _, checked = select_config(
             compiled,
             run,
             check=lambda config: tuple(

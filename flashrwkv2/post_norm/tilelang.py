@@ -3,17 +3,29 @@
 
 import math
 
-import torch
-
-from .._internal.tuning import _AutogradContext, device_class, tuning_operation
 import tilelang
 import tilelang.language as T
+import torch
+
+from .._internal.tuning import (
+    _AutogradContext,
+    _fixed_strategy_device,
+    device_class,
+    prepared_kernel,
+    tuning_operation,
+    workload_bucket,
+)
 
 _ROW_CONFIGS = {}
 
 
 def _config_key(x, has_res):
-    return (device_class(x.device), x.shape, has_res)
+    rows = workload_bucket(x.numel() // x.shape[-1])
+    return (device_class(x.device), (rows, x.shape[-1]), has_res)
+
+
+def _fixed_rows(x):
+    return _fixed_strategy_device(device_class(x.device))
 
 
 def _row_layout(channels, rows_per_block):
@@ -180,8 +192,11 @@ class _Norm(torch.autograd.Function):
     def forward(ctx, x, weight, bias, res, eps):
         total = torch.empty_like(x) if res is not None else x
         from .._internal.tuning import get_config
-        rows_per_block = get_config(_ROW_CONFIGS, "post_norm", _config_key(x, res is not None), 1, tune=lambda: tune_norm(x, weight, bias, eps, res))
-        y, mean, rstd = _forward(x.shape[-1], eps, res is not None, rows_per_block=rows_per_block)(
+        rows_per_block = get_config(
+            _ROW_CONFIGS, "post_norm", _config_key(x, res is not None), 1,
+            tune=lambda: tune_norm(x, weight, bias, eps, res), fixed=_fixed_rows(x),
+        )
+        y, mean, rstd = prepared_kernel("post_norm", _forward, (x.shape[-1], eps, res is not None, True, True, rows_per_block))(
             x, res if res is not None else x, weight, bias, total
         )
         ctx.save_for_backward(total, weight, mean, rstd)
@@ -199,7 +214,10 @@ class _Norm(torch.autograd.Function):
 
         group = min(32, tilelang.next_power_of_2(max(1, total.shape[0] // 128)))
         need_weight, need_bias = ctx.needs_input_grad[1:3]
-        dx, dw, db = _backward(total.shape[-1], dsum is not None, group, need_weight, need_bias)(
+        dx, dw, db = prepared_kernel("post_norm", _backward,
+            (total.shape[-1], dsum is not None, group, need_weight, need_bias),
+            ((total.shape[-1], dsum is not None, g, need_weight, need_bias) for g in (1, 2, 4, 8, 16, 32))
+            if _fixed_rows(total) else ())(
             dy, dsum.contiguous() if dsum is not None else dy, weight, total, mean, rstd
         )
         return (
@@ -217,9 +235,11 @@ def _compiled_norm(x, weight, bias, res, eps, save, return_res):
     _check_inputs(x, weight, bias, res, eps)
     store = res is not None and (save or return_res)
     total = torch.empty_like(x) if store else x.new_empty((0, x.shape[-1]))
-    group = get_config(_ROW_CONFIGS, "post_norm", _config_key(x, res is not None), 1,
-                       tune=lambda: tune_norm(x, weight, bias, eps, res))
-    y, mean, rstd = _forward(x.shape[-1], eps, res is not None, save, store, group)(
+    group = get_config(
+        _ROW_CONFIGS, "post_norm", _config_key(x, res is not None), 1,
+        tune=lambda: tune_norm(x, weight, bias, eps, res), fixed=_fixed_rows(x),
+    )
+    y, mean, rstd = prepared_kernel("post_norm", _forward, (x.shape[-1], eps, res is not None, save, store, group))(
         x, x if res is None else res, weight, bias, total,
     )
     result_sum = total if store else x.clone() if return_res else None
@@ -317,8 +337,11 @@ def norm(
         total = torch.empty_like(flat) if store_res else flat
         buffer = total if store_res else flat.new_empty((0, x.shape[-1]))
         from .._internal.tuning import get_config
-        rows_per_block = get_config(_ROW_CONFIGS, "post_norm", _config_key(flat, res is not None), 1, tune=lambda: tune_norm(x, weight, bias, eps, res))
-        y, _, _ = _forward(x.shape[-1], float(eps), res is not None, False, store_res, rows_per_block)(
+        rows_per_block = get_config(
+            _ROW_CONFIGS, "post_norm", _config_key(flat, res is not None), 1,
+            tune=lambda: tune_norm(x, weight, bias, eps, res), fixed=_fixed_rows(flat),
+        )
+        y, _, _ = prepared_kernel("post_norm", _forward, (x.shape[-1], float(eps), res is not None, False, store_res, rows_per_block))(
             flat, flat_res if flat_res is not None else flat, weight, bias, buffer
         )
     return (y.view_as(x), total.view_as(x)) if return_res else y.view_as(x)

@@ -7,17 +7,25 @@ import tilelang
 import tilelang.language as T
 import torch
 
-from ..._internal.tuning import _AutogradContext, device_class, tuning_operation
-
+from ..._internal.tuning import (
+    _AutogradContext,
+    device_class,
+    prepared_kernel,
+    tuning_operation,
+    workload_bucket,
+)
 from ...post_norm.tilelang import _check_inputs as _check_norm
-from ...post_norm.tilelang import _normalize, _row_layout
+from ...post_norm.tilelang import _fixed_rows, _normalize, _row_layout
 
 _BLOCK_CONFIGS = {}
 _FUSED_CONFIGS = {}
 
 
 def _config_key(x, mixes, batch):
-    return (device_class(x.device), x.shape, len(mixes), batch)
+    return (
+        device_class(x.device), (workload_bucket(x.shape[0]), x.shape[1]),
+        len(mixes), workload_bucket(batch),
+    )
 
 
 def _pack_mixes(x, mixes, *, pack=True):
@@ -128,10 +136,16 @@ def fused_post_norm_tokenshift(x, res, weight, bias, mixes, pool, indices, statu
     if x.shape[1] % 2 == 0 and pool.data_ptr() % 4:
         raise ValueError("fused TokenShift state and parameters must be 4-byte aligned")
     from ..._internal.tuning import get_config
-    group = get_config(_FUSED_CONFIGS, "tmix/tokenshift/fused", _config_key(x, mixes, x.shape[0]), 1, tune=lambda: tune_fused_tokenshift(x, res, weight, bias, mixes, pool, indices, status, eps))
+    group = get_config(
+        _FUSED_CONFIGS, "tmix/tokenshift/fused", _config_key(x, mixes, x.shape[0]), 1,
+        tune=lambda: tune_fused_tokenshift(x, res, weight, bias, mixes, pool, indices, status, eps),
+        fixed=(
+            len(mixes) in (1, 6) and _fixed_rows(x)
+        ),
+    )
     # CMix reuses its pointer for the unused TMix parameter arguments.
     mix_args = mixes + (mixes[-1],) * (6 - len(mixes))
-    total, output = _fused_forward(x.shape[1], len(mixes), float(eps), group)(
+    total, output = prepared_kernel("tmix/tokenshift/fused", _fused_forward, (x.shape[1], len(mixes), float(eps), group))(
         x, res, weight, bias, *mix_args, pool, indices, status
     )
     return total, tuple(output.unbind(0))
@@ -139,10 +153,10 @@ def fused_post_norm_tokenshift(x, res, weight, bias, mixes, pool, indices, statu
 
 @tilelang.jit(pass_configs={"tl.enable_fast_math": False}, out_idx=[5, 6], compile_flags=["--fmad=false"])
 def _forward(
-    channels: int, count: int, batch: int, index_dtype: str,
+    channels: int, count: int, index_dtype: str,
     block: int = 256, use_status: bool = False,
 ):
-    rows = T.dynamic("rows")
+    rows, batch = T.dynamic("rows, batch")
     threads = min(128, block // 2)
     layout = T.Fragment(
         (block,),
@@ -169,13 +183,12 @@ def _forward(
             T.annotate_layout({current: layout, previous: layout, final: layout})
             if row < rows and (not use_status or (Status[0] == 0 and row < Status[1])):
                 lo[0], hi[0] = 0, T.if_then_else(use_status, Status[2], batch)
-                for _ in T.unroll(batch.bit_length()):
-                    if lo[0] < hi[0]:
-                        middle = (lo[0] + hi[0]) // 2
-                        if Cu[middle + 1] <= row:
-                            lo[0] = middle + 1
-                        else:
-                            hi[0] = middle
+                while lo[0] < hi[0]:
+                    middle = (lo[0] + hi[0]) // 2
+                    if Cu[middle + 1] <= row:
+                        lo[0] = middle + 1
+                    else:
+                        hi[0] = middle
                 for c in T.Parallel(block):
                     channel = bc * block + c
                     if channel < channels:
@@ -207,10 +220,10 @@ def _forward(
 
 @tilelang.jit(pass_configs={"tl.enable_fast_math": False}, out_idx=[6, 7, 8], compile_flags=["--fmad=false"])
 def _backward(
-    channels: int, count: int, batch: int, index_dtype: str, block: int = 256,
+    channels: int, count: int, index_dtype: str, block: int = 256,
     rows_per_block: int = 1, need_mix: bool = True,
 ):
-    rows = T.dynamic("rows")
+    rows, batch = T.dynamic("rows, batch")
     threads = min(128, block // 2)
     layout = T.Fragment(
         (block,),
@@ -247,13 +260,12 @@ def _backward(
                 row = tile * rows_per_block + offset
                 if row < rows:
                     lo[0], hi[0] = 0, batch
-                    for _ in T.unroll(batch.bit_length()):
-                        if lo[0] < hi[0]:
-                            middle = (lo[0] + hi[0]) // 2
-                            if Cu[middle + 1] <= row:
-                                lo[0] = middle + 1
-                            else:
-                                hi[0] = middle
+                    while lo[0] < hi[0]:
+                        middle = (lo[0] + hi[0]) // 2
+                        if Cu[middle + 1] <= row:
+                            lo[0] = middle + 1
+                        else:
+                            hi[0] = middle
                     T.clear(total)
                     for m in T.unroll(count):
                         for c in T.Parallel(block):
@@ -306,15 +318,26 @@ def _backward(
     return kernel
 
 
+def _tokenshift_block(x, mixes, cu, initial, status=None):
+    from ..._internal.tuning import get_config
+
+    fixed = 256 if mixes.shape[0] in (1, 6) and _fixed_rows(x) else None
+    return get_config(
+        _BLOCK_CONFIGS, "tmix/tokenshift", _config_key(x, mixes, initial.shape[0]),
+        256 if fixed is None else fixed,
+        tune=lambda: tune_tokenshift(x, mixes, cu, initial, _status=status),
+        fixed=fixed is not None,
+    )
+
+
 class _TokenShift(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, mixes, cu_seqlens, initial):
         if x.shape[-1] % 2 == 0 and any(t.data_ptr() % 4 for t in (x, mixes, initial)):
             raise ValueError("tokenshift inputs must be 4-byte aligned")
-        from ..._internal.tuning import get_config
-        block = get_config(_BLOCK_CONFIGS, "tmix/tokenshift", _config_key(x, mixes, initial.shape[0]), 256, tune=lambda: tune_tokenshift(x, mixes, cu_seqlens, initial))
-        options = (x.shape[-1], mixes.shape[0], initial.shape[0], str(cu_seqlens.dtype).split(".")[-1], block)
-        y, final = _forward(*options)(x, mixes, cu_seqlens, initial, cu_seqlens[:0])
+        block = _tokenshift_block(x, mixes, cu_seqlens, initial)
+        options = (x.shape[-1], mixes.shape[0], str(cu_seqlens.dtype).split(".")[-1], block)
+        y, final = prepared_kernel("tmix/tokenshift", _forward, options)(x, mixes, cu_seqlens, initial, cu_seqlens[:0])
         ctx.save_for_backward(x, mixes, cu_seqlens, initial)
         ctx.options = options
         return y, final
@@ -326,7 +349,9 @@ class _TokenShift(torch.autograd.Function):
 
         group = min(32, tilelang.next_power_of_2(max(1, x.shape[0] // 128)))
         need_mix = ctx.needs_input_grad[1]
-        dx, dm, di = _backward(*ctx.options, group, need_mix)(
+        dx, dm, di = prepared_kernel("tmix/tokenshift", _backward, (*ctx.options, group, need_mix),
+            ((*ctx.options, g, need_mix) for g in (1, 2, 4, 8, 16, 32))
+            if ctx.options[1] in (1, 6) and _fixed_rows(x) else ())(
             dy.contiguous(), dfinal.contiguous(), x, mixes, cu, initial
         )
         gradient = sum_partials(dm.flatten(1)).view_as(mixes) if need_mix else None
@@ -357,11 +382,9 @@ def _compiled_tokenshift_vjp(
     dy: torch.Tensor, dfinal: torch.Tensor, x: torch.Tensor, mixes: torch.Tensor,
     cu: torch.Tensor, initial: torch.Tensor, need_mix: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
-    from ..._internal.tuning import get_config
-    block = get_config(_BLOCK_CONFIGS, "tmix/tokenshift", _config_key(x, mixes, initial.shape[0]), 256,
-                       tune=lambda: tune_tokenshift(x, mixes, cu, initial))
+    block = _tokenshift_block(x, mixes, cu, initial)
     ctx = _AutogradContext(saved_tensors=(x, mixes, cu, initial),
-                          options=(x.shape[-1], mixes.shape[0], initial.shape[0], str(cu.dtype).split(".")[-1], block),
+                          options=(x.shape[-1], mixes.shape[0], str(cu.dtype).split(".")[-1], block),
                           needs_input_grad=(True, need_mix, False, True))
     dx, dm, _, di = _TokenShift.backward(ctx, dy, dfinal)
     return dx, dm, di
@@ -415,9 +438,8 @@ def tokenshift(
         operation = _compiled_tokenshift if torch.compiler.is_compiling() else _TokenShift.apply
         y, final = operation(x, mixes, cu_seqlens, initial_shift)
     else:
-        from ..._internal.tuning import get_config
-        block = get_config(_BLOCK_CONFIGS, "tmix/tokenshift", _config_key(x, mixes, batch), 256, tune=lambda: tune_tokenshift(x, mixes, cu_seqlens, initial_shift, _status=_status))
-        y, final = _forward(channels, mixes.shape[0], batch, str(cu_seqlens.dtype).split(".")[-1], block, True)(
+        block = _tokenshift_block(x, mixes, cu_seqlens, initial_shift, _status)
+        y, final = prepared_kernel("tmix/tokenshift", _forward, (channels, mixes.shape[0], str(cu_seqlens.dtype).split(".")[-1], block, True))(
             x, mixes, cu_seqlens, initial_shift, _status
         )
     return tuple(y.unbind(0)), final
@@ -449,7 +471,7 @@ def tune_tokenshift(x, mixes, cu_seqlens, initial_shift=None, *, _status=None):
     if not valid or not 0 < active_rows <= x.shape[0] or not 0 < active_batch <= batch:
         raise ValueError("TokenShift tuning requires valid nonempty active tokens and sequences")
     tokenshift(x, mixes, cu_seqlens, initial_shift, _status=status)
-    options = (channels, mixes.shape[0], batch, str(cu_seqlens.dtype).split(".")[-1])
+    options = (channels, mixes.shape[0], str(cu_seqlens.dtype).split(".")[-1])
     functional_cu = cu_seqlens
     if active_batch < batch:
         functional_cu = cu_seqlens.clone()

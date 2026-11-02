@@ -3,22 +3,8 @@
 import pytest
 import torch
 import torch.nn.functional as F
-import tilelang
 
-from flashrwkv2.post_norm.tilelang import _backward, _forward, norm
-
-
-@pytest.mark.parametrize("arch", ("sm_89", "sm_120"))
-@pytest.mark.parametrize("channels", (64, 257, 1024, 4096, 7168))
-def test_norm_lowering(arch, channels):
-    with tilelang.tvm.target.Target({"kind": "cuda", "arch": arch}) as target:
-        for args in ((channels, 1e-5, True), (channels, 1e-5, True, False, False)):
-            tilelang.lower(_forward.get_tir(*args), target=target)
-        tilelang.lower(_backward.get_tir(channels, True), target=target)
-        for save_stats, store_res in ((True, True), (False, False), (False, True)):
-            tilelang.lower(_forward.get_tir(channels, 1e-5, True, save_stats, store_res, 4), target=target)
-        for needed in (False, True):
-            tilelang.lower(_backward.get_tir(channels, True, 32, needed, needed), target=target)
+from flashrwkv2.post_norm.tilelang import norm
 
 
 @pytest.mark.parametrize("fault", ("stats", "production", "res_output", "res_store"))

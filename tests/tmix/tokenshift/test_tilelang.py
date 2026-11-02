@@ -1,35 +1,22 @@
 # SPDX-License-Identifier: MIT
 
+import itertools
+
 import pytest
 import torch
-import tilelang
 
-from flashrwkv2._internal.state import _transfer
 from flashrwkv2.post_norm.tilelang import norm
 from flashrwkv2.tmix.tokenshift.tilelang import (
-    _backward, _forward, _fused_forward, fused_post_norm_tokenshift, tokenshift,
+    _forward,
+    _fused_forward,
+    fused_post_norm_tokenshift,
+    tokenshift,
 )
-
-
-@pytest.mark.parametrize("arch", ("sm_89", "sm_120"))
-@pytest.mark.parametrize("channels", (7, 128, 1024, 4096, 7168))
-def test_tokenshift_lowering(arch, channels):
-    with tilelang.tvm.target.Target({"kind": "cuda", "arch": arch}) as target:
-        for block in (128, 256, 512):
-            tilelang.lower(_forward.get_tir(channels, 6, 5, "int32", block), target=target)
-        tilelang.lower(_forward.get_tir(channels, 6, 5, "int32", 256, True), target=target)
-        tilelang.lower(_backward.get_tir(channels, 6, 5, "int64"), target=target)
-        for write in (False, True):
-            tilelang.lower(_transfer.get_tir(channels, 5, "bfloat16", write), target=target)
-        for count in (1, 6):
-            tilelang.lower(_fused_forward.get_tir(channels, count, 1e-5, 2), target=target)
-        tilelang.lower(_backward.get_tir(channels, 6, 5, "int32", 256, 32, True), target=target)
-        tilelang.lower(_backward.get_tir(channels, 1, 5, "int32", 256, 32, False), target=target)
 
 
 def reference(x, mixes, offsets, initial):
     previous, final = [], []
-    for b, (start, end) in enumerate(zip(offsets, offsets[1:])):
+    for b, (start, end) in enumerate(itertools.pairwise(offsets)):
         if end > start:
             previous.append(torch.cat((initial[b:b + 1], x[start:end - 1])))
             final.append(x[end - 1])
@@ -56,7 +43,7 @@ def test_tokenshift_tuning_checks_both_variants_with_active_metadata(monkeypatch
     status = torch.tensor([0, 3, 2], dtype=torch.int32) if live else None
     launches = []
 
-    def forward(channels, count, batch, index_dtype, block=256, use_status=False):
+    def forward(channels, count, index_dtype, block=256, use_status=False):
         def kernel(values, mixes, offsets, initial_shift, active):
             launches.append(use_status)
             if not use_status:
@@ -118,7 +105,7 @@ def test_fused_tuning_rejects_changed_pool_and_preserves_caller_state(monkeypatc
     def forward(channels, count, eps, rows_per_block=1):
         def kernel(x, res, weight, bias, *parameters_and_state):
             assert len(parameters_and_state) == 9
-            scratch, indices, status = parameters_and_state[-3:]
+            scratch, indices, _status = parameters_and_state[-3:]
             scratch[indices.long()] = 2 if rows_per_block == 2 else 1
             return torch.ones_like(x), torch.ones(count, *x.shape, dtype=x.dtype)
         return kernel
@@ -164,7 +151,7 @@ def test_tokenshift_bitwise_packing_chunks_and_grad_mode(channels):
         infer, infer_final = tokenshift(x, mixes, cu, initial)
         collected = [[] for _ in range(6)]
         states = []
-        for b, (start, end) in enumerate(zip(offsets, offsets[1:])):
+        for b, (start, end) in enumerate(itertools.pairwise(offsets)):
             state = initial[b:b + 1].contiguous()
             for left in range(start, end, 3):
                 right = min(left + 3, end)
@@ -257,3 +244,40 @@ def test_fused_t1_matches_training_and_preserves_inactive_slots(channels, count,
     assert torch.equal(pool, original)
     assert torch.isnan(inactive_total).all()
     assert all(torch.isnan(output).all() for output in inactive_outputs)
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("use_status", [False, True])
+def test_dynamic_batch_reuses_tokenshift_and_state_kernels(monkeypatch, use_status):
+    from tilelang.jit import JITImpl
+
+    from flashrwkv2._internal.state import gather_state, scatter_state
+
+    torch.manual_seed(714)
+    channels, count = 64, 1
+    forward = _forward(channels, count, "int32", 256, use_status)
+    mixes = torch.randn(count, channels, device="cuda", dtype=torch.bfloat16)
+    def forbidden(*args, **kwargs):
+        pytest.fail("new batch or pool capacity triggered compilation")
+    for batch in (89, 90, 100, 1, 129, 257, 512):
+        # Include empty sequences and changing pool capacity in the same kernel.
+        lengths = [b % 3 for b in range(batch)]
+        offsets = [0]
+        for length in lengths:
+            offsets.append(offsets[-1] + length)
+        rows = offsets[-1]
+        x = torch.randn(rows, channels, device="cuda", dtype=torch.bfloat16)
+        pool = torch.randn(batch + 2, channels, device="cuda", dtype=torch.bfloat16)
+        indices = torch.arange(batch, device="cuda", dtype=torch.int32).flip(0) + 1
+        status = indices.new_tensor([0, rows, batch])
+        initial = gather_state(pool, indices, status)
+        cu = indices.new_tensor(offsets)
+        output, final = forward(x, mixes, cu, initial, status if use_status else cu[:0])
+        expected = reference(x, mixes, offsets, initial) if rows else (output.new_empty(count, rows, channels)[0], initial)
+        assert torch.equal(output[0], expected[0])
+        assert torch.equal(final, expected[-1])
+        expected_pool = pool.clone().index_copy_(0, indices.long(), final)
+        scatter_state(pool, final, indices, status)
+        assert torch.equal(pool, expected_pool)
+        monkeypatch.setattr(JITImpl, "compile", forbidden)

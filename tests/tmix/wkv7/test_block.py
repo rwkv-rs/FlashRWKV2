@@ -15,13 +15,13 @@ pytestmark = [
 ]
 
 
-def parameters(channels, rank=32, vocab=257, *, device="cuda"):
+def parameters(channels, rank=32, vocab=257, *, device="cuda", ranks=None):
     def value(*shape, scale=0.02):
         return (torch.randn(*shape, device=device) * scale).bfloat16().requires_grad_()
 
     result = {name: value(channels, channels) for name in ("r", "k", "v", "out")}
-    result.update({name: value(channels, rank) for name in ("w1", "a1", "g1", "v1")})
-    result.update({name: value(rank, channels) for name in ("w2", "a2", "g2", "v2")})
+    for name, width in zip(("w", "a", "g", "v"), ranks or (rank,) * 4, strict=True):
+        result[name + "1"], result[name + "2"] = value(channels, width), value(width, channels)
     result.update({
         name: value(channels, scale=0.1)
         for name in ("w0", "a0", "v0", "k_k", "k_a", "r_k", "cmix_x")
@@ -185,52 +185,71 @@ def infer_block(
     return fr.head_logprobs(logits, targets), logits
 
 
-@pytest.mark.parametrize("length", [1, 5])
-def test_prepare_tuning_migration_preserves_block_state_logits_and_logprobs(monkeypatch, tmp_path, length):
-    import hashlib
+@pytest.mark.parametrize("training", (False, True))
+def test_prepare_tuning_profiles_preserve_block_state_logits_and_logprobs(monkeypatch, tmp_path, training):
     import json
-    from flashrwkv2._internal import tuning
+    from pathlib import Path
 
+    from flashrwkv2._internal import linear as linear_impl
+    from flashrwkv2._internal import tuning
+    from flashrwkv2.post_norm import tilelang as norm_impl
+    from flashrwkv2.tmix.readout import tilelang as readout_impl
+    from flashrwkv2.tmix.wkv7 import tilelang as wkv_impl
+    from flashrwkv2.tmix.wkv_prepare import tilelang as prepare_impl
+    for module in (linear_impl, norm_impl, readout_impl, prepare_impl, wkv_impl):
+        monkeypatch.setattr(module, "_fixed_strategy_device", lambda *args: False)
     monkeypatch.setattr(tuning, "_profile_root", lambda: tmp_path / "new")
     monkeypatch.setattr(tuning, "_LOADED", {})
     torch.manual_seed(736)
-    batch, channels, head_size = 2, 128, 64
+    batch, channels, head_size, length = 2, 128, 64, 5
     params = parameters(channels)
-    x = torch.randn(batch * length, channels, device="cuda", dtype=torch.bfloat16) * .1
+    x = (torch.randn(batch, length, channels, device="cuda") * .1).bfloat16().requires_grad_(training)
     res = torch.randn_like(x) * .1
     initial = torch.randn(batch, 2, 64, 64, device="cuda") * .01
     shifts = [torch.randn(batch, channels, device="cuda", dtype=torch.bfloat16) * .1 for _ in range(2)]
     slots = torch.arange(batch, device="cuda", dtype=torch.int32)
     cu = slots.new_tensor([0, length, batch * length])
-    targets = torch.randint(257, (batch * length,), device="cuda")
+    targets = torch.randint(257, (batch, length), device="cuda")
     state, pools = state_pools(initial, shifts, slots, batch)
     snapshots = []
 
-    @torch.no_grad()
     def call():
         for target, source in zip((state._components()[0], *pools), (initial, *shifts), strict=True):
             target.copy_(source)
-        result = infer_block(x, res, params, state, pools, cu, slots, targets, head_size, None)
-        snapshots.append(tuple(t.clone() for t in (*result, state._components()[0], *pools)))
+        if training:
+            values = train_block(x, res, params, initial, shifts, targets, head_size, None)
+            gradients = torch.autograd.grad(values[0].sum(), (x, *params.values()), allow_unused=True)
+            values = (*values, *(g for g in gradients if g is not None))
+        else:
+            with torch.no_grad():
+                result = infer_block(x.flatten(0, 1), res.flatten(0, 1), params, state, pools, cu,
+                                     slots, targets.flatten(), head_size, None)
+            values = (*result, state._components()[0], *pools)
+        snapshots.append(tuple(t.detach().clone() for t in values))
 
     before = fr.prepare_tuning([call], mode="inspect")
     assert not before["complete"]
     canonical = {"linear": (16, 64, 2, 32), "tmix/wkv_prepare": (16, 64, 2, 32),
                  "tmix/wkv7": (64, 1), "tmix/tokenshift": 256,
                  "tmix/tokenshift/fused": 1, "post_norm": 1, "tmix/readout": 1}
-    legacy = tmp_path / "legacy"
     for record in before["records"]:
-        key = [record["key"][0][0], *record["key"][1:]]
-        encoded = json.dumps(key, separators=(",", ":"))
-        path = legacy / record["owner"] / (hashlib.sha256(encoded.encode()).hexdigest() + ".json")
+        if record["status"] == "fixed":
+            continue
+        path = Path(record["path"])
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"key": key, "config": canonical[record["owner"]], "bitwise_equal": True}))
-    prepared = fr.prepare_tuning([call], mode="tune", legacy_dir=legacy)
+        path.write_text(json.dumps({
+            "schema": before["schema"], "owner": record["owner"],
+            "fingerprint": record["fingerprint"], "key": record["key"],
+            "config": canonical[record["owner"]], "bitwise_equal": True,
+        }))
+    prepared = fr.prepare_tuning([call], mode="require")
     assert prepared["complete"]
-    assert prepared["counts"]["revalidated"] == len(before["records"])
+    assert prepared["counts"]["hit"] == before["counts"]["missing"]
+    assert prepared["counts"]["fixed"] == before["counts"]["fixed"]
     tuning._LOADED.clear()
     loaded = fr.prepare_tuning([call])
-    assert loaded["counts"]["hit"] == len(before["records"])
+    assert loaded["counts"]["hit"] == before["counts"]["missing"]
+    assert loaded["counts"]["fixed"] == before["counts"]["fixed"]
     assert all(value.dtype == torch.float32 for value in snapshots[0][:3])
     for actual in snapshots[1:]:
         for value, reference in zip(actual, snapshots[0], strict=True):
@@ -241,7 +260,12 @@ def test_prepare_tuning_migration_preserves_block_state_logits_and_logprobs(monk
 @pytest.mark.parametrize("adapter", ["none", "lora", "nora"])
 @pytest.mark.parametrize("backend", ["eager", "inductor"])
 @pytest.mark.cuda_graph
-def test_fullgraph_training_block_preserves_outputs_gradients_and_capture(adapter, backend):
+def test_fullgraph_training_block_preserves_outputs_gradients_and_capture(monkeypatch, adapter, backend):
+    import tilelang
+    from tilelang.jit import JITImpl
+
+    from flashrwkv2._internal import tuning
+
     torch.manual_seed(738)
     params = parameters(128, rank=16, vocab=257)
     adapters = None if adapter == "none" else adapter_parameters(params)
@@ -271,6 +295,9 @@ def test_fullgraph_training_block_preserves_outputs_gradients_and_capture(adapte
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
+        fr.prepare_tuning([lambda: step(model)], mode="inspect")
+        for value in leaves:
+            value.grad = None
         outputs, loss = step(model)
         expected = tuple(value.detach().clone() for value in outputs)
         expected_loss = loss.detach().clone()
@@ -286,6 +313,13 @@ def test_fullgraph_training_block_preserves_outputs_gradients_and_capture(adapte
             step(compiled)
     torch.cuda.current_stream().wait_stream(stream)
     torch.cuda.synchronize()
+    def forbidden(*args, **kwargs):
+        pytest.fail("prepared compiled block attempted TileLang compilation, search or profile access")
+    monkeypatch.setattr(JITImpl, "compile", forbidden)
+    monkeypatch.setattr(tilelang, "compile", forbidden)
+    monkeypatch.setattr(tilelang, "par_compile", forbidden)
+    monkeypatch.setattr(tuning, "select_config", forbidden)
+    monkeypatch.setattr(tuning, "_read_profile", forbidden)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
         actual, loss = step(compiled)
@@ -306,15 +340,19 @@ def test_fullgraph_training_block_preserves_outputs_gradients_and_capture(adapte
 
 
 @pytest.mark.parametrize(
-    "channels,head_size,vocab,length,use_vres",
-    ((128, 64, 257, 17, False), (128, 64, 257, 17, True),
-     (1024, 128, 257, 17, False), (4096, 64, 257, 17, True),
-     (256, 256, 65536, 3, False)),
+    "channels,head_size,vocab,length,use_vres,ranks",
+    ((128, 64, 257, 17, False, None), (128, 64, 257, 17, True, None),
+     (1024, 128, 257, 17, False, None), (256, 256, 65536, 3, False, None),
+     (128, 64, 257, 2048, True, None),
+     (2048, 64, 257, 17, False, (96, 96, 256, 64)),
+     (2560, 64, 257, 17, True, (96, 96, 320, 64)),
+     (4096, 64, 257, 17, True, (128, 128, 480, 96)),
+     (4096, 64, 257, 17, False, (192, 192, 384, 128))),
 )
-def test_block_bitwise_training_prefill_decode_and_batch(channels, head_size, vocab, length, use_vres):
+def test_block_bitwise_training_prefill_decode_and_batch(channels, head_size, vocab, length, use_vres, ranks):
     torch.manual_seed(731)
     batch = 2
-    params = parameters(channels, vocab=vocab)
+    params = parameters(channels, vocab=vocab, ranks=ranks)
     x = (torch.randn(batch, length, channels, device="cuda") * 0.1).bfloat16().requires_grad_()
     res = torch.randn_like(x) * 0.1
     initial = torch.randn(batch, channels // head_size, head_size, head_size, device="cuda") * 0.01
@@ -727,3 +765,54 @@ def test_block_independent_torch_vjp_and_optimizer_step(mode):
         assert any(
             not torch.equal(before[parameter_names.index(name)], params[name]) for name in names
         ), f"{names}: optimizer did not update this block stage"
+
+
+@pytest.mark.parametrize("training", (False, True))
+def test_prepared_block_has_no_tilelang_compilation_for_new_tokens(monkeypatch, training):
+    import tilelang
+    from tilelang.jit import JITImpl
+
+    from flashrwkv2._internal import tuning
+
+    if not tuning._fixed_strategy_device(tuning.device_class(torch.device("cuda"))):
+        pytest.skip("deterministic strategy is qualified on tested devices")
+    torch.manual_seed(804)
+    params = parameters(128, rank=32, vocab=257)
+    initial = torch.randn(1, 2, 64, 64, device="cuda") * .01
+    shifts = tuple(torch.randn(1, 128, device="cuda").bfloat16() * .1 for _ in range(2))
+    def inputs(length, batch=1):
+        x = (torch.randn(batch, length, 128, device="cuda") * .1).bfloat16()
+        res = torch.randn_like(x) * .1
+        targets = torch.randint(257, (batch, length), device="cuda")
+        return x, res, targets
+    def call(data):
+        x, res, targets = data
+        batch = x.shape[0]
+        current = initial.expand(batch, -1, -1, -1).contiguous()
+        previous = tuple(s.expand(batch, -1).contiguous() for s in shifts)
+        if training:
+            values = train_block(x.requires_grad_(), res.requires_grad_(), params,
+                                 current, previous, targets, 64, None)
+            return torch.autograd.grad(-values[0].sum(), (x, res, *params.values()), allow_unused=True)
+        slots = torch.arange(batch, device="cuda", dtype=torch.int32)
+        cu = torch.arange(batch + 1, device="cuda", dtype=torch.int32) * x.shape[1]
+        state, pools = state_pools(current, previous, slots, batch + 7)
+        return infer_block(x.flatten(0, 1), res.flatten(0, 1), params, state, pools,
+                           cu, slots, targets.flatten(), 64, None)
+    warmups = [inputs(32)] if training else [inputs(1), inputs(32)]
+    report = fr.prepare_tuning([lambda data=data: call(data) for data in warmups])
+    assert report["complete"] and report["counts"]["missing"] == 0
+    def forbidden(*args, **kwargs):
+        pytest.fail("new tokens triggered TileLang compilation, code generation, or search")
+    monkeypatch.setattr(JITImpl, "compile", forbidden)
+    monkeypatch.setattr(tilelang, "compile", forbidden)
+    monkeypatch.setattr(tilelang, "par_compile", forbidden)
+    monkeypatch.setattr(tuning, "select_config", forbidden)
+    monkeypatch.setattr(tuning, "_read_profile", forbidden)
+    import random
+    for length in (1, 17, 31, 64, 65, 89, 90, 100, 129, 257, 513, 1024,
+                   *random.Random(805).sample(range(1, 1025), 20)):
+        call(inputs(length))
+    for batch in (89, 90, 100):
+        call(inputs(1, batch))
+    torch.cuda.synchronize()

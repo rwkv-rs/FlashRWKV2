@@ -21,7 +21,14 @@ import tilelang
 import tilelang.language as T
 import torch
 
-from ..._internal.tuning import _AutogradContext, device_class, tuning_operation
+from ..._internal.tuning import (
+    _AutogradContext,
+    _fixed_strategy_device,
+    device_class,
+    prepared_kernel,
+    tuning_operation,
+    workload_bucket,
+)
 
 _CHECKPOINT = 16
 _LOG2E = 1.4426950408889634
@@ -434,6 +441,14 @@ def _backward_kernel(
     return kernel
 
 
+def _prepared_forward_kernel(device, *options):
+    variants = (options[:9] + (prefetch,) + options[10:] for prefetch in (1, 4)) if (
+        options[1] == 64 and options[-1] == "float32"
+        and _fixed_strategy_device(device_class(device))
+    ) else (options,)
+    return prepared_kernel("tmix/wkv7", _forward_kernel, options, variants)
+
+
 def _forward(
     r,
     decay_logits,
@@ -459,8 +474,8 @@ def _forward(
         dtype=initial_state.dtype,
         device=r.device,
     )
-    _forward_kernel(
-        heads,
+    _prepared_forward_kernel(
+        r.device, heads,
         dim,
         scale,
         bias.numel() != 0,
@@ -523,14 +538,14 @@ def _recurrent_vjp(ctx, grad_output, grad_final_state):
     gradients = torch.zeros((6, *r.shape), dtype=torch.float32, device=r.device)
     ds0 = torch.empty_like(ds)
     _, heads, dim = r.shape
-    _backward_kernel(
+    prepared_kernel("tmix/wkv7", _backward_kernel, (
         heads,
         dim,
         ctx.scale,
         bias.numel() != 0,
         status.numel() != 0,
         "bfloat16" if bias.dtype == torch.bfloat16 else "float32",
-    )(
+    ))(
         r,
         w,
         k,
@@ -623,12 +638,22 @@ def _bias_tensor(r, decay_bias):
 def _config_key(r, batch, bias, *, indexed=False, state_dtype=torch.float32):
     return (
         device_class(r.device),
-        tuple(r.shape),
-        batch,
+        (workload_bucket(r.shape[0]), *r.shape[1:]),
+        workload_bucket(batch),
+        r.shape[0] > batch,
         None if bias is None else bias.dtype,
         indexed,
         state_dtype,
     )
+
+
+def _fixed_recurrent_config(r, batch, state_dtype):
+    # Each value column retains the same key reduction and FP32 update order.
+    # Multi-token prefetch overlaps input loads; decode needs no prefetch.
+    device = device_class(r.device)
+    if not _fixed_strategy_device(device) or r.shape[-1] != 64 or state_dtype != torch.float32:
+        return None
+    return 64, 4 if r.shape[0] > batch else 1
 
 
 def _infer_recurrent(
@@ -678,15 +703,18 @@ def _infer_recurrent(
 
     config = (64, 1)
     if block_values is None or prefetch_tokens is None:
+        fixed = _fixed_recurrent_config(r, batch, state_pool.dtype)
         config = get_config(
             _TUNED_CONFIGS, "tmix/wkv7",
-            _config_key(r, batch, decay_bias, indexed=True, state_dtype=state_pool.dtype), (64, 1),
+            _config_key(r, batch, decay_bias, indexed=True, state_dtype=state_pool.dtype),
+            fixed or config,
             tune=lambda: tune_tmix_wkv7_recurrent(
                 r, decay_logits, k, v, a, b,
                 state_pool, cu_seqlens,
                 scale=scale, decay_bias=decay_bias, indexed=True,
                 state_indices=state_indices, status=status,
             ),
+            fixed=fixed is not None,
         )
     block_values = config[0] if block_values is None else block_values
     prefetch_tokens = config[1] if prefetch_tokens is None else prefetch_tokens
@@ -694,8 +722,8 @@ def _infer_recurrent(
     bias = _bias_tensor(r, decay_bias)
     output = torch.empty_like(v)
     empty = torch.empty((0, heads, dim, dim), dtype=state_pool.dtype, device=r.device)
-    _forward_kernel(
-        heads,
+    _prepared_forward_kernel(
+        r.device, heads,
         dim,
         float(scale),
         bias.numel() != 0,
@@ -779,10 +807,13 @@ def _functional_config(r, decay_logits, k, v, a, b, initial_state, cu_seqlens, s
     from ..._internal.tuning import get_config
     config = (64, 1)
     if block_values is None or prefetch_tokens is None:
+        fixed = _fixed_recurrent_config(r, initial_state.shape[0], initial_state.dtype)
         config = get_config(
-            _TUNED_CONFIGS, "tmix/wkv7", _config_key(r, initial_state.shape[0], decay_bias), (64, 1),
+            _TUNED_CONFIGS, "tmix/wkv7", _config_key(r, initial_state.shape[0], decay_bias),
+            fixed or config,
             tune=lambda: tune_tmix_wkv7_recurrent(r, decay_logits, k, v, a, b, initial_state, cu_seqlens,
                                                  scale=scale, decay_bias=decay_bias),
+            fixed=fixed is not None,
         )
     return config[0] if block_values is None else block_values, config[1] if prefetch_tokens is None else prefetch_tokens
 
@@ -813,10 +844,10 @@ def tmix_wkv7_recurrent(
     State is functional: the caller-owned initial state is never mutated.
 
     ``block_values`` chooses independent value columns per CTA, leaving the
-    key reduction unchanged. ``None`` uses an explicitly tuned configuration,
-    or 64 columns until tuning has run for this device and shape. Likewise,
-    ``prefetch_tokens`` selects one or four input tokens per shared-memory load;
-    it defaults to one until explicit tuning.
+    key reduction unchanged. ``prefetch_tokens`` selects one or four tokens
+    per shared-memory load. The validated RTX 4090 head-size-64 FP32-state
+    path uses 64 columns and selects prefetch by workload; other paths use a
+    verified profile or the default of 64 columns and one token.
     """
     batch = initial_state.shape[0] if initial_state.ndim else 0
     _check_inputs(

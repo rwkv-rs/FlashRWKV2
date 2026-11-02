@@ -3,17 +3,25 @@
 
 import math
 
-import torch
-
-from ..._internal.tuning import _AutogradContext, device_class, tuning_operation
 import tilelang
 import tilelang.language as T
+import torch
+
+from ..._internal.tuning import (
+    _AutogradContext,
+    _fixed_strategy_device,
+    device_class,
+    prepared_kernel,
+    tuning_operation,
+    workload_bucket,
+)
 
 _ROW_CONFIGS = {}
 
 
 def _config_key(x, head_size):
-    return (device_class(x.device), x.shape, x.dtype, head_size)
+    rows = workload_bucket(x.numel() // x.shape[-1])
+    return (device_class(x.device), (rows, x.shape[-1]), x.dtype, head_size)
 
 
 @tilelang.jit(pass_configs={"tl.enable_fast_math": False}, out_idx=[8, 9], compile_flags=["--fmad=false"])
@@ -181,13 +189,32 @@ def _backward(
     return kernel
 
 
+def _readout_group(x, r, k, v, r_k, weight, bias, gate, head_size, eps):
+    from ..._internal.tuning import get_config
+
+    rows = x.numel() // x.shape[-1]
+    fixed = (4 if rows == 1 else 8) if head_size == 64 and _fixed_strategy_device(device_class(x.device)) else None
+    return get_config(
+        _ROW_CONFIGS, "tmix/readout", _config_key(x, head_size),
+        1 if fixed is None else fixed,
+        tune=lambda: tune_readout(x, r, k, v, r_k, weight, bias, gate, head_size, eps),
+        fixed=fixed is not None,
+    )
+
+
+def _prepared_forward(x, head_size, eps, save, group):
+    options = (x.shape[-1], head_size, eps, str(x.dtype).split(".")[-1], save)
+    fixed = head_size == 64 and _fixed_strategy_device(device_class(x.device))
+    variants = ((*options, g) for g in (4, 8)) if fixed else ()
+    return prepared_kernel("tmix/readout", _forward, (*options, group), variants)
+
+
 class _Readout(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, r, k, v, r_k, weight, bias, gate, head_size, eps):
         options = (x.shape[-1], head_size, str(x.dtype).split(".")[-1])
-        from ..._internal.tuning import get_config
-        group = get_config(_ROW_CONFIGS, "tmix/readout", _config_key(x, head_size), 1, tune=lambda: tune_readout(x, r, k, v, r_k, weight, bias, gate, head_size, eps))
-        y, stats = _forward(options[0], head_size, eps, options[2], rows_per_block=group)(
+        group = _readout_group(x, r, k, v, r_k, weight, bias, gate, head_size, eps)
+        y, stats = _prepared_forward(x, head_size, eps, True, group)(
             x, r, k, v, r_k, weight, bias, gate
         )
         ctx.save_for_backward(x, r, k, v, r_k, weight, bias, gate, stats)
@@ -200,7 +227,9 @@ class _Readout(torch.autograd.Function):
 
         group = min(32, tilelang.next_power_of_2(max(1, dy.shape[0] // 128)))
         needed = ctx.needs_input_grad[4:7]
-        gradients = list(_backward(*ctx.options, group, needed)(dy.contiguous(), *ctx.saved_tensors))
+        gradients = list(prepared_kernel("tmix/readout", _backward, (*ctx.options, group, needed),
+            ((*ctx.options, g, needed) for g in (1, 2, 4, 8, 16, 32))
+            if ctx.options[1] == 64 and _fixed_strategy_device(device_class(dy.device)) else ())( dy.contiguous(), *ctx.saved_tensors))
         for i, need in zip((4, 5, 6), needed):
             gradients[i] = sum_partials(gradients[i]) if need else None
         return (*gradients, None, None)
@@ -212,12 +241,10 @@ def _compiled_readout(
     r_k: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, gate: torch.Tensor,
     head_size: int, eps: float, save: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    from ..._internal.tuning import get_config
     if x.data_ptr() % (2 * x.element_size()) or any(t.data_ptr() % 4 for t in (r, k, v, r_k, weight, bias, gate)):
         raise ValueError("readout inputs must be aligned for two-element vector access")
-    group = get_config(_ROW_CONFIGS, "tmix/readout", _config_key(x, head_size), 1,
-                       tune=lambda: tune_readout(x, r, k, v, r_k, weight, bias, gate, head_size, eps))
-    return tuple(_forward(x.shape[-1], head_size, eps, str(x.dtype).split(".")[-1], save, group)(x, r, k, v, r_k, weight, bias, gate))
+    group = _readout_group(x, r, k, v, r_k, weight, bias, gate, head_size, eps)
+    return tuple(_prepared_forward(x, head_size, eps, save, group)( x, r, k, v, r_k, weight, bias, gate))
 
 
 @_compiled_readout.register_fake
@@ -294,9 +321,8 @@ def readout(
     elif torch.is_grad_enabled() and any(t.requires_grad for t in args):
         output = _Readout.apply(*args, head_size, float(eps))
     else:
-        from ..._internal.tuning import get_config
-        group = get_config(_ROW_CONFIGS, "tmix/readout", _config_key(args[0], head_size), 1, tune=lambda: tune_readout(*args, head_size, eps))
-        output, _ = _forward(c, head_size, float(eps), str(x.dtype).split(".")[-1], False, group)(*args)
+        group = _readout_group(*args, head_size, eps)
+        output, _ = _prepared_forward(x, head_size, float(eps), False, group)( *args)
     return output.view_as(x)
 
 

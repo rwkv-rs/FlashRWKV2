@@ -23,10 +23,9 @@ _SCHEMA = 2
 _SESSION = None
 _PREPARATION_LOCK = Lock()
 _TUNING = ContextVar("flashrwkv2_tuning_active", default=False)
-_REVALIDATE = ContextVar("flashrwkv2_revalidate", default=None)
+_TUNING_TARGET = ContextVar("flashrwkv2_tuning_target", default=None)
 _LOADED = {}
 _WARNED = set()
-_WARMED_DEFAULTS = set()
 _OWNER_SOURCES = {
     "linear": "_internal/linear.py",
     "post_norm": "post_norm/tilelang.py",
@@ -64,6 +63,10 @@ def _profile_root():
 def device_class(device):
     props = torch.cuda.get_device_properties(device)
     return (props.name, props.major, props.minor, props.multi_processor_count)
+
+
+def _fixed_strategy_device(info):
+    return info[1:] in ((8, 9, 128), (12, 0, 188))
 
 
 @cache
@@ -127,7 +130,7 @@ def _profile_path(owner, encoded_key):
     return _profile_root() / owner / _fingerprint(owner) / name
 
 
-def _validate_record(record, encoded_key, *, owner=None):
+def _validate_record(record, encoded_key, *, owner):
     if not isinstance(record, dict):
         raise ValueError("invalid verified kernel tuning profile")
     config = record.get("config")
@@ -137,11 +140,9 @@ def _validate_record(record, encoded_key, *, owner=None):
         or record.get("bitwise_equal") is not True
         or not values
         or any(type(value) is not int or value <= 0 for value in values)
-        or (owner is not None and (
-            record.get("schema") != _SCHEMA
-            or record.get("fingerprint") != _fingerprint(owner)
-            or record.get("owner") != owner
-        ))
+        or record.get("schema") != _SCHEMA
+        or record.get("fingerprint") != _fingerprint(owner)
+        or record.get("owner") != owner
     ):
         raise ValueError("invalid verified kernel tuning profile")
     return tuple(config) if isinstance(config, list) else config
@@ -159,23 +160,18 @@ def _capturing():
     return torch.cuda.is_initialized() and torch.cuda.is_current_stream_capturing()
 
 
-def _legacy_config(directory, owner, key):
-    # Legacy keys used the product name; preserve every remaining shape/dtype field.
-    legacy_key = (key[0][0], *key[1:])
-    encoded = _encode(legacy_key)
-    name = hashlib.sha256(encoded.encode()).hexdigest() + ".json"
-    path = Path(directory) / owner / name
-    try:
-        return _validate_record(json.loads(path.read_text()), encoded)
-    except FileNotFoundError:
-        return None
-
-
-def get_config(configs, owner, key, default=None, *, tune=None):
+def get_config(configs, owner, key, default=None, *, tune=None, fixed=False):
+    session = _SESSION
+    if fixed and (not _TUNING.get() or _TUNING_TARGET.get() != (owner, key)):
+        if session is not None and not _TUNING.get():
+            session["records"][(owner, key, "fixed", _encode(default))] = {
+                "owner": owner, "key": json.loads(_encode(key)),
+                "fingerprint": None, "status": "fixed", "config": default, "path": None,
+            }
+        return default
     # Owner benchmarks deliberately inject candidates into their process cache.
     if _TUNING.get():
         return configs.get(key, default)
-    session = _SESSION
     identity = (str(_profile_root()), owner, key)
     # Explicit preparation reloads each key once, including files published or
     # removed by another process after an earlier eager call.
@@ -183,47 +179,36 @@ def get_config(configs, owner, key, default=None, *, tune=None):
     config = None if refresh else _LOADED.get(identity)
     status = "hit"
     if config is None:
-        if _capturing() and identity in _WARMED_DEFAULTS and session is None:
+        if _capturing() and identity in _LOADED and session is None:
             return default
         if _capturing():
             raise RuntimeError(f"unprepared tuning key for {owner}; run prepare_tuning before CUDA Graph capture")
         encoded = _encode(key)
         config = _read_profile(owner, encoded)
         if config is None and session is not None and session["mode"] == "tune":
-            if tune is None:
-                raise RuntimeError(f"no tuning callback for {owner}")
             path = _profile_path(owner, encoded)
             path.parent.mkdir(parents=True, exist_ok=True)
             with path.with_suffix(".lock").open("a+b") as lock:
                 fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
                 config = _read_profile(owner, encoded)
                 if config is None:
-                    legacy = session["legacy_dir"]
-                    candidate = None if legacy is None else _legacy_config(legacy, owner, key)
-                    active = _TUNING.set(True)
-                    validation = _REVALIDATE.set(candidate)
-                    try:
-                        tune()
-                    finally:
-                        _REVALIDATE.reset(validation)
-                        _TUNING.reset(active)
+                    tune()
                     config = _read_profile(owner, encoded)
                     if config is None:
                         raise RuntimeError(f"tuner did not publish {owner}")
-                    status = "revalidated" if candidate is not None else "tuned"
+                    status = "tuned"
     if config is not None:
         _LOADED[identity] = config
-        _WARMED_DEFAULTS.discard(identity)
         configs[key] = config
     else:
         status = "missing"
-        # Never cache defaults: a later publication must become visible.
+        # Recheck missing profiles on the next eager call.
         _LOADED.pop(identity, None)
         configs.pop(key, None)
     if session is not None:
         encoded = _encode(key)
         previous = session["records"].get((owner, key))
-        if previous is not None and previous["status"] in {"tuned", "revalidated"} and status == "hit":
+        if previous is not None and previous["status"] == "tuned" and status == "hit":
             status = previous["status"]
         session["records"][(owner, key)] = {
             "owner": owner, "key": json.loads(encoded),
@@ -240,7 +225,8 @@ def get_config(configs, owner, key, default=None, *, tune=None):
         warnings.warn(f"FlashRWKV2 {owner} uses an untuned default; run prepare_tuning(..., mode='tune') before capture; cache={get_tuning_cache_dir()}", RuntimeWarning, stacklevel=2)
         _WARNED.add(owner)
     if config is None:
-        _WARMED_DEFAULTS.add(identity)
+        # None records a warmed default; eager calls still reload its profile.
+        _LOADED[identity] = None
     return default if config is None else config
 
 
@@ -264,14 +250,14 @@ def save_config(owner, key, config):
     _LOADED.pop((str(_profile_root()), owner, key), None)
 
 
-def prepare_tuning(calls, *, mode="require", legacy_dir=None):
+def prepare_tuning(calls, *, mode="require"):
     """Execute real model calls before capture, loading or tuning their exact keys.
 
     ``calls`` is an iterable of zero-argument callables. Each callable owns its
     scratch model state and valid metadata; it executes once, so reset state as
     needed before serving. Modes: ``inspect`` reports defaults, ``require`` fails
     at the first missing key, ``tune`` verifies and times only missing keys.
-    ``legacy_dir`` is one explicit legacy namespace, revalidated without timing.
+    Validated fixed configurations do not load profiles or run tuning.
     The returned JSON-compatible report describes every actual tuned dispatch.
     """
     global _SESSION
@@ -279,13 +265,7 @@ def prepare_tuning(calls, *, mode="require", legacy_dir=None):
         raise ValueError("mode must be inspect, require, or tune")
     if _capturing():
         raise RuntimeError("prepare_tuning must run outside CUDA Graph capture")
-    if legacy_dir is not None and mode != "tune":
-        raise ValueError("legacy_dir requires mode='tune'")
-    if legacy_dir is not None:
-        legacy_dir = Path(legacy_dir).expanduser().resolve()
-        if not legacy_dir.is_dir():
-            raise NotADirectoryError(f"legacy tuning namespace does not exist: {legacy_dir}")
-    session = {"mode": mode, "legacy_dir": legacy_dir, "records": {}}
+    session = {"mode": mode, "records": {}, "compilation": {}}
     # Autograd executes CUDA backward nodes on engine threads. Preparation is
     # an exclusive process phase, so those dispatches share the same report.
     if not _PREPARATION_LOCK.acquire(blocking=False):
@@ -300,10 +280,15 @@ def prepare_tuning(calls, *, mode="require", legacy_dir=None):
     records = list(session["records"].values())
     if not records:
         raise RuntimeError("prepare_tuning observed no configurable kernel dispatches")
+    variants = tuple(session["compilation"].values())
+    compilation = {"families": len(variants),
+                   "required_variants": sum(len(keys) for keys in variants),
+                   "available_variants": sum(len(keys) for keys in variants), "complete": True}
     return {"cache_root": str(get_tuning_cache_dir()), "schema": _SCHEMA,
             "complete": all(row["status"] != "missing" for row in records),
+            "compilation": compilation,
             "counts": {status: sum(row["status"] == status for row in records)
-                       for status in ("hit", "missing", "tuned", "revalidated")},
+                       for status in ("fixed", "hit", "missing", "tuned")},
             "records": records}
 
 
@@ -320,29 +305,71 @@ def tuning_operation(function):
     return wrapped
 
 
-def revalidation_config():
-    return _REVALIDATE.get()
+def benchmark_config(owner, key, benchmark):
+    """Temporarily apply a candidate only to the operator being benchmarked."""
+    token = _TUNING_TARGET.set((owner, key))
+    try:
+        return benchmark()
+    finally:
+        _TUNING_TARGET.reset(token)
+
+
+def prepare_variants(owner, family, variants, cache, spec):
+    """Prepare every reachable variant of an observed deterministic family."""
+    session = _SESSION
+    if session is None or _TUNING.get() or (owner, family) in session["compilation"]:
+        return
+    keys = tuple(dict.fromkeys(variants()))
+    compile_candidates(keys, cache, spec)
+    for key in keys:
+        if key not in cache:
+            import tilelang
+
+            try:
+                program, options = spec(*key)
+                cache[key] = tilelang.compile(program, **options)
+            except Exception as error:
+                raise RuntimeError(
+                    f"failed to prepare {owner} variant {key}: {error}"
+                ) from error
+    session["compilation"][(owner, family)] = keys
+
+
+def prepared_kernel(owner, compiler, args, variants=()):
+    """Compile bounded JIT alternatives only during explicit preparation."""
+    session = _SESSION
+    if session is not None and not _TUNING.get():
+        keys = tuple(sorted({args, *variants}))
+        family = owner, compiler.func.__name__, keys
+        if family not in session["compilation"]:
+            for key in keys:
+                try:
+                    compiler(*key)
+                except Exception as error:
+                    raise RuntimeError(
+                        f"failed to prepare {owner} variant {key}: {error}"
+                    ) from error
+            session["compilation"][family] = keys
+    return compiler(*args)
 
 
 def compile_candidates(keys, cache, spec):
-    """Compile candidates sharing compiler options after serial TIR elaboration."""
+    """Elaborate serially, then batch only kernels with identical options."""
     import tilelang
 
-    pending, programs = [], []
+    batches = {}
     for key in dict.fromkeys(keys):
         if key in cache:
             continue
         try:
             program, options = spec(*key)
         except RuntimeError:
-            # The owner records individual errors through its normal launcher.
             continue
-        pending.append(key)
-        programs.append(program)
-    if programs:
-        kernels = tilelang.par_compile(
-            programs, **options, ignore_error=True
-        )
+        batch = batches.setdefault(_encode(options), (options, [], []))
+        batch[1].append(key)
+        batch[2].append(program)
+    for options, pending, programs in batches.values():
+        kernels = tilelang.par_compile(programs, **options, ignore_error=True)
         cache.update(
             (key, kernel)
             for key, kernel in zip(pending, kernels, strict=True)
@@ -350,17 +377,67 @@ def compile_candidates(keys, cache, spec):
         )
 
 
-def projection_finalists(measurements):
-    """Retain three verified tiles per copy span for sustained graph timing."""
-    spans = {}
-    for item in measurements:
-        if item.get("bitwise_equal"):
-            spans.setdefault(item["config"][3], []).append(item)
+def workload_bucket(size):
+    """At most eleven workload classes; model dimensions remain exact."""
+    return 0 if size == 0 else min(512, 1 << (size - 1).bit_length())
+
+
+def projection_configs(rows, channels, outputs, device, measurements=()):
+    """At most 12 tiles followed by 12 copy variants of two verified tiles.
+
+    Keep adjacent row tiles on either side of a full SM wave. Copy spans divide
+    every input width and fit shared memory before any TIR is constructed.
+    """
+    props = torch.cuda.get_device_properties(device)
+    measured = {item["config"]: item for item in measurements}
+    if measured:
+        tiles = dict.fromkeys(
+            item["config"][:2]
+            for item in sorted(
+                (item for item in measured.values() if item.get("bitwise_equal")),
+                key=lambda item: item["milliseconds"],
+            )
+        )
+        spans = [64, 128]
+        if rows < 16 or max(outputs) <= 128:
+            spans.extend(
+                span for span in (1024, 512, 256)
+                if all(width % span == 0 for width in channels)
+            )
+            spans = spans[:3]
+        candidates = (
+            (m, n, stages, span)
+            for m, n in tuple(tiles)[:2]
+            for stages in (2, 3)
+            for span in spans
+            if all(width % span == 0 for width in channels)
+        )
+    else:
+        columns = (8, 16, 32, 64, 128) if rows < 16 and max(outputs) <= 128 else (32, 64, 128)
+        candidates = []
+        for n in columns:
+            if n > max(32, 1 << (max(outputs) - 1).bit_length()):
+                continue
+            blocks_n = sum(math.ceil(width / n) for width in outputs)
+            limit = min(256, max(16, 1 << (max(1, rows) - 1).bit_length()))
+            row_tiles = [m for m in (16, 32, 64, 128, 256) if m <= limit]
+            full_wave = [m for m in row_tiles
+                         if math.ceil(rows / m) * blocks_n >= props.multi_processor_count]
+            center = row_tiles.index(full_wave[-1]) if full_wave else 0
+            start = min(center, max(0, len(row_tiles) - 2))
+            candidates.extend((m, n, stages, 32) for m in row_tiles[start:start + 2] for stages in (2, 3))
     return tuple(
-        item["config"]
-        for items in spans.values()
-        for item in sorted(items, key=lambda item: item["milliseconds"])[:3]
+        config for config in candidates
+        if config not in measured
+        and (config[0] + config[1]) * config[2] * config[3] * 2 <= props.shared_memory_per_block_optin
     )
+
+
+def projection_finalists(measurements):
+    """Retain at most three verified configurations for sustained graph timing."""
+    eligible = (item for item in measurements if item.get("bitwise_equal"))
+    ranked = sorted(eligible, key=lambda item: item["milliseconds"])
+    return tuple(item["config"] for item in ranked[:3])
 
 
 @torch.no_grad()
@@ -377,9 +454,6 @@ def select_config(candidates, run, *, check=None, reference=None, warmup=3, repe
     check = run if check is None else check
     reference = check(candidates[0]) if reference is None else reference
     expected = (reference,) if isinstance(reference, torch.Tensor) else tuple(reference)
-    imported = revalidation_config()
-    if imported is not None:
-        candidates = (imported,)
     measurements, eligible = [], []
     for config in candidates:
         actual = check(config)
@@ -393,8 +467,6 @@ def select_config(candidates, run, *, check=None, reference=None, warmup=3, repe
             eligible.append((config, record))
     if not eligible:
         raise RuntimeError("no kernel configuration satisfies the bitwise contract")
-    if imported is not None:
-        return eligible[0][0], measurements
     for config, record in eligible:
         for _ in range(warmup):
             run(config)

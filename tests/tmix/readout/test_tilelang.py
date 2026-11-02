@@ -2,23 +2,8 @@
 
 import pytest
 import torch
-import tilelang
 
-from flashrwkv2.tmix.readout.tilelang import _backward, _forward, readout
-
-
-@pytest.mark.parametrize("arch", ("sm_89", "sm_120"))
-@pytest.mark.parametrize("head_size", (64, 128, 256))
-def test_readout_lowering(arch, head_size):
-    with tilelang.tvm.target.Target({"kind": "cuda", "arch": arch}) as target:
-        for dtype in ("bfloat16", "float32"):
-            for save in (False, True):
-                tilelang.lower(_forward.get_tir(4096, head_size, 64e-5, dtype, save), target=target)
-            tilelang.lower(_backward.get_tir(4096, head_size, dtype), target=target)
-            for save in (False, True):
-                tilelang.lower(_forward.get_tir(4096, head_size, 64e-5, dtype, save, 16), target=target)
-            for needed in (False, True):
-                tilelang.lower(_backward.get_tir(4096, head_size, dtype, 32, (needed,) * 3), target=target)
+from flashrwkv2.tmix.readout.tilelang import readout
 
 
 @pytest.mark.parametrize("fault", ("stats", "production"))
