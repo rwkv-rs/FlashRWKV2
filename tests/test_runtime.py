@@ -49,7 +49,7 @@ def tuning_cache(monkeypatch, tmp_path):
 
     monkeypatch.setattr(tuning, "_profile_root", lambda: tmp_path)
     monkeypatch.setattr(tuning, "_LOADED", {})
-    monkeypatch.setattr(tuning, "_WARMED_DEFAULTS", set())
+    monkeypatch.setattr(tuning, "_WARNED", set())
     return tuning
 
 
@@ -247,19 +247,34 @@ def test_tuning_require_and_capture_fail_before_using_missing_key(tuning_cache, 
     with pytest.raises(RuntimeError, match="unprepared tuning key"):
         call()
     assert not calls
+    monkeypatch.setattr(tuning, "_capturing", lambda: False)
+    with pytest.warns(RuntimeWarning, match="untuned default"):
+        assert call() is None
+    with monkeypatch.context() as patch:
+        patch.setattr(tuning, "_capturing", lambda: True)
+        patch.setattr(tuning, "_read_profile", lambda *args: pytest.fail("capture must not read profiles"))
+        assert call() is None
+    config = (32, 64, 2, 64)
+    tuning.save_config("linear", key, config)
+    assert tuning.prepare_tuning([call])["complete"]
+    monkeypatch.setattr(tuning, "_capturing", lambda: True)
+    monkeypatch.setattr(tuning, "_read_profile", lambda *args: pytest.fail("capture must use the prepared profile"))
+    assert call() == config
 
 
 def test_tuning_prepares_once_and_reports_actual_dispatch(tuning_cache):
     tuning = tuning_cache
     key = (("test", 12, 0, 188), 128)
     count = []
+    @tuning.tuning_operation
     def tune():
+        assert tuning._TUNING.get()
         count.append(1)
         tuning.save_config("linear", key, (32, 64, 2, 64))
     def call():
         assert tuning.get_config({}, "linear", key, tune=tune) == (32, 64, 2, 64)
     report = tuning.prepare_tuning([call, call], mode="tune")
-    assert count == [1]
+    assert count == [1] and not tuning._TUNING.get()
     assert report["counts"]["tuned"] == 1
     assert report["records"][0]["key"][0] == ["test", 12, 0, 188]
     assert tuning.prepare_tuning([call], mode="tune")["counts"]["hit"] == 1

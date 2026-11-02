@@ -26,7 +26,6 @@ _TUNING = ContextVar("flashrwkv2_tuning_active", default=False)
 _TUNING_TARGET = ContextVar("flashrwkv2_tuning_target", default=None)
 _LOADED = {}
 _WARNED = set()
-_WARMED_DEFAULTS = set()
 _OWNER_SOURCES = {
     "linear": "_internal/linear.py",
     "post_norm": "post_norm/tilelang.py",
@@ -180,37 +179,30 @@ def get_config(configs, owner, key, default=None, *, tune=None, fixed=False):
     config = None if refresh else _LOADED.get(identity)
     status = "hit"
     if config is None:
-        if _capturing() and identity in _WARMED_DEFAULTS and session is None:
+        if _capturing() and identity in _LOADED and session is None:
             return default
         if _capturing():
             raise RuntimeError(f"unprepared tuning key for {owner}; run prepare_tuning before CUDA Graph capture")
         encoded = _encode(key)
         config = _read_profile(owner, encoded)
         if config is None and session is not None and session["mode"] == "tune":
-            if tune is None:
-                raise RuntimeError(f"no tuning callback for {owner}")
             path = _profile_path(owner, encoded)
             path.parent.mkdir(parents=True, exist_ok=True)
             with path.with_suffix(".lock").open("a+b") as lock:
                 fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
                 config = _read_profile(owner, encoded)
                 if config is None:
-                    active = _TUNING.set(True)
-                    try:
-                        tune()
-                    finally:
-                        _TUNING.reset(active)
+                    tune()
                     config = _read_profile(owner, encoded)
                     if config is None:
                         raise RuntimeError(f"tuner did not publish {owner}")
                     status = "tuned"
     if config is not None:
         _LOADED[identity] = config
-        _WARMED_DEFAULTS.discard(identity)
         configs[key] = config
     else:
         status = "missing"
-        # Never cache defaults: a later publication must become visible.
+        # Recheck missing profiles on the next eager call.
         _LOADED.pop(identity, None)
         configs.pop(key, None)
     if session is not None:
@@ -233,7 +225,8 @@ def get_config(configs, owner, key, default=None, *, tune=None, fixed=False):
         warnings.warn(f"FlashRWKV2 {owner} uses an untuned default; run prepare_tuning(..., mode='tune') before capture; cache={get_tuning_cache_dir()}", RuntimeWarning, stacklevel=2)
         _WARNED.add(owner)
     if config is None:
-        _WARMED_DEFAULTS.add(identity)
+        # None records a warmed default; eager calls still reload its profile.
+        _LOADED[identity] = None
     return default if config is None else config
 
 

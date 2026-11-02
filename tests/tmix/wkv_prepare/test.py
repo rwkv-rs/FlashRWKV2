@@ -27,6 +27,7 @@ def test_real_model_rank_profile_is_loaded_for_decode_graph(monkeypatch, tmp_pat
     from flashrwkv2.tmix.wkv_prepare import tilelang as implementation
 
     monkeypatch.setattr(tuning, "_profile_root", lambda: tmp_path)
+    monkeypatch.setattr(implementation, "_fixed_projection_config", lambda *args: None)
     monkeypatch.setattr(implementation, "_GROUP_CONFIGS", {})
     generator = torch.Generator(device="cuda").manual_seed(20261022)
     ranks = (128, 128, 480, 96)
@@ -96,10 +97,18 @@ def test_deterministic_group_projection_checks_layout(monkeypatch):
     ))
     xs = tuple(torch.empty(89, 256, device="meta") for _ in range(3))
     weights = tuple(torch.empty(96, 256, device="meta") for _ in range(3))
-    assert implementation._fixed_projection_config(xs, weights, (1, 0, 2), (None,) * 3) is not None
+    assert implementation._fixed_projection_config(xs, weights) is not None
     mixed = (weights[0].t().contiguous().t(), *weights[1:])
-    assert implementation._fixed_projection_config(xs, mixed, (1, 0, 2), (None,) * 3) is None
+    assert implementation._fixed_projection_config(xs, mixed) is None
 
+    def unexpected(*args, **kwargs):
+        pytest.fail("explicit grouped configurations must skip automatic selection")
+
+    monkeypatch.setattr(implementation, "_fixed_projection_config", unexpected)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (8, 9))
+    config = (16, 64, 2, 32)
+    key, _ = implementation._group_call(xs, weights, (0,) * 3, (None,) * 3, 0, config)
+    assert key[5] == config
 
 
 @cuda
@@ -288,7 +297,7 @@ def test_fixed_decode_projection_preserves_accumulators_and_graph(
     for mode in ("inspect", "require", "tune"):
         report = tuning.prepare_tuning([call], mode=mode)
         assert report["complete"] and report["counts"]["fixed"] == 1
-        assert report["records"][0]["config"] == implementation._fixed_projection_config(xs, weights, kinds, biases)
+        assert report["records"][0]["config"] == implementation._fixed_projection_config(xs, weights)
     for mode in (0, 1, 2):
         values, raw = implementation._run_groups(xs, weights, kinds, biases, raw_mode=mode)
         expected, expected_raw = references[mode]
@@ -943,7 +952,7 @@ def test_fixed_group_projection_preserves_accumulators_and_vjp(monkeypatch, tmp_
         weights = tuple(torch.randn(rank, channels, device="cuda", dtype=torch.bfloat16).t().detach().requires_grad_() for rank in ranks)
         first_bias = None if stage == "lowrank_output" else torch.randn(channels, device="cuda", dtype=torch.bfloat16).requires_grad_()
         biases = (first_bias, torch.randn(channels, device="cuda", dtype=torch.bfloat16).requires_grad_()) + (None,) * (len(ranks) - 2)
-    fixed = implementation._fixed_projection_config(xs, weights, kinds, biases)
+    fixed = implementation._fixed_projection_config(xs, weights)
     assert fixed is not None
     with torch.no_grad():
         reference, raw = implementation._run_groups(xs, weights, kinds, biases, raw_mode=2, config=(16, 64, 2, 32))

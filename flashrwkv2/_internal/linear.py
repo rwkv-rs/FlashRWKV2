@@ -260,7 +260,7 @@ def _projection_variants(channels, outputs, device):
     )
 
 
-def _fixed_projection_config(x, weight, output_dtype, bias):
+def _fixed_projection_config(x, weight):
     if _fixed_strategy_device(device_class(x.device)) and weight.stride() in (
         (x.shape[1], 1),
         (1, weight.shape[0]),
@@ -277,15 +277,16 @@ def _forward(x, weight, bias, output_dtype, config=None, *, dynamic_k=False):
     info = device_class(x.device)
     dynamic_k = dynamic_k and _fixed_strategy_device(info)
     aligned_k = x.shape[1] % 32 == 0
-    fixed = (
-        _projection_config(
-            x.shape[0], None, (weight.shape[0],), x.device, aligned_k=aligned_k
-        )
-        if dynamic_k
-        else _fixed_projection_config(x, weight, output_dtype, bias)
-    )
     automatic = config is None
+    fixed = None
     if automatic:
+        fixed = (
+            _projection_config(
+                x.shape[0], None, (weight.shape[0],), x.device, aligned_k=aligned_k
+            )
+            if dynamic_k
+            else _fixed_projection_config(x, weight)
+        )
         from .tuning import get_config
 
         selection_key = _key(x, weight, output_dtype, bias)

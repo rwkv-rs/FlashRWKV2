@@ -442,6 +442,10 @@ def test_tilelang_linear_aligns_storage_offset_before_launch(
 
         return launch
 
+    def unexpected(*args, **kwargs):
+        pytest.fail("explicit projection configurations must skip automatic selection")
+
+    monkeypatch.setattr(implementation, "_fixed_projection_config", unexpected)
     monkeypatch.setattr(implementation, "_compiled", compile_kernel)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (12, 0))
     actual = implementation._forward(x, weight, bias, torch.float32, (16, 64, 2, 32))
@@ -724,7 +728,7 @@ def test_fixed_decode_linear_preserves_fp32_and_graph(monkeypatch, tmp_path, kin
     else:
         weight = torch.randn(outputs, channels, device="cuda", dtype=torch.bfloat16)
     dtype = torch.float32 if kind == "head" else torch.bfloat16
-    fixed = implementation._fixed_projection_config(x, weight, dtype, None)
+    fixed = implementation._fixed_projection_config(x, weight)
     reference = implementation._forward(x, weight, None, torch.float32, (16, 64, 2, 32))
     accumulator = implementation._forward(x, weight, None, torch.float32, fixed)
     assert torch.equal(accumulator.view(torch.int32), reference.view(torch.int32))
@@ -884,12 +888,12 @@ def test_deterministic_linear_checks_layout_and_device(monkeypatch):
     ))
     x = torch.empty(89, 256, device="meta")
     w = torch.empty(128, 256, device="meta")
-    assert implementation._fixed_projection_config(x, w, torch.float32, None) is not None
-    assert implementation._fixed_projection_config(x, w[:, ::2], torch.bfloat16, None) is None
+    assert implementation._fixed_projection_config(x, w) is not None
+    assert implementation._fixed_projection_config(x, w[:, ::2]) is None
     info = ("test", 12, 0, 188)
-    assert implementation._fixed_projection_config(x, w, torch.bfloat16, None) is not None
+    assert implementation._fixed_projection_config(x, w) is not None
     info = ("other", 8, 9, 114)
-    assert implementation._fixed_projection_config(x, w, torch.bfloat16, None) is None
+    assert implementation._fixed_projection_config(x, w) is None
 
 
 @cuda

@@ -410,7 +410,7 @@ def _group_key(xs, weights, kinds, biases):
     )
 
 
-def _fixed_projection_config(xs, weights, kinds, biases):
+def _fixed_projection_config(xs, weights):
     if _fixed_strategy_device(device_class(xs[0].device)) and (
         all(w.stride() == (w.shape[1], 1) for w in weights)
         or all(w.stride() == (1, w.shape[0]) for w in weights)
@@ -480,18 +480,19 @@ def _group_call(xs, weights, kinds, biases, raw_mode, config, dynamic_k=False):
     count = len(xs)
     automatic = config is None
     aligned_k = xs[0].shape[1] % 32 == 0
-    fixed = (
-        _projection_config(
-            xs[0].shape[0],
-            None,
-            tuple(w.shape[0] for w in weights),
-            xs[0].device,
-            aligned_k=aligned_k,
-        )
-        if dynamic_k
-        else _fixed_projection_config(xs, weights, kinds, biases)
-    )
+    fixed = None
     if automatic:
+        fixed = (
+            _projection_config(
+                xs[0].shape[0],
+                None,
+                tuple(w.shape[0] for w in weights),
+                xs[0].device,
+                aligned_k=aligned_k,
+            )
+            if dynamic_k
+            else _fixed_projection_config(xs, weights)
+        )
         from ..._internal.tuning import get_config
 
         config = get_config(
