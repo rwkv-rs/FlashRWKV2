@@ -1,6 +1,6 @@
 # FlashRWKV2 TileLang operator contract
 
-模型前向统一使用 BF16 激活和权重、FP32 累加与归约。WKV 状态固定为连续
+模型前向统一使用 BF16 激活和权重、FP32 累加与归约。默认 WKV 状态为连续
 FP32 `[slots,H,D,D]`，TokenShift 状态为 BF16 `[slots,C]`。Head 输出 logits、
 `head_logprobs` 与 loss 为 FP32。公共名称保留模块所有者；内部 primitive 不从根包导出。
 
@@ -26,10 +26,7 @@ y[v] = scale * sum_k r[k] * state[k,v]
 logprob；梯度使用独立 FP32 参考与相对误差验证。WKV 反向从保存的 chunk 起始状态
 重放前向，并在短片段内逆序求 VJP；不同 value tile 的部分梯度通过 FP32 原子加累积，
 调度顺序会造成极小的舍入差异。前向输出和 state 逐位比较，反向沿用独立 VJP 测试的
-`atol=2e-5, rtol=2e-2` 容差。对 200 组固定输入和上游梯度的复测中，
-相同 `(64,1)` 配置重复运行有 4 组梯度不完全相同，`(64,1)` 与 `(64,4)`
-比较有 5 组不同；最大绝对差为 3.05e-5，前向输出和 state 均逐位一致。
-只有需要梯度时才保存 checkpoint。
+`atol=2e-5, rtol=2e-2` 容差。只有需要梯度时才保存 checkpoint。
 
 ## Inference
 
@@ -92,7 +89,7 @@ slot copy 具有同时复制语义，支持同池重叠 COW；目标 slots 必�
 `memory_layout` 报告实际 bytes per slot 和 total bytes。
 
 静态 `prepare_tmix_wkv7_recurrent_metadata(cu_seqlens, state_indices, *,
-state_pool_size, total_tokens, max_seqlen=None)` 验证非空序列、边界、slot 范围和唯一性，
+state_pool_size, total_tokens, max_seqlen=None)` 验证序列边界、slot 范围和唯一性，
 保存 snapshot，并校验后续调用的 identity、version、shape 和 CUDA stream。
 `cu_seqlens` 与 `state_indices` 为连续 CUDA INT32。
 
@@ -250,6 +247,9 @@ warmup is supported separately and is not a tuning sample.
 
 ### Validation and performance
 
+CPU runtime/profile checks: 67 passed. SM89/SM120 device-code regressions:
+12 passed.
+
 Business tests cover train/prefill/decode equivalence, independent VJPs and optimizer
 updates, state ownership, frozen/unused gradients, compiled/Graph execution,
 prepared dynamic workloads and real fresh-process profile/binary-cache reuse.
@@ -258,16 +258,16 @@ Model geometry uses C=2048/2560/4096/4096 and W/A/G/V ranks
 
 | Measured result | SM89 | SM120 |
 | --- | --- | --- |
-| Kernel numerics, state, Graph and prepared dynamic workloads | Passed | Passed |
+| Business GPU suite: complete block, numerics, state, Graph and prepared workloads | 330 passed | 330 passed |
 | Training workloads within 2% of the best measured comparison | 9/9 | 5/9 measured |
-| Fresh-process disk-cache reuse | Zero device compilation | Pending |
+| Fresh-process disk-cache reuse | 139 cold / 0 warm device compilations | 137 cold / 0 warm device compilations |
 
 SM89 T1024 training is 42.20 ms for 7.2B and 42.21 ms for 13.3B
 (−0.39% / +0.33% versus baseline). Remaining performance target deviations are
 SM89 B1 layer latency +2.41%–4.46%, 2.9B T1024 prefill combined latency +2.39%,
 and SM120 1.5B B128 tuning-benefit retention of 93.77% (95% target).
 SM120 still lacks 7.2B T1024, 13.3B T128/T1024 and compiled 1.5B T128 training,
-plus fresh-process disk-cache validation. These are not marked accepted.
+which remain unaccepted performance cases.
 
 Raw paired samples, references and numerical evidence remain in the existing
 `artifacts/cmix-acceptance-a239bc3.json` and associated artifacts. Performance
