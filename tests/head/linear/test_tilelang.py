@@ -231,6 +231,7 @@ def test_tilelang_linear_batch_and_chunk_invariance(monkeypatch, shape, output_d
         for module, name in ((tilelang, "compile"), (tilelang, "par_compile"),
                              (tuning, "select_config"), (tuning, "_read_profile")):
             monkeypatch.setattr(module, name, forbidden)
+        assert torch.equal(linear(x, weight.clone(), bias, output_dtype), result)
         sizes = {1, 17, 89, 90, 100, 4096, *random.Random(803).sample(range(1, 4097), 20)}
         previous = None
         for size in range(1, 8193):

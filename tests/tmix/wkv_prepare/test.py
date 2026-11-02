@@ -15,7 +15,7 @@ cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is require
 
 @cuda
 @pytest.mark.cuda
-def test_fixed_grouped_operator_benchmark_uses_its_candidate(monkeypatch):
+def test_grouped_operator_benchmark_uses_its_candidate(monkeypatch):
     from flashrwkv2._internal import tuning
     from flashrwkv2.tmix.wkv_prepare import tilelang as implementation
 
@@ -25,7 +25,8 @@ def test_fixed_grouped_operator_benchmark_uses_its_candidate(monkeypatch):
     xs = tuple(torch.randn(1, channels, device="cuda", dtype=torch.bfloat16) for _ in ranks)
     weights = tuple(torch.randn(rank, channels, device="cuda", dtype=torch.bfloat16) for rank in ranks)
     kinds, biases = (1, 0, 2), (None,) * len(ranks)
-    fixed, candidate = (16, 16, 2, 512), (16, 32, 2, 256)
+    fixed = implementation._group_call(xs, weights, kinds, biases, 0, None)[0][5]
+    candidate = (16, 32, 2, 256)
     seen = []
 
     def benchmark():
