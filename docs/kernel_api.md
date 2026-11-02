@@ -259,18 +259,37 @@ Model geometry uses C=2048/2560/4096/4096 and W/A/G/V ranks
 | Measured result | SM89 | SM120 |
 | --- | --- | --- |
 | Business GPU suite: complete block, numerics, state, Graph and prepared workloads | 330 passed | 330 passed |
-| Training workloads within 2% of the best measured comparison | 9/9 | 5/9 measured |
+| Training workloads within 2% of the best measured comparison | 9/9 | 9/9 |
 | Fresh-process disk-cache reuse | 139 cold / 0 warm device compilations | 137 cold / 0 warm device compilations |
 
 SM89 T1024 training is 42.20 ms for 7.2B and 42.21 ms for 13.3B
 (−0.39% / +0.33% versus baseline). Remaining performance target deviations are
 SM89 B1 layer latency +2.41%–4.46%, 2.9B T1024 prefill combined latency +2.39%,
 and SM120 1.5B B128 tuning-benefit retention of 93.77% (95% target).
-SM120 still lacks 7.2B T1024, 13.3B T128/T1024 and compiled 1.5B T128 training,
-which remain unaccepted performance cases.
+
+Completed SM120 training acceptance (B1, layer plus Head; forward, backward and
+gradient zeroing, excluding optimizer):
+
+| Workload | Best comparison (ms) | Prepared (ms) | Latency change | Retained gain |
+| --- | ---: | ---: | ---: | ---: |
+| 7.2B T1024 eager | 32.786 | 32.196 | -1.80% | 119.77% |
+| 13.3B T128 eager | 7.399 | 7.311 | -1.20% | 114.17% |
+| 13.3B T1024 eager | 32.897 | 32.267 | -1.91% | 121.38% |
+| 1.5B T128 compiled | 3.603 | 3.577 | -0.71% | 109.19% |
+
+All four meet the 2% latency and 95% gain-retention targets. The comparison is the
+fastest of baseline, existing offline reference and previous strategy. Gain retention
+applies when `default - best > max(0.02 * default, 3 * (IQR(default) + IQR(best)))`.
+The four cases used an idle Shanghai PRO 6000 Workstation (188 SMs), Torch
+2.13.0+cu130 and CUDA 13.0; the earlier five used PRO 6000 Server. Each comparison
+uses the same device/toolchain, bitwise output/state checks and ABBA timing
+(7 samples × 5 Graph replays per phase). Preparation and capture are excluded.
+Whole-machine monitoring found no competing GPU processes; all four preparations
+reported 103/103 required variants available across 30 families.
 
 Raw paired samples, references and numerical evidence remain in the existing
-`artifacts/cmix-acceptance-a239bc3.json` and associated artifacts. Performance
-comparisons require idle hardware, numerical checks and paired timing; unit-test
+`artifacts/cmix-acceptance-a239bc3.json`,
+`artifacts/sm120-remaining-acceptance-results-07c7913.json` and associated artifacts.
+Performance comparisons require idle hardware, numerical checks and paired timing; unit-test
 time is not performance evidence. Existing benchmarks expose implementation,
 tuning and eager/Graph timing options; run `--help` for their workload arguments.
