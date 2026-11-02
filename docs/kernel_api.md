@@ -419,7 +419,8 @@ CTA，128×128 tile 在这组数据中优于 256×64，因此动态权重 VJP �
 共享选择及枚举由原两套 234 行、85 个 if 语句变为 86 行、7 个 if 语句
 （另有 4 个条件表达式）。历史阈值参数化形状用例从 523 个收敛到 44 个，
 以设备、布局、dtype、资源、舍入、梯度与缓存行为覆盖代替配置表抄写。
-相对 main，生产代码净增由 377 行降至 372 行；测试净增由 1535 行变为 1800 行。
+相对 main，生产代码净增由 377 行降至 319 行；测试净增由 1535 行变为 1770 行。
+删除旧 profile 迁移后，生产代码减少 53 行。
 新增测试集中于动态 K、完整准备、失败复现、冻结路线及真实新进程缓存验证。
 保留的结构特例分别对应小行数 MMA、窄输出并行度、列并行充分时的权重复用、
 分组累加器预算、归约对齐与硬件同步要求，以及 owner 的真实融合/梯度语义。
@@ -429,7 +430,7 @@ CTA，128×128 tile 在这组数据中优于 256×64，因此动态权重 VJP �
 `artifacts/deterministic-acceptance-30f5098.json` 及其关联记录中，不提交生成文件。
 Nsight 硬件计数器权限限制保持现状；本轮定位使用 CUDA Graph 计时事件。
 
-### Profile 兼容路径与离线参考
+### Profile 路径与离线参考
 
 内部 `tune_linear`、`tune_norm`、`tune_tokenshift`、`tune_readout` 与 WKV tuner
 继续用于未覆盖路径和离线参考。先逐位比较，再用 CUDA Graph 计时；候选只改变
@@ -504,6 +505,10 @@ profile 配置分别报告。`complete` 要求实际观察到的全部配置及�
 升级后使用当前版本重新执行 `prepare_tuning`。确定性形状族在准备阶段编译有限变体；
 仍需 profile 的路径使用 `mode="tune"` 验证并测量缺失配置，再发布当前 fingerprint
 对应的结果。旧版调优记录可直接删除。TileLang 自带编译缓存继续复用。
+接口为 `prepare_tuning(calls, *, mode="require")`，不再提供 `legacy_dir` 参数或
+`revalidated` 状态。移除迁移后的回归为 274 项 CPU 测试、7 项 SM89 CUDA 测试通过；
+CUDA 用例覆盖当前 profile 加载、block/CMix 数值与梯度、正常调优、
+新进程 profile 复用及准备后新 token 零编译。
 跨 release/venv 验证应在目标环境的新进程运行 `mode="require"` 并保存报告；
 修改 Torch/XDG 缓存变量仍应命中相同 profile 路径。
 基准还覆盖真实 7.2B 的 `w/a=128,g=480,v=96` 首层与后续层，以及
