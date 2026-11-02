@@ -5,7 +5,6 @@ import itertools
 import pytest
 import torch
 
-from flashrwkv2._internal.state import _transfer
 from flashrwkv2.post_norm.tilelang import norm
 from flashrwkv2.tmix.tokenshift.tilelang import (
     _forward,
@@ -250,14 +249,17 @@ def test_fused_t1_matches_training_and_preserves_inactive_slots(channels, count,
 @pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("use_status", [False, True])
-def test_dynamic_batch_reuses_tokenshift_and_state_kernels(use_status):
+def test_dynamic_batch_reuses_tokenshift_and_state_kernels(monkeypatch, use_status):
+    from tilelang.jit import JITImpl
+
     from flashrwkv2._internal.state import gather_state, scatter_state
 
     torch.manual_seed(714)
     channels, count = 64, 1
     forward = _forward(channels, count, "int32", 256, use_status)
     mixes = torch.randn(count, channels, device="cuda", dtype=torch.bfloat16)
-    cache_sizes = None
+    def forbidden(*args, **kwargs):
+        pytest.fail("new batch or pool capacity triggered compilation")
     for batch in (89, 90, 100, 1, 129, 257, 512):
         # Include empty sequences and changing pool capacity in the same kernel.
         lengths = [b % 3 for b in range(batch)]
@@ -278,7 +280,4 @@ def test_dynamic_batch_reuses_tokenshift_and_state_kernels(use_status):
         expected_pool = pool.clone().index_copy_(0, indices.long(), final)
         scatter_state(pool, final, indices, status)
         assert torch.equal(pool, expected_pool)
-        sizes = tuple(len(kernel._kernel_cache) for kernel in (_forward, _transfer))
-        if cache_sizes is None:
-            cache_sizes = sizes
-        assert sizes == cache_sizes
+        monkeypatch.setattr(JITImpl, "compile", forbidden)

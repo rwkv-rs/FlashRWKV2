@@ -376,9 +376,12 @@ def test_dynamic_weight_reduction_preserves_accumulators_and_graph(monkeypatch, 
             weight = weight.t().contiguous().t()
         reference = _forward(x, weight, None, torch.float32, config=(16, 64, 2, 32))
         cases.append((x, weight, reference))
-    x, weight, _ = next(case for case in cases if case[0].shape[1] == 32)
-    report = tuning.prepare_tuning([lambda dtype=dtype: _forward(x, weight, None, dtype, dynamic_k=True)
-                                   for dtype in (torch.float32, torch.bfloat16)])
+    # K=1 contiguous weights also have stride(0)=1, selecting the input-major layout.
+    layouts = {weight.stride(0) == 1: (x, weight) for x, weight, _ in cases}
+    report = tuning.prepare_tuning([
+        lambda x=x, weight=weight, dtype=dtype: _forward(x, weight, None, dtype, dynamic_k=True)
+        for x, weight in layouts.values() for dtype in (torch.float32, torch.bfloat16)
+    ])
     assert report["complete"] and report["compilation"]["complete"]
     def forbidden(*args, **kwargs):
         pytest.fail("prepared dynamic K attempted compilation or tuning")

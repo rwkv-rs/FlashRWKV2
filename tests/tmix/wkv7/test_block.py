@@ -260,7 +260,12 @@ def test_prepare_tuning_profiles_preserve_block_state_logits_and_logprobs(monkey
 @pytest.mark.parametrize("adapter", ["none", "lora", "nora"])
 @pytest.mark.parametrize("backend", ["eager", "inductor"])
 @pytest.mark.cuda_graph
-def test_fullgraph_training_block_preserves_outputs_gradients_and_capture(adapter, backend):
+def test_fullgraph_training_block_preserves_outputs_gradients_and_capture(monkeypatch, adapter, backend):
+    import tilelang
+    from tilelang.jit import JITImpl
+
+    from flashrwkv2._internal import tuning
+
     torch.manual_seed(738)
     params = parameters(128, rank=16, vocab=257)
     adapters = None if adapter == "none" else adapter_parameters(params)
@@ -290,6 +295,7 @@ def test_fullgraph_training_block_preserves_outputs_gradients_and_capture(adapte
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
+        fr.prepare_tuning([lambda: step(model)], mode="inspect")
         outputs, loss = step(model)
         expected = tuple(value.detach().clone() for value in outputs)
         expected_loss = loss.detach().clone()
@@ -305,6 +311,13 @@ def test_fullgraph_training_block_preserves_outputs_gradients_and_capture(adapte
             step(compiled)
     torch.cuda.current_stream().wait_stream(stream)
     torch.cuda.synchronize()
+    def forbidden(*args, **kwargs):
+        pytest.fail("prepared compiled block attempted TileLang compilation, search or profile access")
+    monkeypatch.setattr(JITImpl, "compile", forbidden)
+    monkeypatch.setattr(tilelang, "compile", forbidden)
+    monkeypatch.setattr(tilelang, "par_compile", forbidden)
+    monkeypatch.setattr(tuning, "select_config", forbidden)
+    monkeypatch.setattr(tuning, "_read_profile", forbidden)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
         actual, loss = step(compiled)
