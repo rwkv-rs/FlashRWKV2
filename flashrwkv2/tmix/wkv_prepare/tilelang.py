@@ -301,6 +301,9 @@ def _group_program(
                         T.copy(W3[k * copy_k, nb * bn], ws)
                     else:
                         T.copy(W3[nb * bn, k * copy_k], ws)
+                # Conditional grouped copies can lower to synchronous stores.
+                # Keep their CTA barrier in the pipeline's final iteration too.
+                T.sync_threads()
                 for inner in T.unroll(copy_k // 32):
                     if k * copy_k + inner * 32 < active_channels:
                         if input_major:
