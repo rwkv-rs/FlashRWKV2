@@ -7,6 +7,7 @@ import torch
 
 from flashrwkv2.post_norm.tilelang import norm
 from flashrwkv2.tmix.tokenshift.tilelang import (
+    _backward,
     _forward,
     _fused_forward,
     fused_post_norm_tokenshift,
@@ -190,6 +191,52 @@ def test_tokenshift_independent_vjp_with_empty_sequences():
         assert torch.equal(output, ref)
     for gradient, ref in zip(gradients, expected_grads, strict=True):
         torch.testing.assert_close(gradient, ref, atol=0.125, rtol=0.02)
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("count", (1, 6))
+@pytest.mark.parametrize("use_status", (False, True))
+@pytest.mark.parametrize("large_axis", ("tokens", "batch"))
+def test_tokenshift_large_grid_preserves_forward_and_vjp(count, use_status, large_axis):
+    torch.manual_seed(715)
+    channels = 320
+    rows, batch, split = (66880, 2, 33440) if large_axis == "tokens" else (2, 66880, 0)
+    x = torch.randn(rows, channels, device="cuda", dtype=torch.bfloat16)
+    mixes = torch.randn(count, channels, device="cuda", dtype=torch.bfloat16)
+    initial = torch.randn(batch, channels, device="cuda", dtype=torch.bfloat16)
+    if large_axis == "tokens":
+        cu = torch.tensor([0, split, rows], device="cuda", dtype=torch.int32)
+    else:
+        cu = torch.zeros(batch + 1, device="cuda", dtype=torch.int32)
+        cu[-2:] = torch.tensor([1, 2], device="cuda", dtype=torch.int32)
+    status = cu.new_tensor([0, rows, batch]) if use_status else cu[:0]
+    forward = _forward(channels, count, "int32", 256, use_status)
+    output, final = forward(x, mixes, cu, initial, status)
+    chunks = (
+        (x[:split], initial[:batch // 2], cu[:batch // 2 + 1]),
+        (x[split:], initial[batch // 2:], cu[batch // 2:] - split),
+    )
+    references = []
+    for values, state, offsets in chunks:
+        active = cu.new_tensor([0, values.shape[0], state.shape[0]]) if use_status else cu[:0]
+        references.append(forward(values, mixes, offsets, state, active))
+    assert torch.equal(output, torch.cat([value[0] for value in references], dim=1))
+    assert torch.equal(final, torch.cat([value[1] for value in references]))
+    dy, dfinal = torch.randn_like(output), torch.randn_like(final)
+    for group in (1, 32):
+        backward = _backward(channels, count, "int32", 256, group, True)
+        actual = backward(dy, dfinal, x, mixes, cu, initial)
+        references = []
+        for index, (values, state, offsets) in enumerate(chunks):
+            start, end = (0, split) if index == 0 else (split, rows)
+            bstart, bend = (0, batch // 2) if index == 0 else (batch // 2, batch)
+            references.append(backward(
+                dy[:, start:end].contiguous(), dfinal[bstart:bend],
+                values, mixes, offsets, state,
+            ))
+        for index, value in enumerate(actual):
+            assert torch.equal(value, torch.cat([reference[index] for reference in references]))
 
 
 @pytest.mark.cuda

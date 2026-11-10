@@ -32,8 +32,8 @@ def _activation_kernel(
         partial: T.Tensor(partial_shape, T.float32),
     ):
         with T.Kernel(
-            T.ceildiv(channels, block_c), T.ceildiv(rows, block_r), threads=128
-        ) as (bc, br):
+            T.ceildiv(rows, block_r), T.ceildiv(channels, block_c), threads=128
+        ) as (br, bc):
             gradients = T.alloc_fragment((block_r, block_c), T.float32)
             column_sum = T.alloc_fragment((block_c,), T.float32)
             for i, j in T.Parallel(block_r, block_c):

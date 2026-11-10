@@ -376,6 +376,54 @@ def test_statetune_cmix_matches_torch_forward_backward(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.cuda
+def test_cmix_large_token_grid_require_forward_backward() -> None:
+    from flashrwkv2 import prepare_tuning
+
+    torch.manual_seed(30)
+    x = (torch.randn(2, 33440, 64, device="cuda", dtype=torch.bfloat16) * .02).requires_grad_()
+    mix = (torch.randn(64, device="cuda", dtype=torch.bfloat16) * .1).requires_grad_()
+    key = (torch.randn(256, 64, device="cuda", dtype=torch.bfloat16) * .02).requires_grad_()
+    value = (torch.randn(64, 256, device="cuda", dtype=torch.bfloat16) * .02).requires_grad_()
+    variables = (x, mix, key, value)
+    upstream = torch.randn_like(x)
+
+    def step():
+        output = pretrain_cmix_bf16(*variables)
+        return output, torch.autograd.grad(output, variables, upstream)
+
+    report = prepare_tuning([step], mode="require")
+    assert report["complete"]
+    actual, gradients = step()
+    xr, mr, kr, vr = (tensor.detach().clone().requires_grad_() for tensor in variables)
+    previous = torch.cat((torch.zeros_like(xr[:, :1]), xr[:, :-1]), dim=1)
+    mixed = (xr.float() + (previous.float() - xr.float()) * mr.float()).bfloat16()
+    features = _linear_reference(mixed, kr).float().relu().square().bfloat16()
+    expected = _linear_reference(features, vr)
+    expected_gradients = torch.autograd.grad(expected, (xr, mr, kr, vr), upstream)
+    torch.testing.assert_close(actual, expected, atol=.003, rtol=.03)
+    for gradient, reference in zip(gradients, expected_gradients, strict=True):
+        torch.testing.assert_close(gradient, reference, atol=.06, rtol=.06)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.cuda
+def test_cmix_relu2_large_grid_preserves_forward_and_backward() -> None:
+    from flashrwkv2._internal.elementwise import activation
+
+    torch.manual_seed(31)
+    # Both directions process 32 rows per block at this width, crossing the
+    # second grid dimension's limit with a small activation working set.
+    x = torch.randn(65536 * 32, 8, device="cuda", dtype=torch.bfloat16).requires_grad_()
+    upstream = torch.randn_like(x)
+    actual = activation(x, "relu2")
+    gradient, = torch.autograd.grad(actual, (x,), upstream)
+    positive = x.detach().float().clamp_min(0)
+    assert torch.equal(actual, positive.square().bfloat16())
+    assert torch.equal(gradient, (upstream.float() * (2 * positive)).bfloat16())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.cuda
 def test_statetune_cmix_chunk_composition() -> None:
     torch.manual_seed(29)
     device = torch.device("cuda")
