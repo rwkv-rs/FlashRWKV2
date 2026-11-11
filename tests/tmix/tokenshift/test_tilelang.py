@@ -7,6 +7,7 @@ import torch
 
 from flashrwkv2.post_norm.tilelang import norm
 from flashrwkv2.tmix.tokenshift.tilelang import (
+    _backward,
     _forward,
     _fused_forward,
     fused_post_norm_tokenshift,
@@ -190,6 +191,21 @@ def test_tokenshift_independent_vjp_with_empty_sequences():
         assert torch.equal(output, ref)
     for gradient, ref in zip(gradients, expected_grads, strict=True):
         torch.testing.assert_close(gradient, ref, atol=0.125, rtol=0.02)
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_tokenshift_crosses_grid_y_limit():
+    x = torch.randn(65536, 8, device="cuda", dtype=torch.bfloat16)
+    cu = torch.tensor([0, x.shape[0]], device=x.device, dtype=torch.int32)
+    zero = x.new_zeros((1, x.shape[1]))
+    output, final = _forward(8, 1, "int32")(x, zero, cu, zero, cu[:0])
+    dx, _, _ = _backward(8, 1, "int32", rows_per_block=1, need_mix=False)(
+        output, zero, x, zero, cu, zero,
+    )
+    assert torch.equal(output[0], x)
+    assert torch.equal(final, x[-1:])
+    assert torch.equal(dx, x)
 
 
 @pytest.mark.cuda

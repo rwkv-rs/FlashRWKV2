@@ -174,7 +174,7 @@ def _forward(
         Y: T.Tensor((count, rows, channels), "bfloat16"),
         Final: T.Tensor((batch, channels), "bfloat16"),
     ):
-        with T.Kernel(T.ceildiv(channels, block), T.max(rows, batch), threads=threads) as (bc, row):
+        with T.Kernel(T.max(rows, batch), T.ceildiv(channels, block), threads=threads) as (row, bc):
             lo = T.alloc_local((1,), "int32")
             hi = T.alloc_local((1,), "int32")
             current = T.alloc_fragment((block,), "float32")
@@ -249,7 +249,7 @@ def _backward(
         DMix: T.Tensor((T.ceildiv(rows, rows_per_block) if need_mix else 0, count, channels), "float32"),
         DInitial: T.Tensor((batch, channels), "bfloat16"),
     ):
-        with T.Kernel(T.ceildiv(channels, block), T.max(T.ceildiv(rows, rows_per_block), batch), threads=threads) as (bc, tile):
+        with T.Kernel(T.max(T.ceildiv(rows, rows_per_block), batch), T.ceildiv(channels, block), threads=threads) as (tile, bc):
             lo = T.alloc_local((1,), "int32")
             hi = T.alloc_local((1,), "int32")
             total = T.alloc_fragment((block,), "float32")

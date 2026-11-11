@@ -401,7 +401,10 @@ def test_prepare_training_batch_and_raw_decay_bias_are_bitwise_equal(
 @cuda
 @pytest.mark.cuda
 @pytest.mark.cuda_graph
-def test_grouped_weight_vjp_preserves_accumulators_and_graph():
+@pytest.mark.parametrize(
+    "reduction", (17, pytest.param(32, marks=pytest.mark.racecheck), 64, 65, 89, 128, 1000, 1024),
+)
+def test_grouped_weight_vjp_preserves_accumulators_and_graph(reduction):
     from flashrwkv2._internal import tuning
     from flashrwkv2._internal.linear import _forward
     from flashrwkv2.tmix.wkv_prepare import tilelang as implementation
@@ -410,28 +413,29 @@ def test_grouped_weight_vjp_preserves_accumulators_and_graph():
         pytest.skip("dynamic grouped VJP is qualified on tested devices")
     torch.manual_seed(723)
     ranks, channels = (96, 96, 256, 64), 2048
-    kinds, biases, config = (0,) * 4, (None,) * 4, (64, 64, 1, 64)
-    for reduction in (17, 32, 64, 65, 89, 128, 1000, 1024):
-        xs = tuple(torch.randn(channels, reduction, device="cuda", dtype=torch.bfloat16) * .02 for _ in ranks)
-        weights = tuple((torch.randn(reduction, rank, device="cuda", dtype=torch.bfloat16) * .02).t() for rank in ranks)
-        values, raw = implementation._run_groups(
+    kinds, biases = (0,) * 4, (None,) * 4
+    # The 32-element reduction reaches the two-stage pipeline epilogue directly.
+    config = (64, 64, 2, 32) if reduction == 32 else (64, 64, 1, 64)
+    xs = tuple(torch.randn(channels, reduction, device="cuda", dtype=torch.bfloat16) * .02 for _ in ranks)
+    weights = tuple((torch.randn(reduction, rank, device="cuda", dtype=torch.bfloat16) * .02).t() for rank in ranks)
+    values, raw = implementation._run_groups(
+        xs, weights, kinds, biases, raw_mode=2, config=config, dynamic_k=True
+    )
+    offset = 0
+    for x, weight, value in zip(xs, weights, values, strict=True):
+        reference = _forward(x, weight, None, torch.float32, config=(16, 64, 2, 32))
+        size = reference.numel()
+        assert torch.equal(raw[offset : offset + size].view_as(reference), reference)
+        assert torch.equal(value, reference.bfloat16())
+        offset += size
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured, captured_raw = implementation._run_groups(
             xs, weights, kinds, biases, raw_mode=2, config=config, dynamic_k=True
         )
-        offset = 0
-        for x, weight, value in zip(xs, weights, values, strict=True):
-            reference = _forward(x, weight, None, torch.float32, config=(16, 64, 2, 32))
-            size = reference.numel()
-            assert torch.equal(raw[offset : offset + size].view_as(reference), reference)
-            assert torch.equal(value, reference.bfloat16())
-            offset += size
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            captured, captured_raw = implementation._run_groups(
-                xs, weights, kinds, biases, raw_mode=2, config=config, dynamic_k=True
-            )
-        graph.replay()
-        assert torch.equal(captured_raw, raw)
-        assert all(torch.equal(a, b) for a, b in zip(captured, values, strict=True))
+    graph.replay()
+    assert torch.equal(captured_raw, raw)
+    assert all(torch.equal(a, b) for a, b in zip(captured, values, strict=True))
 
 
 @cuda

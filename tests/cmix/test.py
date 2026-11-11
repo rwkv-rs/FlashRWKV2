@@ -263,12 +263,14 @@ def test_infer_cmix_ticket_mutation_fails_without_state_write() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.cuda
-@pytest.mark.memcheck
-@pytest.mark.racecheck
-def test_pretrain_cmix_forward_backward() -> None:
+@pytest.mark.parametrize(
+    ("t", "c"),
+    (pytest.param(3, 4, marks=(pytest.mark.memcheck, pytest.mark.racecheck)), (65536, 64)),
+)
+def test_pretrain_cmix_forward_backward(t, c) -> None:
     torch.manual_seed(5)
     device = torch.device("cuda")
-    b, t, c = 1, 3, 4
+    b = 1
     x = (torch.randn(b, t, c, device=device) * 0.03).to(torch.bfloat16).requires_grad_()
     x_k = (torch.randn(c, device=device) * 0.1).to(torch.bfloat16).requires_grad_()
     key = (
