@@ -130,3 +130,7 @@ use git to sync your changes instead of rsync.
 PR 描述应说明契约或性能影响，列出实际运行的测试及硬件/架构信息；发布基准
 结果前必须先提供正确性证据。移植 CUDA 内核时要记录源码来源和许可证边界；
 如有对应 issue，请在 PR 中关联。
+
+## Pull request review
+
+Before reviewing or re-reviewing a pull request, read the [pull request review guide](docs/dev/pr-review.md) and follow its rules.
