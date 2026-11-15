@@ -8,9 +8,9 @@ import torch
 from .tuning import prepared_kernel
 
 
-def check_cuda_condition(condition, message):
-    """Validate device metadata without host reads in compiled/captured calls."""
-    if torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing():
+def check_cuda_condition(condition, message, *, non_blocking=False):
+    """Check on-device in nonblocking, compiled or captured calls."""
+    if non_blocking or torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing():
         torch._assert_async(condition, message)
     elif not bool(condition.item()):
         raise ValueError(message)

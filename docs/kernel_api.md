@@ -88,6 +88,12 @@ slot copy 具有同时复制语义，支持同池重叠 COW；目标 slots 必�
 `materialize_slots_` 保留 lifecycle 调用入口，FP32 状态本身已物化。
 `memory_layout` 报告实际 bytes per slot 和 total bytes。
 
+slot lifecycle 方法接受 `non_blocking=True`，在当前 CUDA stream 上异步校验并执行，
+支持 CUDA Graph capture/replay。shape、dtype、device 错误仍立即报错；越界或重复
+目标 slot 会触发 device assertion，在后续 CUDA 调用或同步时报错，需要重启该
+CUDA worker。默认 `non_blocking=False` 保留 eager 下的同步 `ValueError` 行为。
+异步调用仍检查 slot 范围和目标唯一性，并保留同池重叠复制的快照语义。
+
 静态 `prepare_tmix_wkv7_recurrent_metadata(cu_seqlens, state_indices, *,
 state_pool_size, total_tokens, max_seqlen=None)` 验证序列边界、slot 范围和唯一性，
 保存 snapshot，并校验后续调用的 identity、version、shape 和 CUDA stream。

@@ -45,45 +45,63 @@ class _TmixWkv7RecurrentState:
     def _components(self):
         return (self._state_pool,)
 
-    def _indices(self, indices):
+    def _indices(self, indices, *, non_blocking=False):
+        from ..._internal.state import check_cuda_condition
+
         if (
             indices.dtype != torch.int32 or indices.ndim != 1
             or indices.device != self._state_pool.device or not indices.is_contiguous()
         ):
             raise ValueError("state indices must be contiguous CUDA int32 [B] on the state device")
-        if torch.any((indices < 0) | (indices >= self._state_pool.shape[0])).item():
-            raise ValueError("state indices must be within the state pool")
+        if indices.numel():
+            check_cuda_condition(
+                ((indices >= 0) & (indices < self._state_pool.shape[0])).all(),
+                "state indices must be within the state pool",
+                non_blocking=non_blocking,
+            )
         return indices.long()
 
     def clone(self):
         return type(self)(self._state_pool.clone())
 
-    def clone_slots(self, state_indices):
-        return type(self)(self._state_pool.index_select(0, self._indices(state_indices)))
+    def clone_slots(self, state_indices, *, non_blocking=False):
+        return type(self)(self._state_pool.index_select(
+            0, self._indices(state_indices, non_blocking=non_blocking)
+        ))
 
-    def copy_slots_(self, source, source_indices, destination_indices):
+    def copy_slots_(self, source, source_indices, destination_indices, *, non_blocking=False):
+        from ..._internal.state import check_cuda_condition
+
         if (
             source._state_pool.shape[1:] != self._state_pool.shape[1:]
             or source._state_pool.device != self._state_pool.device
             or source._state_pool.dtype != self._state_pool.dtype
         ):
             raise ValueError("source and destination state geometry, dtype and device must match")
-        src, dst = source._indices(source_indices), self._indices(destination_indices)
+        src = source._indices(source_indices, non_blocking=non_blocking)
+        dst = self._indices(destination_indices, non_blocking=non_blocking)
         if src.numel() != dst.numel():
             raise ValueError("source and destination slot counts must match")
-        if dst.unique().numel() != dst.numel():
-            raise ValueError("destination state indices must be unique")
+        if dst.numel() > 1:
+            ordered = dst.sort().values
+            check_cuda_condition(
+                (ordered[1:] != ordered[:-1]).all(),
+                "destination state indices must be unique",
+                non_blocking=non_blocking,
+            )
         values = source._state_pool.index_select(0, src)
         self._state_pool.index_copy_(0, dst, values)
         return self
 
-    def reset_slots_(self, state_indices):
-        self._state_pool.index_fill_(0, self._indices(state_indices), 0)
+    def reset_slots_(self, state_indices, *, non_blocking=False):
+        self._state_pool.index_fill_(
+            0, self._indices(state_indices, non_blocking=non_blocking), 0
+        )
         return self
 
-    def materialize_slots_(self, state_indices):
+    def materialize_slots_(self, state_indices, *, non_blocking=False):
         """Recurrent state is materialized after every call."""
-        self._indices(state_indices)
+        self._indices(state_indices, non_blocking=non_blocking)
         return self
 
     def copy_(self, source):
