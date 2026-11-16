@@ -19,6 +19,7 @@ MODULES = (
     "head/l2wrap_ce",
     "head/linear",
     "loss/l2wrap_ce",
+    "mtp",
     "sampling",
     "tmix/a_gate",
     "tmix/kk_pre",
@@ -40,10 +41,10 @@ SHARED_FILES = {"setup.py", *RELEASE_METADATA_FILES}
 SHARED_PREFIXES = ("csrc/bindings.cpp", "csrc/registration.cpp", "csrc/validation")
 # Edges point from a provider to every semantic consumer, not directory parents.
 MODULE_CONSUMERS = {
-    "post_norm": ("embedding", "cmix", "tmix/tokenshift"),
+    "post_norm": ("embedding", "cmix", "mtp", "tmix/tokenshift"),
     "tmix/tokenshift": ("cmix",),
     "loss/l2wrap_ce": ("head/l2wrap_ce",),
-    "head/linear": ("head/l2wrap_ce",),
+    "head/linear": ("head/l2wrap_ce", "mtp"),
     "tmix/kk_pre": ("tmix/wkv_prepare",),
     "tmix/vres_gate": ("tmix/wkv_prepare",),
     "tmix/wkv7": ("tmix/wkv7/rl_infctx", "tmix/tokenshift", "cmix"),
@@ -70,6 +71,7 @@ SHARED_PRIMITIVE_CALLERS = {
         "cmix",
         "head/linear",
         "head/l2wrap_ce",
+        "mtp",
         "tmix/readout",
         "tmix/wkv_prepare",
     ),
@@ -482,6 +484,7 @@ def _self_test() -> None:
         "post_norm",
         "embedding",
         "cmix",
+        "mtp",
         "tmix/tokenshift",
     }
     assert set(classify(["flashrwkv2/tmix/kk_pre/tilelang.py"]).affected_modules) == {
@@ -491,6 +494,7 @@ def _self_test() -> None:
     assert set(classify(["flashrwkv2/head/linear/__init__.py"]).affected_modules) == {
         "head/linear",
         "head/l2wrap_ce",
+        "mtp",
     }
     primitive = classify(["flashrwkv2/_internal/linear.py"])
     assert set(primitive.affected_modules) == set(

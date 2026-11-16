@@ -1279,6 +1279,7 @@ def _self_test() -> None:
         "post_norm",
         "embedding",
         "cmix",
+        "mtp",
         "tmix/tokenshift",
     }
     assert BLOCK_TEST in plan["test_paths"] and not plan["impact"]["run_all"]
@@ -1308,9 +1309,15 @@ def _self_test() -> None:
     }
 
     def result(suite):
-        selected = {
+        paths = _suite_paths(plan, suite)
+        observed = {
             node: marks
             for node, marks in collected.items()
+            if _paths_cover(paths, [node.split("::")[0]])
+        }
+        selected = {
+            node: marks
+            for node, marks in observed.items()
             if (suite == "cpu") == (not marks)
         }
         return {
@@ -1324,10 +1331,10 @@ def _self_test() -> None:
                 )
             },
             "suite": suite,
-            "paths": ["tests"],
+            "paths": paths,
             "environment": {"target": "cpu"} if suite == "cpu" else env,
             "wheel_sha256": None if suite == "cpu" else artifacts["wheel"]["sha256"],
-            "collected": collected,
+            "collected": observed,
             "selected": selected,
             "reports": {
                 node: {

@@ -66,6 +66,7 @@ BENCHMARKS = {
             "pretrain_forward_backward", "benchmarks/loss/l2wrap_ce/bench.py"
         ),
     ),
+    "mtp": (BenchmarkCase("draft", "benchmarks/mtp/bench.py", ("--depth", "4")),),
     "sampling": (BenchmarkCase("infer", "benchmarks/sampling/bench.py"),),
     "tmix/a_gate": (BenchmarkCase("pretrain", "benchmarks/tmix/a_gate/bench.py"),),
     "tmix/kk_pre": (BenchmarkCase("pretrain", "benchmarks/tmix/kk_pre/bench.py"),),

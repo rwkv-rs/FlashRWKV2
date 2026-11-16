@@ -76,6 +76,12 @@ capturing. StateTune chunk metadata is prepared once with
 `prepare_tmix_wkv7_statetune_metadata` and supplied through `prepared_metadata`;
 see the [training contract](docs/kernel_api.md#training).
 
+Speculative decoding can export per-token WKV checkpoints and normalized TMix
+and CMix shift states from the verifier. The optional
+`flashrwkv2.mtp.DraftLoop` runs a single-request LightMTP block eagerly or in
+a CUDA Graph. See the [state export and DraftLoop contracts](docs/kernel_api.md#state-and-packed-metadata)
+and the [original TileRWKV changes by Joluck](https://github.com/Joluck/tilerwkv/commit/409b492e952086a61d89817d8032375a851b51da).
+
 ## Tests
 
 ```bash
@@ -157,6 +163,12 @@ compatibility, sanitizer coverage, and complete performance results on both
 architectures. Publish the release after its manual verification succeeds.
 
 ## Benchmarks
+
+Run the LightMTP comparison at the RWKV-7 G1k 7.2B draft shape with:
+
+```bash
+PYTHONPATH=benchmarks timeout 10m .venv/bin/python benchmarks/mtp/bench.py --depth 4
+```
 
 Operator benchmarks live in [`benchmarks/`](benchmarks/). The WKV matrix covers
 batch size, sequence length, and head dimensions:
