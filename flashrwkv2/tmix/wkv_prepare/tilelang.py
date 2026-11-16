@@ -9,7 +9,6 @@ from torch.autograd.function import once_differentiable
 from ..._internal.elementwise import _activation_kernel, activation, sum_partials
 from ..._internal.linear import (
     _aligned,
-    _cuda_target,
     _forward,
     _projection_config,
     _projection_variants,
@@ -467,7 +466,7 @@ def _group_spec(
         ),
         {
             "out_idx": [12, 13],
-            "target": _cuda_target(arch),
+            "target": {"kind": "cuda", "arch": f"sm_{arch}a" if arch == 90 else f"sm_{arch}"},
             "pass_configs": flags,
         },
     )
