@@ -85,6 +85,12 @@ then restore state and gradients before capture. Dense and packed training
 accept optional FP32 initial state and can return final state for the next
 chunk. See the [training contract](docs/kernel_api.md#training).
 
+Speculative decoding can export per-token WKV checkpoints and normalized TMix
+and CMix shift states from the verifier. The optional
+`flashrwkv2.mtp.DraftLoop` runs a single-request LightMTP block eagerly or in
+a CUDA Graph. See the [state export and DraftLoop contracts](docs/kernel_api.md#state-and-packed-metadata)
+and the [original TileRWKV changes by Joluck](https://github.com/Joluck/tilerwkv/commit/409b492e952086a61d89817d8032375a851b51da).
+
 ## Tests
 
 ```bash
@@ -129,6 +135,12 @@ the original distribution hashes. It publishes through PyPI trusted publishing
 and checks the public digests.
 
 ## Benchmarks
+
+Run the LightMTP comparison at the RWKV-7 G1k 7.2B draft shape with:
+
+```bash
+PYTHONPATH=benchmarks timeout 10m .venv/bin/python benchmarks/mtp/bench.py --depth 4
+```
 
 Operator benchmarks live in [`benchmarks/`](benchmarks/). The WKV matrix covers
 batch size, sequence length, and head dimensions:
