@@ -254,7 +254,7 @@ def _infer_forward_varlen(
     r, decay_logits, k, v, a, b, *,
     state, cu_seqlens, state_indices, scale=1.0, decay_bias=None,
     max_seqlen=None, validated_metadata=None,
-    state_dtype,
+    state_dtype, save, boundaries, checkpoint_interval,
 ):
     """Launch indexed recurrence with the requested state storage precision."""
     from .tilelang import _infer_recurrent
@@ -279,7 +279,7 @@ def _infer_forward_varlen(
     batch = state_indices.numel()
     # The device chooses append or writeback independently for each physical slot.
     delta = state._delta if state._state_pool.shape[0] >= 16 else None
-    append = delta is not None and batch >= 16
+    append = not save and delta is not None and batch >= 16
     if append and r.shape[1] == 40 and batch > 64:
         append = torch.cuda.get_device_capability(r.device) == (12, 0)
     return _infer_recurrent(
@@ -287,6 +287,7 @@ def _infer_forward_varlen(
         state_indices, status, scale=scale, decay_bias=decay_bias,
         row_order=ticket._row_order(),
         delta_buffers=delta, append_log=append,
+        save=save, boundaries=boundaries, checkpoint_interval=checkpoint_interval,
     )
 
 
@@ -295,13 +296,19 @@ def infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
     r, decay_logits, k, v, a, b, *,
     state, cu_seqlens, state_indices, scale=1.0, decay_bias=None,
     max_seqlen=None, validated_metadata=None,
+    save=False, boundaries=None, checkpoint_interval=16,
 ):
-    """Match training with BF16 token IO, FP32 recurrence and FP32 state."""
+    """Match training with BF16 token IO, FP32 recurrence and FP32 state.
+
+    With ``save=True``, return the output and the packed states before each
+    checkpoint token. ``boundaries`` optionally supplies their storage.
+    """
     return _infer_forward_varlen(
         r, decay_logits, k, v, a, b, state=state, cu_seqlens=cu_seqlens,
         state_indices=state_indices, scale=scale, decay_bias=decay_bias,
         max_seqlen=max_seqlen, validated_metadata=validated_metadata,
-        state_dtype=torch.float32,
+        state_dtype=torch.float32, save=save, boundaries=boundaries,
+        checkpoint_interval=checkpoint_interval,
     )
 
 
@@ -310,13 +317,18 @@ def infer_tmix_wkv7_recurrent_fp16_forward_varlen(
     r, decay_logits, k, v, a, b, *,
     state, cu_seqlens, state_indices, scale=1.0, decay_bias=None,
     max_seqlen=None, validated_metadata=None,
+    save=False, boundaries=None, checkpoint_interval=16,
 ):
-    """Serving prefill and decode with BF16 IO and FP32 arithmetic, rounding state to FP16 per token."""
+    """Serving prefill and decode with BF16 IO, FP32 arithmetic and per-token FP16 state.
+
+    With ``save=True``, return the output and FP16 packed checkpoints.
+    """
     return _infer_forward_varlen(
         r, decay_logits, k, v, a, b, state=state, cu_seqlens=cu_seqlens,
         state_indices=state_indices, scale=scale, decay_bias=decay_bias,
         max_seqlen=max_seqlen, validated_metadata=validated_metadata,
-        state_dtype=torch.float16,
+        state_dtype=torch.float16, save=save, boundaries=boundaries,
+        checkpoint_interval=checkpoint_interval,
     )
 
 

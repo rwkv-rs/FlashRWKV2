@@ -159,9 +159,14 @@ def _decode_traversal(heads, ordered, compact):
 
 @tilelang.jit(pass_configs={**_PASSES, tilelang.PassConfigKey.TL_DISABLE_SAFE_MEMORY_ACCESS: True},
               compile_flags=_COMPILE_FLAGS)
-def _fp16_serving_kernel(heads, scale, bias_dtype, has_bias, ordered, with_log, allow_append, alternate=False, bulk_threshold=0, fields=5, rows="all"):
+def _fp16_serving_kernel(
+    heads, scale, bias_dtype, has_bias, ordered, with_log, allow_append,
+    alternate=False, bulk_threshold=0, fields=5, rows="all", checkpoint_interval=0,
+):
     """D64 recurrence: each warp sums fixed contiguous key groups for its value columns."""
     n, batch, slots = T.dynamic("n, batch, slots")
+    stride = checkpoint_interval or 1
+    checkpoints = n // stride + batch if checkpoint_interval else 0
     records = 2 if fields == 6 else 1
     count_mask = 0xf if fields == 6 else 1
     groups, columns = 4, 16
@@ -224,7 +229,12 @@ def _fp16_serving_kernel(heads, scale, bias_dtype, has_bias, ordered, with_log, 
         vectors[t, 5, key] = T.cast(B[token, h, key], "float32")
 
     @T.macro
-    def step(state, vectors, Y, token, h, t, group, col, dot):
+    def step(state, vectors, Y, Boundaries, token, seq, start, h, t, group, col, dot):
+        if checkpoint_interval:
+            if (token - start) % stride == 0:
+                checkpoint = start // stride + seq + (token - start) // stride
+                for j in T.unroll(keys):
+                    Boundaries[checkpoint, h, group * keys + j, col] = T.cast(state[j], "float16")
         accum = T.alloc_var("float32", init=0.0)
         for j in T.unroll(keys):
             accum = T.fma(state[j], vectors[t, 4, group * keys + j], accum)
@@ -241,7 +251,12 @@ def _fp16_serving_kernel(heads, scale, bias_dtype, has_bias, ordered, with_log, 
             Y[token, h, col] = T.cast(output * scale, "bfloat16")
 
     @T.macro
-    def column_step(state, values, Y, token, h, t, tid, sa):
+    def column_step(state, values, Y, Boundaries, token, seq, start, h, t, tid, sa):
+        if checkpoint_interval:
+            if (token - start) % stride == 0:
+                checkpoint = start // stride + seq + (token - start) // stride
+                for key in T.unroll(64):
+                    Boundaries[checkpoint, h, key, tid] = T.cast(state[key], "float16")
         sy = T.alloc_local((groups,), "float32")
         for g in T.unroll(groups):
             sa[g] = 0.0
@@ -260,7 +275,7 @@ def _fp16_serving_kernel(heads, scale, bias_dtype, has_bias, ordered, with_log, 
         Y[token, h, tid] = T.cast(sy[0] * scale, "bfloat16")
 
     @T.macro
-    def full_head(R, W, K, V, A, B, Bias, Pool, Log, Phase, Y, start, end, slot, h, tid, single):
+    def full_head(R, W, K, V, A, B, Bias, Pool, Log, Phase, Y, Boundaries, seq, start, end, slot, h, tid, single):
         vectors = T.alloc_shared((1 if single else 4, 6, 64), "float32")
         past = T.alloc_shared((5 if with_log else 0, 64), "float32")
         pending = T.alloc_shared((1 if with_log else 0,), "int32")
@@ -289,20 +304,20 @@ def _fp16_serving_kernel(heads, scale, bias_dtype, has_bias, ordered, with_log, 
                         state[key] = T.cast(T.cast(updated, "float16"), "float32")
                     T.sync_threads()
         if single:
-            column_step(state, vectors, Y, start, h, 0, tid, sa)
+            column_step(state, vectors, Y, Boundaries, start, seq, start, h, 0, tid, sa)
         else:
             for chunk in T.serial((end - start) // 4):
                 for t, key in T.Parallel(4, 64):
                     load_token(R, W, K, V, A, B, Bias, vectors, start + chunk * 4 + t, h, t, key)
                 T.sync_threads()
                 for t in T.unroll(4):
-                    column_step(state, vectors, Y, start + chunk * 4 + t, h, t, tid, sa)
+                    column_step(state, vectors, Y, Boundaries, start + chunk * 4 + t, seq, start, h, t, tid, sa)
                 T.sync_threads()
             for tail in T.serial((end - start) % 4):
                 token = end - (end - start) % 4 + tail
                 load_token(R, W, K, V, A, B, Bias, vectors, token, h, 0, tid)
                 T.sync_threads()
-                column_step(state, vectors, Y, token, h, 0, tid, sa)
+                column_step(state, vectors, Y, Boundaries, token, seq, start, h, 0, tid, sa)
                 T.sync_threads()
         # Offset the three-step cycle by head so each call writes back part of the pool.
         append = False
@@ -368,6 +383,7 @@ def _fp16_serving_kernel(heads, scale, bias_dtype, has_bias, ordered, with_log, 
         Log: T.Tensor((slots if with_log else 0, heads, fields, 64), "float32"),
         Phase: T.Tensor((slots if with_log else 0, heads), "int32"),
         Reverse: T.Tensor((1 if alternate else 0,), "int32"),
+        Boundaries: T.Tensor((checkpoints, heads, 64, 64), "float16"),
     ):
         # Full heads need one row per grid slot. A sparse prefill uses four value tiles.
         extra = T.min(batch, 4) * (tiles - 1) if ordered else T.if_then_else(batch == 1 and n > 1, tiles - 1, 0)
@@ -414,9 +430,9 @@ def _fp16_serving_kernel(heads, scale, bias_dtype, has_bias, ordered, with_log, 
                 start, end = CU[seq], CU[seq + 1]
                 slot = Indices[seq]
                 if not is_prefill:
-                    full_head(R, W, K, V, A, B, Bias, Pool, Log, Phase, Y, start, end, slot, h, tid, True)
+                    full_head(R, W, K, V, A, B, Bias, Pool, Log, Phase, Y, Boundaries, seq, start, end, slot, h, tid, True)
                 elif bulk_threshold and not narrow:
-                    full_head(R, W, K, V, A, B, Bias, Pool, Log, Phase, Y, start, end, slot, h, tid, False)
+                    full_head(R, W, K, V, A, B, Bias, Pool, Log, Phase, Y, Boundaries, seq, start, end, slot, h, tid, False)
                 else:
                     tile = rank % tiles
                     col = tile * columns + local_col
@@ -442,14 +458,14 @@ def _fp16_serving_kernel(heads, scale, bias_dtype, has_bias, ordered, with_log, 
                             load_token(R, W, K, V, A, B, Bias, vectors, start + chunk * 4 + t, h, t, k)
                         T.sync_threads()
                         for t in T.unroll(4):
-                            step(state, vectors, Y, start + chunk * 4 + t, h, t, group, col, dot)
+                            step(state, vectors, Y, Boundaries, start + chunk * 4 + t, seq, start, h, t, group, col, dot)
                         T.sync_threads()
                     for tail in T.serial((end - start) % 4):
                         token = end - (end - start) % 4 + tail
                         if tid < 64:
                             load_token(R, W, K, V, A, B, Bias, vectors, token, h, 0, tid)
                         T.sync_threads()
-                        step(state, vectors, Y, token, h, 0, group, col, dot)
+                        step(state, vectors, Y, Boundaries, token, seq, start, h, 0, group, col, dot)
                         T.sync_threads()
                     for j in T.unroll(keys):
                         Pool[slot, h, group * keys + j, col] = T.cast(state[j], "float16")
@@ -469,12 +485,13 @@ def _forward_kernel(
     bias_dtype: str = "float32",
     prefetch_tokens: int = 1,
     state_dtype: str = "float32",
+    checkpoint_interval: int = _CHECKPOINT,
 ):
     n, batch = T.dynamic("n, batch")
     state_slots = T.dynamic("state_slots") if indexed else batch
     columns = min(block_values, dim)
     key_groups = dim // 64
-    checkpoints = n // _CHECKPOINT + batch
+    checkpoints = n // checkpoint_interval + batch
     threads = columns * key_groups
     within_loop = T.unroll if prefetch_tokens > 1 and dim <= 128 else T.serial
 
@@ -577,10 +594,10 @@ def _forward_kernel(
                 for within in within_loop(prefetch_tokens):
                     token = start + chunk * prefetch_tokens + within
                     if prefetch_tokens == 1 or token < end:
-                        if save and (token - start) % _CHECKPOINT == 0:
+                        if save and (token - start) % checkpoint_interval == 0:
                             checkpoint = (
-                                start // _CHECKPOINT + seq
-                                + (token - start) // _CHECKPOINT
+                                start // checkpoint_interval + seq
+                                + (token - start) // checkpoint_interval
                             )
                             for key, value in T.Parallel(dim, columns):
                                 Boundaries[
@@ -1365,6 +1382,9 @@ def _infer_recurrent(
     row_order=None,
     delta_buffers=None,
     append_log=False,
+    save=False,
+    boundaries=None,
+    checkpoint_interval=_CHECKPOINT,
 ):
     """Launch the common forward directly against an indexed inference pool."""
     if (
@@ -1393,7 +1413,32 @@ def _infer_recurrent(
         inference=True,
     )
 
-    _, heads, dim = r.shape
+    tokens, heads, dim = r.shape
+    if save:
+        if (not isinstance(checkpoint_interval, int) or isinstance(checkpoint_interval, bool)
+                or checkpoint_interval <= 0):
+            raise ValueError("checkpoint_interval must be a positive integer")
+        shape = (tokens // checkpoint_interval + batch, heads, dim, dim)
+        if boundaries is None:
+            boundaries = state_pool.new_empty(shape)
+        elif (
+            not isinstance(boundaries, torch.Tensor) or boundaries.shape != shape
+            or boundaries.dtype != state_pool.dtype or boundaries.device != r.device
+            or not boundaries.is_contiguous()
+        ):
+            raise ValueError(
+                f"boundaries must be contiguous {state_pool.dtype} with shape {shape} on {r.device}"
+            )
+        start = boundaries.data_ptr()
+        end = start + boundaries.nbytes
+        inputs = (r, decay_logits, k, v, a, b, decay_bias, state_pool, cu_seqlens, state_indices, status)
+        for tensor in inputs:
+            if tensor is not None and tensor.nbytes:
+                address = tensor.data_ptr()
+                if start < address + tensor.nbytes and address < end:
+                    raise ValueError("boundaries must not overlap inputs or state_pool")
+    else:
+        checkpoint_interval = _CHECKPOINT
     if state_pool.dtype == torch.float16 and dim == 64 and heads in (40, 64):
         output = torch.empty_like(v)
         bias = _bias_tensor(r, decay_bias)
@@ -1418,7 +1463,8 @@ def _infer_recurrent(
             4 if batch >= 4 and order.numel() else 0, log.shape[2],
         )
         tensors = (r, decay_logits, k, v, a, b, state_pool, cu_seqlens, bias, status, state_indices,
-                   output, order, log, phase, reverse)
+                   output, order, log, phase, reverse,
+                   boundaries if save else state_pool[:0])
         if alternate and log.shape[2] == 6:
             if order.numel():
                 caller = torch.cuda.current_stream(r.device)
@@ -1431,8 +1477,8 @@ def _infer_recurrent(
             else:
                 _fp16_serving_kernel(*config, rows="decode")(*tensors)
         else:
-            _fp16_serving_kernel(*config)(*tensors)
-        return output
+            _fp16_serving_kernel(*config, checkpoint_interval=checkpoint_interval if save else 0)(*tensors)
+        return (output, boundaries) if save else output
 
     block_values, prefetch_tokens = _recurrent_config(
         r, batch, block_values, prefetch_tokens,
@@ -1445,13 +1491,14 @@ def _infer_recurrent(
         dim,
         float(scale),
         bias.numel() != 0,
-        False,
+        save,
         block_values,
         True,
         True,
         "bfloat16" if bias.dtype == torch.bfloat16 else "float32",
         prefetch_tokens,
         str(state_pool.dtype).removeprefix("torch."),
+        checkpoint_interval=checkpoint_interval,
     )(
         r,
         decay_logits,
@@ -1465,9 +1512,10 @@ def _infer_recurrent(
         status,
         state_indices,
         output,
-        empty, empty,
+        empty,
+        boundaries if save else empty,
     )
-    return output
+    return (output, boundaries) if save else output
 
 
 @torch.library.custom_op("flashrwkv2::tmix_wkv7_forward", mutates_args=())
