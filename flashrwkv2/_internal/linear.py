@@ -21,6 +21,10 @@ _TUNED_CONFIGS = {}
 _COMPILED_KERNELS = {}
 
 
+def _cuda_target(arch):
+    return {"kind": "cuda", "arch": "sm_90a" if arch == 90 else f"sm_{arch}"}
+
+
 def _matmul_program(
     outputs,
     channels,
@@ -152,7 +156,7 @@ def _compile_spec(
         ),
         {
             "out_idx": [3],
-            "target": {"kind": "cuda", "arch": f"sm_{arch}"},
+            "target": _cuda_target(arch),
             "pass_configs": pass_configs,
         },
     )
@@ -422,7 +426,7 @@ def _adapter_kernel(outputs, dtype, scale, arch):
     return tilelang.compile(
         epilogue,
         out_idx=[2],
-        target={"kind": "cuda", "arch": f"sm_{arch}"},
+        target=_cuda_target(arch),
         pass_configs=_PASS_CONFIG,
     )
 
@@ -501,7 +505,7 @@ def _nora_kernel(rank, channels, dtype, strides, backward, arch):
 
     return tilelang.compile(
         normalize,
-        target={"kind": "cuda", "arch": f"sm_{arch}"},
+        target=_cuda_target(arch),
         pass_configs=_PASS_CONFIG,
     )
 
