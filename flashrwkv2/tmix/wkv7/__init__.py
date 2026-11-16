@@ -255,7 +255,7 @@ def _infer_forward_varlen(
     r, decay_logits, k, v, a, b, *,
     state, cu_seqlens, state_indices, scale=1.0, decay_bias=None,
     max_seqlen=None, validated_metadata=None,
-    state_dtype,
+    state_dtype, save, boundaries, checkpoint_interval,
 ):
     """Launch indexed recurrence with the requested state storage precision."""
     from .tilelang import _infer_recurrent
@@ -280,6 +280,7 @@ def _infer_forward_varlen(
     return _infer_recurrent(
         r, decay_logits, k, v, a, b, state._state_pool, cu_seqlens,
         state_indices, status, scale=scale, decay_bias=decay_bias,
+        save=save, boundaries=boundaries, checkpoint_interval=checkpoint_interval,
     )
 
 
@@ -288,13 +289,19 @@ def infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
     r, decay_logits, k, v, a, b, *,
     state, cu_seqlens, state_indices, scale=1.0, decay_bias=None,
     max_seqlen=None, validated_metadata=None,
+    save=False, boundaries=None, checkpoint_interval=16,
 ):
-    """Match training with BF16 token IO, FP32 recurrence and FP32 state."""
+    """Match training with BF16 token IO, FP32 recurrence and FP32 state.
+
+    With ``save=True``, return the output and the packed states before each
+    checkpoint token. ``boundaries`` optionally supplies their storage.
+    """
     return _infer_forward_varlen(
         r, decay_logits, k, v, a, b, state=state, cu_seqlens=cu_seqlens,
         state_indices=state_indices, scale=scale, decay_bias=decay_bias,
         max_seqlen=max_seqlen, validated_metadata=validated_metadata,
-        state_dtype=torch.float32,
+        state_dtype=torch.float32, save=save, boundaries=boundaries,
+        checkpoint_interval=checkpoint_interval,
     )
 
 
@@ -303,16 +310,19 @@ def infer_tmix_wkv7_recurrent_fp16_forward_varlen(
     r, decay_logits, k, v, a, b, *,
     state, cu_seqlens, state_indices, scale=1.0, decay_bias=None,
     max_seqlen=None, validated_metadata=None,
+    save=False, boundaries=None, checkpoint_interval=16,
 ):
     """Optional inference: BF16 token IO, FP32 arithmetic, FP16 state per token.
 
     This mode does not promise bitwise equality with the FP32 training state.
+    With ``save=True``, return the output and FP16 packed checkpoints.
     """
     return _infer_forward_varlen(
         r, decay_logits, k, v, a, b, state=state, cu_seqlens=cu_seqlens,
         state_indices=state_indices, scale=scale, decay_bias=decay_bias,
         max_seqlen=max_seqlen, validated_metadata=validated_metadata,
-        state_dtype=torch.float16,
+        state_dtype=torch.float16, save=save, boundaries=boundaries,
+        checkpoint_interval=checkpoint_interval,
     )
 
 

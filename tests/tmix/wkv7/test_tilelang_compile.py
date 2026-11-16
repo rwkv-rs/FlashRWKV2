@@ -76,7 +76,7 @@ def test_recurrent_tuning_and_dispatch_keep_mode_caches_separate(monkeypatch, tm
 
     def forward_kernel(
         heads, dim, scale, has_bias, save, columns, has_status, indexed, bias_dtype,
-        prefetch_tokens, state_dtype,
+        prefetch_tokens, state_dtype, checkpoint_interval,
     ):
         def kernel(*args):
             launches.append((indexed, columns, prefetch_tokens))

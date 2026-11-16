@@ -44,6 +44,7 @@ def test_infer_cmix_highest_fusion_island_matches_reference() -> None:
     value = torch.randn(features, channels, device=device, dtype=torch.bfloat16) * 0.01
     initial = torch.randn(3, channels, device=device, dtype=torch.bfloat16) * 0.02
     shift = initial.clone()
+    saved = torch.full_like(x, 123)
     cu = torch.tensor([0, 1], device=device, dtype=torch.int32)
     slots = torch.tensor([2], device=device, dtype=torch.int32)
 
@@ -59,6 +60,7 @@ def test_infer_cmix_highest_fusion_island_matches_reference() -> None:
             shift_state_pool=shift,
             cu_seqlens=cu,
             state_indices=slots,
+            save_normalized=saved,
         )
     assert "aten::max" not in recorder.operations
     summed_ref = (x.float() + res.float()).to(torch.bfloat16).float()
@@ -82,7 +84,17 @@ def test_infer_cmix_highest_fusion_island_matches_reference() -> None:
     torch.testing.assert_close(summed.float(), summed_ref, atol=0.01, rtol=0.01)
     torch.testing.assert_close(output.float(), expected_output, atol=0.10, rtol=0.06)
     torch.testing.assert_close(shift[2], normalized_bf16[0], atol=0.01, rtol=0.01)
+    assert torch.equal(saved[0], shift[2])
     assert torch.equal(shift[:2], initial[:2])
+
+    before = shift.clone()
+    for invalid in (saved[:, :-1], saved.float(), shift[2:]):
+        with pytest.raises(ValueError, match="save_normalized"):
+            infer_cmix_forward_varlen(
+                x, res, weight, bias, x_k, key, value, shift_state_pool=shift,
+                cu_seqlens=cu, state_indices=slots, save_normalized=invalid,
+            )
+    assert torch.equal(shift, before)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -176,6 +188,7 @@ def test_infer_cmix_packed_ragged_matches_reference_and_slot_updates() -> None:
     value = torch.randn(features, channels, device=device, dtype=torch.bfloat16) * 0.01
     initial = torch.randn(5, channels, device=device, dtype=torch.bfloat16) * 0.02
     state = initial.clone()
+    saved = torch.full_like(x, 123)
     cu = torch.tensor([0, 1, 4], device=device, dtype=torch.int32)
     slots = torch.tensor([3, 1], device=device, dtype=torch.int32)
     ticket = prepare_tmix_wkv7_recurrent_metadata(
@@ -197,6 +210,7 @@ def test_infer_cmix_packed_ragged_matches_reference_and_slot_updates() -> None:
         cu_seqlens=cu,
         state_indices=slots,
         validated_metadata=ticket,
+        save_normalized=saved,
     )
     summed_ref = (x.float() + res.float()).to(torch.bfloat16).float()
     centered = summed_ref - summed_ref.mean(dim=-1, keepdim=True)
@@ -226,6 +240,17 @@ def test_infer_cmix_packed_ragged_matches_reference_and_slot_updates() -> None:
         state[1].float(), normalized[3].float(), atol=0.01, rtol=0.01
     )
     assert torch.equal(state[[0, 2, 4]], initial[[0, 2, 4]])
+    decode_state = initial.clone()
+    one = cu.new_tensor([0, 1])
+    for row, seq in enumerate((0, 1, 1, 1)):
+        decode_sum, decode_output = infer_cmix_forward_varlen(
+            x[row:row + 1], res[row:row + 1], weight, bias, x_k, key, value,
+            shift_state_pool=decode_state, cu_seqlens=one, state_indices=slots[seq:seq + 1],
+        )
+        assert torch.equal(saved[row:row + 1], decode_state[slots[seq:seq + 1].long()])
+        assert torch.equal(summed[row:row + 1], decode_sum)
+        assert torch.equal(output[row:row + 1], decode_output)
+    assert torch.equal(state, decode_state)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

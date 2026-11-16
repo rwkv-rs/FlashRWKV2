@@ -26,7 +26,7 @@ y[v] = scale * sum_k r[k] * state[k,v]
 logprob；梯度使用独立 FP32 参考与相对误差验证。WKV 反向从保存的 chunk 起始状态
 重放前向，并在短片段内逆序求 VJP；不同 value tile 的部分梯度通过 FP32 原子加累积，
 调度顺序会造成极小的舍入差异。前向输出和 state 逐位比较，反向沿用独立 VJP 测试的
-`atol=2e-5, rtol=2e-2` 容差。只有需要梯度时才保存 checkpoint。
+`atol=2e-5, rtol=2e-2` 容差。训练只在需要梯度时保存 checkpoint。
 
 ## Inference
 
@@ -97,6 +97,28 @@ CUDA Graph 使用 `token_capacity`、`sequence_capacity`、`max_seqlen_capacity`
 两个 CUDA INT32 scalar `num_active_tokens`、`num_active_sequences`。同一 graph
 内所有 stateful 算子共享 ticket；每次 replay 验证有效前缀。零 active warmup 不
 修改 state，非法 metadata 也不修改 state。inactive 输出为 NaN，不应被下游消费。
+
+### 推理状态导出
+
+两个 WKV 推理入口默认返回 BF16 输出。传入 `save=True` 时返回
+`(output, boundaries)`，每个 checkpoint 保存**处理对应 token 之前**的 WKV state。
+`checkpoint_interval` 为正整数，默认 16。以当前调用的 token 容量 `N`、
+sequence 容量 `B` 和 interval `S` 计算形状 `[N // S + B, H, D, D]`。
+调用方可传入同设备、连续且与 state pool 同 dtype 的 `boundaries`，否则由入口分配。
+
+对第 `i` 条序列，设 `start = cu_seqlens[i]`。当序列内 token 偏移 `j` 能被
+`S` 整除时，写入 `boundaries[start // S + i + j // S]`。
+图重放只写入 live metadata 描述的有效 checkpoint，容量空洞保留原值。
+
+`infer_tmix_postnorm_tokenshift_forward_varlen` 和 `infer_cmix_forward_varlen` 的
+`save_normalized` 接收同设备、连续的 BF16 `[N,C]` 缓冲区，写入每个有效 token
+的 res 后 ln 结果。T=1 融合路径与通用 packed 路径均写出该 token 作为序列末尾时
+的 shift state。调用方为导出缓冲区提供与输入和对应 pool 独立的存储。
+
+对 MTP verifier 设 `checkpoint_interval=1`。若只保留已处理的前 `m` 个 token
+且 `m` 小于序列长度，由 `boundaries[start + i + m]` 恢复 WKV state，并从
+各自的 `save_normalized[start + m - 1]` 恢复 TMix 和 CMix shift state。
+整段接受时，直接使用算子已写回的 pool。
 
 ## Training
 

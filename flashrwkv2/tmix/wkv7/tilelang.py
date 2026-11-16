@@ -82,12 +82,13 @@ def _forward_kernel(
     bias_dtype: str = "float32",
     prefetch_tokens: int = 1,
     state_dtype: str = "float32",
+    checkpoint_interval: int = _CHECKPOINT,
 ):
     n, batch = T.dynamic("n, batch")
     state_slots = T.dynamic("state_slots") if indexed else batch
     columns = min(block_values, dim)
     key_groups = dim // 64
-    checkpoints = n // _CHECKPOINT + batch
+    checkpoints = n // checkpoint_interval + batch
     threads = columns * key_groups
     within_loop = T.unroll if prefetch_tokens > 1 and dim <= 128 else T.serial
 
@@ -190,10 +191,10 @@ def _forward_kernel(
                 for within in within_loop(prefetch_tokens):
                     token = start + chunk * prefetch_tokens + within
                     if prefetch_tokens == 1 or token < end:
-                        if save and (token - start) % _CHECKPOINT == 0:
+                        if save and (token - start) % checkpoint_interval == 0:
                             checkpoint = (
-                                start // _CHECKPOINT + seq
-                                + (token - start) // _CHECKPOINT
+                                start // checkpoint_interval + seq
+                                + (token - start) // checkpoint_interval
                             )
                             for key, value in T.Parallel(dim, columns):
                                 Boundaries[
@@ -441,12 +442,15 @@ def _backward_kernel(
     return kernel
 
 
-def _prepared_forward_kernel(device, *options):
+def _prepared_forward_kernel(device, *options, checkpoint_interval=_CHECKPOINT):
     variants = (options[:9] + (prefetch,) + options[10:] for prefetch in (1, 4)) if (
         options[1] == 64 and options[-1] == "float32"
         and _fixed_strategy_device(device_class(device))
     ) else (options,)
-    return prepared_kernel("tmix/wkv7", _forward_kernel, options, variants)
+    return prepared_kernel(
+        "tmix/wkv7", _forward_kernel, (*options, checkpoint_interval),
+        ((*variant, checkpoint_interval) for variant in variants),
+    )
 
 
 def _forward(
@@ -672,6 +676,9 @@ def _infer_recurrent(
     decay_bias=None,
     block_values=None,
     prefetch_tokens=None,
+    save=False,
+    boundaries=None,
+    checkpoint_interval=_CHECKPOINT,
 ):
     """Launch the common forward directly against an indexed inference pool."""
     if (
@@ -699,6 +706,30 @@ def _infer_recurrent(
         batch,
         inference=True,
     )
+    tokens, heads, dim = r.shape
+    if save:
+        if (not isinstance(checkpoint_interval, int) or isinstance(checkpoint_interval, bool)
+                or checkpoint_interval <= 0):
+            raise ValueError("checkpoint_interval must be a positive integer")
+        shape = (tokens // checkpoint_interval + batch, heads, dim, dim)
+        if boundaries is None:
+            boundaries = state_pool.new_empty(shape)
+        elif (
+            not isinstance(boundaries, torch.Tensor) or boundaries.shape != shape
+            or boundaries.dtype != state_pool.dtype or boundaries.device != r.device
+            or not boundaries.is_contiguous()
+        ):
+            raise ValueError(
+                f"boundaries must be contiguous {state_pool.dtype} with shape {shape} on {r.device}"
+            )
+        pool_start = state_pool.data_ptr()
+        boundary_start = boundaries.data_ptr()
+        if (boundary_start < pool_start + state_pool.nbytes
+                and pool_start < boundary_start + boundaries.nbytes):
+            raise ValueError("boundaries must not overlap state_pool")
+    else:
+        checkpoint_interval = _CHECKPOINT
+
     from ..._internal.tuning import get_config
 
     config = (64, 1)
@@ -718,7 +749,6 @@ def _infer_recurrent(
         )
     block_values = config[0] if block_values is None else block_values
     prefetch_tokens = config[1] if prefetch_tokens is None else prefetch_tokens
-    _, heads, dim = r.shape
     bias = _bias_tensor(r, decay_bias)
     output = torch.empty_like(v)
     empty = torch.empty((0, heads, dim, dim), dtype=state_pool.dtype, device=r.device)
@@ -727,13 +757,14 @@ def _infer_recurrent(
         dim,
         float(scale),
         bias.numel() != 0,
-        False,
+        save,
         block_values,
         True,
         True,
         "bfloat16" if bias.dtype == torch.bfloat16 else "float32",
         prefetch_tokens,
         str(state_pool.dtype).removeprefix("torch."),
+        checkpoint_interval=checkpoint_interval,
     )(
         r,
         decay_logits,
@@ -748,9 +779,9 @@ def _infer_recurrent(
         state_indices,
         output,
         empty,
-        empty,
+        boundaries if save else empty,
     )
-    return output
+    return (output, boundaries) if save else output
 
 
 @torch.library.custom_op("flashrwkv2::tmix_wkv7_forward", mutates_args=())

@@ -34,6 +34,28 @@ def _case():
     return inputs, state, cu, slots
 
 
+def _decode_reference(infer, prepare_state, inputs, initial, lengths, slots):
+    pool = initial.clone()
+    handle = prepare_state(pool)
+    cu = slots.new_tensor([0, 1])
+    output, checkpoints = [], []
+    start = 0
+    for seq, length in enumerate(lengths):
+        indices = slots[seq:seq + 1]
+        slot = int(indices[0])
+        ticket = prepare_tmix_wkv7_recurrent_metadata(
+            cu, indices, total_tokens=1, state_pool_size=pool.shape[0], max_seqlen=1,
+        )
+        for token in range(start, start + length):
+            checkpoints.append(pool[slot].clone())
+            output.append(infer(
+                *(tensor[token:token + 1] for tensor in inputs),
+                state=handle, cu_seqlens=cu, state_indices=indices, validated_metadata=ticket,
+            ))
+        start += length
+    return torch.cat(output), pool, checkpoints
+
+
 @pytest.mark.memcheck
 @pytest.mark.racecheck
 def test_public_recurrence_matches_functional_and_preserves_inactive_slots():
@@ -52,6 +74,79 @@ def test_public_recurrence_matches_functional_and_preserves_inactive_slots():
     assert torch.equal(pool, expected_pool)
     assert torch.equal(pool[[0, 2]], initial[[0, 2]])
     assert actual.dtype == torch.bfloat16
+
+
+@pytest.mark.parametrize("dtype,interval", [
+    pytest.param(torch.float32, 1, marks=(pytest.mark.memcheck, pytest.mark.racecheck)),
+    (torch.float32, 3),
+    (torch.float32, 16),
+    (torch.float16, 1),
+])
+def test_infer_recurrent_checkpoints_match_token_decode(dtype, interval):
+    _require_cuda_extension()
+    torch.manual_seed(634)
+    inputs = tuple(
+        (torch.randn(24, 2, 64, device="cuda") * 0.1).bfloat16() for _ in range(6)
+    )
+    initial = (torch.randn(7, 2, 64, 64, device="cuda") * 0.02).to(dtype)
+    slots = torch.tensor([5, 1, 3], dtype=torch.int32, device="cuda")
+    cu = slots.new_tensor([0, 2, 7, 24])
+    starts, lengths = (0, 2, 7), (2, 5, 17)
+    if dtype == torch.float32:
+        infer = infer_tmix_wkv7_recurrent_fp32io16_forward_varlen
+        prepare = prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor
+    else:
+        infer = infer_tmix_wkv7_recurrent_fp16_forward_varlen
+        prepare = prepare_tmix_wkv7_recurrent_fp16_state_from_tensor
+    expected, expected_pool, checkpoints = _decode_reference(
+        infer, prepare, inputs, initial, lengths, slots,
+    )
+    pool = initial.clone()
+    state = prepare(pool)
+    boundaries = initial.new_full((24 // interval + 3, 2, 64, 64), 123)
+    wanted = boundaries.clone()
+    written = []
+    for seq, (start, length) in enumerate(zip(starts, lengths, strict=True)):
+        for token in range(0, length, interval):
+            index = start // interval + seq + token // interval
+            wanted[index] = checkpoints[start + token]
+            written.append(index)
+
+    result, saved = infer(
+        *inputs, state=state, cu_seqlens=cu, state_indices=slots,
+        save=True, boundaries=boundaries, checkpoint_interval=interval,
+    )
+    assert saved is boundaries
+    assert torch.equal(result, expected)
+    assert torch.equal(pool, expected_pool)
+    assert torch.equal(saved, wanted)
+
+    if dtype == torch.float32 and interval == 16:
+        pool.copy_(initial)
+        result, allocated = infer(
+            *inputs, state=state, cu_seqlens=cu, state_indices=slots, save=True,
+        )
+        assert torch.equal(result, expected)
+        assert torch.equal(allocated[written], wanted[written])
+        assert torch.equal(pool, expected_pool)
+
+
+def test_invalid_checkpoint_requests_preserve_pool():
+    _require_cuda_extension()
+    inputs, pool, cu, slots = _case()
+    initial = pool.clone()
+    infer = infer_tmix_wkv7_recurrent_fp32io16_forward_varlen
+    state = prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor(pool)
+    args = dict(state=state, cu_seqlens=cu, state_indices=slots, save=True)
+    for interval in (0, True, 1.5):
+        with pytest.raises(ValueError, match="positive integer"):
+            infer(*inputs, **args, checkpoint_interval=interval)
+    for invalid in (pool[:1], pool[:2].half(), pool[:2].transpose(-1, -2)):
+        with pytest.raises(ValueError, match="contiguous .* with shape"):
+            infer(*inputs, **args, boundaries=invalid)
+    with pytest.raises(ValueError, match="overlap state_pool"):
+        infer(*inputs, **args, boundaries=pool[:2])
+    assert torch.equal(pool, initial)
 
 
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.float16])
@@ -260,6 +355,78 @@ def test_wkv_zero_active_precapture_warmup_then_graph_replay(
     graph.replay()
     torch.cuda.synchronize()
     assert torch.equal(state, initial_state)
+
+
+@pytest.mark.cuda_graph
+def test_verify_checkpoint_graph_writes_only_active_prefixes():
+    _require_cuda_extension()
+    torch.manual_seed(635)
+    inputs = tuple(
+        (torch.randn(8, 1, 64, device="cuda") * 0.1).bfloat16() for _ in range(6)
+    )
+    initial = torch.randn(4, 1, 64, 64, device="cuda").mul_(0.02)
+    pool = initial.clone()
+    prepare = prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor
+    infer = infer_tmix_wkv7_recurrent_fp32io16_forward_varlen
+    handle = prepare(pool)
+    boundaries = initial.new_full((10, 1, 64, 64), 123)
+    offsets = torch.tensor([0, -1, -1], device="cuda", dtype=torch.int32)
+    slots = offsets.new_full((2,), 99)
+    active_tokens = offsets.new_zeros(1)
+    active_sequences = offsets.new_zeros(1)
+
+    def launch():
+        ticket = prepare_tmix_wkv7_recurrent_metadata(
+            offsets, slots, state_pool_size=4, token_capacity=8, sequence_capacity=2,
+            max_seqlen_capacity=8, num_active_tokens=active_tokens,
+            num_active_sequences=active_sequences,
+        )
+        return infer(
+            *inputs, state=handle, cu_seqlens=offsets, state_indices=slots,
+            validated_metadata=ticket, save=True, boundaries=boundaries, checkpoint_interval=1,
+        )[0]
+
+    current = torch.cuda.current_stream()
+    side = torch.cuda.Stream()
+    side.wait_stream(current)
+    with torch.cuda.stream(side):
+        launch()
+    current.wait_stream(side)
+    assert torch.equal(pool, initial)
+    assert (boundaries == 123).all()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=side):
+        output = launch()
+
+    for lengths, slot_values in [((5,), [3, 99]), ((2, 4), [1, 0])]:
+        counts = [0, lengths[0], sum(lengths) if len(lengths) == 2 else -1]
+        offsets.copy_(offsets.new_tensor(counts))
+        slots.copy_(slots.new_tensor(slot_values))
+        active_tokens.fill_(sum(lengths))
+        active_sequences.fill_(len(lengths))
+        pool.copy_(initial)
+        boundaries.fill_(123)
+        expected, final, rows = _decode_reference(infer, prepare, inputs, initial, lengths, slots)
+        wanted = torch.full_like(boundaries, 123)
+        start = 0
+        for seq, length in enumerate(lengths):
+            wanted[start + seq:start + seq + length] = torch.stack(rows[start:start + length])
+            start += length
+
+        graph.replay()
+        assert torch.equal(output[:start], expected)
+        assert torch.isnan(output[start:]).all()
+        assert torch.equal(boundaries, wanted)
+        assert torch.equal(pool, final)
+
+    pool.copy_(initial)
+    boundaries.fill_(123)
+    slots.fill_(1)
+    graph.replay()
+    assert torch.isnan(output).all()
+    assert torch.equal(pool, initial)
+    assert (boundaries == 123).all()
 
 
 def test_static_metadata_validates_once_and_reads_only_a_summary() -> None:

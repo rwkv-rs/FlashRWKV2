@@ -213,6 +213,7 @@ def test_infer_tmix_postnorm_tokenshift_matches_shared_t1_path(use_ticket: bool)
     params = [(torch.randn(c, device=device) * 0.1).to(torch.bfloat16) for _ in range(6)]
     initial = torch.randn(5, c, device=device, dtype=torch.bfloat16)
     shift_state = initial.clone()
+    saved = torch.full_like(x, 123)
     cu_seqlens = torch.tensor([0, 1], device=device, dtype=torch.int32)
     state_indices = torch.tensor([3], device=device, dtype=torch.int32)
     ticket = prepare_tmix_wkv7_recurrent_metadata(
@@ -234,6 +235,7 @@ def test_infer_tmix_postnorm_tokenshift_matches_shared_t1_path(use_ticket: bool)
             cu_seqlens=cu_seqlens,
             state_indices=state_indices,
             validated_metadata=ticket if use_ticket else None,
+            save_normalized=saved,
         )
 
     assert "aten::max" not in recorder.operations
@@ -258,6 +260,7 @@ def test_infer_tmix_postnorm_tokenshift_matches_shared_t1_path(use_ticket: bool)
     expected_state = initial.clone()
     expected_state[3] = normalized[0]
     assert torch.allclose(shift_state, expected_state, atol=0.01, rtol=0.01)
+    assert torch.equal(saved[0], shift_state[3])
     assert torch.equal(shift_state[[0, 1, 2, 4]], initial[[0, 1, 2, 4]])
 
 
@@ -353,6 +356,7 @@ def test_infer_tokenshift_generic_packed_ragged_matches_reference() -> None:
     ]
     initial = torch.randn(5, channels, device=device, dtype=torch.bfloat16) * 0.02
     state = initial.clone()
+    saved = torch.full_like(x, 123)
     cu = torch.tensor([0, 1, 4], device=device, dtype=torch.int32)
     slots = torch.tensor([3, 1], device=device, dtype=torch.int32)
     ticket = prepare_tmix_wkv7_recurrent_metadata(
@@ -368,6 +372,7 @@ def test_infer_tokenshift_generic_packed_ragged_matches_reference() -> None:
         cu_seqlens=cu,
         state_indices=slots,
         validated_metadata=ticket,
+        save_normalized=saved,
     )
     summed = (x + res).float()
     centered = summed - summed.mean(dim=-1, keepdim=True)
@@ -395,16 +400,29 @@ def test_infer_tokenshift_generic_packed_ragged_matches_reference() -> None:
     torch.testing.assert_close(
         state.float(), expected_state.float(), atol=0.01, rtol=0.01
     )
+    decode_state = initial.clone()
+    one = cu.new_tensor([0, 1])
+    for row, seq in enumerate((0, 1, 1, 1)):
+        decoded = infer_tmix_postnorm_tokenshift_forward_varlen(
+            x[row:row + 1], res[row:row + 1], weight, bias, *params,
+            shift_state_pool=decode_state, cu_seqlens=one, state_indices=slots[seq:seq + 1],
+        )
+        assert torch.equal(saved[row:row + 1], decode_state[slots[seq:seq + 1].long()])
+        assert all(torch.equal(actual[row:row + 1], want) for actual, want in zip(outputs, decoded, strict=True))
+    assert torch.equal(state, decode_state)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.cuda
 @pytest.mark.cuda_graph
-def test_infer_tokenshift_postnorm_tokenshift_cuda_graph_zero_active_has_no_state_side_effect() -> None:
+@pytest.mark.parametrize("length,capacity", [(1, 2), (5, 8)])
+def test_shift_state_export_cuda_graph_writes_only_active_rows(length, capacity):
+    from flashrwkv2.cmix import infer_cmix_forward_varlen
+
     torch.manual_seed(20260809)
     device = torch.device("cuda")
     channels, num_slots = 4096, 4
-    x = torch.randn(1, channels, device=device, dtype=torch.bfloat16)
+    x = torch.randn(capacity, channels, device=device, dtype=torch.bfloat16)
     res = torch.randn_like(x)
     weight = torch.randn(channels, device=device, dtype=torch.bfloat16)
     bias = torch.randn(channels, device=device, dtype=torch.bfloat16)
@@ -413,75 +431,67 @@ def test_infer_tokenshift_postnorm_tokenshift_cuda_graph_zero_active_has_no_stat
         for _ in range(6)
     ]
     initial = torch.randn(num_slots, channels, device=device, dtype=torch.bfloat16)
-    shift_state = initial.clone()
-    cu_seqlens = torch.tensor([0, 1], device=device, dtype=torch.int32)
-    state_indices = torch.tensor([3], device=device, dtype=torch.int32)
-    num_active_tokens = torch.tensor([1], device=device, dtype=torch.int32)
-    num_active_sequences = torch.tensor([1], device=device, dtype=torch.int32)
+    cmix_key = torch.randn(64, channels, device=device, dtype=torch.bfloat16) * 0.01
+    cmix_value = torch.randn_like(cmix_key) * 0.01
+    pools = (initial.clone(), initial.clone())
+    saves = (torch.full_like(x, 123), torch.full_like(x, 123))
+    cu = torch.tensor([0, length, -1], device=device, dtype=torch.int32)
+    indices = cu.new_tensor([3, 99])
+    num_active_tokens = cu.new_tensor([length])
+    num_active_sequences = cu.new_tensor([1])
 
-    infer_tmix_postnorm_tokenshift_forward_varlen(
-        x,
-        res,
-        weight,
-        bias,
-        *params,
-        shift_state_pool=initial.clone(),
-        cu_seqlens=cu_seqlens,
-        state_indices=state_indices,
-        max_seqlen=1,
-    )
-    torch.cuda.synchronize()
+    def infer(values, residual, offsets, slots, states, normalized, ticket=None):
+        tmix = infer_tmix_postnorm_tokenshift_forward_varlen(
+            values, residual, weight, bias, *params,
+            shift_state_pool=states[0], cu_seqlens=offsets, state_indices=slots,
+            validated_metadata=ticket, save_normalized=normalized[0],
+        )
+        cmix = infer_cmix_forward_varlen(
+            values, residual, weight, bias, params[0], cmix_key, cmix_value,
+            shift_state_pool=states[1], cu_seqlens=offsets, state_indices=slots,
+            validated_metadata=ticket, save_normalized=normalized[1],
+        )
+        return (*tmix, *cmix)
 
-    expected_state = initial.clone()
-    expected_outputs = infer_tmix_postnorm_tokenshift_forward_varlen(
-        x,
-        res,
-        weight,
-        bias,
-        *params,
-        shift_state_pool=expected_state,
-        cu_seqlens=cu_seqlens,
-        state_indices=state_indices,
-        max_seqlen=1,
-    )
-    torch.cuda.synchronize()
-
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
+    def launch():
         ticket = prepare_tmix_wkv7_recurrent_metadata(
-            cu_seqlens,
-            state_indices,
-            state_pool_size=num_slots,
-            token_capacity=1,
-            sequence_capacity=1,
-            max_seqlen_capacity=1,
+            cu, indices, state_pool_size=num_slots, token_capacity=capacity,
+            sequence_capacity=2, max_seqlen_capacity=length,
             num_active_tokens=num_active_tokens,
             num_active_sequences=num_active_sequences,
         )
-        graph_outputs = infer_tmix_postnorm_tokenshift_forward_varlen(
-            x,
-            res,
-            weight,
-            bias,
-            *params,
-            shift_state_pool=shift_state,
-            cu_seqlens=cu_seqlens,
-            state_indices=state_indices,
-            validated_metadata=ticket,
-        )
+        return infer(x, res, cu, indices, pools, saves, ticket)
 
-    shift_state.copy_(initial)
+    expected_pools = (initial.clone(), initial.clone())
+    expected_saves = (torch.empty_like(x[:length]), torch.empty_like(x[:length]))
+    expected = infer(x[:length], res[:length], cu[:2], indices[:1], expected_pools, expected_saves)
+    current = torch.cuda.current_stream()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(current)
+    with torch.cuda.stream(stream):
+        launch()
+    current.wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        outputs = launch()
+
+    for pool, saved in zip(pools, saves, strict=True):
+        pool.copy_(initial)
+        saved.fill_(123)
     graph.replay()
-    torch.cuda.synchronize()
-    for actual, expected in zip(graph_outputs, expected_outputs, strict=True):
-        assert torch.equal(actual, expected)
-    assert torch.equal(shift_state, expected_state)
+    for actual, reference in zip(outputs, expected, strict=True):
+        assert torch.equal(actual[:length], reference)
+    for pool, saved, expected_pool, expected_saved in zip(pools, saves, expected_pools, expected_saves, strict=True):
+        assert torch.equal(pool, expected_pool)
+        assert torch.equal(saved[:length], expected_saved)
+        assert (saved[length:] == 123).all()
+        pool.copy_(initial)
+        saved.fill_(123)
 
-    shift_state.copy_(initial)
-    cu_seqlens.zero_()
-    state_indices.fill_(99)
+    indices.fill_(99)
     num_active_tokens.zero_()
     num_active_sequences.zero_()
     graph.replay()
-    torch.cuda.synchronize()
-    assert torch.equal(shift_state, initial)
+    for pool, saved in zip(pools, saves, strict=True):
+        assert torch.equal(pool, initial)
+        assert (saved == 123).all()

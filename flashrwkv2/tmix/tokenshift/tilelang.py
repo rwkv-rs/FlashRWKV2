@@ -43,8 +43,27 @@ def _pack_mixes(x, mixes, *, pack=True):
     return mixes[0].unsqueeze(0) if len(mixes) == 1 else torch.stack(mixes)
 
 
-@tilelang.jit(pass_configs={"tl.enable_fast_math": False}, out_idx=[13, 14], compile_flags=["--fmad=false"])
-def _fused_forward(channels: int, count: int, eps: float, rows_per_block: int = 1):
+def _check_save_normalized(buffer, x, *other_inputs):
+    if buffer is None:
+        return
+    if (
+        not isinstance(buffer, torch.Tensor) or buffer.shape != x.shape
+        or buffer.dtype != torch.bfloat16 or not buffer.is_cuda
+        or buffer.device != x.device or not buffer.is_contiguous()
+    ):
+        raise ValueError("save_normalized must be contiguous CUDA bfloat16 with x's shape and device")
+    if x.shape[-1] % 2 == 0 and buffer.data_ptr() % 4:
+        raise ValueError("save_normalized must be 4-byte aligned")
+    storage = buffer.untyped_storage().data_ptr()
+    if any(t.untyped_storage().data_ptr() == storage for t in (x, *other_inputs) if t is not None):
+        raise ValueError("save_normalized must use storage separate from the inputs and shift_state_pool")
+
+
+@tilelang.jit(pass_configs={"tl.enable_fast_math": False}, out_idx=[14, 15], compile_flags=["--fmad=false"])
+def _fused_forward(
+    channels: int, count: int, eps: float, rows_per_block: int = 1,
+    save_normalized: bool = False,
+):
     rows, slots = T.dynamic("rows, slots")
     block, row_threads, layout = _row_layout(channels, rows_per_block)
 
@@ -63,6 +82,7 @@ def _fused_forward(channels: int, count: int, eps: float, rows_per_block: int = 
         Pool: T.Tensor((slots, channels), "bfloat16"),
         Indices: T.Tensor((rows,), "int32"),
         Status: T.Tensor((3,), "int32"),
+        Normalized: T.Tensor((rows if save_normalized else 0, channels), "bfloat16"),
         Sum: T.Tensor((rows, channels), "bfloat16"),
         Y: T.Tensor((count, rows, channels), "bfloat16"),
     ):
@@ -115,12 +135,16 @@ def _fused_forward(channels: int, count: int, eps: float, rows_per_block: int = 
                 row = tile * rows_per_block + r
                 if row < rows and c < channels and Status[0] == 0 and row < Status[2]:
                     Pool[Indices[row], c] = normalized[r, c]
+                    if save_normalized:
+                        Normalized[row, c] = normalized[r, c]
 
     return kernel
 
 
 @torch.no_grad()
-def fused_post_norm_tokenshift(x, res, weight, bias, mixes, pool, indices, status, eps=1e-5):
+def fused_post_norm_tokenshift(
+    x, res, weight, bias, mixes, pool, indices, status, eps=1e-5, *, save_normalized=None,
+):
     """Fuse T=1 ln and indexed TokenShift for TMix's six or CMix's one mix."""
     _check_norm(x, weight, bias, res, eps)
     mixes = _pack_mixes(x, mixes, pack=False)
@@ -145,16 +169,19 @@ def fused_post_norm_tokenshift(x, res, weight, bias, mixes, pool, indices, statu
     )
     # CMix reuses its pointer for the unused TMix parameter arguments.
     mix_args = mixes + (mixes[-1],) * (6 - len(mixes))
-    total, output = prepared_kernel("tmix/tokenshift/fused", _fused_forward, (x.shape[1], len(mixes), float(eps), group))(
-        x, res, weight, bias, *mix_args, pool, indices, status
+    save = save_normalized is not None
+    options = (x.shape[1], len(mixes), float(eps), group, save)
+    total, output = prepared_kernel("tmix/tokenshift/fused", _fused_forward, options)(
+        x, res, weight, bias, *mix_args, pool, indices, status,
+        save_normalized if save else x[:0],
     )
     return total, tuple(output.unbind(0))
 
 
-@tilelang.jit(pass_configs={"tl.enable_fast_math": False}, out_idx=[5, 6], compile_flags=["--fmad=false"])
+@tilelang.jit(pass_configs={"tl.enable_fast_math": False}, out_idx=[6, 7], compile_flags=["--fmad=false"])
 def _forward(
     channels: int, count: int, index_dtype: str,
-    block: int = 256, use_status: bool = False,
+    block: int = 256, use_status: bool = False, save_normalized: bool = False,
 ):
     rows, batch = T.dynamic("rows, batch")
     threads = min(128, block // 2)
@@ -171,6 +198,7 @@ def _forward(
         Cu: T.Tensor((batch + 1,), index_dtype),
         Initial: T.Tensor((batch, channels), "bfloat16"),
         Status: T.Tensor((3 if use_status else 0,), index_dtype),
+        Normalized: T.Tensor((rows if save_normalized else 0, channels), "bfloat16"),
         Y: T.Tensor((count, rows, channels), "bfloat16"),
         Final: T.Tensor((batch, channels), "bfloat16"),
     ):
@@ -193,6 +221,8 @@ def _forward(
                     channel = bc * block + c
                     if channel < channels:
                         current[c] = X[row, channel]
+                        if save_normalized:
+                            Normalized[row, channel] = X[row, channel]
                         previous[c] = T.if_then_else(
                             row == Cu[lo[0]], Initial[lo[0], channel], X[row - 1, channel]
                         )
@@ -337,7 +367,9 @@ class _TokenShift(torch.autograd.Function):
             raise ValueError("tokenshift inputs must be 4-byte aligned")
         block = _tokenshift_block(x, mixes, cu_seqlens, initial)
         options = (x.shape[-1], mixes.shape[0], str(cu_seqlens.dtype).split(".")[-1], block)
-        y, final = prepared_kernel("tmix/tokenshift", _forward, options)(x, mixes, cu_seqlens, initial, cu_seqlens[:0])
+        y, final = prepared_kernel("tmix/tokenshift", _forward, options)(
+            x, mixes, cu_seqlens, initial, cu_seqlens[:0], x[:0],
+        )
         ctx.save_for_backward(x, mixes, cu_seqlens, initial)
         ctx.options = options
         return y, final
@@ -410,6 +442,7 @@ def tokenshift(
     initial_shift: torch.Tensor | None = None,
     *,
     _status: torch.Tensor | None = None,
+    _save_normalized: torch.Tensor | None = None,
 ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
     """Mix packed rows with their predecessor, preserving differentiable state.
 
@@ -439,8 +472,11 @@ def tokenshift(
         y, final = operation(x, mixes, cu_seqlens, initial_shift)
     else:
         block = _tokenshift_block(x, mixes, cu_seqlens, initial_shift, _status)
-        y, final = prepared_kernel("tmix/tokenshift", _forward, (channels, mixes.shape[0], str(cu_seqlens.dtype).split(".")[-1], block, True))(
-            x, mixes, cu_seqlens, initial_shift, _status
+        save = _save_normalized is not None
+        options = (channels, mixes.shape[0], str(cu_seqlens.dtype).split(".")[-1], block, True, save)
+        y, final = prepared_kernel("tmix/tokenshift", _forward, options)(
+            x, mixes, cu_seqlens, initial_shift, _status,
+            _save_normalized if save else x[:0],
         )
     return tuple(y.unbind(0)), final
 
@@ -479,12 +515,12 @@ def tune_tokenshift(x, mixes, cu_seqlens, initial_shift=None, *, _status=None):
 
     def functional(block):
         return _forward(*options, block)(
-            x[:active_rows], mixes, functional_cu, initial_shift, cu_seqlens[:0]
+            x[:active_rows], mixes, functional_cu, initial_shift, cu_seqlens[:0], x[:0],
         )
 
     def production(block):
         return _forward(*options, block, True)(
-            x, mixes, cu_seqlens, initial_shift, status
+            x, mixes, cu_seqlens, initial_shift, status, x[:0],
         )
 
     def check(block):
@@ -513,7 +549,7 @@ def tune_fused_tokenshift(x, res, weight, bias, mixes, pool, indices, status, ep
 
     def run(group):
         return _fused_forward(x.shape[1], len(mixes), eps, group)(
-            x, res, weight, bias, *mix_args, scratch, indices, status
+            x, res, weight, bias, *mix_args, scratch, indices, status, x[:0],
         )
 
     def check(group):

@@ -28,11 +28,16 @@ def infer_tmix_postnorm_tokenshift_forward_varlen(
     max_seqlen: int | None = None,
     eps: float = 1.0e-5,
     validated_metadata: object | None = None,
+    save_normalized: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, ...]:
-    """Packed BF16 res, ln and TokenShift with active-slot state updates."""
+    """Packed BF16 res, ln and TokenShift with active-slot state updates.
+
+    ``save_normalized`` optionally receives the BF16 shift state of each
+    active input row, including rows before the end of each sequence.
+    """
     from ..._internal.state import gather_state, scatter_state
     from ...post_norm.tilelang import norm
-    from .tilelang import fused_post_norm_tokenshift, tokenshift
+    from .tilelang import _check_save_normalized, fused_post_norm_tokenshift, tokenshift
 
     if x.ndim != 2:
         raise ValueError("x must have packed shape [total_tokens,C]")
@@ -42,6 +47,8 @@ def infer_tmix_postnorm_tokenshift_forward_varlen(
         or not shift_state_pool.is_contiguous() or shift_state_pool.device != x.device
     ):
         raise ValueError("shift_state_pool must be contiguous CUDA bfloat16 [slots,C]")
+    mixes = (x_r, x_w, x_k, x_v, x_a, x_g)
+    _check_save_normalized(save_normalized, x, res, weight, bias, *mixes, shift_state_pool)
     launch_max = _validate_launch_max_seqlen(max_seqlen)
     ticket = validated_metadata
     if ticket is None:
@@ -56,14 +63,14 @@ def infer_tmix_postnorm_tokenshift_forward_varlen(
     indices, status = ticket._state_indices_snapshot(), ticket._status()
     if ticket._max_seqlen() == 1 and x.shape[0] == indices.numel():
         total, mixed = fused_post_norm_tokenshift(
-            x, res, weight, bias, (x_r, x_w, x_k, x_v, x_a, x_g),
-            shift_state_pool, indices, status, eps,
+            x, res, weight, bias, mixes, shift_state_pool, indices, status, eps,
+            save_normalized=save_normalized,
         )
         return (total, *mixed)
     normalized, total = norm(x, weight, bias, eps, res, return_res=True)
     initial = gather_state(shift_state_pool, indices, status)
     mixed, final = tokenshift(
-        normalized, (x_r, x_w, x_k, x_v, x_a, x_g), cu, initial, _status=status,
+        normalized, mixes, cu, initial, _status=status, _save_normalized=save_normalized,
     )
     scatter_state(shift_state_pool, final, indices, status)
     return (total, *mixed)

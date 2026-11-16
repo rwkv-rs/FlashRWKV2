@@ -113,6 +113,7 @@ def _cmix(
     value_use_nora=False,
     *,
     status=None,
+    save_normalized=None,
 ):
     from ..tmix.tokenshift.tilelang import tokenshift
 
@@ -122,6 +123,7 @@ def _cmix(
         cu_seqlens,
         initial_shift,
         _status=status,
+        _save_normalized=save_normalized,
     )
     output = _project(
         mixed[0],
@@ -163,15 +165,18 @@ def infer_cmix_forward_varlen(
     value_lora_scale=1.0,
     key_use_nora=False,
     value_use_nora=False,
+    save_normalized: torch.Tensor | None = None,
 ):
     """Apply res/ln, TokenShift, ReLU² and projection to packed rows.
 
     The inference value weight retains its runtime [F,C] layout. A transpose
     view feeds the same projection as the training [C,F] weight.
+    ``save_normalized`` optionally receives the BF16 shift state of each
+    active input row.
     """
     from .._internal.state import gather_state, scatter_state
     from ..post_norm.tilelang import norm
-    from ..tmix.tokenshift.tilelang import fused_post_norm_tokenshift
+    from ..tmix.tokenshift.tilelang import _check_save_normalized, fused_post_norm_tokenshift
     from ..tmix.wkv7 import (
         _validate_launch_max_seqlen,
         prepare_tmix_wkv7_recurrent_metadata,
@@ -197,6 +202,10 @@ def infer_cmix_forward_varlen(
         or shift_state_pool.device != x.device
     ):
         raise ValueError("shift_state_pool must be contiguous CUDA bfloat16 [slots,C]")
+    _check_save_normalized(
+        save_normalized, x, res, weight, bias, x_k, shift_state_pool,
+        key_weight, value_weight, key_lora_a, key_lora_b, value_lora_a, value_lora_b,
+    )
     ticket = validated_metadata
     if ticket is None:
         ticket = prepare_tmix_wkv7_recurrent_metadata(
@@ -227,6 +236,7 @@ def infer_cmix_forward_varlen(
             state_indices,
             status,
             eps,
+            save_normalized=save_normalized,
         )
         return residual, _project(
             mixed[0],
@@ -259,6 +269,7 @@ def infer_cmix_forward_varlen(
         key_use_nora,
         value_use_nora,
         status=status,
+        save_normalized=save_normalized,
     )
     scatter_state(shift_state_pool, final, state_indices, status)
     return residual, output
