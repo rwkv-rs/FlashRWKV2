@@ -24,6 +24,7 @@ import torch
 from ..._internal.tuning import (
     _AutogradContext,
     _fixed_strategy_device,
+    _preparing_kernels,
     device_class,
     prepared_kernel,
     tuning_operation,
@@ -515,25 +516,22 @@ def _direct_backward_kernel(heads, scale, has_bias, bias_dtype, segmented):
     return kernel
 
 
-def _direct_vjp(r, w, k, v, a, b, cu, bias, boundary, dy, ds, scale):
+def _direct_vjp(r, w, k, v, a, b, cu, bias, boundary, dy, ds, options, segmented):
     n, heads, dim = r.shape
     batch = ds.shape[0]
-    has_bias = bias.numel() != 0
-    bias_dtype = "bfloat16" if bias.dtype == torch.bfloat16 else "float32"
-    segmented = n > _BACKWARD_SEGMENT and batch * heads < 128
+    _, _, has_bias, bias_dtype = options
     sa = torch.empty_like(r, dtype=torch.float32)
     ds0 = torch.empty_like(ds)
     gradients = r.new_empty((6, n, heads, dim))
-    device = r.device
-    prepared_kernel("tmix/wkv7", _prepare_sa_kernel, (heads, has_bias, bias_dtype))(
+    _prepare_sa_kernel(heads, has_bias, bias_dtype)(
         w, k, v, a, b, cu, bias, boundary, sa,
     )
     incoming = ds.new_empty((n // _BACKWARD_SEGMENT + batch if segmented else 0, heads, dim, dim))
     if segmented:
-        prepared_kernel("tmix/wkv7", _adjoint_boundaries_kernel, (heads, scale, has_bias, bias_dtype))(
+        _adjoint_boundaries_kernel(*options)(
             r, w, a, b, dy, cu, bias, ds, incoming,
         )
-    prepared_kernel("tmix/wkv7", _direct_backward_kernel, (heads, scale, has_bias, bias_dtype, segmented))(
+    _direct_backward_kernel(*options, segmented)(
         r, w, k, v, a, b, cu, bias, boundary, sa, dy, ds, incoming, gradients, ds0,
     )
     return gradients, ds0
@@ -848,23 +846,35 @@ def _recurrent_vjp(ctx, grad_output, grad_final_state):
         if grad_final_state is None
         else grad_final_state.contiguous()
     )
-    # The extra replay launch pays off on longer sequences. Keep the shared
-    # history path for short batches, wider heads and status-masked capacity.
-    if r.shape[2] == 64 and r.shape[0] >= max(4096, _CHECKPOINT * ds.shape[0]) and status.numel() == 0:
-        rounded, ds0 = _direct_vjp(r, w, k, v, a, b, cu, bias, boundary, dy, ds, ctx.scale)
+    n, heads, dim = r.shape
+    batch = ds.shape[0]
+    has_bias = bias.numel() != 0
+    has_status = status.numel() != 0
+    bias_dtype = "bfloat16" if bias.dtype == torch.bfloat16 else "float32"
+    options = heads, dim, ctx.scale, has_bias, has_status, bias_dtype
+    direct_options = heads, ctx.scale, has_bias, bias_dtype
+    can_direct = dim == 64 and not has_status
+    # The extra replay launch pays off on longer sequences.
+    direct = can_direct and n >= max(4096, _CHECKPOINT * batch)
+    segmented = n > _BACKWARD_SEGMENT and batch * heads < 128
+    if _preparing_kernels():
+        # Token and batch thresholds only select among these JIT variants.
+        fixed = can_direct and _fixed_strategy_device(device_class(r.device))
+        if fixed or not direct:
+            prepared_kernel("tmix/wkv7", _backward_kernel, options)
+        if fixed or direct:
+            prepared_kernel("tmix/wkv7", _prepare_sa_kernel, (heads, has_bias, bias_dtype))
+            if segmented or (fixed and heads < 128):
+                prepared_kernel("tmix/wkv7", _adjoint_boundaries_kernel, direct_options)
+            variants = ((*direct_options, False), (*direct_options, True)) if fixed and heads < 128 else ()
+            prepared_kernel("tmix/wkv7", _direct_backward_kernel, (*direct_options, segmented), variants)
+    if direct:
+        rounded, ds0 = _direct_vjp(r, w, k, v, a, b, cu, bias, boundary, dy, ds, direct_options, segmented)
         dbias = rounded[1].float().sum(dim=0).to(bias.dtype) if bias.numel() else None
         return rounded, ds0, dbias
     gradients = torch.zeros((6, *r.shape), dtype=torch.float32, device=r.device)
     ds0 = torch.empty_like(ds)
-    _, heads, dim = r.shape
-    prepared_kernel("tmix/wkv7", _backward_kernel, (
-        heads,
-        dim,
-        ctx.scale,
-        bias.numel() != 0,
-        status.numel() != 0,
-        "bfloat16" if bias.dtype == torch.bfloat16 else "float32",
-    ))(
+    _backward_kernel(*options)(
         r,
         w,
         k,

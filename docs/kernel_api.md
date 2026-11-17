@@ -188,7 +188,7 @@ workloads. Norm and Readout preserve their existing statistics/residual semantic
 from flashrwkv2 import prepare_tuning
 
 # Real calls with disposable/reset state; include backward when training.
-report = prepare_tuning(warmup_calls, mode="tune")
+report = prepare_tuning(warmup_calls, mode="require")
 assert report["complete"]
 # Restore serving state, then specialize torch.compile and capture CUDA Graphs.
 ```
@@ -213,7 +213,12 @@ and CUDA Graph capture shapes are separate initialization responsibilities.
 | PostNorm / TokenShift forward | 1 |
 | PostNorm / TokenShift / Readout backward, per gradient requirement | 6 |
 | Readout / WKV forward, head size 64 and FP32 WKV state | 2 |
-| WKV backward; state transfer per gather/scatter direction | 1 |
+| WKV backward, head size 64 without status masking | 5 |
+| Other WKV backward; state transfer per gather/scatter direction | 1 |
+
+Head-size-64 backward prepares shared replay, direct checkpoint replay and the
+segment-boundary kernels for the observed bias and scaling form. A short
+training warmup covers the packed-token and batch-head dispatch thresholds.
 
 Single-variant auxiliary kernels are warmed by the real calls. A required compile
 failure aborts preparation with its owner and key; it is never silently skipped.

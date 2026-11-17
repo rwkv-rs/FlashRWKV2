@@ -176,13 +176,14 @@ layouts and gradient requirements:
 ```python
 from flashrwkv2 import prepare_tuning
 
-report = prepare_tuning(warmup_calls, mode="tune")
+report = prepare_tuning(warmup_calls, mode="require")
 assert report["complete"]
 ```
 
-Prepare before torch.compile specialization and CUDA Graph capture. Other paths
-retain verified profiles and bounded tuning. After upgrading, prepare again;
-compatible TileLang binaries can be reused. See the
+Prepare before torch.compile specialization and CUDA Graph capture. The fixed
+paths work with an empty tuning profile cache. For other paths, use `mode="tune"`
+to generate missing verified profiles. After upgrading, prepare again to reuse
+compatible TileLang binaries. See the
 [preparation and cache contract](docs/kernel_api.md#tuning-and-acceptance) for
 coverage, state ownership, validation and performance results.
 

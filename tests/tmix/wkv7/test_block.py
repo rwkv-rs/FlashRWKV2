@@ -767,8 +767,11 @@ def test_block_independent_torch_vjp_and_optimizer_step(mode):
         ), f"{names}: optimizer did not update this block stage"
 
 
-@pytest.mark.parametrize("training", (False, True))
-def test_prepared_block_has_no_tilelang_compilation_for_new_tokens(monkeypatch, training):
+@pytest.mark.parametrize(
+    "channels,ranks,use_vres",
+    ((2560, (96, 96, 320, 64), True), (4096, (128, 128, 480, 96), False)),
+)
+def test_prepared_block_has_no_tilelang_compilation_for_new_tokens(monkeypatch, tmp_path, channels, ranks, use_vres):
     import tilelang
     from tilelang.jit import JITImpl
 
@@ -777,42 +780,68 @@ def test_prepared_block_has_no_tilelang_compilation_for_new_tokens(monkeypatch, 
     if not tuning._fixed_strategy_device(tuning.device_class(torch.device("cuda"))):
         pytest.skip("deterministic strategy is qualified on tested devices")
     torch.manual_seed(804)
-    params = parameters(128, rank=32, vocab=257)
-    initial = torch.randn(1, 2, 64, 64, device="cuda") * .01
-    shifts = tuple(torch.randn(1, 128, device="cuda").bfloat16() * .1 for _ in range(2))
+    heads = channels // 64
+    params = parameters(channels, ranks=ranks)
+    initial = torch.randn(1, heads, 64, 64, device="cuda") * .01
+    shifts = tuple(torch.randn(1, channels, device="cuda").bfloat16() * .1 for _ in range(2))
+
     def inputs(length, batch=1):
-        x = (torch.randn(batch, length, 128, device="cuda") * .1).bfloat16()
+        x = (torch.randn(batch, length, channels, device="cuda") * .1).bfloat16()
         res = torch.randn_like(x) * .1
         targets = torch.randint(257, (batch, length), device="cuda")
-        return x, res, targets
-    def call(data):
-        x, res, targets = data
+        v_first = torch.randn_like(x) * .1 if use_vres else None
+        return x, res, targets, v_first
+
+    def call(data, training):
+        x, res, targets, v_first = data
         batch = x.shape[0]
         current = initial.expand(batch, -1, -1, -1).contiguous()
         previous = tuple(s.expand(batch, -1).contiguous() for s in shifts)
         if training:
-            values = train_block(x.requires_grad_(), res.requires_grad_(), params,
-                                 current, previous, targets, 64, None)
-            return torch.autograd.grad(-values[0].sum(), (x, res, *params.values()), allow_unused=True)
+            x, res = x.detach().requires_grad_(), res.detach().requires_grad_()
+            values = train_block(x, res, params, current, previous, targets, 64, v_first)
+            torch.autograd.grad(-values[0].sum(), (x, res, *params.values()), allow_unused=True)
+            return tuple(value.detach() for value in values)
         slots = torch.arange(batch, device="cuda", dtype=torch.int32)
         cu = torch.arange(batch + 1, device="cuda", dtype=torch.int32) * x.shape[1]
         state, pools = state_pools(current, previous, slots, batch + 7)
-        return infer_block(x.flatten(0, 1), res.flatten(0, 1), params, state, pools,
-                           cu, slots, targets.flatten(), 64, None)
-    warmups = [inputs(32)] if training else [inputs(1), inputs(32)]
-    report = fr.prepare_tuning([lambda data=data: call(data) for data in warmups])
-    assert report["complete"] and report["counts"]["missing"] == 0
+        logprobs, logits = infer_block(
+            x.flatten(0, 1), res.flatten(0, 1), params, state, pools, cu, slots,
+            targets.flatten(), 64, None if v_first is None else v_first.flatten(0, 1),
+        )
+        return (
+            logprobs.view_as(targets), logits.view(batch, x.shape[1], -1),
+            state._components()[0][:batch], *(pool[:batch] for pool in pools),
+        )
+
+    profile_root = tmp_path / "profiles"
+
     def forbidden(*args, **kwargs):
-        pytest.fail("new tokens triggered TileLang compilation, code generation, or search")
+        pytest.fail("fixed workloads accessed a profile, searched, or compiled outside preparation")
+
+    monkeypatch.setattr(tuning, "_profile_root", lambda: profile_root)
+    monkeypatch.setattr(tuning, "_LOADED", {})
+    monkeypatch.setattr(tuning, "_read_profile", forbidden)
+    monkeypatch.setattr(tuning, "save_config", forbidden)
+    monkeypatch.setattr(tuning, "select_config", forbidden)
+    prefill, decode = inputs(32), inputs(1)
+    report = fr.prepare_tuning([
+        lambda: call(prefill, True), lambda: call(prefill, False), lambda: call(decode, False),
+    ])
+    assert report["complete"] and report["counts"]["fixed"] > 0
+    assert all(report["counts"][status] == 0 for status in ("hit", "missing", "tuned"))
     monkeypatch.setattr(JITImpl, "compile", forbidden)
     monkeypatch.setattr(tilelang, "compile", forbidden)
     monkeypatch.setattr(tilelang, "par_compile", forbidden)
-    monkeypatch.setattr(tuning, "select_config", forbidden)
-    monkeypatch.setattr(tuning, "_read_profile", forbidden)
-    import random
-    for length in (1, 17, 31, 64, 65, 89, 90, 100, 129, 257, 513, 1024,
-                   *random.Random(805).sample(range(1, 1025), 20)):
-        call(inputs(length))
-    for batch in (89, 90, 100):
-        call(inputs(1, batch))
+    # Cross both N=4096 and the B*H segmentation cutoff with unseen shapes.
+    large_batch = math.ceil(128 / heads)
+    for batch, length in (
+        (2, 1), (1, 65), (1, 4095), (1, 4096), (1, 4097),
+        (large_batch, 4096 // large_batch + 1),
+    ):
+        data = inputs(length, batch)
+        for actual, expected in zip(call(data, False), call(data, True), strict=True):
+            bits = torch.int32 if expected.dtype == torch.float32 else torch.int16
+            assert torch.equal(actual.view(bits), expected.view(bits)), (batch, length)
     torch.cuda.synchronize()
+    assert not profile_root.exists()
