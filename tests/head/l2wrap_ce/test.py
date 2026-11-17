@@ -12,8 +12,8 @@ from flashrwkv2.head.l2wrap_ce import pretrain_head_l2wrap_ce_bf16
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.cuda
 @pytest.mark.memcheck
-@pytest.mark.parametrize("chunk_rows", (1, 2))
-def test_head_l2wrap_forward_backward(chunk_rows: int) -> None:
+@pytest.mark.parametrize(("chunk_rows", "backward_chunk_rows"), ((1, None), (2, 3)))
+def test_head_l2wrap_forward_backward(chunk_rows: int, backward_chunk_rows: int | None) -> None:
     torch.manual_seed(29)
     device = torch.device("cuda")
     hidden = torch.randn(
@@ -23,7 +23,12 @@ def test_head_l2wrap_forward_backward(chunk_rows: int) -> None:
         torch.randn(65536, 8, device=device, dtype=torch.bfloat16) * 0.01
     ).requires_grad_()
     targets = torch.tensor([3, 4096, 65535], device=device, dtype=torch.int64)
-    loss = pretrain_head_l2wrap_ce_bf16(hidden, weight, targets, chunk_rows=chunk_rows)
+    loss = pretrain_head_l2wrap_ce_bf16(
+        hidden, weight, targets, chunk_rows=chunk_rows, backward_chunk_rows=backward_chunk_rows,
+    )
+    if backward_chunk_rows is not None:
+        expected_loss = pretrain_head_l2wrap_ce_bf16(hidden, weight, targets, chunk_rows=chunk_rows)
+        assert torch.equal(loss, expected_loss)
     hidden_ref = hidden.detach().clone().requires_grad_()
     weight_ref = weight.detach().clone().requires_grad_()
     logits = hidden_ref.float().reshape(-1, 8) @ weight_ref.float().t()
@@ -132,7 +137,7 @@ def test_fullgraph_head_loss_ten_steps_preserve_loss_and_grad_norm(use_nora):
 
     def loss_function(a, b):
         return pretrain_head_l2wrap_ce_bf16(
-            hidden, weight, targets, chunk_rows=4, lora_a=a, lora_b=b,
+            hidden, weight, targets, chunk_rows=4, backward_chunk_rows=5, lora_a=a, lora_b=b,
             lora_scale=.75, use_nora=use_nora,
         )
 

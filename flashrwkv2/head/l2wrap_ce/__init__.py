@@ -47,7 +47,7 @@ def _check(hidden, weight, targets, chunk_rows: int) -> None:
 
 class _HeadL2Wrap(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, hidden, weight, targets, a, b, scale, use_nora, chunk_rows):
+    def forward(ctx, hidden, weight, targets, a, b, scale, use_nora, chunk_rows, backward_chunk_rows):
         from ..._internal.logprob import logprob_stats
 
         rows = hidden.view(-1, hidden.shape[-1])
@@ -62,7 +62,7 @@ class _HeadL2Wrap(torch.autograd.Function):
             logprobs[start:stop] = logprob_stats(logits, flat_targets[start:stop])[0]
             del logits
         ctx.save_for_backward(hidden, weight, targets, a, b)
-        ctx.options = (scale, use_nora, chunk_rows)
+        ctx.options = (scale, use_nora, backward_chunk_rows)
         return -logprobs.mean()
 
     @staticmethod
@@ -131,26 +131,28 @@ class _HeadL2Wrap(torch.autograd.Function):
             None,
             da,
             None if db is None else db.to(torch.bfloat16).to(b.dtype),
-            None, None, None,
+            None, None, None, None,
         )
 
 
 @torch.library.custom_op("flashrwkv2::head_l2wrap_ce_forward", mutates_args=())
 def _compiled_head_loss(hidden: torch.Tensor, weight: torch.Tensor, targets: torch.Tensor,
                         a: torch.Tensor | None, b: torch.Tensor | None, scale: float,
-                        use_nora: bool, chunk_rows: int) -> torch.Tensor:
-    return _HeadL2Wrap.forward(_AutogradContext(), hidden, weight, targets, a, b, scale, use_nora, chunk_rows)
+                        use_nora: bool, chunk_rows: int, backward_chunk_rows: int) -> torch.Tensor:
+    return _HeadL2Wrap.forward(
+        _AutogradContext(), hidden, weight, targets, a, b, scale, use_nora, chunk_rows, backward_chunk_rows,
+    )
 
 
 @_compiled_head_loss.register_fake
-def _compiled_head_loss_fake(hidden, weight, targets, a, b, scale, use_nora, chunk_rows):
+def _compiled_head_loss_fake(hidden, weight, targets, a, b, scale, use_nora, chunk_rows, backward_chunk_rows):
     return hidden.new_empty((), dtype=torch.float32)
 
 
 def _compiled_head_loss_context(ctx, inputs, output):
-    hidden, weight, targets, a, b, scale, use_nora, chunk_rows = inputs
+    hidden, weight, targets, a, b, scale, use_nora, _, backward_chunk_rows = inputs
     ctx.save_for_backward(hidden, weight, targets, a, b)
-    ctx.options = (scale, use_nora, chunk_rows)
+    ctx.options = (scale, use_nora, backward_chunk_rows)
 
 
 @torch.library.custom_op(
@@ -172,7 +174,7 @@ def _compiled_head_loss_vjp_fake(dy, hidden, weight, targets, a, b, scale, use_n
 
 
 def _compiled_head_loss_backward(ctx, dy):
-    return (*_compiled_head_loss_vjp(dy, *ctx.saved_tensors, *ctx.options, list(ctx.needs_input_grad[:5])), None, None, None)
+    return (*_compiled_head_loss_vjp(dy, *ctx.saved_tensors, *ctx.options, list(ctx.needs_input_grad[:5])), None, None, None, None)
 
 
 _compiled_head_loss.register_autograd(_compiled_head_loss_backward, setup_context=_compiled_head_loss_context)
@@ -184,17 +186,26 @@ def pretrain_head_l2wrap_ce_bf16(
     targets,
     *,
     chunk_rows: int = 4096,
+    backward_chunk_rows: int | None = None,
     lora_a=None,
     lora_b=None,
     lora_scale=1.0,
     use_nora=False,
 ):
-    """Memory-bounded head CE; parameter VJPs accumulate across chunks in FP32."""
+    """Stream head CE and accumulate parameter VJPs in FP32.
+
+    ``chunk_rows`` bounds the forward logits. ``backward_chunk_rows`` independently
+    bounds recomputation and VJPs and defaults to ``chunk_rows``.
+    """
     _check(hidden, weight, targets, chunk_rows)
+    if backward_chunk_rows is None:
+        backward_chunk_rows = chunk_rows
+    elif type(backward_chunk_rows) is not int or backward_chunk_rows <= 0:
+        raise ValueError("backward_chunk_rows must be a positive integer")
     operation = _compiled_head_loss if torch.compiler.is_compiling() else _HeadL2Wrap.apply
     return operation(
         hidden, weight, targets, lora_a, lora_b,
-        float(lora_scale), bool(use_nora), chunk_rows,
+        float(lora_scale), bool(use_nora), chunk_rows, backward_chunk_rows,
     )
 
 
