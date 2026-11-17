@@ -292,7 +292,7 @@ def test_recurrent_independent_vjp(dim, logits, cotangent, prefetch_tokens):
         )
 
 
-@pytest.mark.parametrize(("lengths", "logits"), [((0, 257, 33), -2.0), ((3, 4129), -8.0)])
+@pytest.mark.parametrize(("lengths", "logits"), [((0, 4097, 33), -2.0), ((3, 4129), -8.0)])
 def test_recurrent_direct_vjp_matches_checkpoint_replay(lengths, logits):
     from utils import assert_relative_rmse
 
@@ -314,14 +314,15 @@ def test_recurrent_direct_vjp_matches_checkpoint_replay(lengths, logits):
 
 
 def test_recurrent_backward_replays_state_before_large_updates():
-    values = [torch.zeros(256, 1, 64, device="cuda", dtype=torch.bfloat16) for _ in range(6)]
+    tokens = 4096
+    values = [torch.zeros(tokens, 1, 64, device="cuda", dtype=torch.bfloat16) for _ in range(6)]
     values[1].fill_(-32.0)
     values[2][-1, 0, 0] = 2.0**20
     values[3][-1, 0, 0] = 2.0**20
     values[0].requires_grad_()
     state = torch.zeros(1, 1, 64, 64, device="cuda")
     state[0, 0, 0, 0] = 1.0
-    cu = torch.tensor([0, 256], device="cuda", dtype=torch.int32)
+    cu = torch.tensor([0, tokens], device="cuda", dtype=torch.int32)
     output, _ = tmix_wkv7_recurrent(*values, state, cu)
     dy = torch.zeros_like(output)
     dy[-2, 0, 0] = 1.0

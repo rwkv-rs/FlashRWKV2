@@ -850,7 +850,7 @@ def _recurrent_vjp(ctx, grad_output, grad_final_state):
     )
     # The extra replay launch pays off on longer sequences. Keep the shared
     # history path for short batches, wider heads and status-masked capacity.
-    if r.shape[2] == 64 and r.shape[0] >= max(256, _CHECKPOINT * ds.shape[0]) and status.numel() == 0:
+    if r.shape[2] == 64 and r.shape[0] >= max(4096, _CHECKPOINT * ds.shape[0]) and status.numel() == 0:
         rounded, ds0 = _direct_vjp(r, w, k, v, a, b, cu, bias, boundary, dy, ds, ctx.scale)
         dbias = rounded[1].float().sum(dim=0).to(bias.dtype) if bias.numel() else None
         return rounded, ds0, dbias
