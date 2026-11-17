@@ -23,10 +23,12 @@ y[v] = scale * sum_k r[k] * state[k,v]
 ```
 
 `head_size` 支持 64、128、256。前向一致性按位比较输出、state 和所选 token 的
-logprob；梯度使用独立 FP32 参考与相对误差验证。WKV 反向从保存的 chunk 起始状态
-重放前向，并在短片段内逆序求 VJP；不同 value tile 的部分梯度通过 FP32 原子加累积，
-调度顺序会造成极小的舍入差异。前向输出和 state 逐位比较，反向沿用独立 VJP 测试的
-`atol=2e-5, rtol=2e-2` 容差。只有需要梯度时才保存 checkpoint。
+logprob，梯度使用独立 FP32 参考与相对误差验证。WKV 反向每 16 token 使用一份
+FP32 checkpoint。较长的 64 维 head 先重放每步的 `sa` 向量，再从 checkpoint
+按前向算术重放短窗口内的 FP32 state。每个梯度由负责该 key 或 value 的线程直接写出。
+当 batch-head 并行度较低时，长序列按 4096 token 分段，先用实际 cotangent 计算
+state 梯度边界，再并行计算各段 VJP。通用路径保留 shared-memory state history 和 FP32 原子归约。
+只有需要梯度时才保存 checkpoint。
 
 ## Inference
 

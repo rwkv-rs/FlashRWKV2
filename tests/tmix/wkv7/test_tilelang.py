@@ -292,6 +292,61 @@ def test_recurrent_independent_vjp(dim, logits, cotangent, prefetch_tokens):
         )
 
 
+@pytest.mark.parametrize(("lengths", "logits"), [((0, 257, 33), -2.0), ((3, 4129), -8.0)])
+def test_recurrent_direct_vjp_matches_checkpoint_replay(lengths, logits):
+    from utils import assert_relative_rmse
+
+    values, state, cu, bias = _case(64, lengths, requires_grad=True, logits=logits)
+    dy = torch.randn_like(values[0])
+    ds = torch.randn_like(state)
+    status = torch.tensor([0, values[0].shape[0], len(lengths)], device=cu.device, dtype=cu.dtype)
+    candidate = tmix_wkv7_recurrent(*values, state, cu, decay_bias=bias, scale=.75)
+    reference = tmix_wkv7_recurrent(
+        *values, state, cu, decay_bias=bias, scale=.75, _status=status,
+    )
+    for actual, expected in zip(candidate, reference, strict=True):
+        assert torch.equal(actual, expected)
+    inputs = (*values, state, bias)
+    actual_grads = torch.autograd.grad(candidate, inputs, (dy, ds))
+    expected_grads = torch.autograd.grad(reference, inputs, (dy, ds))
+    for actual, expected in zip(actual_grads, expected_grads, strict=True):
+        assert_relative_rmse(actual, expected)
+
+
+def test_recurrent_backward_replays_state_before_large_updates():
+    values = [torch.zeros(256, 1, 64, device="cuda", dtype=torch.bfloat16) for _ in range(6)]
+    values[1].fill_(-32.0)
+    values[2][-1, 0, 0] = 2.0**20
+    values[3][-1, 0, 0] = 2.0**20
+    values[0].requires_grad_()
+    state = torch.zeros(1, 1, 64, 64, device="cuda")
+    state[0, 0, 0, 0] = 1.0
+    cu = torch.tensor([0, 256], device="cuda", dtype=torch.int32)
+    output, _ = tmix_wkv7_recurrent(*values, state, cu)
+    dy = torch.zeros_like(output)
+    dy[-2, 0, 0] = 1.0
+    (dr,) = torch.autograd.grad(output, values[0], dy)
+    assert dr[-2, 0, 0].item() == 1.0
+
+
+def test_recurrent_segment_boundaries_propagate_actual_cotangent():
+    tokens = 4224
+    values = [torch.zeros(tokens, 1, 64, device="cuda", dtype=torch.bfloat16) for _ in range(6)]
+    values[1].fill_(-32.0)
+    values[4][-128:, 0, 0] = 1.0
+    values[5][-128:, 0, 0] = 1.0
+    for value in values:
+        value.requires_grad_()
+    state = torch.zeros(1, 1, 64, 64, device="cuda", requires_grad=True)
+    cu = torch.tensor([0, tokens], device="cuda", dtype=torch.int32)
+    output, final = tmix_wkv7_recurrent(*values, state, cu)
+    gradients = torch.autograd.grad(
+        (output, final), (*values, state), (torch.zeros_like(output), torch.zeros_like(final)),
+    )
+    for gradient in gradients:
+        assert torch.count_nonzero(gradient).item() == 0
+
+
 def test_recurrent_final_state_only_and_empty_sequences():
     values, state, cu, bias = _case(64, (0, 0), requires_grad=True)
     y, final = tmix_wkv7_recurrent(*values, state, cu, decay_bias=bias)

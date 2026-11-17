@@ -10,9 +10,9 @@ the same key reduction and update order, independently of sequence packing,
 the number of columns assigned to a block, or whether backward is requested.
 The backward differentiates the real-valued recurrence, treating the BF16
 output cast as an identity, as in ordinary mixed-precision training.
-It saves FP32 boundaries every 16 tokens, replays the shared arithmetic into
-a bounded shared-memory history, and accumulates partial key gradients in
-FP32 across independent value tiles.
+It saves FP32 boundaries every 16 tokens. For longer head-size-64 inputs,
+checkpoint replay saves a vector per token and the reverse pass replays short
+FP32 state windows with one writer per gradient. Other inputs use bounded shared-memory replay.
 """
 
 import math
@@ -31,6 +31,7 @@ from ..._internal.tuning import (
 )
 
 _CHECKPOINT = 16
+_BACKWARD_SEGMENT = 4096
 _LOG2E = 1.4426950408889634
 _EXP_NEG_HALF = 0.6065306597126334
 _DECAY_EXP2 = -0.8750387749145276
@@ -225,6 +226,318 @@ def _forward_kernel(
                     SN[seq, h, key, tile * columns + value] = state[key, value]
 
     return kernel
+
+
+@T.macro
+def _backward_sequence(cu, batch, slot, span, seq):
+    # Each sequence owns the slots starting at floor(CU[seq] / span) + seq.
+    # Padding between sequences keeps their checkpoint and segment indices disjoint.
+    hi = T.alloc_var("int32", init=batch)
+    seq[0] = 0
+    while seq[0] + 1 < hi:
+        mid = (seq[0] + hi) // 2
+        if cu[mid] // span + mid <= slot:
+            seq[0] = mid
+        else:
+            hi = mid
+
+
+@T.macro
+def _backward_logit(w, bias, token, head, lane, has_bias, logit):
+    logit[0] = T.cast(w[token, head, lane], "float32")
+    if has_bias:
+        logit[0] = T.cast(T.cast(logit[0] + T.cast(bias[head, lane], "float32"), "bfloat16"), "float32")
+
+
+@tilelang.jit(pass_configs=_PASSES, compile_flags=_COMPILE_FLAGS)
+def _prepare_sa_kernel(heads, has_bias, bias_dtype):
+    n, batch = T.dynamic("n, batch")
+    slots = n // _CHECKPOINT + batch
+
+    @T.prim_func
+    def kernel(
+        W: T.Tensor((n, heads, 64), "bfloat16"),
+        K: T.Tensor((n, heads, 64), "bfloat16"),
+        V: T.Tensor((n, heads, 64), "bfloat16"),
+        A: T.Tensor((n, heads, 64), "bfloat16"),
+        B: T.Tensor((n, heads, 64), "bfloat16"),
+        CU: T.Tensor((batch + 1,), "int32"),
+        Bias: T.Tensor((heads if has_bias else 0, 64), bias_dtype),
+        Boundaries: T.Tensor((slots, heads, 64, 64), "float32"),
+        SA: T.Tensor((n, heads, 64), "float32"),
+    ):
+        with T.Kernel(slots, heads, threads=64) as (slot, h):
+            lane = T.get_thread_binding()
+            seq = T.alloc_local((1,), "int32")
+            _backward_sequence(CU, batch, slot, _CHECKPOINT, seq)
+            start = CU[seq[0]]
+            end = CU[seq[0] + 1]
+            chunk_start = start + (slot - start // _CHECKPOINT - seq[0]) * _CHECKPOINT
+            if chunk_start < end:
+                state = T.alloc_local((64,), "float32")
+                staged = T.alloc_shared((4, 64), "float32")
+                logit = T.alloc_local((1,), "float32")
+                dot = T.alloc_var("float32")
+                for key in T.unroll(64):
+                    state[key] = Boundaries[slot, h, key, lane]
+                chunk_end = T.min(end, chunk_start + _CHECKPOINT)
+                for t in T.serial(chunk_start, chunk_end):
+                    _backward_logit(W, Bias, t, h, lane, has_bias, logit)
+                    staged[0, lane] = T.exp2(_DECAY_EXP2 / (1.0 + T.exp2(-_LOG2E * logit[0])))
+                    staged[1, lane] = T.cast(K[t, h, lane], "float32")
+                    staged[2, lane] = T.cast(A[t, h, lane], "float32")
+                    staged[3, lane] = T.cast(B[t, h, lane], "float32")
+                    T.sync_threads()
+                    dot = 0.0
+                    for key in T.unroll(64):
+                        dot = T.fma(state[key], staged[2, key], dot)
+                    SA[t, h, lane] = dot
+                    value = T.cast(V[t, h, lane], "float32")
+                    for key in T.unroll(64):
+                        state[key] = T.fma(
+                            staged[1, key], value,
+                            T.fma(staged[3, key], dot, staged[0, key] * state[key]),
+                        )
+                    T.sync_threads()
+
+    return kernel
+
+
+@tilelang.jit(pass_configs=_PASSES, compile_flags=_COMPILE_FLAGS)
+def _adjoint_boundaries_kernel(heads, scale, has_bias, bias_dtype):
+    n, batch = T.dynamic("n, batch")
+    segments = n // _BACKWARD_SEGMENT + batch
+
+    @T.prim_func
+    def kernel(
+        R: T.Tensor((n, heads, 64), "bfloat16"),
+        W: T.Tensor((n, heads, 64), "bfloat16"),
+        A: T.Tensor((n, heads, 64), "bfloat16"),
+        B: T.Tensor((n, heads, 64), "bfloat16"),
+        DY: T.Tensor((n, heads, 64), "bfloat16"),
+        CU: T.Tensor((batch + 1,), "int32"),
+        Bias: T.Tensor((heads if has_bias else 0, 64), bias_dtype),
+        DSN: T.Tensor((batch, heads, 64, 64), "float32"),
+        Incoming: T.Tensor((segments, heads, 64, 64), "float32"),
+    ):
+        with T.Kernel(2, heads, batch, threads=32) as (tile, h, seq):
+            lane = T.get_thread_binding()
+            value = tile * 32 + lane
+            start = CU[seq]
+            end = CU[seq + 1]
+            if end - start > _BACKWARD_SEGMENT:
+                adjoint = T.alloc_local((64,), "float32")
+                x = T.alloc_shared((4, 64), "float32")
+                logit = T.alloc_local((1,), "float32")
+                dsa = T.alloc_var("float32")
+                for key in T.unroll(64):
+                    adjoint[key] = DSN[seq, h, key, value]
+                for reverse in T.serial(end - start - _BACKWARD_SEGMENT):
+                    t = end - 1 - reverse
+                    for pair in T.unroll(2):
+                        key = pair * 32 + lane
+                        _backward_logit(W, Bias, t, h, key, has_bias, logit)
+                        x[0, key] = T.exp2(_DECAY_EXP2 / (1.0 + T.exp2(-_LOG2E * logit[0])))
+                        x[1, key] = T.cast(A[t, h, key], "float32")
+                        x[2, key] = T.cast(B[t, h, key], "float32")
+                        x[3, key] = T.cast(R[t, h, key], "float32")
+                    dy = T.cast(DY[t, h, value], "float32") * scale
+                    T.sync_threads()
+                    dsa = 0.0
+                    for key in T.unroll(64):
+                        adjoint[key] = T.fma(x[3, key], dy, adjoint[key])
+                        dsa = T.fma(adjoint[key], x[2, key], dsa)
+                    for key in T.unroll(64):
+                        adjoint[key] = T.fma(x[1, key], dsa, x[0, key] * adjoint[key])
+                    if (t - start) % _BACKWARD_SEGMENT == 0:
+                        slot = start // _BACKWARD_SEGMENT + seq + (t - start) // _BACKWARD_SEGMENT - 1
+                        for key in T.unroll(64):
+                            Incoming[slot, h, key, value] = adjoint[key]
+                    T.sync_threads()
+
+    return kernel
+
+
+@T.macro
+def _replay_key_row(state, inputs, local, key):
+    for value in T.unroll(64):
+        state[value] = T.fma(
+            inputs[1, local, key], inputs[2, local, value],
+            T.fma(inputs[3, local, key], inputs[4, local, value], inputs[0, local, key] * state[value]),
+        )
+
+
+@tilelang.jit(pass_configs=_PASSES, compile_flags=_COMPILE_FLAGS)
+def _direct_backward_kernel(heads, scale, has_bias, bias_dtype, segmented):
+    n, batch = T.dynamic("n, batch")
+    slots = n // _CHECKPOINT + batch
+    segments = n // _BACKWARD_SEGMENT + batch if segmented else batch
+
+    @T.prim_func
+    def kernel(
+        R: T.Tensor((n, heads, 64), "bfloat16"),
+        W: T.Tensor((n, heads, 64), "bfloat16"),
+        K: T.Tensor((n, heads, 64), "bfloat16"),
+        V: T.Tensor((n, heads, 64), "bfloat16"),
+        A: T.Tensor((n, heads, 64), "bfloat16"),
+        B: T.Tensor((n, heads, 64), "bfloat16"),
+        CU: T.Tensor((batch + 1,), "int32"),
+        Bias: T.Tensor((heads if has_bias else 0, 64), bias_dtype),
+        Boundaries: T.Tensor((slots, heads, 64, 64), "float32"),
+        SA: T.Tensor((n, heads, 64), "float32"),
+        DY: T.Tensor((n, heads, 64), "bfloat16"),
+        DSN: T.Tensor((batch, heads, 64, 64), "float32"),
+        Incoming: T.Tensor((segments if segmented else 0, heads, 64, 64), "float32"),
+        Grad: T.Tensor((6, n, heads, 64), "bfloat16"),
+        DS0: T.Tensor((batch, heads, 64, 64), "float32"),
+    ):
+        with T.Kernel(segments, heads, threads=64) as (slot, h):
+            lane = T.get_thread_binding()
+            seq = T.alloc_local((1,), "int32")
+            if segmented:
+                _backward_sequence(CU, batch, slot, _BACKWARD_SEGMENT, seq)
+            else:
+                seq[0] = slot
+            start = CU[seq[0]]
+            end = CU[seq[0] + 1]
+            if segmented:
+                begin = start + (slot - start // _BACKWARD_SEGMENT - seq[0]) * _BACKWARD_SEGMENT
+                stop = T.min(end, begin + _BACKWARD_SEGMENT)
+            else:
+                begin = start
+                stop = end
+            if begin < stop or begin == end == start:
+                # Keep both adjoint orientations so each lane owns its key
+                # and value gradients. Stage two replay states at a time.
+                state = T.alloc_local((64,), "float32")
+                first = T.alloc_shared((64, 64), "float32")
+                dkey = T.alloc_local((64,), "float32")
+                dvalue = T.alloc_local((64,), "float32")
+                inputs = T.alloc_shared((6, _CHECKPOINT, 64), "float32")
+                x = T.alloc_shared((3, 64), "float32")
+                du = T.alloc_shared((64,), "float32")
+                logit = T.alloc_local((1,), "float32")
+                dr = T.alloc_var("float32")
+                dw = T.alloc_var("float32")
+                dk = T.alloc_var("float32")
+                dv = T.alloc_var("float32")
+                da = T.alloc_var("float32")
+                db = T.alloc_var("float32")
+                dsa = T.alloc_var("float32")
+                if segmented and stop != end:
+                    for j in T.unroll(64):
+                        dkey[j] = Incoming[slot, h, lane, j]
+                        dvalue[j] = Incoming[slot, h, j, lane]
+                else:
+                    for j in T.unroll(64):
+                        dkey[j] = DSN[seq[0], h, lane, j]
+                        dvalue[j] = DSN[seq[0], h, j, lane]
+                chunks = T.ceildiv(stop - begin, _CHECKPOINT)
+                for reverse_chunk in T.serial(chunks):
+                    chunk_start = begin + (chunks - 1 - reverse_chunk) * _CHECKPOINT
+                    checkpoint = start // _CHECKPOINT + seq[0] + (chunk_start - start) // _CHECKPOINT
+                    count = T.min(_CHECKPOINT, stop - chunk_start)
+                    for local in T.serial(count):
+                        t = chunk_start + local
+                        _backward_logit(W, Bias, t, h, lane, has_bias, logit)
+                        denom = 1.0 + T.exp2(-_LOG2E * logit[0])
+                        inputs[0, local, lane] = T.exp2(_DECAY_EXP2 / denom)
+                        inputs[1, local, lane] = T.cast(K[t, h, lane], "float32")
+                        inputs[2, local, lane] = T.cast(V[t, h, lane], "float32")
+                        inputs[3, local, lane] = T.cast(B[t, h, lane], "float32")
+                        inputs[4, local, lane] = SA[t, h, lane]
+                        inputs[5, local, lane] = 1.0 / denom
+                    T.sync_threads()
+                    windows = T.ceildiv(count, 2)
+                    for reverse_window in T.serial(windows):
+                        local_start = (windows - 1 - reverse_window) * 2
+                        size = T.min(2, count - local_start)
+                        for j in T.unroll(64):
+                            state[j] = Boundaries[checkpoint, h, lane, j]
+                        for local in T.serial(local_start):
+                            _replay_key_row(state, inputs, local, lane)
+                        if size == 2:
+                            for j in T.unroll(64):
+                                first[j, lane] = state[j]
+                            _replay_key_row(state, inputs, local_start, lane)
+                        for reverse in T.serial(size):
+                            local = local_start + size - 1 - reverse
+                            t = chunk_start + local
+                            if reverse != 0:
+                                for j in T.unroll(64):
+                                    state[j] = first[j, lane]
+                            decay = inputs[0, local, lane]
+                            key = inputs[1, local, lane]
+                            beta = inputs[3, local, lane]
+                            x[0, lane] = T.cast(R[t, h, lane], "float32")
+                            x[1, lane] = T.cast(A[t, h, lane], "float32")
+                            x[2, lane] = T.cast(DY[t, h, lane], "float32") * scale
+                            T.sync_threads()
+                            dr = 0.0
+                            dw = 0.0
+                            dk = 0.0
+                            dv = 0.0
+                            db = 0.0
+                            dsa = 0.0
+                            for j in T.unroll(64):
+                                v = inputs[2, local, j]
+                                sa = inputs[4, local, j]
+                                next_state = T.fma(key, v, T.fma(beta, sa, decay * state[j]))
+                                dr = T.fma(next_state, x[2, j], dr)
+                                dkey[j] = T.fma(x[0, lane], x[2, j], dkey[j])
+                                dvalue[j] = T.fma(x[0, j], x[2, lane], dvalue[j])
+                                dw = T.fma(dkey[j], state[j], dw)
+                                dk = T.fma(dkey[j], v, dk)
+                                db = T.fma(dkey[j], sa, db)
+                                dv = T.fma(dvalue[j], inputs[1, local, j], dv)
+                                dsa = T.fma(dvalue[j], inputs[3, local, j], dsa)
+                            du[lane] = dsa
+                            T.sync_threads()
+                            da = 0.0
+                            for j in T.unroll(64):
+                                da = T.fma(state[j], du[j], da)
+                                dkey[j] = T.fma(x[1, lane], du[j], decay * dkey[j])
+                                dvalue[j] = T.fma(x[1, j], dsa, inputs[0, local, j] * dvalue[j])
+                            sigmoid = inputs[5, local, lane]
+                            Grad[0, t, h, lane] = T.cast(dr, "bfloat16")
+                            Grad[1, t, h, lane] = T.cast(
+                                dw * (-_EXP_NEG_HALF * sigmoid * (1.0 - sigmoid) * decay), "bfloat16",
+                            )
+                            Grad[2, t, h, lane] = T.cast(dk, "bfloat16")
+                            Grad[3, t, h, lane] = T.cast(dv, "bfloat16")
+                            Grad[4, t, h, lane] = T.cast(da, "bfloat16")
+                            Grad[5, t, h, lane] = T.cast(db, "bfloat16")
+                            T.sync_threads()
+                if begin == start:
+                    for j in T.unroll(64):
+                        DS0[seq[0], h, j, lane] = dvalue[j]
+
+    return kernel
+
+
+def _direct_vjp(r, w, k, v, a, b, cu, bias, boundary, dy, ds, scale):
+    n, heads, dim = r.shape
+    batch = ds.shape[0]
+    has_bias = bias.numel() != 0
+    bias_dtype = "bfloat16" if bias.dtype == torch.bfloat16 else "float32"
+    segmented = n > _BACKWARD_SEGMENT and batch * heads < 128
+    sa = torch.empty_like(r, dtype=torch.float32)
+    ds0 = torch.empty_like(ds)
+    gradients = r.new_empty((6, n, heads, dim))
+    device = r.device
+    prepared_kernel("tmix/wkv7", _prepare_sa_kernel, (heads, has_bias, bias_dtype))(
+        w, k, v, a, b, cu, bias, boundary, sa,
+    )
+    incoming = ds.new_empty((n // _BACKWARD_SEGMENT + batch if segmented else 0, heads, dim, dim))
+    if segmented:
+        prepared_kernel("tmix/wkv7", _adjoint_boundaries_kernel, (heads, scale, has_bias, bias_dtype))(
+            r, w, a, b, dy, cu, bias, ds, incoming,
+        )
+    prepared_kernel("tmix/wkv7", _direct_backward_kernel, (heads, scale, has_bias, bias_dtype, segmented))(
+        r, w, k, v, a, b, cu, bias, boundary, sa, dy, ds, incoming, gradients, ds0,
+    )
+    return gradients, ds0
+
 
 
 @tilelang.jit(pass_configs=_PASSES, compile_flags=_COMPILE_FLAGS)
@@ -535,6 +848,12 @@ def _recurrent_vjp(ctx, grad_output, grad_final_state):
         if grad_final_state is None
         else grad_final_state.contiguous()
     )
+    # The extra replay launch pays off on longer sequences. Keep the shared
+    # history path for short batches, wider heads and status-masked capacity.
+    if r.shape[2] == 64 and r.shape[0] >= max(256, _CHECKPOINT * ds.shape[0]) and status.numel() == 0:
+        rounded, ds0 = _direct_vjp(r, w, k, v, a, b, cu, bias, boundary, dy, ds, ctx.scale)
+        dbias = rounded[1].float().sum(dim=0).to(bias.dtype) if bias.numel() else None
+        return rounded, ds0, dbias
     gradients = torch.zeros((6, *r.shape), dtype=torch.float32, device=r.device)
     ds0 = torch.empty_like(ds)
     _, heads, dim = r.shape
