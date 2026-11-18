@@ -55,6 +55,8 @@ def main():
     parser.add_argument("--cases", nargs="+", default=CASES,
                         help="packed BxT terms in scheduler order, e.g. 255x1+1x256")
     parser.add_argument("--metadata", choices=("static", "live"), default="static")
+    parser.add_argument("--include-ticket-preparation", action="store_true",
+                        help="time live metadata validation together with one WKV layer")
     parser.add_argument("--state-pool-size", type=int, help="physical slots (defaults to the active batch)")
     parser.add_argument("--slot-order", choices=("sequential", "random"), default="sequential")
     parser.add_argument("--decay-bias", action="store_true")
@@ -77,6 +79,8 @@ def main():
         "--output", type=Path, default=Path("artifacts/wkv7-recurrent-bf16.json")
     )
     args = parser.parse_args()
+    if args.include_ticket_preparation and args.metadata != "live":
+        parser.error("--include-ticket-preparation requires --metadata live")
     if args.timing_mode == "graph":
         torch.cuda.set_stream(torch.cuda.Stream())
     package_path = Path(flashrwkv2.__file__).resolve()
@@ -151,7 +155,9 @@ def main():
                 )
             else:
                 metadata_args = dict(total_tokens=tokens, max_seqlen=length)
-            ticket = prepare_tmix_wkv7_recurrent_metadata(cu, slots, state_pool_size=pool_size, **metadata_args)
+            prepare_ticket = partial(prepare_tmix_wkv7_recurrent_metadata, cu, slots,
+                                     state_pool_size=pool_size, **metadata_args)
+            ticket = prepare_ticket()
             bias = (
                 torch.randn(heads, dim, device="cuda").bfloat16().half().to(dtype)
                 if args.decay_bias
@@ -169,7 +175,7 @@ def main():
                     indexed=True,
                 )
 
-            run = partial(
+            run_layer = partial(
                 infer,
                 *values,
                 state=state,
@@ -177,8 +183,10 @@ def main():
                 state_indices=slots,
                 decay_bias=bias,
                 max_seqlen=length,
-                validated_metadata=ticket,
             )
+            def run():
+                batch_ticket = prepare_ticket() if args.include_ticket_preparation else ticket
+                return run_layer(validated_metadata=batch_ticket)
 
             expected = run().clone()
             state.materialize_slots_(slots)
@@ -260,6 +268,7 @@ def main():
                 "metadata": {
                     "total_tokens": tokens,
                     "ticket": args.metadata, "slot_order": args.slot_order,
+                    "includes_ticket_preparation": args.include_ticket_preparation,
                     "sequences": batch,
                     "state_pool_size": pool_size,
                     "max_seqlen": length,

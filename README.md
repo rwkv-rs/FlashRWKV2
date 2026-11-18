@@ -183,6 +183,10 @@ PYTHONPATH=benchmarks ./.venv/bin/python benchmarks/tmix/wkv7/bench.py \
   --output artifacts/wkv7-live.json
 ```
 
+The per-layer time uses the ticket shared by the model's layers. Add
+`--include-ticket-preparation` to capture and time the device-side validation and sort
+together with one WKV layer on every step.
+
 Deterministic strategies on RTX 4090 (SM89/128 SM) and PRO 6000 (SM120/188 SM)
 prepare bounded kernel variants for dynamic batch/token workloads. Supply real
 first/later-layer, decode/prefill and training-backward calls with their actual
