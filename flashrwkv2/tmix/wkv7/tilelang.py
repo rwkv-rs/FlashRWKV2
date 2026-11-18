@@ -5,9 +5,9 @@
 An explicit inference-only mode stores FP16 state after every token; it does
 not change training or claim equality with the default FP32-state trajectory.
 
-State is stored as [sequence, head, key, value].  Every value column follows
-the same key reduction and update order, independently of sequence packing,
-the number of columns assigned to a block, or whether backward is requested.
+State is stored as [sequence, head, key, value].  Each state mode has a fixed key reduction
+and update order independent of sequence packing and value tiling. D64 FP16
+serving with 40 or 64 heads reduces four contiguous groups of 16 keys.
 The backward differentiates the real-valued recurrence, treating the BF16
 output cast as an identity, as in ordinary mixed-precision training.
 It saves FP32 boundaries every 16 tokens. For longer head-size-64 inputs,
@@ -115,7 +115,6 @@ def _materialize_deltalog(heads):
     return kernel
 
 
-
 @tilelang.jit(pass_configs=_PASSES, compile_flags=_COMPILE_FLAGS)
 def _decode_traversal(heads, ordered):
     batch, capacity = T.dynamic("batch, capacity")
@@ -137,9 +136,10 @@ def _decode_traversal(heads, ordered):
 
 @tilelang.jit(pass_configs={**_PASSES, tilelang.PassConfigKey.TL_DISABLE_SAFE_MEMORY_ACCESS: True},
               compile_flags=_COMPILE_FLAGS)
-def _fp16_serving_kernel(heads, scale, bias_dtype, has_bias, ordered, with_log, allow_append, alternate=False, groups=4, columns=16):
+def _fp16_serving_kernel(heads, scale, bias_dtype, has_bias, ordered, with_log, allow_append, alternate=False):
     """D64 recurrence: each warp sums fixed contiguous key groups for its value columns."""
     n, batch, slots = T.dynamic("n, batch, slots")
+    groups, columns = 4, 16
     lanes = 32 // groups
     keys = 64 // groups
     threads = columns * groups
@@ -149,10 +149,9 @@ def _fp16_serving_kernel(heads, scale, bias_dtype, has_bias, ordered, with_log, 
       const int mask = 1 << tile;
       return (atomicAnd(phases + index, ~mask) & mask) != 0;
     }
-    template<int groups>
     __device__ __forceinline__ float rwkv_sum_groups(float x) {
       #pragma unroll
-      for (int delta = 32 / groups; delta < 32; delta *= 2)
+      for (int delta = 8; delta < 32; delta *= 2)
         x = __fadd_rn(x, __shfl_xor_sync(0xffffffff, x, delta));
       return x;
     }
@@ -175,7 +174,7 @@ def _fp16_serving_kernel(heads, scale, bias_dtype, has_bias, ordered, with_log, 
         accum = T.alloc_var("float32", init=0.0)
         for j in T.unroll(keys):
             accum = T.fma(state[j], vectors[t, 4, group * keys + j], accum)
-        dot[0] = T.call_pure_extern("float32", f"rwkv_sum_groups<{groups}>", accum)
+        dot[0] = T.call_pure_extern("float32", "rwkv_sum_groups", accum)
         accum = 0.0
         for j in T.unroll(keys):
             k = group * keys + j
@@ -183,10 +182,9 @@ def _fp16_serving_kernel(heads, scale, bias_dtype, has_bias, ordered, with_log, 
                             T.fma(vectors[t, 5, k], dot[0], vectors[t, 1, k] * state[j]))
             state[j] = T.cast(T.cast(updated, "float16"), "float32")
             accum = T.fma(state[j], vectors[t, 0, k], accum)
-        output = T.call_pure_extern("float32", f"rwkv_sum_groups<{groups}>", accum)
+        output = T.call_pure_extern("float32", "rwkv_sum_groups", accum)
         if group == 0:
             Y[token, h, col] = T.cast(output * scale, "bfloat16")
-
 
     @T.macro
     def decode(R, W, K, V, A, B, Bias, Pool, Log, Phase, Y, token, slot, h, tid):
@@ -220,9 +218,7 @@ def _fp16_serving_kernel(heads, scale, bias_dtype, has_bias, ordered, with_log, 
                 sy[g] = 0.0
                 for j in T.unroll(keys):
                     sa[g] = T.fma(state[g * keys + j], values[0, 4, g * keys + j], sa[g])
-            for level in T.unroll(groups.bit_length() - 1):
-                for g in T.unroll(groups // (2 << level)):
-                    sa[g * (2 << level)] = sa[g * (2 << level)] + sa[g * (2 << level) + (1 << level)]
+            sa[0] = (sa[0] + sa[1]) + (sa[2] + sa[3])
             for g in T.unroll(groups):
                 for j in T.unroll(keys):
                     k = g * keys + j
@@ -230,9 +226,7 @@ def _fp16_serving_kernel(heads, scale, bias_dtype, has_bias, ordered, with_log, 
                                 T.fma(values[0, 5, k], sa[0], values[0, 1, k] * state[k]))
                     state[k] = T.cast(T.cast(val, "float16"), "float32")
                     sy[g] = T.fma(state[k], values[0, 0, k], sy[g])
-            for level in T.unroll(groups.bit_length() - 1):
-                for g in T.unroll(groups // (2 << level)):
-                    sy[g * (2 << level)] = sy[g * (2 << level)] + sy[g * (2 << level) + (1 << level)]
+            sy[0] = (sy[0] + sy[1]) + (sy[2] + sy[3])
             Y[token, h, tid] = T.cast(sy[0] * scale, "bfloat16")
             if with_log and allow_append:
                 if pending[0] == 0:
@@ -265,7 +259,10 @@ def _fp16_serving_kernel(heads, scale, bias_dtype, has_bias, ordered, with_log, 
         Phase: T.Tensor((slots if with_log else 0, heads), "int32"),
         Reverse: T.Tensor((1 if alternate else 0,), "int32"),
     ):
-        with T.Kernel(heads, batch + (T.min(batch * (tiles - 1), 12) if ordered else T.if_then_else(batch == 1 and n > 1, tiles - 1, 0)), threads=threads, prelude=reduction) as (h, priority):
+        # Reserve room for four tiled prefill rows; additional tiles reuse the grid.
+        width = batch + (T.min(batch, 4) * (tiles - 1) if ordered else
+                         T.if_then_else(batch == 1 and n > 1, tiles - 1, 0))
+        with T.Kernel(heads, width, threads=threads, prelude=reduction) as (h, priority):
             tid = T.get_thread_binding()
             group = tid % 32 // lanes
             local_col = tid // 32 * lanes + tid % lanes
@@ -282,7 +279,6 @@ def _fp16_serving_kernel(heads, scale, bias_dtype, has_bias, ordered, with_log, 
                             Y[row, h, tid] = T.cast(float("nan"), "bfloat16")
             num_prefills = Order[batch] if ordered else T.if_then_else(batch == 1 and Status[1] > 1, 1, 0)
             tasks = Status[2] + (tiles - 1) * num_prefills
-            width = batch + (T.min(batch * (tiles - 1), 12) if ordered else T.if_then_else(batch == 1 and n > 1, tiles - 1, 0))
             for offset in T.serial(T.ceildiv(tasks - priority, width)):
                 rank = priority + offset * width
                 is_prefill = rank < tiles * num_prefills

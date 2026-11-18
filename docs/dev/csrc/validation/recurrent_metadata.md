@@ -8,6 +8,10 @@ private ticket。ticket 记录 metadata 的 identity、version、shape、device�
 slot 范围与唯一性。去重使用 Fibonacci hash 和 linear probing，工作区大小由
 sequence capacity 决定。状态为三个 INT32：`[error, active_tokens, active_sequences]`。
 
+混合 batch 的 ticket 还包含设备上的执行顺序和 prefill 行数。验证器按有效行长度
+稳定降序排列，长度为 1 的 decode 行排在 prefill 之后。单行以及保证全是 decode
+的 ticket 省去排序。所有 WKV 层共享这份顺序。
+
 静态 preparation 回读 4 个 INT32 的摘要，得到同步异常与精确 max_seqlen。
 Graph preparation 不做 D2H；每次 replay 校验 active prefix。所有 TileLang
 消费者在读取有效 metadata 和写入 state 前检查 status，支持零 active warmup。

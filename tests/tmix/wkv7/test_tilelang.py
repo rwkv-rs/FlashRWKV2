@@ -108,9 +108,9 @@ def test_optional_fp16_tuning_preserves_inference_outputs(dim, has_bias):
     assert torch.equal(initial.view(torch.int16), original.view(torch.int16))
 
 
-def _case(dim, lengths, *, requires_grad=False, logits=-2.0):
+def _case(dim, lengths, *, heads=2, requires_grad=False, logits=-2.0):
     generator = torch.Generator(device="cuda").manual_seed(1729 + dim)
-    n, heads = sum(lengths), 2
+    n = sum(lengths)
 
     def rand(*shape):
         return torch.randn(*shape, device="cuda", generator=generator)
@@ -130,18 +130,18 @@ def _case(dim, lengths, *, requires_grad=False, logits=-2.0):
     return values, state, cu, bias
 
 
-def _reference(values, initial, lengths, bias, scale, *, state_dtype=None):
-    """Independent FP32 PyTorch graph, including the declared BF16 boundary."""
-    r, logits, k, v, a, b = (value.float() for value in values)
+def _reference(values, initial, lengths, bias, scale, *, state_dtype=None, dtype=torch.float32):
+    """Mathematical recurrence with explicit token and state rounding boundaries."""
+    r, logits, k, v, a, b = (value.to(dtype) for value in values)
     if bias is not None:
-        logits = (logits + bias).to(torch.bfloat16).float()
+        logits = (logits + bias).to(torch.bfloat16).to(dtype)
     # Use the mathematical exp/sigmoid formula, independently of the kernel's
     # exp2 implementation. The tiny activation error is below BF16 VJP noise.
     retention = torch.exp(-math.exp(-0.5) * torch.sigmoid(logits))
     outputs, final_states = [], []
     offset = 0
     for sequence, length in enumerate(lengths):
-        state = initial[sequence].float()
+        state = initial[sequence].to(dtype)
         for token in range(offset, offset + length):
             sa = torch.einsum("hkv,hk->hv", state, a[token])
             state = (
@@ -150,7 +150,7 @@ def _reference(values, initial, lengths, bias, scale, *, state_dtype=None):
                 + k[token, :, :, None] * v[token, :, None, :]
             )
             if state_dtype is not None:
-                state = state.to(state_dtype).float()
+                state = state.to(state_dtype).to(dtype)
             outputs.append(
                 (torch.einsum("hkv,hk->hv", state, r[token]) * scale).to(torch.bfloat16)
             )
@@ -158,6 +158,26 @@ def _reference(values, initial, lengths, bias, scale, *, state_dtype=None):
         offset += length
     output = torch.stack(outputs) if outputs else torch.empty_like(values[0])
     return output, torch.stack(final_states)
+
+
+def test_fp16_serving_prefill_and_decode_match_independent_reference():
+    from flashrwkv2 import (
+        infer_tmix_wkv7_recurrent_fp16_forward_varlen,
+        prepare_tmix_wkv7_recurrent_fp16_state_from_tensor,
+    )
+
+    lengths = (1, 17, 5)
+    values, initial, cu, bias = _case(64, lengths, heads=64)
+    pool = initial.half()
+    expected = _reference(values, pool, lengths, bias, .75, state_dtype=torch.float16, dtype=torch.float64)
+    handle = prepare_tmix_wkv7_recurrent_fp16_state_from_tensor(pool)
+    slots = torch.arange(len(lengths), device="cuda", dtype=torch.int32)
+    actual = infer_tmix_wkv7_recurrent_fp16_forward_varlen(
+        *values, state=handle, cu_seqlens=cu, state_indices=slots, decay_bias=bias, scale=.75,
+    )
+    handle.materialize_slots_(slots)
+    for result, reference in zip((actual, pool), expected, strict=True):
+        torch.testing.assert_close(result, reference, atol=2e-4, rtol=8e-3)
 
 
 @pytest.mark.parametrize("dim", [64, 128, 256])

@@ -1,7 +1,7 @@
 # FlashRWKV2
 
-FlashRWKV2 is a TileLang operator library for RWKV-7 with a shared BF16
-training and inference forward and FP32 accumulation. Training uses FP32 recurrent state. Its public
+FlashRWKV2 is a TileLang operator library for RWKV-7. Training and inference use
+BF16 token inputs and outputs with FP32 accumulation. Training uses FP32 recurrent state. Its public
 inference API exposes the highest semantic fusion islands used by the model;
 kernel composition and shape-dependent dispatch remain internal. Complete
 models, schedulers, and training frameworks remain the responsibility of
@@ -9,7 +9,10 @@ downstream projects.
 
 For serving on SM89 and SM120, prefer FP16 recurrent state for both prefill and
 decode. This path uses BF16 token IO and FP32 arithmetic, and rounds state to
-FP16 after every token. D64 state pools with 40 or 64 heads reserve 1,284 additional bytes
+FP16 after every token. For D64 with 40 or 64 heads, prefill and decode use the same
+four groups of 16 keys for each dot product. A live metadata ticket schedules longer
+prefill rows first, and each decode slot can append to its DeltaLog independently.
+These state pools reserve 1,284 additional bytes
 per head per slot for exact DeltaLog replay. Use the handle's `memory_layout`
 when budgeting concurrency. Call `materialize_slots_(indices)` before reading
 or copying the externally bound tensor. Training, RL rollout and its evaluation
@@ -122,6 +125,15 @@ PYTHONPATH=benchmarks ./.venv/bin/python benchmarks/tmix/wkv7/bench.py \
   --shapes h12d64 h16d64 h32d64 h40d64 h64d64 h80d64 h16d128 h8d256 \
   --cases 1x1 16x1 1x16 64x16 1x128 --tune --timing-mode graph \
   --output artifacts/wkv7-recurrent-bf16.json
+```
+
+To measure chunked serving with decode rows first and randomly assigned slots:
+
+```bash
+PYTHONPATH=benchmarks ./.venv/bin/python benchmarks/tmix/wkv7/bench.py \
+  --shapes h64d64 --state-dtype float16 --timing-mode graph --metadata live \
+  --slot-order random --state-pool-size 320 --cases 255x1+1x4 255x1+1x256 1x1024 \
+  --output artifacts/wkv7-live.json
 ```
 
 RTX 4090 and PRO 6000 use checked-in execution configurations. Each operator benchmark
