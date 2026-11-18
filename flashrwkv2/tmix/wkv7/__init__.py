@@ -279,12 +279,13 @@ def _infer_forward_varlen(
     # H40 uses immediate high-concurrency writeback on SM89. Blackwell can
     # retain the log for steady traversal and detect a change in slot order.
     delta = state._delta if state._state_pool.shape[0] >= 16 else None
-    append = delta is not None and max_length == 1 and batch >= 16
+    append = delta is not None and batch >= 16
     if append and r.shape[1] == 40 and batch > 64:
         append = torch.cuda.get_device_capability(r.device) == (12, 0)
     return _infer_recurrent(
         r, decay_logits, k, v, a, b, state._state_pool, cu_seqlens,
         state_indices, status, scale=scale, decay_bias=decay_bias,
+        row_order=ticket._row_order(),
         dense_decode=(state_dtype == torch.float16 and not ticket._is_graph()
                       and max_length == 1 and r.shape[0] == batch),
         uniform_prefill=(

@@ -131,6 +131,134 @@ def _materialize_deltalog(heads):
     return kernel
 
 
+
+@tilelang.jit(pass_configs=_PASSES, compile_flags=_COMPILE_FLAGS)
+def _fp16_serving_kernel(heads, scale, bias_dtype, has_bias, ordered, with_log, allow_append, groups=4):
+    """D64 recurrence: each warp sums fixed contiguous key groups for its value columns."""
+    n, batch, slots = T.dynamic("n, batch, slots")
+    lanes = 32 // groups
+    keys = 64 // groups
+    threads = 64 * groups
+    reduction = r"""
+    template<int groups>
+    __device__ __forceinline__ float rwkv_sum_groups(float x) {
+      #pragma unroll
+      for (int delta = 32 / groups; delta < 32; delta *= 2)
+        x = __fadd_rn(x, __shfl_xor_sync(0xffffffff, x, delta));
+      return x;
+    }
+    """
+
+    @T.macro
+    def load_token(R, W, K, V, A, B, Bias, vectors, token, h, t, key):
+        vectors[t, 0, key] = T.cast(R[token, h, key], "float32")
+        logits = T.cast(W[token, h, key], "float32")
+        if has_bias:
+            logits = T.cast(T.cast(logits + T.cast(Bias[h, key], "float32"), "bfloat16"), "float32")
+        vectors[t, 1, key] = T.exp2(_DECAY_EXP2 / (1.0 + T.exp2(-_LOG2E * logits)))
+        vectors[t, 2, key] = T.cast(K[token, h, key], "float32")
+        vectors[t, 3, key] = T.cast(V[token, h, key], "float32")
+        vectors[t, 4, key] = T.cast(A[token, h, key], "float32")
+        vectors[t, 5, key] = T.cast(B[token, h, key], "float32")
+
+    @T.macro
+    def step(state, vectors, Y, token, h, t, group, col, dot):
+        accum = T.alloc_var("float32", init=0.0)
+        for j in T.unroll(keys):
+            accum = T.fma(state[j], vectors[t, 4, group * keys + j], accum)
+        dot[0] = T.call_pure_extern("float32", f"rwkv_sum_groups<{groups}>", accum)
+        accum = 0.0
+        for j in T.unroll(keys):
+            k = group * keys + j
+            updated = T.fma(vectors[t, 2, k], vectors[t, 3, col],
+                            T.fma(vectors[t, 5, k], dot[0], vectors[t, 1, k] * state[j]))
+            state[j] = T.cast(T.cast(updated, "float16"), "float32")
+            accum = T.fma(state[j], vectors[t, 0, k], accum)
+        output = T.call_pure_extern("float32", f"rwkv_sum_groups<{groups}>", accum)
+        if group == 0:
+            Y[token, h, col] = T.cast(output * scale, "bfloat16")
+
+    @T.prim_func
+    def kernel(
+        R: T.Tensor((n, heads, 64), "bfloat16"), W: T.Tensor((n, heads, 64), "bfloat16"),
+        K: T.Tensor((n, heads, 64), "bfloat16"), V: T.Tensor((n, heads, 64), "bfloat16"),
+        A: T.Tensor((n, heads, 64), "bfloat16"), B: T.Tensor((n, heads, 64), "bfloat16"),
+        Pool: T.Tensor((slots, heads, 64, 64), "float16"), CU: T.Tensor((batch + 1,), "int32"),
+        Bias: T.Tensor((heads if has_bias else 0, 64), bias_dtype),
+        Status: T.Tensor((3,), "int32"), Indices: T.Tensor((batch,), "int32"),
+        Y: T.Tensor((n, heads, 64), "bfloat16"),
+        Order: T.Tensor((batch if ordered else 0,), "int32"),
+        Log: T.Tensor((slots if with_log else 0, heads, 5, 64), "float32"),
+        Phase: T.Tensor((slots if with_log else 0, heads), "int32"),
+    ):
+        with T.Kernel(heads, batch, threads=threads, prelude=reduction) as (h, priority):
+            tid = T.get_thread_binding()
+            group = tid % 32 // lanes
+            col = tid // 32 * lanes + tid % lanes
+            state = T.alloc_local((keys,), "float32")
+            dot = T.alloc_local((1,), "float32")
+            vectors = T.alloc_shared((4, 6, 64), "float32")
+            previous = T.alloc_shared((5 if with_log else 0, 64), "float32")
+            phase = T.alloc_shared((1 if with_log else 0,), "int32")
+            if Status[1] < n:
+                if tid < 64:
+                    for i in T.serial(T.ceildiv(n - Status[1], batch)):
+                        row = Status[1] + i * batch + priority
+                        if row < n:
+                            Y[row, h, tid] = T.cast(float("nan"), "bfloat16")
+            if priority < Status[2]:
+                seq = Order[priority] if ordered else priority
+                start, end = CU[seq], CU[seq + 1]
+                slot = Indices[seq]
+                for j in T.unroll(keys):
+                    state[j] = T.cast(Pool[slot, h, group * keys + j, col], "float32")
+                if with_log:
+                    if tid == 0:
+                        phase[0] = Phase[slot, h]
+                    T.sync_threads()
+                    if (phase[0] & 1) != 0:
+                        for i, k in T.Parallel(5, 64):
+                            previous[i, k] = Log[slot, h, i, k]
+                        T.sync_threads()
+                        for j in T.unroll(keys):
+                            k = group * keys + j
+                            replay = T.fma(previous[1, k], previous[2, col],
+                                           T.fma(previous[3, k], previous[4, col],
+                                                 previous[0, k] * state[j]))
+                            state[j] = T.cast(T.cast(replay, "float16"), "float32")
+                for chunk in T.serial((end - start) // 4):
+                    for t, k in T.Parallel(4, 64):
+                        load_token(R, W, K, V, A, B, Bias, vectors, start + chunk * 4 + t, h, t, k)
+                    T.sync_threads()
+                    for t in T.unroll(4):
+                        step(state, vectors, Y, start + chunk * 4 + t, h, t, group, col, dot)
+                    T.sync_threads()
+                for tail in T.serial((end - start) % 4):
+                    token = end - (end - start) % 4 + tail
+                    if tid < 64:
+                        load_token(R, W, K, V, A, B, Bias, vectors, token, h, 0, tid)
+                    T.sync_threads()
+                    step(state, vectors, Y, token, h, 0, group, col, dot)
+                    T.sync_threads()
+                append = T.alloc_var("bool", init=False)
+                if with_log:
+                    append = allow_append and end - start == 1 and (phase[0] & 1) == 0
+                    if append:
+                        if tid < 64:
+                            Log[slot, h, 0, tid] = vectors[0, 1, tid]
+                            Log[slot, h, 1, tid] = vectors[0, 2, tid]
+                            Log[slot, h, 2, tid] = vectors[0, 3, tid]
+                            Log[slot, h, 3, tid] = vectors[0, 5, tid]
+                        if group == 0:
+                            Log[slot, h, 4, col] = dot[0]
+                    if tid == 0:
+                        Phase[slot, h] = T.cast(append, "int32")
+                if not append:
+                    for j in T.unroll(keys):
+                        Pool[slot, h, group * keys + j, col] = T.cast(state[j], "float16")
+    return kernel
+
+
 @tilelang.jit(pass_configs=_PASSES, compile_flags=_COMPILE_FLAGS)
 def _forward_kernel(
     heads: int,
@@ -1143,6 +1271,7 @@ def _infer_recurrent(
     decay_bias=None,
     block_values=None,
     prefetch_tokens=None,
+    row_order=None,
     dense_decode=False,
     uniform_prefill=False,
     delta_buffers=None,
@@ -1174,6 +1303,23 @@ def _infer_recurrent(
         batch,
         inference=True,
     )
+
+    _, heads, dim = r.shape
+    if state_pool.dtype == torch.float16 and dim == 64 and heads in (40, 64):
+        output = torch.empty_like(v)
+        bias = _bias_tensor(r, decay_bias)
+        order = status[:0] if row_order is None else row_order
+        if delta_buffers is None:
+            log = torch.empty((0, heads, 5, 64), device=r.device, dtype=torch.float32)
+            phase = status[:0].view(0, heads)
+        else:
+            log, phase = delta_buffers
+        _fp16_serving_kernel(
+            heads, float(scale), "bfloat16" if bias.dtype == torch.bfloat16 else "float32",
+            bias.numel() != 0, order.numel() != 0, delta_buffers is not None, append_log,
+        )(*[r, decay_logits, k, v, a, b], state_pool, cu_seqlens, bias, status, state_indices,
+          output, order, log, phase)
+        return output
 
     block_values, prefetch_tokens = _recurrent_config(
         r, batch, state_pool.dtype, block_values, prefetch_tokens,
