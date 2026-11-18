@@ -141,7 +141,7 @@ def _decode_traversal(heads, ordered):
 
 @tilelang.jit(pass_configs={**_PASSES, tilelang.PassConfigKey.TL_DISABLE_SAFE_MEMORY_ACCESS: True},
               compile_flags=_COMPILE_FLAGS)
-def _fp16_serving_kernel(heads, scale, bias_dtype, has_bias, ordered, with_log, allow_append, alternate=False):
+def _fp16_serving_kernel(heads, scale, bias_dtype, has_bias, ordered, with_log, allow_append, alternate=False, bulk_threshold=0):
     """D64 recurrence: each warp sums fixed contiguous key groups for its value columns."""
     n, batch, slots = T.dynamic("n, batch, slots")
     groups, columns = 4, 16
@@ -150,6 +150,16 @@ def _fp16_serving_kernel(heads, scale, bias_dtype, has_bias, ordered, with_log, 
     threads = columns * groups
     tiles = 64 // columns
     reduction = r"""
+    __device__ __forceinline__ int rwkv_row(const int* order, int rank, int tiled,
+                                           int prefills, int active, int reverse, int ordered) {
+      int index;
+      if (rank < 4 * tiled) index = rank / 4;
+      else {
+        index = rank - 3 * tiled;
+        if (reverse && index >= prefills) index = active - 1 - (index - prefills);
+      }
+      return ordered ? order[index] : index;
+    }
     __device__ __forceinline__ int rwkv_claim_prefill_tile(int* phases, long long index, int tile) {
       const int mask = 1 << tile;
       return (atomicAnd(phases + index, ~mask) & mask) != 0;
@@ -192,63 +202,80 @@ def _fp16_serving_kernel(heads, scale, bias_dtype, has_bias, ordered, with_log, 
             Y[token, h, col] = T.cast(output * scale, "bfloat16")
 
     @T.macro
-    def decode(R, W, K, V, A, B, Bias, Pool, Log, Phase, Y, token, slot, h, tid):
-        values = T.alloc_shared((1, 6, 64), "float32")
+    def column_step(state, values, Y, token, h, t, tid, sa):
+        sy = T.alloc_local((groups,), "float32")
+        for g in T.unroll(groups):
+            sa[g] = 0.0
+            sy[g] = 0.0
+            for j in T.unroll(keys):
+                sa[g] = T.fma(state[g * keys + j], values[t, 4, g * keys + j], sa[g])
+        sa[0] = (sa[0] + sa[1]) + (sa[2] + sa[3])
+        for g in T.unroll(groups):
+            for j in T.unroll(keys):
+                k = g * keys + j
+                val = T.fma(values[t, 2, k], values[t, 3, tid],
+                            T.fma(values[t, 5, k], sa[0], values[t, 1, k] * state[k]))
+                state[k] = T.cast(T.cast(val, "float16"), "float32")
+                sy[g] = T.fma(state[k], values[t, 0, k], sy[g])
+        sy[0] = (sy[0] + sy[1]) + (sy[2] + sy[3])
+        Y[token, h, tid] = T.cast(sy[0] * scale, "bfloat16")
+
+    @T.macro
+    def full_head(R, W, K, V, A, B, Bias, Pool, Log, Phase, Y, start, end, slot, h, tid, single):
+        vectors = T.alloc_shared((1 if single else 4, 6, 64), "float32")
         past = T.alloc_shared((5 if with_log else 0, 64), "float32")
         pending = T.alloc_shared((1 if with_log else 0,), "int32")
         state = T.alloc_local((64,), "float32")
-        if tid < 64:
-            for k in T.unroll(64):
-                state[k] = T.cast(Pool[slot, h, k, tid], "float32")
-            load_token(R, W, K, V, A, B, Bias, values, token, h, 0, tid)
+        sa = T.alloc_local((groups,), "float32")
+        for key in T.unroll(64):
+            state[key] = T.cast(Pool[slot, h, key, tid], "float32")
+        if single:
+            load_token(R, W, K, V, A, B, Bias, vectors, start, h, 0, tid)
         if with_log:
             if tid == 0:
                 pending[0] = Phase[slot, h] & 1
         T.sync_threads()
         if with_log:
             if pending[0] != 0:
-                for i, k in T.Parallel(5, 64):
-                    past[i, k] = Log[slot, h, i, k]
+                for i, key in T.Parallel(5, 64):
+                    past[i, key] = Log[slot, h, i, key]
                 T.sync_threads()
-                if tid < 64:
-                    for k in T.unroll(64):
-                        val = T.fma(past[1, k], past[2, tid],
-                                    T.fma(past[3, k], past[4, tid], past[0, k] * state[k]))
-                        state[k] = T.cast(T.cast(val, "float16"), "float32")
-        if tid < 64:
-            sa = T.alloc_local((groups,), "float32")
-            sy = T.alloc_local((groups,), "float32")
-            for g in T.unroll(groups):
-                sa[g] = 0.0
-                sy[g] = 0.0
-                for j in T.unroll(keys):
-                    sa[g] = T.fma(state[g * keys + j], values[0, 4, g * keys + j], sa[g])
-            sa[0] = (sa[0] + sa[1]) + (sa[2] + sa[3])
-            for g in T.unroll(groups):
-                for j in T.unroll(keys):
-                    k = g * keys + j
-                    val = T.fma(values[0, 2, k], values[0, 3, tid],
-                                T.fma(values[0, 5, k], sa[0], values[0, 1, k] * state[k]))
-                    state[k] = T.cast(T.cast(val, "float16"), "float32")
-                    sy[g] = T.fma(state[k], values[0, 0, k], sy[g])
-            sy[0] = (sy[0] + sy[1]) + (sy[2] + sy[3])
-            Y[token, h, tid] = T.cast(sy[0] * scale, "bfloat16")
-            if with_log and allow_append:
-                if pending[0] == 0:
-                    Log[slot, h, 0, tid] = values[0, 1, tid]
-                    Log[slot, h, 1, tid] = values[0, 2, tid]
-                    Log[slot, h, 2, tid] = values[0, 3, tid]
-                    Log[slot, h, 3, tid] = values[0, 5, tid]
-                    Log[slot, h, 4, tid] = sa[0]
-                else:
-                    for k in T.unroll(64):
-                        Pool[slot, h, k, tid] = T.cast(state[k], "float16")
+                for key in T.unroll(64):
+                    updated = T.fma(past[1, key], past[2, tid],
+                                    T.fma(past[3, key], past[4, tid], past[0, key] * state[key]))
+                    state[key] = T.cast(T.cast(updated, "float16"), "float32")
+        if single:
+            column_step(state, vectors, Y, start, h, 0, tid, sa)
+        else:
+            for chunk in T.serial((end - start) // 4):
+                for t, key in T.Parallel(4, 64):
+                    load_token(R, W, K, V, A, B, Bias, vectors, start + chunk * 4 + t, h, t, key)
+                T.sync_threads()
+                for t in T.unroll(4):
+                    column_step(state, vectors, Y, start + chunk * 4 + t, h, t, tid, sa)
+                T.sync_threads()
+            for tail in T.serial((end - start) % 4):
+                token = end - (end - start) % 4 + tail
+                load_token(R, W, K, V, A, B, Bias, vectors, token, h, 0, tid)
+                T.sync_threads()
+                column_step(state, vectors, Y, token, h, 0, tid, sa)
+                T.sync_threads()
+        if with_log and allow_append and single:
+            if pending[0] == 0:
+                Log[slot, h, 0, tid] = vectors[0, 1, tid]
+                Log[slot, h, 1, tid] = vectors[0, 2, tid]
+                Log[slot, h, 2, tid] = vectors[0, 3, tid]
+                Log[slot, h, 3, tid] = vectors[0, 5, tid]
+                Log[slot, h, 4, tid] = sa[0]
             else:
-                for k in T.unroll(64):
-                    Pool[slot, h, k, tid] = T.cast(state[k], "float16")
-            if with_log:
-                if tid == 0:
-                    Phase[slot, h] = T.if_then_else(allow_append and pending[0] == 0, (1 << tiles) - 1, 0)
+                for key in T.unroll(64):
+                    Pool[slot, h, key, tid] = T.cast(state[key], "float16")
+        else:
+            for key in T.unroll(64):
+                Pool[slot, h, key, tid] = T.cast(state[key], "float16")
+        if with_log:
+            if tid == 0:
+                Phase[slot, h] = T.if_then_else(allow_append and single and pending[0] == 0, (1 << tiles) - 1, 0)
 
     @T.prim_func
     def kernel(
@@ -264,9 +291,9 @@ def _fp16_serving_kernel(heads, scale, bias_dtype, has_bias, ordered, with_log, 
         Phase: T.Tensor((slots if with_log else 0, heads), "int32"),
         Reverse: T.Tensor((1 if alternate else 0,), "int32"),
     ):
-        # Reserve room for four tiled prefill rows; additional tiles reuse the grid.
-        width = batch + (T.min(batch, 4) * (tiles - 1) if ordered else
-                         T.if_then_else(batch == 1 and n > 1, tiles - 1, 0))
+        # Full heads need one row per grid slot. A sparse prefill uses four value tiles.
+        extra = T.min(batch, 4) * (tiles - 1) if ordered else T.if_then_else(batch == 1 and n > 1, tiles - 1, 0)
+        width = batch if bulk_threshold else batch + extra
         with T.Kernel(heads, width, threads=threads, prelude=reduction) as (h, priority):
             tid = T.get_thread_binding()
             group = tid % 32 // lanes
@@ -283,19 +310,21 @@ def _fp16_serving_kernel(heads, scale, bias_dtype, has_bias, ordered, with_log, 
                         if row < n:
                             Y[row, h, tid] = T.cast(float("nan"), "bfloat16")
             num_prefills = Order[batch] if ordered else T.if_then_else(batch == 1 and Status[1] > 1, 1, 0)
-            tasks = Status[2] + (tiles - 1) * num_prefills
+            tiled = T.if_then_else(num_prefills >= bulk_threshold, 0, num_prefills) if bulk_threshold else num_prefills
+            tasks = Status[2] + (tiles - 1) * tiled
             for offset in T.serial(T.ceildiv(tasks - priority, width)):
                 rank = priority + offset * width
-                is_prefill = rank < tiles * num_prefills
-                decode_idx = rank - (tiles - 1) * num_prefills
-                if alternate:
-                    decode_idx = T.if_then_else(Reverse[0] != 0, Status[2] - 1 - (rank - tiles * num_prefills), decode_idx)
-                idx = T.if_then_else(is_prefill, rank // tiles, decode_idx)
-                seq = Order[idx] if ordered else idx
+                narrow = rank < tiles * tiled
+                is_prefill = rank < num_prefills + (tiles - 1) * tiled
+                direction = Reverse[0] if alternate else 0
+                seq = T.call_pure_extern("int32", "rwkv_row", Order.access_ptr("r"), rank, tiled,
+                                         num_prefills, Status[2], direction, int(ordered))
                 start, end = CU[seq], CU[seq + 1]
                 slot = Indices[seq]
                 if not is_prefill:
-                    decode(R, W, K, V, A, B, Bias, Pool, Log, Phase, Y, start, slot, h, tid)
+                    full_head(R, W, K, V, A, B, Bias, Pool, Log, Phase, Y, start, end, slot, h, tid, True)
+                elif bulk_threshold and not narrow:
+                    full_head(R, W, K, V, A, B, Bias, Pool, Log, Phase, Y, start, end, slot, h, tid, False)
                 else:
                     tile = rank % tiles
                     col = tile * columns + local_col
@@ -1317,6 +1346,7 @@ def _infer_recurrent(
         _fp16_serving_kernel(
             heads, float(scale), "bfloat16" if bias.dtype == torch.bfloat16 else "float32",
             bias.numel() != 0, order.numel() != 0, delta_buffers is not None, append_log, alternate,
+            4 if batch >= 4 and order.numel() else 0,
         )(r, decay_logits, k, v, a, b, state_pool, cu_seqlens, bias, status, state_indices,
           output, order, log, phase, reverse)
         return output
