@@ -101,7 +101,8 @@ Python、测试和 benchmark 的模块所有权保持一致。`flashrwkv2/_inter
 validation 与 sampling；实际 `.cpp/.cu` 仍须在 `docs/dev/csrc` 镜像。
 
 默认训练、prefill、decode 使用同一 BF16 forward，FP32 累加与 WKV state。
-可以保留显式选择的 FP16 state 推理版本，其算术仍为 FP32，不承诺与 FP32 训练逐位一致。
+FP16 serving 保留 FP32 算术和逐 token 舍入，使用 DeltaLog 时必须计入私有内存并在访问绑定 tensor 前物化。
+RL rollout、eval 与采样搜索必须使用 FP32 state，以保持 learner 与 rollout 的 logprob 一致。
 不得通过降低训练 state 或计算精度来实现训推逐位一致。Head
 logits、所选 logprobs 与 loss 为 FP32。调优必须先逐位验证输出及 state，才计时；
 不得改变每个输出的 K 归约顺序、舍入边界或使用 split-K。仅 CPU lowering 不能

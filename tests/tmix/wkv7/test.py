@@ -293,3 +293,119 @@ def test_static_metadata_validates_once_and_reads_only_a_summary() -> None:
     assert sum("validate_recurrent_metadata_kernel" in name for name in kernels) == 1, (
         kernels
     )
+
+
+@pytest.mark.memcheck
+@pytest.mark.racecheck
+def test_fp16_deltalog_materializes_reads_and_preserves_overlapping_copies():
+    from flashrwkv2.tmix.wkv7.tilelang import _infer_recurrent
+
+    torch.manual_seed(67)
+    batch, heads, dim = 16, 40, 64
+    slots = torch.arange(batch, device="cuda", dtype=torch.int32)
+    bias = torch.randn(heads, dim, device="cuda", dtype=torch.bfloat16)
+    raw = torch.randn(batch + 2, heads, dim, dim, device="cuda").mul_(0.03).half()
+    initial, reference = raw.clone(), raw.clone()
+    state = prepare_tmix_wkv7_recurrent_fp16_state_from_tensor(raw)
+    base = heads * dim * dim * raw.element_size()
+    private = heads * (5 * dim + 1) * 4
+    assert state.memory_layout == {
+        "base_bytes_per_slot": base, "private_bytes_per_slot": private,
+        "bytes_per_slot": base + private, "fixed_workspace_nbytes": 0,
+        "total_nbytes": (batch + 2) * (base + private),
+    }
+
+    def advance(offsets, indices):
+        n = offsets[-1]
+        values = tuple(torch.randn(n, heads, dim, device="cuda").mul_(.06).bfloat16() for _ in range(6))
+        cu = torch.tensor(offsets, device="cuda", dtype=torch.int32)
+        ticket = prepare_tmix_wkv7_recurrent_metadata(cu, indices, total_tokens=n, state_pool_size=raw.shape[0])
+        expected = _infer_recurrent(
+            *values, reference, cu, indices, ticket._status(), scale=.75, decay_bias=bias,
+            block_values=64, prefetch_tokens=1,
+        )
+        actual = infer_tmix_wkv7_recurrent_fp16_forward_varlen(
+            *values, state=state, cu_seqlens=cu, state_indices=indices,
+            validated_metadata=ticket, scale=.75, decay_bias=bias,
+        )
+        assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+
+    decode_cu = list(range(batch + 1))
+    advance(decode_cu, slots)
+    assert torch.equal(raw, initial)
+    selected = slots[::2].contiguous()
+    state.materialize_slots_(selected.repeat(2))
+    assert torch.equal(raw[selected.long()], reference[selected.long()])
+    assert torch.equal(raw[1:batch:2], initial[1:batch:2])
+    copied = state.clone_slots(slots[1:4])
+    assert torch.equal(copied._components()[0], reference[1:4])
+    src, dst = slots[4:8], slots[4:8].flip((0,))
+    state.copy_slots_(state, src, dst)
+    reference.index_copy_(0, dst.long(), reference.index_select(0, src))
+    state.reset_slots_(slots[11:13])
+    reference[11:13].zero_()
+    advance(decode_cu, slots.flip((0,)))
+    # Run a mixed prefill directly against a partially logged batch, with unequal sequence lengths.
+    mixed_cu = [0]
+    for i in range(batch):
+        mixed_cu.append(mixed_cu[-1] + (2 if i % 2 else 1))
+    advance(mixed_cu, slots)
+    assert torch.equal(state.clone()._components()[0].view(torch.int16), reference.view(torch.int16))
+    advance(decode_cu, slots)
+    target = prepare_tmix_wkv7_recurrent_fp16_state_from_tensor(torch.empty_like(raw))
+    target.copy_(state)
+    assert torch.equal(target._components()[0].view(torch.int16), reference.view(torch.int16))
+    advance(decode_cu, slots)
+    state.zero_()
+    state.materialize_slots_(slots)
+    assert torch.count_nonzero(raw) == 0
+
+
+@pytest.mark.cuda_graph
+def test_fp16_deltalog_graph_replays_live_slot_counts_and_rejects_invalid_tails():
+    from flashrwkv2.tmix.wkv7.tilelang import _infer_recurrent
+
+    torch.manual_seed(68)
+    batch, heads = 16, 64
+    inputs = tuple(torch.randn(batch, heads, 64, device="cuda").mul_(.04).bfloat16() for _ in range(6))
+    raw = torch.randn(batch, heads, 64, 64, device="cuda").mul_(.02).half()
+    reference = raw.clone()
+    state = prepare_tmix_wkv7_recurrent_fp16_state_from_tensor(raw)
+    cu = torch.arange(batch + 1, device="cuda", dtype=torch.int32)
+    slots = torch.arange(batch, device="cuda", dtype=torch.int32)
+    count = torch.zeros(1, device="cuda", dtype=torch.int32)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+
+    def launch():
+        ticket = prepare_tmix_wkv7_recurrent_metadata(
+            cu, slots, state_pool_size=batch, token_capacity=batch, sequence_capacity=batch,
+            max_seqlen_capacity=1, num_active_tokens=count, num_active_sequences=count,
+        )
+        return infer_tmix_wkv7_recurrent_fp16_forward_varlen(
+            *inputs, state=state, cu_seqlens=cu, state_indices=slots, validated_metadata=ticket,
+        )
+
+    with torch.cuda.stream(stream):
+        launch()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        output = launch()
+
+    all_slots = torch.arange(batch, device="cuda", dtype=torch.int32)
+    for active in (16, 7, 0, 12, 16):
+        slots.copy_(all_slots.flip((0,)))
+        slots[active:] = -99
+        count.fill_(active)
+        graph.replay()
+        if active:
+            status = torch.tensor([0, active, active], dtype=torch.int32, device="cuda")
+            expected = _infer_recurrent(*inputs, reference, cu, slots, status, block_values=64, prefetch_tokens=1)
+            assert torch.equal(output[:active].view(torch.int16), expected[:active].view(torch.int16))
+        assert torch.isnan(output[active:]).all()
+    slots[1] = slots[0]
+    graph.replay()
+    assert torch.isnan(output).all()
+    state.materialize_slots_(all_slots)
+    assert torch.equal(raw.view(torch.int16), reference.view(torch.int16))
