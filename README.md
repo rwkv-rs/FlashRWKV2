@@ -1,14 +1,15 @@
 # FlashRWKV2
 
 FlashRWKV2 is a TileLang operator library for RWKV-7 with a shared BF16
-training and inference forward, FP32 accumulation, and FP32 recurrent state. Its public
+training and inference forward and FP32 accumulation. Training uses FP32 recurrent state. Its public
 inference API exposes the highest semantic fusion islands used by the model;
 kernel composition and shape-dependent dispatch remain internal. Complete
 models, schedulers, and training frameworks remain the responsibility of
 downstream projects.
 
-FP16 serving uses BF16 token IO, FP32 arithmetic and FP16 state rounding after
-every token. D64 state pools with 40 or 64 heads reserve 1,284 additional bytes
+For serving on SM89 and SM120, prefer FP16 recurrent state for both prefill and
+decode. This path uses BF16 token IO and FP32 arithmetic, and rounds state to
+FP16 after every token. D64 state pools with 40 or 64 heads reserve 1,284 additional bytes
 per head per slot for exact DeltaLog replay. Use the handle's `memory_layout`
 when budgeting concurrency. Call `materialize_slots_(indices)` before reading
 or copying the externally bound tensor. Training, RL rollout and its evaluation

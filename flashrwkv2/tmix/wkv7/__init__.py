@@ -26,7 +26,7 @@ def _validate_state(state, dtypes=(torch.float32,)):
 class _TmixWkv7RecurrentState:
     """Owned or externally bound state pool, including prefix-cache COW."""
 
-    __slots__ = ("_state_pool", "_delta")
+    __slots__ = ("_delta", "_state_pool")
 
     def __init__(self, state_pool):
         _validate_state(state_pool, (torch.float32, torch.float16))
@@ -318,10 +318,7 @@ def infer_tmix_wkv7_recurrent_fp16_forward_varlen(
     state, cu_seqlens, state_indices, scale=1.0, decay_bias=None,
     max_seqlen=None, validated_metadata=None,
 ):
-    """Optional inference: BF16 token IO, FP32 arithmetic, FP16 state per token.
-
-    This mode does not promise bitwise equality with the FP32 training state.
-    """
+    """Serving prefill and decode with BF16 IO and FP32 arithmetic, rounding state to FP16 per token."""
     return _infer_forward_varlen(
         r, decay_logits, k, v, a, b, state=state, cu_seqlens=cu_seqlens,
         state_indices=state_indices, scale=scale, decay_bias=decay_bias,
@@ -335,8 +332,8 @@ from .pretrain import pretrain_tmix_wkv7_recurrent_bf16
 __all__ = [
     "infer_tmix_wkv7_recurrent_fp16_forward_varlen",
     "infer_tmix_wkv7_recurrent_fp32io16_forward_varlen",
-    "prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor",
     "prepare_tmix_wkv7_recurrent_fp16_state_from_tensor",
+    "prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor",
     "prepare_tmix_wkv7_recurrent_metadata",
     "pretrain_tmix_wkv7_recurrent_bf16",
 ]

@@ -7,8 +7,8 @@ import torch
 from flashrwkv2.tmix.wkv7 import (
     infer_tmix_wkv7_recurrent_fp16_forward_varlen,
     infer_tmix_wkv7_recurrent_fp32io16_forward_varlen,
-    prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor,
     prepare_tmix_wkv7_recurrent_fp16_state_from_tensor,
+    prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor,
     prepare_tmix_wkv7_recurrent_metadata,
 )
 
