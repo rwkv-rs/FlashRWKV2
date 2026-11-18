@@ -12,6 +12,8 @@ decode. This path uses BF16 token IO and FP32 arithmetic, and rounds state to
 FP16 after every token. For D64 with 40 or 64 heads, prefill and decode use the same
 four groups of 16 keys for each dot product. A live metadata ticket schedules longer
 prefill rows first, and each decode slot can append to its DeltaLog independently.
+With one to three prefill rows, four blocks share each head's value columns.
+With four or more prefill rows, one block handles a whole head.
 These state pools reserve 1,284 additional bytes
 per head per slot for exact DeltaLog replay. Use the handle's `memory_layout`
 when budgeting concurrency. Call `materialize_slots_(indices)` before reading

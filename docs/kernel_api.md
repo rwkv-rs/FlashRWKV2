@@ -101,6 +101,8 @@ CUDA Graph 使用 `token_capacity`、`sequence_capacity`、`max_seqlen_capacity`
 修改 state，非法 metadata 也不修改 state。inactive 输出为 NaN，不应被下游消费。
 验证器在设备上按有效行长度降序排列执行顺序，结果由各层共享，输出仍按输入行排列。
 FP16 prefill 按四个 token 一块处理整块，每行最后单独处理 0–3 个 token。
+当有效 prefill 有 1–3 行，每个头的 value 列分给四个 CTA。达到四行时，每个 CTA
+处理一个完整头，以复用该行的输入向量。decode 行继续独立读写各自的日志。
 
 ## Training
 
