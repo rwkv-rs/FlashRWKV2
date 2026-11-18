@@ -71,18 +71,21 @@ CMix 推理的 value weight 保持 `[F,C]` runtime 布局；训练入口为 `[C,
 `prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor(state)` 绑定已有连续 CUDA
 FP32 tensor。每次调用返回时状态完整写回。
 
-`prepare_tmix_wkv7_recurrent_fp16_state_from_tensor` 绑定已有连续 CUDA FP16 tensor，
-但 pool 使用 FP16，显存占用为 FP32 的一半。它们只供
-`infer_tmix_wkv7_recurrent_fp16_forward_varlen` 使用，token 输入和输出仍为 BF16，
-递推算术和归约仍为 FP32；每个 token 更新后将 state 舍入为 FP16。
-该可选路径在不同 batch、prefill 分段、decode 和 CUDA Graph 间保持自身的逐位一致性，
-不承诺与 FP32 训练轨迹逐位一致。训练、RL/Infctx 和 state tuning 继续要求 FP32 state。
+`prepare_tmix_wkv7_recurrent_fp16_state_from_tensor` 绑定连续 CUDA FP16 tensor。
+`infer_tmix_wkv7_recurrent_fp16_forward_varlen` 使用 BF16 token I/O、FP32 递推和归约，
+每个 token 后将逻辑 state 舍入为 FP16。不同 batch、分段和 CUDA Graph 使用相同舍入规则。
 
-handle 提供 `clone()`、`copy_()`、`zero_()`、`clone_slots(indices)`、
-`copy_slots_(source, source_indices, destination_indices)` 和 `reset_slots_(indices)`。
-slot copy 具有同时复制语义，支持同池重叠 COW；目标 slots 必须唯一。
-`materialize_slots_` 保留 lifecycle 调用入口，FP32 状态本身已物化。
-`memory_layout` 报告实际 bytes per slot 和 total bytes。
+D64、H40 或 H64 的 FP16 handle 为每个 slot、每个头分配五个长度为 64 的 FP32 向量和一个
+int32 phase，共 1,284 字节。批量 decode 可以把一步更新留在日志，下次读取该 slot 时按原
+FP32 顺序重放并舍入。H64 模型的 32 层每序列共用 16 MiB 基态和约 2.508 MiB 日志。
+其他几何和 FP32 handle 的私有字节数为零。容量规划使用 `memory_layout["bytes_per_slot"]`，
+其中包括基态和日志，`fixed_workspace_nbytes` 为零。
+
+读取、复制或导出底层绑定 tensor 之前，对读出的槽位调用 `materialize_slots_(indices)`。
+在替换、丢弃或重新绑定同一个底层 tensor 之前，同样需要物化仍要保留的槽位。
+handle 的 `clone()`、`clone_slots(indices)`、`copy_()`、`copy_slots_(source, src, dst)`、
+`zero_()` 和 `reset_slots_(indices)` 会处理日志。slot copy 支持同池重叠 COW，目标槽位须唯一。
+训练、RL rollout、eval 和采样搜索使用 FP32 state。
 
 静态 `prepare_tmix_wkv7_recurrent_metadata(cu_seqlens, state_indices, *,
 state_pool_size, total_tokens, max_seqlen=None)` 验证序列边界、slot 范围和唯一性，

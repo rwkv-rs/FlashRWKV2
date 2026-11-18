@@ -7,9 +7,12 @@ kernel composition and shape-dependent dispatch remain internal. Complete
 models, schedulers, and training frameworks remain the responsibility of
 downstream projects.
 
-An optional FP16-state inference mode halves state storage while keeping BF16
-token IO and FP32 arithmetic. It does not promise bitwise equality with FP32
-training. The default FP32-state path retains training precision and parity.
+FP16 serving uses BF16 token IO, FP32 arithmetic and FP16 state rounding after
+every token. D64 state pools with 40 or 64 heads reserve 1,284 additional bytes
+per head per slot for exact DeltaLog replay. Use the handle's `memory_layout`
+when budgeting concurrency. Call `materialize_slots_(indices)` before reading
+or copying the externally bound tensor. Training, RL rollout and its evaluation
+and sampling search use FP32 state to reproduce the learner's logprobs.
 
 ## Requirements
 
