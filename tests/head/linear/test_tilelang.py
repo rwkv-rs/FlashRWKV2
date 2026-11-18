@@ -117,7 +117,7 @@ def test_tilelang_linear_offset_views_match_aligned_operands(input_major, output
 @pytest.mark.cuda
 @pytest.mark.parametrize("shape", [(27, 64, 257), (33, 768, 96), (65, 4096, 4096), (17, 64, 65536)])
 @pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float32])
-def test_tilelang_linear_batch_and_chunk_invariance(monkeypatch, shape, output_dtype):
+def test_tilelang_linear_batch_and_chunk_invariance(shape, output_dtype):
     rows, channels, outputs = shape
     torch.manual_seed(71)
     x = torch.randn(rows, channels, device="cuda", dtype=torch.bfloat16)
@@ -273,7 +273,7 @@ def test_tilelang_linear_cuda_graph():
     (96, 128, (1, 17, 31, 32, 33, 63, 64, 65, 89, 90, 100, 127, 128, 129, 1000, 1024, 4096)),
     (129, 16384, (32, 33, 64, 96, 128, 129, 1024, 4096)),
 ))
-def test_dynamic_weight_reduction_preserves_accumulators_and_graph(monkeypatch, rows, outputs, reductions, input_major):
+def test_dynamic_weight_reduction_preserves_accumulators_and_graph(rows, outputs, reductions, input_major):
 
     from flashrwkv2._internal import execution as tuning
 

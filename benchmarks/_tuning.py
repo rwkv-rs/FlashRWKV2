@@ -535,16 +535,13 @@ def tune_tmix_wkv7_recurrent(
     scale=1.0,
     decay_bias=None,
     indexed=False,
-    state_indices=None,
-    status=None,
 ):
     """Check both forward variants and time the requested production mode.
 
     Every candidate must preserve functional/indexed BF16 outputs and the
     final states. ``indexed=True`` measures in-place inference on a private
     pool with identity slots and valid status. Otherwise it measures the
-    functional forward. The two modes retain separate configuration caches;
-    neither mode mutates the caller's initial state.
+    functional forward. Both modes preserve the caller's initial state.
     """
     from flashrwkv2.tmix.wkv7.tilelang import (
         _bias_tensor,
@@ -554,10 +551,6 @@ def tune_tmix_wkv7_recurrent(
         tmix_wkv7_recurrent,
     )
 
-    if state_indices is not None:
-        if status.tolist() != [0, r.shape[0], state_indices.numel()]:
-            raise ValueError("WKV tuning requires valid fully active representative metadata for the capture shape")
-        initial_state = initial_state.index_select(0, state_indices.long())
     if initial_state.dtype == torch.float16 and not indexed:
         raise ValueError("FP16 state is inference-only; tuning requires indexed=True")
 

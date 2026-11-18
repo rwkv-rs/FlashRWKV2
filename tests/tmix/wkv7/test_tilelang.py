@@ -92,7 +92,7 @@ def test_optional_fp16_state_preserves_inference_packing_and_training_precision(
 
 @pytest.mark.parametrize("dim", [64, 128, 256])
 @pytest.mark.parametrize("has_bias", [False, True])
-def test_optional_fp16_tuning_preserves_inference_outputs(dim, has_bias, monkeypatch, tmp_path):
+def test_optional_fp16_tuning_preserves_inference_outputs(dim, has_bias):
     import _tuning as tuning
 
     values, initial, cu, bias = _case(dim, (1, 3))
@@ -455,7 +455,7 @@ def test_recurrent_indexed_pool_matches_functional_forward(dim, block_values, pr
 
 @pytest.mark.parametrize("dim", [64, 128, 256])
 @pytest.mark.parametrize("indexed", [False, True])
-def test_recurrent_tuning_preserves_both_forwards_and_caller_state(monkeypatch, tmp_path, dim, indexed):
+def test_recurrent_tuning_preserves_both_forwards_and_caller_state(dim, indexed):
     import _tuning as tuning
 
     values, state, cu, bias = _case(dim, (1, 3))
