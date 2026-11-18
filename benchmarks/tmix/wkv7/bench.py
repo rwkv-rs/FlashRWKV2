@@ -55,6 +55,7 @@ def main():
     parser.add_argument("--cases", nargs="+", default=CASES,
                         help="packed BxT terms in scheduler order, e.g. 255x1+1x256")
     parser.add_argument("--metadata", choices=("static", "live"), default="static")
+    parser.add_argument("--state-pool-size", type=int, help="physical slots (defaults to the active batch)")
     parser.add_argument("--slot-order", choices=("sequential", "random"), default="sequential")
     parser.add_argument("--decay-bias", action="store_true")
     parser.add_argument("--tune", action="store_true")
@@ -114,6 +115,9 @@ def main():
                 lengths.extend([size] * count)
             offsets_cpu = [0, *accumulate(lengths)]
             batch, length, tokens = len(lengths), max(lengths), offsets_cpu[-1]
+            pool_size = batch if args.state_pool_size is None else args.state_pool_size
+            if pool_size < batch:
+                parser.error("--state-pool-size must cover every active sequence")
             # Reset per case so selecting a subset or tuning does not change
             # the logical values used by a different implementation.
             torch.manual_seed(args.seed)
@@ -124,7 +128,7 @@ def main():
                 .to(dtype)
                 for scale in (0.1, 2.0, 0.05, 0.05, 0.05, 0.05)
             )
-            initial = torch.randn(batch, heads, dim, dim, device="cuda") * 0.01
+            initial = torch.randn(pool_size, heads, dim, dim, device="cuda") * 0.01
             if args.state_dtype == "float16":
                 initial = initial.half()
             state = prepare_state(initial.clone())
@@ -136,7 +140,7 @@ def main():
 
             reset()
             cu = torch.tensor(offsets_cpu, device="cuda", dtype=torch.int32)
-            slots = (torch.randperm(batch, device="cuda", dtype=torch.int32)
+            slots = (torch.randperm(pool_size, device="cuda", dtype=torch.int32)[:batch]
                      if args.slot_order == "random" else torch.arange(batch, device="cuda", dtype=torch.int32))
             slot_ids = slots.tolist()
             if args.metadata == "live":
@@ -147,7 +151,7 @@ def main():
                 )
             else:
                 metadata_args = dict(total_tokens=tokens, max_seqlen=length)
-            ticket = prepare_tmix_wkv7_recurrent_metadata(cu, slots, state_pool_size=batch, **metadata_args)
+            ticket = prepare_tmix_wkv7_recurrent_metadata(cu, slots, state_pool_size=pool_size, **metadata_args)
             bias = (
                 torch.randn(heads, dim, device="cuda").bfloat16().half().to(dtype)
                 if args.decay_bias
@@ -197,6 +201,10 @@ def main():
             expected = run().clone()
             state.materialize_slots_(slots)
             expected_state = pool.clone()
+            if pool_size > batch:
+                unused = torch.ones(pool_size, device="cuda", dtype=torch.bool)
+                unused[slots.long()] = False
+                assert torch.equal(pool[unused], initial[unused])
             errors = {"output_relative_l2": 0.0, "state_relative_l2": 0.0}
             # DeltaLog and ordinary CUDA providers can differ within the
             # baseline's 4e-3 relative-L2 contract. TileLang must be bitwise equal.
@@ -271,7 +279,7 @@ def main():
                     "total_tokens": tokens,
                     "ticket": args.metadata, "slot_order": args.slot_order,
                     "sequences": batch,
-                    "state_pool_size": batch,
+                    "state_pool_size": pool_size,
                     "max_seqlen": length,
                 },
                 "correctness": "batch-bitwise-passed"
