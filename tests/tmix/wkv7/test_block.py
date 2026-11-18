@@ -109,8 +109,11 @@ def train_block(x, res, params, initial, shifts, targets, head_size, v_first, ad
     logits = fr.pretrain_head_linear_bf16(
         hidden, params["head"], **adapter_options(adapters, use_nora, (("head", ""),)),
     )
-    logprobs = -torch.nn.functional.cross_entropy(logits.view(-1, logits.shape[-1]), targets.reshape(-1), reduction="none")
-    return logprobs.view_as(targets), logits, final, tmix_shift, cmix_shift
+    loss = fr.pretrain_head_ce_bf16(
+        hidden, params["head"], targets.contiguous(),
+        **adapter_options(adapters, use_nora, (("head", ""),)),
+    )
+    return -loss, logits, final, tmix_shift, cmix_shift
 
 
 def state_pools(initial, shifts, slots, pool_size):
@@ -183,7 +186,14 @@ def infer_block(
     logits = fr.infer_head_linear_all_forward_varlen(
         hidden, params["head"], **adapter_options(adapters, use_nora, (("head", ""),)),
     )
-    return -torch.nn.functional.cross_entropy(logits.reshape(-1, logits.shape[-1]), targets.reshape(-1), reduction="none").view_as(targets), logits
+    from flashrwkv2.head.ce.tilelang import finish_stats, partial_stats
+
+    # Score the emitted inference logits with the vocabulary reduction used in training.
+    width = logits.shape[-1]
+    labels = targets.reshape(-1).contiguous()
+    high, denominator, chosen = partial_stats(width)(logits, labels, 0)
+    loss, _, _ = finish_stats(width)(chosen, labels, high, denominator)
+    return -loss.view_as(targets), logits
 
 
 @pytest.mark.parametrize("adapter", ["none", "lora", "nora"])
