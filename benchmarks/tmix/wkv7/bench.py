@@ -195,7 +195,7 @@ def main():
                 # The benchmark can also load earlier package revisions via PYTHONPATH.
                 selector = getattr(wkv7, "_recurrent_config", None)
                 if args.state_dtype == "float16" and heads in (40, 64) and dim == 64 and hasattr(ticket, "_row_order"):
-                    dispatch = {"reason": "device-ordered rows, per-slot FP16 decode and tiled prefill"}
+                    dispatch = {"reason": "device-ordered rows, per-slot decode, tiled or full-head prefill by active prefill count"}
                 elif selector is not None:
                     columns, prefetch = selector(values[0], batch, pool.dtype, None, None)
                     if length == 1:
@@ -212,7 +212,7 @@ def main():
             if pool_size > batch:
                 unused = torch.ones(pool_size, device="cuda", dtype=torch.bool)
                 unused[slots.long()] = False
-                assert torch.equal(pool[unused], initial[unused])
+                assert torch.equal(pool[unused].view(torch.uint8), initial[unused].view(torch.uint8))
             errors = {"output_relative_l2": 0.0, "state_relative_l2": 0.0}
             # DeltaLog and ordinary CUDA providers can differ within the
             # baseline's 4e-3 relative-L2 contract. TileLang must be bitwise equal.
@@ -256,7 +256,7 @@ def main():
                     )
                     errors[name] = max(errors[name], error)
                     passed = (
-                        torch.equal(result, reference)
+                        torch.equal(result.contiguous().view(torch.uint8), reference.contiguous().view(torch.uint8))
                         if args.implementation == "tilelang"
                         else error <= 4e-3
                     )
@@ -313,7 +313,10 @@ def main():
         "torch": torch.__version__,
         "cuda": torch.version.cuda,
         "logical_inputs": "FP32 normal samples rounded through BF16 and FP16; identical values in both token formats",
-        "steady_state": "owning state reset before each timing batch; metadata preparation and state materialization are untimed",
+        "steady_state": (
+            "State resets before each timing batch and slots materialize after timing. "
+            + ("Ticket preparation is timed." if args.include_ticket_preparation else "The prepared ticket is reused.")
+        ),
         "results": results,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
