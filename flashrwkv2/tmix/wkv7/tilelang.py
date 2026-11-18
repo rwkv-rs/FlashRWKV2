@@ -1003,9 +1003,8 @@ def _recurrent_config(r, batch, state_dtype, columns, prefetch):
     if r.shape[-1] == 64 and r.shape[0] > batch:
         device = device_class(r.device)
         if _fixed_strategy_device(device):
-            if state_dtype == torch.float32:
-                tile = (64, 4)
-            else:
+            tile = (64, 4)
+            if state_dtype == torch.float16:
                 sm = device[1] * 10 + device[2]
                 bucket = 1 << (r.shape[0] - 1).bit_length()
                 key = (sm, r.shape[1] * r.shape[2], state_dtype, bucket)
@@ -1176,9 +1175,8 @@ def tmix_wkv7_recurrent(
 
     ``block_values`` chooses independent value columns per CTA, leaving the
     key reduction unchanged. ``prefetch_tokens`` selects one or four tokens
-    per shared-memory load. The validated RTX 4090 head-size-64 FP32-state
-    path uses 64 columns and selects prefetch by workload; other paths use a
-    verified profile or the default of 64 columns and one token.
+    per shared-memory load. The committed SM89 and SM120 configurations use
+    four-token prefetch for D64 multi-token workloads and one for decode.
     """
     batch = initial_state.shape[0] if initial_state.ndim else 0
     _check_inputs(
