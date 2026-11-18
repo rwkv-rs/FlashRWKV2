@@ -118,7 +118,7 @@ def _materialize_deltalog(heads):
                 pending[0] = T.call_extern("int32", "rwkv_claim_log",
                                            Phase.access_ptr("rw"), T.int64(slot) * heads + h)
             T.sync_threads()
-            if pending[0] != 0:
+            if (pending[0] & 1) != 0:
                 state = T.alloc_fragment((64, 64), "float32")
                 T.annotate_layout({state: T.Fragment((64, 64), forward_thread_fn=lambda k, c: c,
                                                      forward_index_fn=lambda k, c: k)})
@@ -148,6 +148,7 @@ def _forward_kernel(
     dense_decode: bool = False,
     with_log: bool = False,
     append_log: bool = False,
+    check_order: bool = False,
 ):
     n, batch = T.dynamic("n, batch")
     state_slots = T.dynamic("state_slots") if indexed else batch
@@ -208,6 +209,7 @@ def _forward_kernel(
                 start = CU[seq]
                 end = CU[seq + 1]
             pending = T.alloc_shared((1 if with_log else 0,), "int32")
+            next_phase = T.alloc_shared((1 if with_log else 0,), "int32")
             if indexed:
                 T.clear(state)
                 if active:
@@ -216,7 +218,16 @@ def _forward_kernel(
                         state[key, value] = S0[slot, h, key, tile * columns + value]
                     if with_log:
                         if T.get_thread_binding() == 0:
-                            pending[0] = Phase[slot, h]
+                            phase = Phase[slot, h]
+                            pending[0] = phase & 1
+                            if check_order:
+                                # Alternating slot traversal can reuse the last-written dense state in L2.
+                                last = batch - 1 if dense_decode else Status[2] - 1
+                                direction = T.if_then_else(Indices[0] <= Indices[last], 2, 4)
+                                same_order = (phase & 6) == 0 or (phase & 6) == direction
+                                next_phase[0] = direction + T.if_then_else((phase & 1) == 0 and same_order, 1, 0)
+                            else:
+                                next_phase[0] = T.if_then_else(append_log and (phase & 1) == 0, 1, 0)
                         T.sync_threads()
                         if pending[0] != 0:
                             _replay_deltalog(state, Log, slot, h)
@@ -316,7 +327,7 @@ def _forward_kernel(
                     slot = Indices[seq]
                     if with_log:
                         if end > start:
-                            if append_log and pending[0] == 0:
+                            if append_log and (next_phase[0] & 1) != 0:
                                 for key in T.Parallel(64):
                                     Log[slot, h, 0, key] = wv[key]
                                     Log[slot, h, 1, key] = kv[key]
@@ -327,7 +338,7 @@ def _forward_kernel(
                                 for key, value in T.Parallel(64, 64):
                                     S0[slot, h, key, value] = state[key, value]
                             if T.get_thread_binding() == 0:
-                                Phase[slot, h] = T.if_then_else(append_log and pending[0] == 0, 1, 0)
+                                Phase[slot, h] = next_phase[0]
                     else:
                         for key, value in T.Parallel(dim, columns):
                             S0[slot, h, key, tile * columns + value] = state[key, value]
@@ -1189,6 +1200,7 @@ def _infer_recurrent(
                     and device_class(r.device)[1:3] == (12, 0)),
         dense_decode=dense_decode,
         with_log=delta_buffers is not None, append_log=append_log,
+        check_order=append_log and batch >= 128 and device_class(r.device)[1:3] == (12, 0),
     )(
         r,
         decay_logits,

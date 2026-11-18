@@ -77,7 +77,8 @@ FP32 tensor。每次调用返回时状态完整写回。
 
 D64、H40 或 H64 的 FP16 handle 为每个 slot、每个头分配五个长度为 64 的 FP32 向量和一个
 int32 phase，共 1,284 字节。批量 decode 可以把一步更新留在日志，下次读取该 slot 时按原
-FP32 顺序重放并舍入。H64 模型的 32 层每序列共用 16 MiB 基态和约 2.508 MiB 日志。
+FP32 顺序重放并舍入。SM120 大批量 decode 在 slot 遍历方向切换时直接写回，
+使相邻调用可复用仍在 L2 中的基态。H64 模型的 32 层每序列共用 16 MiB 基态和约 2.508 MiB 日志。
 其他几何和 FP32 handle 的私有字节数为零。容量规划使用 `memory_layout["bytes_per_slot"]`，
 其中包括基态和日志，`fixed_workspace_nbytes` 为零。
 

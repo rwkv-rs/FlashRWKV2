@@ -362,11 +362,12 @@ def test_fp16_deltalog_materializes_reads_and_preserves_overlapping_copies():
 
 
 @pytest.mark.cuda_graph
-def test_fp16_deltalog_graph_replays_live_slot_counts_and_rejects_invalid_tails():
+@pytest.mark.parametrize("batch", (16, 128))
+def test_fp16_deltalog_graph_replays_live_slot_counts_and_rejects_invalid_tails(batch):
     from flashrwkv2.tmix.wkv7.tilelang import _infer_recurrent
 
     torch.manual_seed(68)
-    batch, heads = 16, 64
+    heads = 64
     inputs = tuple(torch.randn(batch, heads, 64, device="cuda").mul_(.04).bfloat16() for _ in range(6))
     raw = torch.randn(batch, heads, 64, 64, device="cuda").mul_(.02).half()
     reference = raw.clone()
@@ -394,8 +395,8 @@ def test_fp16_deltalog_graph_replays_live_slot_counts_and_rejects_invalid_tails(
         output = launch()
 
     all_slots = torch.arange(batch, device="cuda", dtype=torch.int32)
-    for active in (16, 7, 0, 12, 16):
-        slots.copy_(all_slots.flip((0,)))
+    for step, active in enumerate((batch, batch, batch, 7, 0, 12, batch)):
+        slots.copy_(all_slots if step % 2 else all_slots.flip((0,)))
         slots[active:] = -99
         count.fill_(active)
         graph.replay()
