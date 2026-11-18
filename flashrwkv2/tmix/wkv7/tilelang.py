@@ -139,8 +139,16 @@ def _fp16_serving_kernel(heads, scale, bias_dtype, has_bias, ordered, with_log, 
     n, batch, slots = T.dynamic("n, batch, slots")
     lanes = 32 // groups
     keys = 64 // groups
-    threads = 64 * groups
+    columns = 16
+    threads = max(64, columns * groups)
+    tiles = 64 // columns
     reduction = r"""
+    __device__ __forceinline__ int rwkv_claim_prefill_tile(int* phases, long long index, int tile) {
+      auto flag = reinterpret_cast<unsigned char*>(phases + index) + tile;
+      int pending = *flag;
+      *flag = 0;
+      return pending;
+    }
     template<int groups>
     __device__ __forceinline__ float rwkv_sum_groups(float x) {
       #pragma unroll
@@ -241,7 +249,7 @@ def _fp16_serving_kernel(heads, scale, bias_dtype, has_bias, ordered, with_log, 
                     Pool[slot, h, k, tid] = T.cast(state[k], "float16")
             if with_log:
                 if tid == 0:
-                    Phase[slot, h] = T.cast(allow_append and pending[0] == 0, "int32")
+                    Phase[slot, h] = T.if_then_else(allow_append and pending[0] == 0, 0x01010101, 0)
 
     @T.prim_func
     def kernel(
@@ -252,37 +260,45 @@ def _fp16_serving_kernel(heads, scale, bias_dtype, has_bias, ordered, with_log, 
         Bias: T.Tensor((heads if has_bias else 0, 64), bias_dtype),
         Status: T.Tensor((3,), "int32"), Indices: T.Tensor((batch,), "int32"),
         Y: T.Tensor((n, heads, 64), "bfloat16"),
-        Order: T.Tensor((batch if ordered else 0,), "int32"),
+        Order: T.Tensor((batch + 1 if ordered else 0,), "int32"),
         Log: T.Tensor((slots if with_log else 0, heads, 5, 64), "float32"),
         Phase: T.Tensor((slots if with_log else 0, heads), "int32"),
     ):
-        with T.Kernel(heads, batch, threads=threads, prelude=reduction) as (h, priority):
+        with T.Kernel(heads, batch + (T.min(batch * (tiles - 1), 12) if ordered else T.if_then_else(batch == 1 and n > 1, tiles - 1, 0)), threads=threads, prelude=reduction) as (h, priority):
             tid = T.get_thread_binding()
             group = tid % 32 // lanes
-            col = tid // 32 * lanes + tid % lanes
+            local_col = tid // 32 * lanes + tid % lanes
             state = T.alloc_local((keys,), "float32")
             dot = T.alloc_local((1,), "float32")
             vectors = T.alloc_shared((4, 6, 64), "float32")
             previous = T.alloc_shared((5 if with_log else 0, 64), "float32")
             phase = T.alloc_shared((1 if with_log else 0,), "int32")
-            if Status[1] < n:
+            if Status[1] < n and priority < batch:
                 if tid < 64:
                     for i in T.serial(T.ceildiv(n - Status[1], batch)):
                         row = Status[1] + i * batch + priority
                         if row < n:
                             Y[row, h, tid] = T.cast(float("nan"), "bfloat16")
-            if priority < Status[2]:
-                seq = Order[priority] if ordered else priority
+            num_prefills = Order[batch] if ordered else T.if_then_else(batch == 1 and Status[1] > 1, 1, 0)
+            tasks = Status[2] + (tiles - 1) * num_prefills
+            width = batch + (T.min(batch * (tiles - 1), 12) if ordered else T.if_then_else(batch == 1 and n > 1, tiles - 1, 0))
+            for offset in T.serial(T.ceildiv(tasks - priority, width)):
+                rank = priority + offset * width
+                is_prefill = rank < tiles * num_prefills
+                idx = T.if_then_else(is_prefill, rank // tiles, rank - (tiles - 1) * num_prefills)
+                seq = Order[idx] if ordered else idx
                 start, end = CU[seq], CU[seq + 1]
                 slot = Indices[seq]
-                if end - start == 1:
+                if not is_prefill:
                     decode(R, W, K, V, A, B, Bias, Pool, Log, Phase, Y, start, slot, h, tid)
                 else:
+                    tile = rank % tiles
+                    col = tile * columns + local_col
                     for j in T.unroll(keys):
                         state[j] = T.cast(Pool[slot, h, group * keys + j, col], "float32")
                     if with_log:
                         if tid == 0:
-                            phase[0] = Phase[slot, h]
+                            phase[0] = T.call_extern("int32", "rwkv_claim_prefill_tile", Phase.access_ptr("rw"), T.int64(slot) * heads + h, tile)
                         T.sync_threads()
                         if (phase[0] & 1) != 0:
                             for i, k in T.Parallel(5, 64):
@@ -310,9 +326,6 @@ def _fp16_serving_kernel(heads, scale, bias_dtype, has_bias, ordered, with_log, 
                         T.sync_threads()
                     for j in T.unroll(keys):
                         Pool[slot, h, group * keys + j, col] = T.cast(state[j], "float16")
-                    if with_log:
-                        if tid == 0:
-                            Phase[slot, h] = 0
     return kernel
 
 
@@ -1365,7 +1378,12 @@ def _infer_recurrent(
     if state_pool.dtype == torch.float16 and dim == 64 and heads in (40, 64):
         output = torch.empty_like(v)
         bias = _bias_tensor(r, decay_bias)
-        order = status[:0] if row_order is None else row_order
+        order = row_order
+        if order is None:
+            lengths = torch.where(torch.arange(batch, device=r.device) < status[2],
+                                  cu_seqlens[1:] - cu_seqlens[:-1], 0)
+            order = torch.cat((lengths.argsort(descending=True, stable=True).int(),
+                               (lengths > 1).sum(dtype=torch.int32).view(1)))
         if delta_buffers is None:
             log = torch.empty((0, heads, 5, 64), device=r.device, dtype=torch.float32)
             phase = status[:0].view(0, heads)

@@ -35,9 +35,11 @@ __global__ void validate_recurrent_metadata_kernel(
   __shared__ int active_tokens;
   __shared__ int active_sequences;
   __shared__ int actual_max_seqlen;
+  __shared__ int prefill_rows;
   if (threadIdx.x == 0) {
     shared_status = 0;
     actual_max_seqlen = 0;
+    prefill_rows = 0;
     active_tokens = num_active_tokens == nullptr ? total_tokens
                                                   : num_active_tokens[0];
     active_sequences = num_active_sequences == nullptr
@@ -101,6 +103,8 @@ __global__ void validate_recurrent_metadata_kernel(
     } else if (token_end - token_start > max_seqlen) {
       error |= kSequenceTooLong;
     }
+    if (order != nullptr && error == 0 && token_end - token_start > 1)
+      atomicAdd(&prefill_rows, 1);
     if (validation_summary != nullptr && error == 0)
       atomicMax(&actual_max_seqlen, token_end - token_start);
 
@@ -146,6 +150,7 @@ __global__ void validate_recurrent_metadata_kernel(
     }
   }
   if (order != nullptr) {
+    if (threadIdx.x == 0) order[num_sequences] = shared_status == 0 ? prefill_rows : 0;
     // Sort once for all WKV layers. Stable ties keep the scheduler's decode order.
     if (num_sequences <= blockDim.x) {
       using Sort = cub::BlockRadixSort<int, 256, 1, int>;
@@ -202,7 +207,7 @@ PreparedRecurrentMetadata launch_recurrent_metadata_validation(
   constexpr int threads = 256;
   const bool sort_rows = num_sequences > 1 && max_seqlen > 1 &&
       !(snapshot && total_tokens == num_sequences);
-  auto order = sort_rows ? torch::empty_like(state_indices) : seen_slots.narrow(0, 0, 0);
+  auto order = sort_rows ? torch::empty({num_sequences + 1}, state_indices.options()) : seen_slots.narrow(0, 0, 0);
   validate_recurrent_metadata_kernel<<<
       1,
       threads,
@@ -226,8 +231,10 @@ PreparedRecurrentMetadata launch_recurrent_metadata_validation(
       validation_summary.defined() ? validation_summary.data_ptr<int>() : nullptr,
       sort_rows ? order.data_ptr<int>() : nullptr);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-  if (sort_rows && num_sequences > threads)
-    order = at::argsort(order, /*stable=*/true, /*dim=*/0, /*descending=*/true).to(at::kInt);
+  if (sort_rows && num_sequences > threads) {
+    auto rows = order.narrow(0, 0, num_sequences);
+    rows.copy_(at::argsort(rows, /*stable=*/true, /*dim=*/0, /*descending=*/true));
+  }
   return PreparedRecurrentMetadata{
       std::move(query_start_loc_snapshot),
       std::move(state_indices_snapshot),
