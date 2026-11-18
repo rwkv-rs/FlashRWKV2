@@ -163,6 +163,22 @@ def main():
                 validated_metadata=ticket,
             )
 
+            dispatch = None
+            if is_tilelang:
+                from flashrwkv2.tmix.wkv7 import tilelang as wkv7
+
+                # The benchmark can also load earlier package revisions via PYTHONPATH.
+                selector = getattr(wkv7, "_recurrent_config", None)
+                if selector is not None:
+                    columns, prefetch = selector(values[0], batch, pool.dtype, None, None)
+                    if length == 1:
+                        reason = "one token per sequence"
+                    elif prefetch > 1:
+                        reason = "validated D64 multi-token prefetch"
+                    else:
+                        reason = "canonical recurrent tile for this geometry"
+                    dispatch = {"block_values": columns, "prefetch_tokens": prefetch, "reason": reason}
+
             expected = run().clone()
             state.materialize_slots_(slots)
             expected_state = pool.clone()
@@ -247,6 +263,8 @@ def main():
                 "correctness_errors": errors,
                 "timing": timing,
             }
+            if dispatch is not None:
+                record["dispatch"] = dispatch
             if tuning is not None:
                 record["tuning"] = tuning
             results.append(record)
