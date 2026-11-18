@@ -132,7 +132,8 @@ def _materialize_deltalog(heads):
 
 
 
-@tilelang.jit(pass_configs=_PASSES, compile_flags=_COMPILE_FLAGS)
+@tilelang.jit(pass_configs={**_PASSES, tilelang.PassConfigKey.TL_DISABLE_SAFE_MEMORY_ACCESS: True},
+              compile_flags=_COMPILE_FLAGS)
 def _fp16_serving_kernel(heads, scale, bias_dtype, has_bias, ordered, with_log, allow_append, groups=4):
     """D64 recurrence: each warp sums fixed contiguous key groups for its value columns."""
     n, batch, slots = T.dynamic("n, batch, slots")
@@ -178,6 +179,70 @@ def _fp16_serving_kernel(heads, scale, bias_dtype, has_bias, ordered, with_log, 
         if group == 0:
             Y[token, h, col] = T.cast(output * scale, "bfloat16")
 
+
+    @T.macro
+    def decode(R, W, K, V, A, B, Bias, Pool, Log, Phase, Y, token, slot, h, tid):
+        values = T.alloc_shared((1, 6, 64), "float32")
+        past = T.alloc_shared((5 if with_log else 0, 64), "float32")
+        pending = T.alloc_shared((1 if with_log else 0,), "int32")
+        state = T.alloc_local((64,), "float32")
+        if tid < 64:
+            for k in T.unroll(64):
+                state[k] = T.cast(Pool[slot, h, k, tid], "float32")
+            load_token(R, W, K, V, A, B, Bias, values, token, h, 0, tid)
+        if with_log:
+            if tid == 0:
+                pending[0] = Phase[slot, h] & 1
+        T.sync_threads()
+        if with_log:
+            if pending[0] != 0:
+                for i, k in T.Parallel(5, 64):
+                    past[i, k] = Log[slot, h, i, k]
+                T.sync_threads()
+                if tid < 64:
+                    for k in T.unroll(64):
+                        val = T.fma(past[1, k], past[2, tid],
+                                    T.fma(past[3, k], past[4, tid], past[0, k] * state[k]))
+                        state[k] = T.cast(T.cast(val, "float16"), "float32")
+        if tid < 64:
+            sa = T.alloc_local((groups,), "float32")
+            sy = T.alloc_local((groups,), "float32")
+            for g in T.unroll(groups):
+                sa[g] = 0.0
+                sy[g] = 0.0
+                for j in T.unroll(keys):
+                    sa[g] = T.fma(state[g * keys + j], values[0, 4, g * keys + j], sa[g])
+            for level in T.unroll(groups.bit_length() - 1):
+                for g in T.unroll(groups // (2 << level)):
+                    sa[g * (2 << level)] = sa[g * (2 << level)] + sa[g * (2 << level) + (1 << level)]
+            for g in T.unroll(groups):
+                for j in T.unroll(keys):
+                    k = g * keys + j
+                    val = T.fma(values[0, 2, k], values[0, 3, tid],
+                                T.fma(values[0, 5, k], sa[0], values[0, 1, k] * state[k]))
+                    state[k] = T.cast(T.cast(val, "float16"), "float32")
+                    sy[g] = T.fma(state[k], values[0, 0, k], sy[g])
+            for level in T.unroll(groups.bit_length() - 1):
+                for g in T.unroll(groups // (2 << level)):
+                    sy[g * (2 << level)] = sy[g * (2 << level)] + sy[g * (2 << level) + (1 << level)]
+            Y[token, h, tid] = T.cast(sy[0] * scale, "bfloat16")
+            if with_log and allow_append:
+                if pending[0] == 0:
+                    Log[slot, h, 0, tid] = values[0, 1, tid]
+                    Log[slot, h, 1, tid] = values[0, 2, tid]
+                    Log[slot, h, 2, tid] = values[0, 3, tid]
+                    Log[slot, h, 3, tid] = values[0, 5, tid]
+                    Log[slot, h, 4, tid] = sa[0]
+                else:
+                    for k in T.unroll(64):
+                        Pool[slot, h, k, tid] = T.cast(state[k], "float16")
+            else:
+                for k in T.unroll(64):
+                    Pool[slot, h, k, tid] = T.cast(state[k], "float16")
+            if with_log:
+                if tid == 0:
+                    Phase[slot, h] = T.cast(allow_append and pending[0] == 0, "int32")
+
     @T.prim_func
     def kernel(
         R: T.Tensor((n, heads, 64), "bfloat16"), W: T.Tensor((n, heads, 64), "bfloat16"),
@@ -210,52 +275,44 @@ def _fp16_serving_kernel(heads, scale, bias_dtype, has_bias, ordered, with_log, 
                 seq = Order[priority] if ordered else priority
                 start, end = CU[seq], CU[seq + 1]
                 slot = Indices[seq]
-                for j in T.unroll(keys):
-                    state[j] = T.cast(Pool[slot, h, group * keys + j, col], "float32")
-                if with_log:
-                    if tid == 0:
-                        phase[0] = Phase[slot, h]
-                    T.sync_threads()
-                    if (phase[0] & 1) != 0:
-                        for i, k in T.Parallel(5, 64):
-                            previous[i, k] = Log[slot, h, i, k]
+                if end - start == 1:
+                    decode(R, W, K, V, A, B, Bias, Pool, Log, Phase, Y, start, slot, h, tid)
+                else:
+                    for j in T.unroll(keys):
+                        state[j] = T.cast(Pool[slot, h, group * keys + j, col], "float32")
+                    if with_log:
+                        if tid == 0:
+                            phase[0] = Phase[slot, h]
                         T.sync_threads()
-                        for j in T.unroll(keys):
-                            k = group * keys + j
-                            replay = T.fma(previous[1, k], previous[2, col],
-                                           T.fma(previous[3, k], previous[4, col],
-                                                 previous[0, k] * state[j]))
-                            state[j] = T.cast(T.cast(replay, "float16"), "float32")
-                for chunk in T.serial((end - start) // 4):
-                    for t, k in T.Parallel(4, 64):
-                        load_token(R, W, K, V, A, B, Bias, vectors, start + chunk * 4 + t, h, t, k)
-                    T.sync_threads()
-                    for t in T.unroll(4):
-                        step(state, vectors, Y, start + chunk * 4 + t, h, t, group, col, dot)
-                    T.sync_threads()
-                for tail in T.serial((end - start) % 4):
-                    token = end - (end - start) % 4 + tail
-                    if tid < 64:
-                        load_token(R, W, K, V, A, B, Bias, vectors, token, h, 0, tid)
-                    T.sync_threads()
-                    step(state, vectors, Y, token, h, 0, group, col, dot)
-                    T.sync_threads()
-                append = T.alloc_var("bool", init=False)
-                if with_log:
-                    append = allow_append and end - start == 1 and (phase[0] & 1) == 0
-                    if append:
+                        if (phase[0] & 1) != 0:
+                            for i, k in T.Parallel(5, 64):
+                                previous[i, k] = Log[slot, h, i, k]
+                            T.sync_threads()
+                            for j in T.unroll(keys):
+                                k = group * keys + j
+                                replay = T.fma(previous[1, k], previous[2, col],
+                                               T.fma(previous[3, k], previous[4, col],
+                                                     previous[0, k] * state[j]))
+                                state[j] = T.cast(T.cast(replay, "float16"), "float32")
+                    for chunk in T.serial((end - start) // 4):
+                        for t, k in T.Parallel(4, 64):
+                            load_token(R, W, K, V, A, B, Bias, vectors, start + chunk * 4 + t, h, t, k)
+                        T.sync_threads()
+                        for t in T.unroll(4):
+                            step(state, vectors, Y, start + chunk * 4 + t, h, t, group, col, dot)
+                        T.sync_threads()
+                    for tail in T.serial((end - start) % 4):
+                        token = end - (end - start) % 4 + tail
                         if tid < 64:
-                            Log[slot, h, 0, tid] = vectors[0, 1, tid]
-                            Log[slot, h, 1, tid] = vectors[0, 2, tid]
-                            Log[slot, h, 2, tid] = vectors[0, 3, tid]
-                            Log[slot, h, 3, tid] = vectors[0, 5, tid]
-                        if group == 0:
-                            Log[slot, h, 4, col] = dot[0]
-                    if tid == 0:
-                        Phase[slot, h] = T.cast(append, "int32")
-                if not append:
+                            load_token(R, W, K, V, A, B, Bias, vectors, token, h, 0, tid)
+                        T.sync_threads()
+                        step(state, vectors, Y, token, h, 0, group, col, dot)
+                        T.sync_threads()
                     for j in T.unroll(keys):
                         Pool[slot, h, group * keys + j, col] = T.cast(state[j], "float16")
+                    if with_log:
+                        if tid == 0:
+                            Phase[slot, h] = 0
     return kernel
 
 
