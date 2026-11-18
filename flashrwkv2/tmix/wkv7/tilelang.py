@@ -73,26 +73,26 @@ def _update_state(state, decay, k, v, b, state_dot_a, offset=0, state_dtype="flo
 
 
 @T.macro
-def _load_deltalog(log, slot, head, previous, fields):
-    if fields == 3:
+def _load_deltalog(log, slot, head, previous, fields, record):
+    if fields == 6:
         for key in T.Parallel(64):
-            wk = T.reinterpret(log[slot, head, 0, key], "uint32")
-            vb = T.reinterpret(log[slot, head, 1, key], "uint32")
+            wk = T.reinterpret(log[slot, head, 3 * record, key], "uint32")
+            vb = T.reinterpret(log[slot, head, 3 * record + 1, key], "uint32")
             w = T.reinterpret(wk & T.uint32(0xffff0000), "float32")
             previous[0, key] = T.exp2(_DECAY_EXP2 / (1.0 + T.exp2(-_LOG2E * w)))
             previous[1, key] = T.reinterpret(wk << 16, "float32")
             previous[2, key] = T.reinterpret(vb & T.uint32(0xffff0000), "float32")
             previous[3, key] = T.reinterpret(vb << 16, "float32")
-            previous[4, key] = log[slot, head, 2, key]
+            previous[4, key] = log[slot, head, 3 * record + 2, key]
     else:
         for field, key in T.Parallel(5, 64):
             previous[field, key] = log[slot, head, field, key]
 
 
 @T.macro
-def _replay_deltalog(state, log, slot, head, fields):
+def _replay_deltalog(state, log, slot, head, fields, record):
     previous = T.alloc_shared((5, 64), "float32")
-    _load_deltalog(log, slot, head, previous, fields)
+    _load_deltalog(log, slot, head, previous, fields, record)
     T.sync_threads()
     for key, col in T.Parallel(64, 64):
         replay = T.fma(previous[1, key], previous[2, col],
@@ -104,6 +104,8 @@ def _replay_deltalog(state, log, slot, head, fields):
 @tilelang.jit(pass_configs=_PASSES, compile_flags=_COMPILE_FLAGS)
 def _materialize_deltalog(heads, fields):
     batch, capacity = T.dynamic("batch, capacity")
+    records = 2 if fields == 6 else 1
+    count_mask = 0xf if fields == 6 else 1
     claim = """
     __device__ __forceinline__ int rwkv_claim_log(int* phase, long long offset) {
         return atomicExch(phase + offset, 0);
@@ -125,13 +127,16 @@ def _materialize_deltalog(heads, fields):
                 pending[0] = T.call_extern("int32", "rwkv_claim_log",
                                            Phase.access_ptr("rw"), T.int64(slot) * heads + h)
             T.sync_threads()
-            if (pending[0] & 1) != 0:
+            if (pending[0] & count_mask) != 0:
                 state = T.alloc_fragment((64, 64), "float32")
                 T.annotate_layout({state: T.Fragment((64, 64), forward_thread_fn=lambda k, c: c,
                                                      forward_index_fn=lambda k, c: k)})
                 for key, col in T.Parallel(64, 64):
                     state[key, col] = Pool[slot, h, key, col]
-                _replay_deltalog(state, Log, slot, h, fields)
+                for record in T.serial(records):
+                    if record < (pending[0] & count_mask):
+                        _replay_deltalog(state, Log, slot, h, fields, record)
+                        T.sync_threads()
                 for key, col in T.Parallel(64, 64):
                     Pool[slot, h, key, col] = T.cast(state[key, col], "float16")
 
@@ -139,7 +144,7 @@ def _materialize_deltalog(heads, fields):
 
 
 @tilelang.jit(pass_configs=_PASSES, compile_flags=_COMPILE_FLAGS)
-def _decode_traversal(heads, ordered):
+def _decode_traversal(heads, ordered, compact):
     batch, capacity = T.dynamic("batch, capacity")
 
     @T.prim_func
@@ -153,7 +158,7 @@ def _decode_traversal(heads, ordered):
                 Reverse[0] = 0
                 if first < Status[2]:
                     seq = Order[first] if ordered else 0
-                    Reverse[0] = Phase[Slots[seq], 0] & 1
+                    Reverse[0] = (Phase[Slots[seq], 0] >> (16 if compact else 0)) & 1
     return kernel
 
 
@@ -162,7 +167,8 @@ def _decode_traversal(heads, ordered):
 def _fp16_serving_kernel(heads, scale, bias_dtype, has_bias, ordered, with_log, allow_append, alternate=False, bulk_threshold=0, fields=5, rows="all"):
     """D64 recurrence: each warp sums fixed contiguous key groups for its value columns."""
     n, batch, slots = T.dynamic("n, batch, slots")
-    chunk_size = 8 if rows == "prefill" else 4
+    records = 2 if fields == 6 else 1
+    count_mask = 0xf if fields == 6 else 1
     groups, columns = 4, 16
     lanes = 32 // groups
     keys = 64 // groups
@@ -179,9 +185,9 @@ def _fp16_serving_kernel(heads, scale, bias_dtype, has_bias, ordered, with_log, 
       }
       return ordered ? order[index] : index;
     }
-    __device__ __forceinline__ int rwkv_claim_prefill_tile(int* phases, long long index, int tile) {
-      const int mask = 1 << tile;
-      return (atomicAnd(phases + index, ~mask) & mask) != 0;
+    __device__ __forceinline__ int rwkv_claim_prefill_tile(int* phases, long long index, int tile, int bits) {
+      const int shift = bits * tile, mask = ((1 << bits) - 1) << shift;
+      return (atomicAnd(phases + index, ~mask) & mask) >> shift;
     }
     __device__ __forceinline__ float rwkv_sum_groups(float x) {
       #pragma unroll
@@ -190,6 +196,25 @@ def _fp16_serving_kernel(heads, scale, bias_dtype, has_bias, ordered, with_log, 
       return x;
     }
     """
+
+    if rows == "decode":
+        # Streaming state accesses leave space for the repeatedly read token and journal vectors.
+        reduction += r"""
+        __device__ __forceinline__ float rwkv_stream_load(const void* pool, long long index) {
+          unsigned short bits;
+          asm("ld.global.cs.b16 %0, [%1];" : "=h"(bits)
+              : "l"(static_cast<const unsigned short*>(pool) + index));
+          float value;
+          asm("cvt.f32.f16 %0, %1;" : "=f"(value) : "h"(bits));
+          return value;
+        }
+        __device__ __forceinline__ void rwkv_stream_store(void* pool, long long index, float value) {
+          unsigned short bits;
+          asm("cvt.rn.f16.f32 %0, %1;" : "=h"(bits) : "f"(value));
+          asm volatile("st.global.cs.b16 [%0], %1;" ::
+                       "l"(static_cast<unsigned short*>(pool) + index), "h"(bits) : "memory");
+        }
+        """
 
     @T.macro
     def load_token(R, W, K, V, A, B, Bias, vectors, token, h, t, key):
@@ -246,8 +271,12 @@ def _fp16_serving_kernel(heads, scale, bias_dtype, has_bias, ordered, with_log, 
         pending = T.alloc_shared((1 if with_log else 0,), "int32")
         state = T.alloc_local((64,), "float32")
         sa = T.alloc_local((groups,), "float32")
+        offset = (T.int64(slot) * heads + h) * 4096 + tid
         for key in T.unroll(64):
-            state[key] = T.cast(Pool[slot, h, key, tid], "float32")
+            if rows == "decode":
+                state[key] = T.call_extern("float32", "rwkv_stream_load", Pool.access_ptr("r"), offset + key * 64)
+            else:
+                state[key] = T.cast(Pool[slot, h, key, tid], "float32")
         if single:
             load_token(R, W, K, V, A, B, Bias, vectors, start, h, 0, tid)
         if with_log:
@@ -255,13 +284,15 @@ def _fp16_serving_kernel(heads, scale, bias_dtype, has_bias, ordered, with_log, 
                 pending[0] = Phase[slot, h]
         T.sync_threads()
         if with_log:
-            if (pending[0] & 1) != 0:
-                _load_deltalog(Log, slot, h, past, fields)
-                T.sync_threads()
-                for key in T.unroll(64):
-                    updated = T.fma(past[1, key], past[2, tid],
-                                    T.fma(past[3, key], past[4, tid], past[0, key] * state[key]))
-                    state[key] = T.cast(T.cast(updated, "float16"), "float32")
+            for record in T.serial(records):
+                if record < (pending[0] & count_mask):
+                    _load_deltalog(Log, slot, h, past, fields, record)
+                    T.sync_threads()
+                    for key in T.unroll(64):
+                        updated = T.fma(past[1, key], past[2, tid],
+                                        T.fma(past[3, key], past[4, tid], past[0, key] * state[key]))
+                        state[key] = T.cast(T.cast(updated, "float16"), "float32")
+                    T.sync_threads()
         if single:
             column_step(state, vectors, Y, start, h, 0, tid, sa)
         else:
@@ -278,15 +309,16 @@ def _fp16_serving_kernel(heads, scale, bias_dtype, has_bias, ordered, with_log, 
                 T.sync_threads()
                 column_step(state, vectors, Y, token, h, 0, tid, sa)
                 T.sync_threads()
-        # The upper half of Ada heads writes through on first use, staggering later flushes.
+        # Offset the three-step cycle by head so each call writes back part of the pool.
         append = False
         if with_log and allow_append and single:
-            append = (pending[0] & 1) == 0 and (
-                rows != "decode" or h < heads // 2 or (pending[0] & 16) != 0
-            )
-        if with_log and allow_append and single:
+            if fields == 6:
+                tick = (pending[0] >> 17) + h * 3 // heads
+                append = (pending[0] & count_mask) < records and (rows != "decode" or tick % 3 != 2)
+            else:
+                append = (pending[0] & 1) == 0
             if append:
-                if fields == 3:
+                if fields == 6:
                     # The four BF16 operands take two words. The state dot keeps all 32 bits.
                     w = T.cast(W[start, h, tid], "float32")
                     if has_bias:
@@ -295,9 +327,10 @@ def _fp16_serving_kernel(heads, scale, bias_dtype, has_bias, ordered, with_log, 
                           | (T.reinterpret(vectors[0, 2, tid], "uint32") >> 16))
                     vb = ((T.reinterpret(vectors[0, 3, tid], "uint32") & T.uint32(0xffff0000))
                           | (T.reinterpret(vectors[0, 5, tid], "uint32") >> 16))
-                    Log[slot, h, 0, tid] = T.reinterpret(wk, "float32")
-                    Log[slot, h, 1, tid] = T.reinterpret(vb, "float32")
-                    Log[slot, h, 2, tid] = sa[0]
+                    log_offset = 3 * (pending[0] & count_mask)
+                    Log[slot, h, log_offset, tid] = T.reinterpret(wk, "float32")
+                    Log[slot, h, log_offset + 1, tid] = T.reinterpret(vb, "float32")
+                    Log[slot, h, log_offset + 2, tid] = sa[0]
                 else:
                     Log[slot, h, 0, tid] = vectors[0, 1, tid]
                     Log[slot, h, 1, tid] = vectors[0, 2, tid]
@@ -306,14 +339,24 @@ def _fp16_serving_kernel(heads, scale, bias_dtype, has_bias, ordered, with_log, 
                     Log[slot, h, 4, tid] = sa[0]
             else:
                 for key in T.unroll(64):
-                    Pool[slot, h, key, tid] = T.cast(state[key], "float16")
+                    if rows == "decode":
+                        T.call_extern("void", "rwkv_stream_store", Pool.access_ptr("w"), offset + key * 64, state[key])
+                    else:
+                        Pool[slot, h, key, tid] = T.cast(state[key], "float16")
         else:
             for key in T.unroll(64):
                 Pool[slot, h, key, tid] = T.cast(state[key], "float16")
         if with_log:
             if tid == 0:
                 if allow_append and single:
-                    Phase[slot, h] = T.if_then_else(append, (1 << tiles) - 1, 0) | (16 if rows == "decode" else 0)
+                    if fields == 6:
+                        count = T.if_then_else(append, (pending[0] & count_mask) + 1, 0)
+                        epoch = ((pending[0] >> 17) + 1) % 3
+                        # Four independently claimable counts, the traversal bit, then the tick.
+                        direction = (pending[0] ^ 0x10000) & 0x10000
+                        Phase[slot, h] = (epoch << 17) | direction | count * 0x1111
+                    else:
+                        Phase[slot, h] = T.if_then_else(append, (1 << tiles) - 1, 0)
                 else:
                     Phase[slot, h] = 0
 
@@ -343,7 +386,7 @@ def _fp16_serving_kernel(heads, scale, bias_dtype, has_bias, ordered, with_log, 
             local_col = tid // 32 * lanes + tid % lanes
             state = T.alloc_local((keys,), "float32")
             dot = T.alloc_local((1,), "float32")
-            vectors = T.alloc_shared((chunk_size, 6, 64), "float32")
+            vectors = T.alloc_shared((4, 6, 64), "float32")
             previous = T.alloc_shared((5 if with_log else 0, 64), "float32")
             phase = T.alloc_shared((1 if with_log else 0,), "int32")
             if rows != "prefill" and Status[1] < n and priority < batch:
@@ -381,26 +424,28 @@ def _fp16_serving_kernel(heads, scale, bias_dtype, has_bias, ordered, with_log, 
                         state[j] = T.cast(Pool[slot, h, group * keys + j, col], "float32")
                     if with_log:
                         if tid == 0:
-                            phase[0] = T.call_extern("int32", "rwkv_claim_prefill_tile", Phase.access_ptr("rw"), T.int64(slot) * heads + h, tile)
+                            phase[0] = T.call_extern("int32", "rwkv_claim_prefill_tile", Phase.access_ptr("rw"), T.int64(slot) * heads + h, tile, 4 if fields == 6 else 1)
                         T.sync_threads()
-                        if (phase[0] & 1) != 0:
-                            _load_deltalog(Log, slot, h, previous, fields)
-                            T.sync_threads()
-                            for j in T.unroll(keys):
-                                k = group * keys + j
-                                replay = T.fma(previous[1, k], previous[2, col],
-                                               T.fma(previous[3, k], previous[4, col],
-                                                     previous[0, k] * state[j]))
-                                state[j] = T.cast(T.cast(replay, "float16"), "float32")
-                    for chunk in T.serial((end - start) // chunk_size):
-                        for t, k in T.Parallel(chunk_size, 64):
-                            load_token(R, W, K, V, A, B, Bias, vectors, start + chunk * chunk_size + t, h, t, k)
+                        for record in T.serial(records):
+                            if record < phase[0]:
+                                _load_deltalog(Log, slot, h, previous, fields, record)
+                                T.sync_threads()
+                                for j in T.unroll(keys):
+                                    k = group * keys + j
+                                    replay = T.fma(previous[1, k], previous[2, col],
+                                                   T.fma(previous[3, k], previous[4, col],
+                                                         previous[0, k] * state[j]))
+                                    state[j] = T.cast(T.cast(replay, "float16"), "float32")
+                                T.sync_threads()
+                    for chunk in T.serial((end - start) // 4):
+                        for t, k in T.Parallel(4, 64):
+                            load_token(R, W, K, V, A, B, Bias, vectors, start + chunk * 4 + t, h, t, k)
                         T.sync_threads()
-                        for t in T.unroll(chunk_size):
-                            step(state, vectors, Y, start + chunk * chunk_size + t, h, t, group, col, dot)
+                        for t in T.unroll(4):
+                            step(state, vectors, Y, start + chunk * 4 + t, h, t, group, col, dot)
                         T.sync_threads()
-                    for tail in T.serial((end - start) % chunk_size):
-                        token = end - (end - start) % chunk_size + tail
+                    for tail in T.serial((end - start) % 4):
+                        token = end - (end - start) % 4 + tail
                         if tid < 64:
                             load_token(R, W, K, V, A, B, Bias, vectors, token, h, 0, tid)
                         T.sync_threads()
@@ -1395,7 +1440,7 @@ def _infer_recurrent(
         alternate = append_log and batch >= 128
         reverse = status.new_empty(1) if alternate else status[:0]
         if alternate:
-            _decode_traversal(heads, order.numel() != 0)(phase, state_indices, status, order, reverse)
+            _decode_traversal(heads, order.numel() != 0, log.shape[2] == 6)(phase, state_indices, status, order, reverse)
         config = (
             heads, float(scale), "bfloat16" if bias.dtype == torch.bfloat16 else "float32",
             bias.numel() != 0, order.numel() != 0, delta_buffers is not None, append_log, alternate,
@@ -1403,7 +1448,7 @@ def _infer_recurrent(
         )
         tensors = (r, decay_logits, k, v, a, b, state_pool, cu_seqlens, bias, status, state_indices,
                    output, order, log, phase, reverse)
-        if alternate and log.shape[2] == 3:
+        if alternate and log.shape[2] == 6:
             if order.numel():
                 caller = torch.cuda.current_stream(r.device)
                 prefill = _prefill_stream(caller)

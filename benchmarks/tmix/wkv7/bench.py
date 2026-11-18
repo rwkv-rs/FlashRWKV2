@@ -188,7 +188,9 @@ def main():
                 batch_ticket = prepare_ticket() if args.include_ticket_preparation else ticket
                 return run_layer(validated_metadata=batch_ticket)
 
-            expected = run().clone()
+            # Six calls cover both traversal directions and every Ada writeback phase.
+            check_steps = 6 if args.state_dtype == "float16" and batch >= 16 and 1 in lengths else 1
+            expected_outputs = [run().clone() for _ in range(check_steps)]
             state.materialize_slots_(slots)
             expected_state = pool.clone()
             if pool_size > batch:
@@ -211,7 +213,7 @@ def main():
                     state_pool_size=1,
                     max_seqlen=size,
                 )
-                actual = infer(
+                run_single = partial(infer,
                     *(
                         value[offsets_cpu[row] : offsets_cpu[row + 1]].contiguous()
                         for value in values
@@ -223,15 +225,12 @@ def main():
                     max_seqlen=size,
                     validated_metadata=single_ticket,
                 )
+                row_slice = slice(offsets_cpu[row], offsets_cpu[row + 1])
+                checks = [("output_relative_l2", run_single(), expected[row_slice])
+                          for expected in expected_outputs]
                 single.materialize_slots_(slot)
-                for name, result, reference in (
-                    (
-                        "output_relative_l2",
-                        actual,
-                        expected[offsets_cpu[row] : offsets_cpu[row + 1]],
-                    ),
-                    ("state_relative_l2", single_pool[0], expected_state[slot_id]),
-                ):
+                checks.append(("state_relative_l2", single_pool[0], expected_state[slot_id]))
+                for name, result, reference in checks:
                     error = float(
                         (result.float() - reference.float()).norm()
                         / reference.float().norm().clamp_min(1e-12)
@@ -262,7 +261,7 @@ def main():
                 "decay_bias_dtype": None
                 if bias is None
                 else str(bias.dtype).removeprefix("torch."),
-                "output_dtype": str(expected.dtype).removeprefix("torch."),
+                "output_dtype": str(expected_outputs[0].dtype).removeprefix("torch."),
                 "state_dtype": str(pool.dtype).removeprefix("torch."),
                 "state_memory_layout": state.memory_layout,
                 "metadata": {
@@ -277,6 +276,7 @@ def main():
                 if args.implementation == "tilelang"
                 else "batch-relative-l2-passed",
                 "correctness_errors": errors,
+                "correctness_steps": check_steps,
                 "timing": timing,
             }
             if tuning is not None:

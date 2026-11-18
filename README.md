@@ -14,8 +14,8 @@ four groups of 16 keys for each dot product. A live metadata ticket schedules lo
 prefill rows first, and each decode slot can append to its DeltaLog independently.
 With one to three prefill rows, four blocks share each head's value columns.
 With four or more prefill rows, one block handles a whole head.
-Exact DeltaLog replay reserves 772 bytes per head per slot for H64 on the
-128-SM RTX 4090 and 1,284 bytes for the other supported H40/H64 configurations. Use the handle's `memory_layout`
+On the 128-SM RTX 4090, H64 stores up to two exact DeltaLog records per head
+and slot (1,540 bytes). The other H40/H64 configurations store one record (1,284 bytes). Use the handle's `memory_layout`
 when budgeting concurrency. Call `materialize_slots_(indices)` before reading
 or copying the externally bound tensor. Training, RL rollout and its evaluation
 and sampling search use FP32 state to reproduce the learner's logprobs.

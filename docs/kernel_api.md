@@ -78,10 +78,10 @@ FP32 tensor。每次调用返回时状态完整写回。
 然后按 `(s0 + s1) + (s2 + s3)` 合并。该求和顺序同时用于单行、混合 batch 和单 token decode。
 
 D64、H40/H64 的 FP16 handle 按 slot 和头分配 DeltaLog。128 个 SM 的 RTX 4090 在 H64 下
-将四个 BF16 操作数紧凑存储，并保留 FP32 点积，加上 int32 phase 共 772 字节。
-其他 H40/H64 配置保存五个长度为 64 的 FP32 向量和一个 int32 phase，共 1,284 字节。批量 decode 可以把一步更新留在日志，下次读取该 slot 时按原
+每条记录保存四个 BF16 操作数和一个 FP32 点积。每个头最多保留两条记录，加上 int32 phase 共 1,540 字节。
+其他 H40/H64 配置保存五个长度为 64 的 FP32 向量和一个 int32 phase，共 1,284 字节。批量 decode 追加记录，下一次读取该 slot 时按原
 FP32 顺序重放并舍入。同一批次里的单 token 行独立决定追加或写回，长行优先执行。
-H64 模型的 32 层每序列共用 16 MiB 基态，紧凑日志占 1.508 MiB，五向量日志占 2.508 MiB。
+H64 模型的 32 层每序列共用 16 MiB 基态，双记录日志占 3.008 MiB，五向量日志占 2.508 MiB。
 其他几何和 FP32 handle 的私有字节数为零。容量规划使用 `memory_layout["bytes_per_slot"]`，
 其中包括基态和日志，`fixed_workspace_nbytes` 为零。
 

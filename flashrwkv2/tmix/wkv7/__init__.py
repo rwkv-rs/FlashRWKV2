@@ -37,7 +37,7 @@ class _TmixWkv7RecurrentState:
             props = torch.cuda.get_device_properties(state_pool.device)
             compact = heads == 64 and (props.major, props.minor, props.multi_processor_count) == (8, 9, 128)
             self._delta = (
-                state_pool.new_empty((slots, heads, 3 if compact else 5, dim), dtype=torch.float32),
+                state_pool.new_empty((slots, heads, 6 if compact else 5, dim), dtype=torch.float32),
                 state_pool.new_zeros((slots, heads), dtype=torch.int32),
             )
 

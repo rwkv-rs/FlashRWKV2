@@ -311,7 +311,7 @@ def test_fp16_deltalog_materializes_reads_and_preserves_overlapping_copies(heads
     base = heads * dim * dim * raw.element_size()
     props = torch.cuda.get_device_properties(raw.device)
     compact = heads == 64 and (props.major, props.minor, props.multi_processor_count) == (8, 9, 128)
-    private = heads * (772 if compact else 1284)
+    private = heads * (1540 if compact else 1284)
     assert state.memory_layout == {
         "base_bytes_per_slot": base, "private_bytes_per_slot": private,
         "bytes_per_slot": base + private, "fixed_workspace_nbytes": 0,
@@ -450,7 +450,9 @@ def test_live_mixed_prefill_matches_token_decode_after_row_reordering(batch):
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
         output = launch()
-    for lengths in ([1] * batch, [1] * (batch - 1) + [17], [5, 2, 7, 4, 3] + [1] * (batch - 9)):
+    for lengths in ([1] * batch, [1] * batch, [1] * (batch - 1) + [17],
+                    [1] * batch, [5, 2, 7, 4, 3] + [1] * (batch - 9)):
+        slots.copy_(slots.roll(3))
         lengths_gpu = torch.tensor(lengths, device="cuda", dtype=torch.int32)
         offsets = torch.cat((lengths_gpu.new_zeros(1), lengths_gpu.cumsum(0, dtype=torch.int32)))
         active, rows = sum(lengths), len(lengths)
