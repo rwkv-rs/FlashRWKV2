@@ -38,9 +38,18 @@ _COMPILE_FLAGS = ["--fmad=false"]
 # Late buckets also cover short batches with many tokens per sequence.
 _PREFILL_CONFIGS = {
     (sm, channels, torch.float16, rows): (columns, 4)
-    for sm, channels, columns in ((89, 2560, 64), (89, 4096, 64), (120, 2560, 32), (120, 4096, 64))
+    for sm, channels, columns in ((89, 2560, 64), (89, 4096, 64), (120, 2560, 64), (120, 4096, 64))
     for rows in (16, 64, 128, 512, 1024)
 }
+_DOT_PAIR_SOURCE = r"""
+__device__ __forceinline__ unsigned long long rwkv_dot_pair(
+    float state, float r, float a, unsigned long long acc) {
+    unsigned long long result;
+    asm("{ .reg .b64 state2, vec; mov.b64 state2,{%1,%1}; mov.b64 vec,{%2,%3}; "
+        "fma.rn.f32x2 %0,state2,vec,%4; }" : "=l"(result) : "f"(state), "f"(r), "f"(a), "l"(acc));
+    return result;
+}
+"""
 
 
 @T.macro
@@ -86,6 +95,8 @@ def _forward_kernel(
     bias_dtype: str = "float32",
     prefetch_tokens: int = 1,
     state_dtype: str = "float32",
+    packed_dot: bool = False,
+    dense_decode: bool = False,
 ):
     n, batch = T.dynamic("n, batch")
     state_slots = T.dynamic("state_slots") if indexed else batch
@@ -93,6 +104,7 @@ def _forward_kernel(
     key_groups = dim // 64
     checkpoints = n // _CHECKPOINT + batch
     threads = columns * key_groups
+    lookahead = state_dtype == "float16" and dim == 64 and prefetch_tokens > 1
     within_loop = T.unroll if prefetch_tokens > 1 and dim <= 128 else T.serial
 
     @T.prim_func
@@ -112,9 +124,10 @@ def _forward_kernel(
         SN: T.Tensor((0 if indexed else batch, heads, dim, dim), state_dtype),
         Boundaries: T.Tensor((checkpoints if save else 0, heads, dim, dim), state_dtype),
     ):
-        with T.Kernel(dim // columns, heads, batch, threads=threads) as (tile, h, seq):
+        with T.Kernel(dim // columns, heads, batch, threads=threads, prelude=_DOT_PAIR_SOURCE if packed_dot else None) as (tile, h, seq):
             state = T.alloc_fragment((dim, columns), "float32")
             partial = T.alloc_fragment((key_groups, columns), "float32")
+            next_dot = T.alloc_fragment((columns,), "float32")
             dot = T.alloc_fragment((columns,), "float32")
             out = T.alloc_fragment((columns,), "float32")
             rv = T.alloc_shared((prefetch_tokens * dim,), "float32")
@@ -139,7 +152,11 @@ def _forward_kernel(
                 forward_index_fn=lambda group, value: 0,
             )
             T.annotate_layout({state: layout, partial: partial_layout})
-            if has_status:
+            if dense_decode:
+                active = True
+                start = seq
+                end = seq + 1
+            elif has_status:
                 active = Status[0] == 0 and seq < Status[2]
                 start = T.if_then_else(active, CU[seq], 0)
                 end = T.if_then_else(active, CU[seq + 1], 0)
@@ -163,7 +180,7 @@ def _forward_kernel(
             else:
                 for key, value in T.Parallel(dim, columns):
                     state[key, value] = S0[seq, h, key, tile * columns + value]
-            for chunk in T.serial(T.ceildiv(end - start, prefetch_tokens)):
+            for chunk in T.serial(1 if dense_decode else T.ceildiv(end - start, prefetch_tokens)):
                 for prefetched, key in T.Parallel(prefetch_tokens, dim):
                     token = start + chunk * prefetch_tokens + prefetched
                     if prefetch_tokens == 1 or token < end:
@@ -184,6 +201,8 @@ def _forward_kernel(
                         kv[offset] = T.cast(K[token, h, key], "float32")
                         av[offset] = T.cast(A[token, h, key], "float32")
                         bv[offset] = T.cast(B[token, h, key], "float32")
+                    elif lookahead:
+                        av[prefetched * dim + key] = 0.0
                 if prefetch_tokens > 1:
                     for prefetched, value in T.Parallel(prefetch_tokens, columns):
                         token = start + chunk * prefetch_tokens + prefetched
@@ -210,11 +229,41 @@ def _forward_kernel(
                                 )
                             else:
                                 vv[value] = vs[within * columns + value]
-                        _dot_keys(state, av, partial, dot, within * dim)
+                        if not lookahead or within == 0:
+                            _dot_keys(state, av, partial, dot, within * dim)
+                        else:
+                            T.copy(next_dot, dot)
                         _update_state(
                             state, wv, kv, vv, bv, dot, within * dim, state_dtype
                         )
-                        _dot_keys(state, rv, partial, out, within * dim)
+                        if lookahead and within + 1 < prefetch_tokens:
+                            # D64 has one key group. Scan r[t] and a[t+1] in
+                            # parallel over the identical rounded state.
+                            if packed_dot:
+                                pair = T.alloc_fragment((columns,), "uint64")
+                                T.clear(pair)
+                                for key in T.unroll(64):
+                                    for value in T.Parallel(columns):
+                                        current = state[key, value]
+                                        pair[value] = T.call_pure_extern(
+                                            "uint64", "rwkv_dot_pair", current,
+                                            rv[within * dim + key], av[(within + 1) * dim + key], pair[value],
+                                        )
+                                for value in T.Parallel(columns):
+                                    out[value] = T.reinterpret("float32", T.cast(pair[value], "uint32"))
+                                    next_dot[value] = T.reinterpret("float32", T.cast(pair[value] >> 32, "uint32"))
+                            else:
+                                T.clear(out)
+                                T.clear(next_dot)
+                                for key in T.unroll(64):
+                                    for value in T.Parallel(columns):
+                                        current = state[key, value]
+                                        out[value] = T.fma(current, rv[within * dim + key], out[value])
+                                        next_dot[value] = T.fma(
+                                            current, av[(within + 1) * dim + key], next_dot[value],
+                                        )
+                        else:
+                            _dot_keys(state, rv, partial, out, within * dim)
                         for value in T.Parallel(columns):
                             Y[token, h, tile * columns + value] = T.cast(
                                 out[value] * scale, "bfloat16"
@@ -980,6 +1029,7 @@ def _infer_recurrent(
     decay_bias=None,
     block_values=None,
     prefetch_tokens=None,
+    dense_decode=False,
 ):
     """Launch the common forward directly against an indexed inference pool."""
     if (
@@ -1027,6 +1077,9 @@ def _infer_recurrent(
         "bfloat16" if bias.dtype == torch.bfloat16 else "float32",
         prefetch_tokens,
         str(state_pool.dtype).removeprefix("torch."),
+        packed_dot=(state_pool.dtype == torch.float16 and dim == 64 and prefetch_tokens > 1
+                    and device_class(r.device)[1:3] == (12, 0)),
+        dense_decode=dense_decode,
     )(
         r,
         decay_logits,
