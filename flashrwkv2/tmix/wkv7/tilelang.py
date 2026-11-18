@@ -116,9 +116,28 @@ def _materialize_deltalog(heads):
 
 
 
+@tilelang.jit(pass_configs=_PASSES, compile_flags=_COMPILE_FLAGS)
+def _decode_traversal(heads, ordered):
+    batch, capacity = T.dynamic("batch, capacity")
+
+    @T.prim_func
+    def kernel(Phase: T.Tensor((capacity, heads), "int32"),
+               Slots: T.Tensor((batch,), "int32"), Status: T.Tensor((3,), "int32"),
+               Order: T.Tensor((batch + 1 if ordered else 0,), "int32"),
+               Reverse: T.Tensor((1,), "int32")):
+        with T.Kernel(1, threads=32):
+            if T.get_thread_binding() == 0:
+                first = Order[batch] if ordered else 0
+                Reverse[0] = 0
+                if first < Status[2]:
+                    seq = Order[first] if ordered else 0
+                    Reverse[0] = Phase[Slots[seq], 0] & 1
+    return kernel
+
+
 @tilelang.jit(pass_configs={**_PASSES, tilelang.PassConfigKey.TL_DISABLE_SAFE_MEMORY_ACCESS: True},
               compile_flags=_COMPILE_FLAGS)
-def _fp16_serving_kernel(heads, scale, bias_dtype, has_bias, ordered, with_log, allow_append, groups=4, columns=16):
+def _fp16_serving_kernel(heads, scale, bias_dtype, has_bias, ordered, with_log, allow_append, alternate=False, groups=4, columns=16):
     """D64 recurrence: each warp sums fixed contiguous key groups for its value columns."""
     n, batch, slots = T.dynamic("n, batch, slots")
     lanes = 32 // groups
@@ -244,6 +263,7 @@ def _fp16_serving_kernel(heads, scale, bias_dtype, has_bias, ordered, with_log, 
         Order: T.Tensor((batch + 1 if ordered else 0,), "int32"),
         Log: T.Tensor((slots if with_log else 0, heads, 5, 64), "float32"),
         Phase: T.Tensor((slots if with_log else 0, heads), "int32"),
+        Reverse: T.Tensor((1 if alternate else 0,), "int32"),
     ):
         with T.Kernel(heads, batch + (T.min(batch * (tiles - 1), 12) if ordered else T.if_then_else(batch == 1 and n > 1, tiles - 1, 0)), threads=threads, prelude=reduction) as (h, priority):
             tid = T.get_thread_binding()
@@ -266,7 +286,10 @@ def _fp16_serving_kernel(heads, scale, bias_dtype, has_bias, ordered, with_log, 
             for offset in T.serial(T.ceildiv(tasks - priority, width)):
                 rank = priority + offset * width
                 is_prefill = rank < tiles * num_prefills
-                idx = T.if_then_else(is_prefill, rank // tiles, rank - (tiles - 1) * num_prefills)
+                decode_idx = rank - (tiles - 1) * num_prefills
+                if alternate:
+                    decode_idx = T.if_then_else(Reverse[0] != 0, Status[2] - 1 - (rank - tiles * num_prefills), decode_idx)
+                idx = T.if_then_else(is_prefill, rank // tiles, decode_idx)
                 seq = Order[idx] if ordered else idx
                 start, end = CU[seq], CU[seq + 1]
                 slot = Indices[seq]
@@ -1257,11 +1280,15 @@ def _infer_recurrent(
             phase = status[:0].view(0, heads)
         else:
             log, phase = delta_buffers
+        alternate = append_log and batch >= 128
+        reverse = status.new_empty(1) if alternate else status[:0]
+        if alternate:
+            _decode_traversal(heads, order.numel() != 0)(phase, state_indices, status, order, reverse)
         _fp16_serving_kernel(
             heads, float(scale), "bfloat16" if bias.dtype == torch.bfloat16 else "float32",
-            bias.numel() != 0, order.numel() != 0, delta_buffers is not None, append_log,
+            bias.numel() != 0, order.numel() != 0, delta_buffers is not None, append_log, alternate,
         )(r, decay_logits, k, v, a, b, state_pool, cu_seqlens, bias, status, state_indices,
-          output, order, log, phase)
+          output, order, log, phase, reverse)
         return output
 
     block_values, prefetch_tokens = _recurrent_config(
