@@ -86,14 +86,14 @@ def test_backward_matches_clampw_recurrence() -> None:
     actual = pretrain_tmix_wkv7_recurrent_bf16(*values)
     grad_output = torch.randn_like(actual)
     actual.backward(grad_output)
-    actual_gradients = [value.grad.detach().float() for value in values]
+    actual_gradients = [value.grad.detach().double() for value in values]
 
     reference_values = tuple(
-        value.detach().clone().requires_grad_() for value in values
+        value.detach().double().requires_grad_() for value in values
     )
     expected = _reference(reference_values)
     expected.backward(grad_output.float())
-    expected_gradients = [value.grad.detach().float() for value in reference_values]
+    expected_gradients = [value.grad.detach() for value in reference_values]
     for actual_gradient, expected_gradient in zip(actual_gradients, expected_gradients):
         assert torch.isfinite(actual_gradient).all()
         assert torch.allclose(actual_gradient, expected_gradient, atol=0.03, rtol=0.05)
@@ -104,7 +104,7 @@ def test_backward_matches_clampw_recurrence() -> None:
 def test_generalized_forward_backward_matches_recurrence(head_size: int) -> None:
     values = _case(1, 17, 1, requires_grad=True, head_size=head_size)
     actual = pretrain_tmix_wkv7_recurrent_bf16(*values, head_size=head_size)
-    expected_values = tuple(value.detach().clone().requires_grad_() for value in values)
+    expected_values = tuple(value.detach().double().requires_grad_() for value in values)
     expected = _reference(expected_values, head_size)
     grad = torch.randn_like(actual)
     actual.backward(grad)
@@ -113,7 +113,7 @@ def test_generalized_forward_backward_matches_recurrence(head_size: int) -> None
     for value, reference in zip(values, expected_values, strict=True):
         assert torch.isfinite(value.grad).all()
         assert torch.allclose(
-            value.grad.float(), reference.grad.float(), atol=0.05, rtol=0.08
+            value.grad.double(), reference.grad, atol=0.05, rtol=0.08
         )
 
 
