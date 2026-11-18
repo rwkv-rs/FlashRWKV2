@@ -242,6 +242,8 @@ def _infer_forward_varlen(
     return _infer_recurrent(
         r, decay_logits, k, v, a, b, state._state_pool, cu_seqlens,
         state_indices, status, scale=scale, decay_bias=decay_bias,
+        dense_decode=(state_dtype == torch.float16 and not ticket._is_graph()
+                      and ticket._max_seqlen() == 1 and r.shape[0] == state_indices.numel()),
     )
 
 
