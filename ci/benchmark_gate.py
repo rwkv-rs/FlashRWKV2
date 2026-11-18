@@ -45,30 +45,23 @@ BENCHMARKS = {
         ),
     ),
     "embedding": (BenchmarkCase("infer", "benchmarks/embedding/bench.py"),),
-    "head/l2wrap_ce": (
-        BenchmarkCase("pretrain", "benchmarks/head/l2wrap_ce/bench.py"),
+    "head/ce": (
+        BenchmarkCase("pretrain", "benchmarks/head/ce/bench.py"),
         BenchmarkCase(
             "pretrain_forward_backward_frozen_base",
-            "benchmarks/head/l2wrap_ce/bench.py",
+            "benchmarks/head/ce/bench.py",
             ("--backward",),
         ),
         BenchmarkCase(
             "pretrain_forward_backward_trainable_base",
-            "benchmarks/head/l2wrap_ce/bench.py",
+            "benchmarks/head/ce/bench.py",
             ("--backward", "--train-base"),
         ),
     ),
     "head/linear": (
         BenchmarkCase("infer", "benchmarks/head/linear/bench.py", ("--compare-torch",)),
     ),
-    "loss/l2wrap_ce": (
-        BenchmarkCase(
-            "pretrain_forward_backward", "benchmarks/loss/l2wrap_ce/bench.py"
-        ),
-    ),
     "sampling": (BenchmarkCase("infer", "benchmarks/sampling/bench.py"),),
-    "tmix/a_gate": (BenchmarkCase("pretrain", "benchmarks/tmix/a_gate/bench.py"),),
-    "tmix/kk_pre": (BenchmarkCase("pretrain", "benchmarks/tmix/kk_pre/bench.py"),),
     "tmix/readout": (
         BenchmarkCase(
             "infer", "benchmarks/tmix/readout/bench.py", ("--operator", "infer")
@@ -93,9 +86,6 @@ BENCHMARKS = {
         ),
     ),
     "post_norm": (BenchmarkCase("infer", "benchmarks/post_norm/bench.py"),),
-    "tmix/vres_gate": (
-        BenchmarkCase("pretrain", "benchmarks/tmix/vres_gate/bench.py"),
-    ),
     "tmix/wkv_prepare": (
         BenchmarkCase("infer", "benchmarks/tmix/wkv_prepare/bench.py"),
     ),
@@ -135,15 +125,6 @@ BENCHMARKS = {
         BenchmarkCase(
             "pretrain_forward_backward", "benchmarks/tmix/wkv7/pretrain/bench.py"
         ),
-        BenchmarkCase("statetune", "benchmarks/tmix/wkv7/statetune/bench.py"),
-    ),
-    "tmix/wkv7/rl_infctx": (
-        BenchmarkCase("forward", "benchmarks/tmix/wkv7/rl_infctx/bench.py"),
-        BenchmarkCase(
-            "forward_backward",
-            "benchmarks/tmix/wkv7/rl_infctx/bench.py",
-            ("--backward",),
-        ),
     ),
 }
 
@@ -158,7 +139,7 @@ STANDARD_BENCHMARKS = {
 for _owner, _arguments in {
     "cmix": ("--operator", "pretrain", "--backward", "--adapter-rank", "256"),
     "head/linear": ("--tokens", "4", "--adapter-rank", "256"),
-    "head/l2wrap_ce": ("--adapter-rank", "256", "--backward"),
+    "head/ce": ("--adapter-rank", "256", "--backward"),
     "tmix/readout": (
         "--operator",
         "pretrain",
@@ -283,10 +264,10 @@ BENCHMARKS["tmix/wkv7"] += (
     ),
 )
 
-BENCHMARKS["head/l2wrap_ce"] += (
+BENCHMARKS["head/ce"] += (
     BenchmarkCase(
         "nora_model_width_chunked_backward",
-        "benchmarks/head/l2wrap_ce/bench.py",
+        "benchmarks/head/ce/bench.py",
         (
             "--channels",
             "4096",
@@ -1200,11 +1181,6 @@ def _self_test() -> None:
         "infer_recurrent_multisize_fp16_state",
         "infer_recurrent_model_decode_fp16_state",
         "pretrain_forward_backward",
-        "statetune",
-    }
-    assert {case.workload for case in BENCHMARKS["tmix/wkv7/rl_infctx"]} == {
-        "forward",
-        "forward_backward",
     }
 
 

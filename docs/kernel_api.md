@@ -2,7 +2,7 @@
 
 模型前向统一使用 BF16 激活和权重、FP32 累加与归约。默认 WKV 状态为连续
 FP32 `[slots,H,D,D]`，TokenShift 状态为 BF16 `[slots,C]`。Head 输出 logits、
-`head_logprobs` 与 loss 为 FP32。公共名称保留模块所有者；内部 primitive 不从根包导出。
+所选 token 的 logprob 与 loss 为 FP32。公共名称保留模块所有者；内部 primitive 不从根包导出。
 
 ## Numerical contract
 
@@ -45,10 +45,7 @@ TMix 公共阶段固定为 `tokenshift -> wkv_prepare -> wkv7 -> readout`。
 | `infer_cmix_forward_varlen` | res/ln、TokenShift、key projection、ReLU²、value projection；返回 `(res_out, cmix_out)`，原位更新 shift pool |
 | `infer_post_norm_output_forward_varlen(x, res, weight, bias, *, eps=1e-5)` | 对 BF16 residual sum 作 FP32 ln，返回 BF16 |
 | `infer_head_linear_all_forward_varlen(x, weight)` | `[N,C]` BF16 hidden 与 `[V,C]` BF16 weight，返回 FP32 `[N,V]` |
-| `infer_head_linear_last_forward_varlen(x, weight, *, tokens_count)` | 调用方已选出的末尾 hidden rows，返回对应 FP32 logits |
-| `head_logprobs(logits, targets)` | 连续 FP32 `[...,V]` logits 和同前缀形状的 INT64 targets，返回 FP32 所选 token logprobs |
-| `infer_sampling_temperature_topk_topp_forward_varlen` | FP32 logits、RNG pool、slot indices，返回 token ids；零温度确定性 argmax 不更新 RNG，正温度抽样更新 RNG |
-| `infer_sampling_six_parameter_forward_varlen` | 同上，另含 presence/frequency penalties 与 penalty decay |
+| `infer_sampling_six_parameter_forward_varlen` | FP32 logits、penalty pool、RNG pool 和 slot indices，返回 token ids 并更新请求状态 |
 
 WKV 推理参数为：
 
@@ -71,13 +68,10 @@ CMix 推理的 value weight 保持 `[F,C]` runtime 布局；训练入口为 `[C,
 
 ## State and packed metadata
 
-`prepare_tmix_wkv7_recurrent_fp32io16_state(state_pool_size, channels, *,
-sequence_capacity, head_size=64, device=None)` 分配零初始化 FP32 pool。
 `prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor(state)` 绑定已有连续 CUDA
 FP32 tensor。每次调用返回时状态完整写回。
 
-`prepare_tmix_wkv7_recurrent_fp16_state` 和
-`prepare_tmix_wkv7_recurrent_fp16_state_from_tensor` 提供相同的容量参数及 lifecycle，
+`prepare_tmix_wkv7_recurrent_fp16_state_from_tensor` 绑定已有连续 CUDA FP16 tensor，
 但 pool 使用 FP16，显存占用为 FP32 的一半。它们只供
 `infer_tmix_wkv7_recurrent_fp16_forward_varlen` 使用，token 输入和输出仍为 BF16，
 递推算术和归约仍为 FP32；每个 token 更新后将 state 舍入为 FP16。
@@ -104,17 +98,13 @@ CUDA Graph 使用 `token_capacity`、`sequence_capacity`、`max_seqlen_capacity`
 
 | API | 说明 |
 |---|---|
-| `pretrain_tmix_tokenshift_bf16` / `statetune_tmix_tokenshift_bf16` | 六路 TokenShift；stateful 形式返回混合输出和 final shift |
+| `pretrain_tmix_tokenshift_bf16` | 六路 TokenShift；stateful 形式返回混合输出和 final shift |
 | `pretrain_tmix_wkv_prepare_bf16` | 训练权重布局与 `w0` bias，输出共享 BF16 prepare 结果 |
-| `pretrain_tmix_wkv7_recurrent_bf16` | `[B,T,C]`、零初始状态，返回同形状 BF16 输出 |
-| `statetune_tmix_wkv7_recurrent_fp32io16` | 指定 segment 和初始 FP32 state，返回 `(output, final_state)` |
-| `rl_infctx_tmix_wkv7_recurrent_bf16` | packed 六路输入、`state_pool`、`cu_seqlens`、可选 `state_indices`，返回 `(output, final_pool)`；输入和 state 可求梯度 |
+| `pretrain_tmix_wkv7_recurrent_bf16` | dense `[B,T,C]` 或带 cu_seqlens 的 packed `[N,H,D]`，支持任意长度和可微 FP32 初始状态 |
 | `pretrain_tmix_readout_bf16` | head ln、RKV residual、gate，可选 output projection |
-| `pretrain_cmix_bf16` / `statetune_cmix_bf16` | ChannelMix 与可微初始/最终 shift state |
-| `pretrain_tmix_a_gate_bf16` / `pretrain_tmix_kk_pre_bf16` / `pretrain_tmix_vres_gate_bf16` | prepare 组成部分，复用相同前向 |
+| `pretrain_cmix_bf16` | ChannelMix 与可微初始/最终 shift state |
 | `pretrain_head_linear_bf16` | BF16 hidden/weight，返回 FP32 logits |
-| `pretrain_l2wrap_ce_bf16` | FP32 CE，梯度包含 train_temp L2Wrap 项 |
-| `pretrain_head_l2wrap_ce_bf16` | `chunk_rows` 限制前向词表投影工作集，`backward_chunk_rows` 可独立设置反向重算和 VJP 的行数，默认沿用 `chunk_rows` |
+| `pretrain_head_ce_bf16` | `chunk_rows` 限制前向词表投影工作集，按 targets 形状返回 FP32 交叉熵，-100 对应零 loss 和梯度，`backward_chunk_rows` 可独立设置反向重算和 VJP 的行数，默认沿用 `chunk_rows` |
 
 投影支持 LoRA/NoRA：A `[R,K]`、B `[O,R]`，参数可为 BF16/FP32。
 NoRA 为 `A / (norm(A, dim=0) + 1e-6)`，FP32 归一化与反向，BF16 投影；
@@ -143,28 +133,10 @@ compiled_model = torch.compile(
 等反向投影 key。准备函数负责清理梯度并恢复可变 state；调优完成后再开始参数更新。
 支持 PyTorch 2.11–2.14；metadata/sampling native 扩展使用 C++20 编译。
 
-StateTune 在编译或 capture 前验证 chunk metadata：
-
-```python
-from flashrwkv2 import (
-    prepare_tmix_wkv7_statetune_metadata,
-    statetune_tmix_wkv7_recurrent_fp32io16,
-)
-
-metadata = prepare_tmix_wkv7_statetune_metadata(
-    sequence_chunk_offsets, chunk_token_starts, chunk_token_ends,
-    total_tokens=r.shape[0],
-)
-output, final_state = statetune_tmix_wkv7_recurrent_fp32io16(
-    initial_state, sequence_chunk_offsets, chunk_token_starts, chunk_token_ends,
-    r, decay_logits, k, v, a, b, prepared_metadata=metadata,
-)
-```
-
-返回的 metadata record 持有独立 CUDA INT32 `cu_seqlens` 和 `total_tokens`。
-使用期间保持 offsets 不变；序列分段或 token 总数变化时重新准备并重新捕获。
-传入 `prepared_metadata` 后，执行路径使用该 record，不再读取原始 chunk 数组。
-未传入时，eager 调用仍在每次执行前验证并转换原有 chunk 参数。
+以 `initial_state` 传入初始 WKV state。设置 `return_final_state=True` 返回
+`(output, final_state)`。packed 输入使用连续 CUDA int32 `cu_seqlens`，
+从 0 起单调非减，末元素为 token 总数。TokenShift 和 CMix 以
+`initial_shift` 传入 shift state，同样通过 `return_final_state` 取出最终 state。
 
 ## Tuning and acceptance
 

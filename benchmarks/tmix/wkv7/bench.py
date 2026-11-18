@@ -16,7 +16,7 @@ from _timing import measure_cuda
 import flashrwkv2
 from flashrwkv2 import (
     infer_tmix_wkv7_recurrent_fp32io16_forward_varlen,
-    prepare_tmix_wkv7_recurrent_fp32io16_state,
+    prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor,
     prepare_tmix_wkv7_recurrent_metadata,
 )
 
@@ -88,14 +88,14 @@ def main():
         parser.error("--tune applies only to TileLang")
     if not is_tilelang and args.state_dtype != "float32":
         parser.error("the saved CUDA comparison uses FP32 state")
-    prepare_state = prepare_tmix_wkv7_recurrent_fp32io16_state
+    prepare_state = prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor
     infer = infer_tmix_wkv7_recurrent_fp32io16_forward_varlen
     if args.state_dtype == "float16":
         from flashrwkv2 import (
             infer_tmix_wkv7_recurrent_fp16_forward_varlen,
-            prepare_tmix_wkv7_recurrent_fp16_state,
+            prepare_tmix_wkv7_recurrent_fp16_state_from_tensor,
         )
-        prepare_state = prepare_tmix_wkv7_recurrent_fp16_state
+        prepare_state = prepare_tmix_wkv7_recurrent_fp16_state_from_tensor
         infer = infer_tmix_wkv7_recurrent_fp16_forward_varlen
     dtype = getattr(torch, args.token_dtype)
     results = []
@@ -118,13 +118,7 @@ def main():
             initial = torch.randn(batch, heads, dim, dim, device="cuda") * 0.01
             if args.state_dtype == "float16":
                 initial = initial.half()
-            state = prepare_state(
-                batch,
-                heads * dim,
-                sequence_capacity=batch,
-                head_size=dim,
-                device="cuda",
-            )
+            state = prepare_state(initial.clone())
             pool = state._components()[0]
 
             def reset(state=state, pool=pool, initial=initial):
@@ -176,16 +170,8 @@ def main():
             # DeltaLog and ordinary CUDA providers can differ within the
             # baseline's 4e-3 relative-L2 contract. TileLang must be bitwise equal.
             for row in range(batch):
-                single = prepare_state(
-                    1,
-                    heads * dim,
-                    sequence_capacity=1,
-                    head_size=dim,
-                    device="cuda",
-                )
-                single.zero_()
-                single_pool = single._components()[0]
-                single_pool.copy_(initial[row : row + 1])
+                single_pool = initial[row : row + 1].clone()
+                single = prepare_state(single_pool)
                 offsets = torch.tensor([0, length], device="cuda", dtype=torch.int32)
                 slot = torch.zeros(1, device="cuda", dtype=torch.int32)
                 single_ticket = prepare_tmix_wkv7_recurrent_metadata(

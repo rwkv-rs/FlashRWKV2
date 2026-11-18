@@ -72,9 +72,8 @@ compiled_model = torch.compile(
 ```
 
 Prepare tuning with eager forward-and-backward calls before compiling or
-capturing. StateTune chunk metadata is prepared once with
-`prepare_tmix_wkv7_statetune_metadata` and supplied through `prepared_metadata`;
-see the [training contract](docs/kernel_api.md#training).
+capturing. Dense and packed training accept optional FP32 initial state and can
+return final state for the next chunk. See the [training contract](docs/kernel_api.md#training).
 
 ## Tests
 

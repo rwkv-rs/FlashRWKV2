@@ -9,7 +9,6 @@ from utils import TorchOperationRecorder
 from flashrwkv2.tmix.tokenshift import (
     infer_tmix_postnorm_tokenshift_forward_varlen,
     pretrain_tmix_tokenshift_bf16,
-    statetune_tmix_tokenshift_bf16,
 )
 from flashrwkv2.tmix.wkv7 import prepare_tmix_wkv7_recurrent_metadata
 
@@ -73,7 +72,7 @@ def test_statetune_tokenshift_matches_torch_forward_backward(
         (torch.randn(channels, device=device) * 0.1).to(torch.bfloat16).requires_grad_()
         for _ in range(6)
     ]
-    actual = statetune_tmix_tokenshift_bf16(x, initial, *params)
+    actual = pretrain_tmix_tokenshift_bf16(x, *params, initial_shift=initial, return_final_state=True)
 
     x_ref = x.detach().clone().requires_grad_()
     initial_ref = initial.detach().clone().requires_grad_()
@@ -112,7 +111,7 @@ def test_statetune_tokenshift_chunk_composition() -> None:
         torch.randn(c, device=device, dtype=torch.bfloat16).requires_grad_()
         for _ in range(6)
     ]
-    whole = statetune_tmix_tokenshift_bf16(x, initial, *params)
+    whole = pretrain_tmix_tokenshift_bf16(x, *params, initial_shift=initial, return_final_state=True)
     upstream = [torch.randn_like(output) for output in whole]
     whole_grads = torch.autograd.grad(
         whole, (x, initial, *params), grad_outputs=upstream
@@ -121,11 +120,13 @@ def test_statetune_tokenshift_chunk_composition() -> None:
     x_chunked = x.detach().clone().requires_grad_()
     initial_chunked = initial.detach().clone().requires_grad_()
     params_chunked = [parameter.detach().clone().requires_grad_() for parameter in params]
-    first = statetune_tmix_tokenshift_bf16(
-        x_chunked[:, :split].contiguous(), initial_chunked, *params_chunked
+    first = pretrain_tmix_tokenshift_bf16(
+        x_chunked[:, :split].contiguous(), *params_chunked,
+        initial_shift=initial_chunked, return_final_state=True,
     )
-    second = statetune_tmix_tokenshift_bf16(
-        x_chunked[:, split:].contiguous(), first[-1], *params_chunked
+    second = pretrain_tmix_tokenshift_bf16(
+        x_chunked[:, split:].contiguous(), *params_chunked,
+        initial_shift=first[-1], return_final_state=True,
     )
     chunked = tuple(
         torch.cat((left, right), dim=1)
@@ -147,7 +148,7 @@ def test_statetune_tokenshift_rejects_cpu_and_invalid_shape() -> None:
     initial = torch.zeros(1, 8, dtype=torch.bfloat16)
     params = [torch.zeros(8, dtype=torch.bfloat16) for _ in range(6)]
     with pytest.raises(ValueError, match="CUDA"):
-        statetune_tmix_tokenshift_bf16(x, initial, *params)
+        pretrain_tmix_tokenshift_bf16(x, *params, initial_shift=initial, return_final_state=True)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -161,7 +162,7 @@ def test_statetune_tokenshift_rejects_misaligned_vec2_input() -> None:
     params = [torch.zeros(8, device=device, dtype=torch.bfloat16) for _ in range(6)]
     assert x.is_contiguous() and x.data_ptr() % 4 == 2
     with pytest.raises(ValueError, match="4-byte aligned"):
-        statetune_tmix_tokenshift_bf16(x, initial, *params)
+        pretrain_tmix_tokenshift_bf16(x, *params, initial_shift=initial, return_final_state=True)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -172,28 +173,43 @@ def test_statetune_tokenshift_rejects_invalid_cuda_contracts() -> None:
     initial = torch.zeros(1, 8, device=device, dtype=torch.bfloat16)
     params = [torch.zeros(8, device=device, dtype=torch.bfloat16) for _ in range(6)]
     with pytest.raises(ValueError, match="bfloat16"):
-        statetune_tmix_tokenshift_bf16(x.float(), initial, *params)
+        pretrain_tmix_tokenshift_bf16(x.float(), *params, initial_shift=initial, return_final_state=True)
     with pytest.raises(ValueError, match="bfloat16"):
-        statetune_tmix_tokenshift_bf16(x, initial.half(), *params)
+        pretrain_tmix_tokenshift_bf16(x, *params, initial_shift=initial.half(), return_final_state=True)
     with pytest.raises(ValueError, match="x must be contiguous"):
-        statetune_tmix_tokenshift_bf16(x.transpose(1, 2), initial, *params)
+        pretrain_tmix_tokenshift_bf16(
+            x.transpose(1, 2), *params,
+            initial_shift=initial, return_final_state=True,
+        )
     with pytest.raises(ValueError, match="non-empty"):
-        statetune_tmix_tokenshift_bf16(x[:, :0], initial, *params)
+        pretrain_tmix_tokenshift_bf16(x[:, :0], *params, initial_shift=initial, return_final_state=True)
     with pytest.raises(ValueError, match="initial_shift must have shape"):
-        statetune_tmix_tokenshift_bf16(x, initial[:, :-2].contiguous(), *params)
+        pretrain_tmix_tokenshift_bf16(
+            x, *params,
+            initial_shift=initial[:, :-2].contiguous(), return_final_state=True,
+        )
     with pytest.raises(ValueError, match="parameters must have shape"):
-        statetune_tmix_tokenshift_bf16(x, initial, params[0][:-2].contiguous(), *params[1:])
+        pretrain_tmix_tokenshift_bf16(
+            x, params[0][:-2].contiguous(), *params[1:],
+            initial_shift=initial, return_final_state=True,
+        )
 
     odd_x = torch.zeros(1, 2, 7, device=device, dtype=torch.bfloat16)
     odd_initial = torch.zeros(1, 7, device=device, dtype=torch.bfloat16)
     odd_params = [torch.zeros(7, device=device, dtype=torch.bfloat16) for _ in range(6)]
-    odd_output = statetune_tmix_tokenshift_bf16(odd_x, odd_initial, *odd_params)
+    odd_output = pretrain_tmix_tokenshift_bf16(
+        odd_x, *odd_params,
+        initial_shift=odd_initial, return_final_state=True,
+    )
     assert all(torch.count_nonzero(tensor) == 0 for tensor in odd_output)
 
     if torch.cuda.device_count() > 1:
         foreign = params[0].to("cuda:1")
         with pytest.raises(ValueError, match="share x's device"):
-            statetune_tmix_tokenshift_bf16(x, initial, foreign, *params[1:])
+            pretrain_tmix_tokenshift_bf16(
+                x, foreign, *params[1:],
+                initial_shift=initial, return_final_state=True,
+            )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

@@ -384,6 +384,8 @@ def test_recurrent_checkpoint_backward_sanitizer(prefetch_tokens):
 @pytest.mark.parametrize("prefetch_tokens", [1, 4])
 def test_recurrent_status_masks_inactive_capacity_and_invalid_metadata(prefetch_tokens):
     values, state, _, bias = _case(64, (3, 1, 1))
+    for tensor in values:
+        tensor[3:].fill_(float("nan"))
     # Only the first sequence is active; inactive CU entries are deliberately
     # invalid and must never determine a token range.
     cu = torch.tensor([0, 3, -999, 1000000], device="cuda", dtype=torch.int32)

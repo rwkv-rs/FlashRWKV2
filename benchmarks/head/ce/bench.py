@@ -8,7 +8,7 @@ import json
 import torch
 from _timing import measure_cuda
 
-from flashrwkv2.head.l2wrap_ce import pretrain_head_l2wrap_ce_bf16
+from flashrwkv2.head.ce import pretrain_head_ce_bf16
 
 
 def main() -> None:
@@ -77,17 +77,17 @@ def main() -> None:
         stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
         prepared_loss = (
-            pretrain_head_l2wrap_ce_bf16(hidden, weight, targets, **options)
+            pretrain_head_ce_bf16(hidden, weight, targets, **options)
             if args.backward_only else None
         )
 
         def run():
             loss = (
                 prepared_loss if args.backward_only
-                else pretrain_head_l2wrap_ce_bf16(hidden, weight, targets, **options)
+                else pretrain_head_ce_bf16(hidden, weight, targets, **options)
             )
             if args.backward:
-                torch.autograd.grad(loss, inputs, retain_graph=args.backward_only)
+                torch.autograd.grad(loss.mean(), inputs, retain_graph=args.backward_only)
             return loss
 
         # Compile and allocate once before measuring the memory of one operation.
@@ -112,7 +112,7 @@ def main() -> None:
     print(
         json.dumps(
             {
-                "operator": "pretrain_head_l2wrap_ce_bf16",
+                "operator": "pretrain_head_ce_bf16",
                 "seed": args.seed,
                 "gpu": torch.cuda.get_device_name(),
                 "cuda": torch.version.cuda,

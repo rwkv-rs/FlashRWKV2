@@ -101,47 +101,9 @@ class _TmixWkv7RecurrentState:
         return self
 
 
-def _prepare_state(
-    state_pool_size, channels, *, sequence_capacity, head_size=64, device=None,
-    dtype,
-):
-    if any(not isinstance(value, int) or isinstance(value, bool) or value <= 0
-           for value in (state_pool_size, channels, sequence_capacity, head_size)):
-        raise ValueError("state dimensions and sequence_capacity must be positive integers")
-    if head_size not in (64, 128, 256) or channels % head_size:
-        raise ValueError("head_size must be 64, 128, or 256 and divide channels")
-    if device is None:
-        device = torch.device("cuda", torch.cuda.current_device())
-    elif isinstance(device, int):
-        device = torch.device("cuda", device)
-    return _TmixWkv7RecurrentState(torch.zeros(
-        state_pool_size, channels // head_size, head_size, head_size,
-        device=device, dtype=dtype,
-    ))
-
-
 def prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor(state):
     _validate_state(state)
     return _TmixWkv7RecurrentState(state)
-
-
-def prepare_tmix_wkv7_recurrent_fp32io16_state(
-    state_pool_size, channels, *, sequence_capacity, head_size=64, device=None,
-):
-    return _prepare_state(
-        state_pool_size, channels, sequence_capacity=sequence_capacity,
-        head_size=head_size, device=device, dtype=torch.float32,
-    )
-
-
-def prepare_tmix_wkv7_recurrent_fp16_state(
-    state_pool_size, channels, *, sequence_capacity, head_size=64, device=None,
-):
-    """Allocate optional FP16 inference state; training keeps FP32 state."""
-    return _prepare_state(
-        state_pool_size, channels, sequence_capacity=sequence_capacity,
-        head_size=head_size, device=device, dtype=torch.float16,
-    )
 
 
 def prepare_tmix_wkv7_recurrent_fp16_state_from_tensor(state):
@@ -316,61 +278,13 @@ def infer_tmix_wkv7_recurrent_fp16_forward_varlen(
     )
 
 
-def rl_infctx_tmix_wkv7_recurrent_bf16(
-    r, decay_logits, k, v, a, b, *,
-    state_pool, cu_seqlens, state_indices=None, scale=1.0, decay_bias=None,
-):
-    """Differentiable packed recurrence and final FP32 state for RL/Infctx."""
-    from .tilelang import tmix_wkv7_recurrent
-    from ..._internal.state import check_cuda_condition
-
-    _validate_state(state_pool)
-    if (
-        cu_seqlens.ndim != 1 or cu_seqlens.numel() < 2
-        or cu_seqlens.dtype != torch.int32
-        or cu_seqlens.device != state_pool.device or not cu_seqlens.is_contiguous()
-    ):
-        raise ValueError("cu_seqlens must be contiguous CUDA int32 [B+1]")
-    invalid_lengths = (
-        (cu_seqlens[0] != 0)
-        | (cu_seqlens[-1] != r.shape[0])
-        | (cu_seqlens[1:] < cu_seqlens[:-1]).any()
-    )
-    check_cuda_condition(~invalid_lengths, "cu_seqlens must be nondecreasing and span [0,N]")
-    if state_indices is None:
-        return tmix_wkv7_recurrent(
-            r, decay_logits, k, v, a, b, state_pool, cu_seqlens,
-            scale=scale, decay_bias=decay_bias,
-        )
-    if (
-        state_indices.ndim != 1
-        or state_indices.shape != (cu_seqlens.numel() - 1,)
-        or state_indices.dtype != torch.int32
-        or state_indices.device != state_pool.device
-        or not state_indices.is_contiguous()
-    ):
-        raise ValueError("state_indices must be contiguous CUDA int32 [B]")
-    check_cuda_condition(((state_indices >= 0) & (state_indices < state_pool.shape[0])).all(), "state_indices must be within state_pool")
-    ordered = state_indices.sort().values
-    check_cuda_condition((ordered[1:] != ordered[:-1]).all(), "state_indices must be unique")
-    indices = state_indices.long()
-    output, final = tmix_wkv7_recurrent(
-        r, decay_logits, k, v, a, b, state_pool.index_select(0, indices), cu_seqlens,
-        scale=scale, decay_bias=decay_bias,
-    )
-    return output, state_pool.index_copy(0, indices, final)
-
-
 from .pretrain import pretrain_tmix_wkv7_recurrent_bf16
 
 __all__ = [
     "infer_tmix_wkv7_recurrent_fp16_forward_varlen",
     "infer_tmix_wkv7_recurrent_fp32io16_forward_varlen",
-    "prepare_tmix_wkv7_recurrent_fp32io16_state",
     "prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor",
-    "prepare_tmix_wkv7_recurrent_fp16_state",
     "prepare_tmix_wkv7_recurrent_fp16_state_from_tensor",
     "prepare_tmix_wkv7_recurrent_metadata",
     "pretrain_tmix_wkv7_recurrent_bf16",
-    "rl_infctx_tmix_wkv7_recurrent_bf16",
 ]

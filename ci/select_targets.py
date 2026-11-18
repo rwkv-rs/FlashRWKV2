@@ -16,21 +16,16 @@ ROOT = Path(__file__).resolve().parents[1]
 MODULES = (
     "cmix",
     "embedding",
-    "head/l2wrap_ce",
+    "head/ce",
     "head/linear",
-    "loss/l2wrap_ce",
     "sampling",
-    "tmix/a_gate",
-    "tmix/kk_pre",
     "tmix/readout",
     "tmix/tokenshift",
     "post_norm",
-    "tmix/vres_gate",
     "tmix/wkv_prepare",
     "tmix/wkv7",
 )
-WORKLOAD_TARGETS = ("tmix/wkv7/rl_infctx",)
-TARGETS = MODULES + WORKLOAD_TARGETS
+TARGETS = MODULES
 RELEASE_METADATA_FILES = {
     "pyproject.toml",
     "uv.lock",
@@ -42,11 +37,8 @@ SHARED_PREFIXES = ("csrc/bindings.cpp", "csrc/registration.cpp", "csrc/validatio
 MODULE_CONSUMERS = {
     "post_norm": ("embedding", "cmix", "tmix/tokenshift"),
     "tmix/tokenshift": ("cmix",),
-    "loss/l2wrap_ce": ("head/l2wrap_ce",),
-    "head/linear": ("head/l2wrap_ce",),
-    "tmix/kk_pre": ("tmix/wkv_prepare",),
-    "tmix/vres_gate": ("tmix/wkv_prepare",),
-    "tmix/wkv7": ("tmix/wkv7/rl_infctx", "tmix/tokenshift", "cmix"),
+    "head/linear": ("head/ce",),
+    "tmix/wkv7": ("tmix/tokenshift", "cmix"),
 }
 PACKAGE_FILES = {
     "setup.py",
@@ -66,10 +58,12 @@ BENCHMARK_SHARED_FILES = {
     "ci/benchmark_gate.py",
 }
 SHARED_PRIMITIVE_CALLERS = {
+    "flashrwkv2/tmix/kk_pre/tilelang.py": ("tmix/wkv_prepare",),
+    "flashrwkv2/tmix/vres_gate/tilelang.py": ("tmix/wkv_prepare",),
     "flashrwkv2/_internal/linear.py": (
         "cmix",
         "head/linear",
-        "head/l2wrap_ce",
+        "head/ce",
         "tmix/readout",
         "tmix/wkv_prepare",
     ),
@@ -78,22 +72,13 @@ SHARED_PRIMITIVE_CALLERS = {
         "post_norm",
         "tmix/readout",
         "tmix/tokenshift",
-        "tmix/a_gate",
-        "tmix/kk_pre",
-        "tmix/vres_gate",
         "tmix/wkv_prepare",
     ),
     "flashrwkv2/_internal/state.py": (
         "cmix",
         "tmix/tokenshift",
         "tmix/wkv7",
-        "head/l2wrap_ce",
-        "loss/l2wrap_ce",
-    ),
-    "flashrwkv2/_internal/logprob.py": (
-        "head/linear",
-        "head/l2wrap_ce",
-        "loss/l2wrap_ce",
+        "head/ce",
     ),
     "flashrwkv2/_internal/tuning.py": MODULES,
 }
@@ -177,8 +162,6 @@ def validate_layout(root: Path = ROOT) -> None:
 
     for candidate in (
         root / "flashrwkv2/tmix/wkv7/tilelang.py",
-        root / "tests/tmix/wkv7/rl_infctx/test.py",
-        root / "benchmarks/tmix/wkv7/rl_infctx/bench.py",
     ):
         if not candidate.is_file():
             missing.append(str(candidate.relative_to(root)))
@@ -485,12 +468,11 @@ def _self_test() -> None:
         "tmix/tokenshift",
     }
     assert set(classify(["flashrwkv2/tmix/kk_pre/tilelang.py"]).affected_modules) == {
-        "tmix/kk_pre",
         "tmix/wkv_prepare",
     }
     assert set(classify(["flashrwkv2/head/linear/__init__.py"]).affected_modules) == {
         "head/linear",
-        "head/l2wrap_ce",
+        "head/ce",
     }
     primitive = classify(["flashrwkv2/_internal/linear.py"])
     assert set(primitive.affected_modules) == set(
@@ -501,8 +483,6 @@ def _self_test() -> None:
         ["flashrwkv2/tmix/kk_pre/tilelang.py", "flashrwkv2/tmix/vres_gate/tilelang.py"]
     )
     assert set(moved.affected_modules) == {
-        "tmix/kk_pre",
-        "tmix/vres_gate",
         "tmix/wkv_prepare",
     }
     release = classify(

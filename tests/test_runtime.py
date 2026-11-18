@@ -17,19 +17,14 @@ import pytest
 PUBLIC_MODULES = (
     "flashrwkv2.cmix",
     "flashrwkv2.embedding",
-    "flashrwkv2.head.l2wrap_ce",
+    "flashrwkv2.head.ce",
     "flashrwkv2.head.linear",
-    "flashrwkv2.loss.l2wrap_ce",
     "flashrwkv2.post_norm",
     "flashrwkv2.sampling",
-    "flashrwkv2.tmix.a_gate",
-    "flashrwkv2.tmix.kk_pre",
     "flashrwkv2.tmix.readout",
     "flashrwkv2.tmix.tokenshift",
-    "flashrwkv2.tmix.vres_gate",
     "flashrwkv2.tmix.wkv_prepare",
     "flashrwkv2.tmix.wkv7",
-    "flashrwkv2.tmix.wkv7.statetune",
 )
 PUBLIC_PREFIXES = (
     "get_",
@@ -37,8 +32,6 @@ PUBLIC_PREFIXES = (
     "infer_",
     "prepare_",
     "pretrain_",
-    "statetune_",
-    "rl_infctx_",
 )
 
 

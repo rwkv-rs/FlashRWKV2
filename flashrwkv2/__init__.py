@@ -20,24 +20,18 @@ def _extension():
 
 from ._internal.tuning import get_tuning_cache_dir, prepare_tuning
 
-from .cmix import infer_cmix_forward_varlen, pretrain_cmix_bf16, statetune_cmix_bf16
+from .cmix import infer_cmix_forward_varlen, pretrain_cmix_bf16
 from .embedding import infer_embedding_ln0_forward_varlen
-from .head.l2wrap_ce import pretrain_head_l2wrap_ce_bf16
+from .head.ce import pretrain_head_ce_bf16
 from .head.linear import (
-    head_logprobs,
     pretrain_head_linear_bf16,
     infer_head_linear_all_forward_varlen,
-    infer_head_linear_last_forward_varlen,
 )
-from .loss.l2wrap_ce import pretrain_l2wrap_ce_bf16
 from .post_norm import infer_post_norm_output_forward_varlen
 from .sampling import (
     infer_sampling_six_parameter_forward_varlen,
-    infer_sampling_temperature_topk_topp_forward_varlen,
     setup_sampling_states,
 )
-from .tmix.a_gate import pretrain_tmix_a_gate_bf16
-from .tmix.kk_pre import pretrain_tmix_kk_pre_bf16
 from .tmix.readout import (
     infer_tmix_readout_forward_varlen,
     pretrain_tmix_readout_bf16,
@@ -45,64 +39,41 @@ from .tmix.readout import (
 from .tmix.tokenshift import (
     infer_tmix_postnorm_tokenshift_forward_varlen,
     pretrain_tmix_tokenshift_bf16,
-    statetune_tmix_tokenshift_bf16,
 )
-from .tmix.vres_gate import pretrain_tmix_vres_gate_bf16
 from .tmix.wkv7 import (
     infer_tmix_wkv7_recurrent_fp16_forward_varlen,
     infer_tmix_wkv7_recurrent_fp32io16_forward_varlen,
-    prepare_tmix_wkv7_recurrent_fp32io16_state,
     prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor,
-    prepare_tmix_wkv7_recurrent_fp16_state,
     prepare_tmix_wkv7_recurrent_fp16_state_from_tensor,
     prepare_tmix_wkv7_recurrent_metadata,
     pretrain_tmix_wkv7_recurrent_bf16,
-    rl_infctx_tmix_wkv7_recurrent_bf16,
-)
-from .tmix.wkv7.statetune import (
-    prepare_tmix_wkv7_statetune_metadata,
-    statetune_tmix_wkv7_recurrent_fp32io16,
 )
 from .tmix.wkv_prepare import infer_tmix_wkv_prepare_forward_varlen, pretrain_tmix_wkv_prepare_bf16
 
 __all__ = [
     "get_tuning_cache_dir",
     "prepare_tuning",
-    "head_logprobs",
     "pretrain_tmix_wkv_prepare_bf16",
     "pretrain_head_linear_bf16",
     "infer_cmix_forward_varlen",
     "infer_embedding_ln0_forward_varlen",
     "infer_head_linear_all_forward_varlen",
-    "infer_head_linear_last_forward_varlen",
     "infer_post_norm_output_forward_varlen",
     "infer_sampling_six_parameter_forward_varlen",
-    "infer_sampling_temperature_topk_topp_forward_varlen",
     "infer_tmix_postnorm_tokenshift_forward_varlen",
     "infer_tmix_readout_forward_varlen",
     "infer_tmix_wkv7_recurrent_fp16_forward_varlen",
     "infer_tmix_wkv7_recurrent_fp32io16_forward_varlen",
     "infer_tmix_wkv_prepare_forward_varlen",
-    "prepare_tmix_wkv7_recurrent_fp32io16_state",
     "prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor",
-    "prepare_tmix_wkv7_recurrent_fp16_state",
     "prepare_tmix_wkv7_recurrent_fp16_state_from_tensor",
     "prepare_tmix_wkv7_recurrent_metadata",
-    "prepare_tmix_wkv7_statetune_metadata",
     "pretrain_cmix_bf16",
-    "pretrain_head_l2wrap_ce_bf16",
-    "pretrain_l2wrap_ce_bf16",
-    "pretrain_tmix_a_gate_bf16",
-    "pretrain_tmix_kk_pre_bf16",
+    "pretrain_head_ce_bf16",
     "pretrain_tmix_readout_bf16",
     "pretrain_tmix_tokenshift_bf16",
-    "pretrain_tmix_vres_gate_bf16",
     "pretrain_tmix_wkv7_recurrent_bf16",
-    "rl_infctx_tmix_wkv7_recurrent_bf16",
     "setup_sampling_states",
-    "statetune_cmix_bf16",
-    "statetune_tmix_tokenshift_bf16",
-    "statetune_tmix_wkv7_recurrent_fp32io16",
 ]
 
-__version__ = "0.1.0a19"
+__version__ = "0.2.0a1"

@@ -270,39 +270,8 @@ def pretrain_cmix_bf16(
     key_weight,
     value_weight,
     *,
-    key_lora_a=None,
-    key_lora_b=None,
-    value_lora_a=None,
-    value_lora_b=None,
-    key_lora_scale=1.0,
-    value_lora_scale=1.0,
-    key_use_nora=False,
-    value_use_nora=False,
-):
-    return statetune_cmix_bf16(
-        x,
-        None,
-        x_k,
-        key_weight,
-        value_weight,
-        key_lora_a=key_lora_a,
-        key_lora_b=key_lora_b,
-        value_lora_a=value_lora_a,
-        value_lora_b=value_lora_b,
-        key_lora_scale=key_lora_scale,
-        value_lora_scale=value_lora_scale,
-        key_use_nora=key_use_nora,
-        value_use_nora=value_use_nora,
-    )[0]
-
-
-def statetune_cmix_bf16(
-    x,
-    initial_shift,
-    x_k,
-    key_weight,
-    value_weight,
-    *,
+    initial_shift=None,
+    return_final_state=False,
     key_lora_a=None,
     key_lora_b=None,
     value_lora_a=None,
@@ -333,7 +302,8 @@ def statetune_cmix_bf16(
         key_use_nora,
         value_use_nora,
     )
-    return output.view_as(x), final
+    output = output.view_as(x)
+    return (output, final) if return_final_state else output
 
 
-__all__ = ["infer_cmix_forward_varlen", "pretrain_cmix_bf16", "statetune_cmix_bf16"]
+__all__ = ["infer_cmix_forward_varlen", "pretrain_cmix_bf16"]

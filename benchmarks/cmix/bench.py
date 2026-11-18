@@ -13,7 +13,6 @@ import flashrwkv2
 from flashrwkv2.cmix import (
     infer_cmix_forward_varlen,
     pretrain_cmix_bf16,
-    statetune_cmix_bf16,
 )
 from flashrwkv2.tmix.wkv7 import prepare_tmix_wkv7_recurrent_metadata
 
@@ -235,7 +234,10 @@ def benchmark(args):
         elif args.operator == "pretrain":
             output = (pretrain_cmix_bf16(x, mix, key, value, **adapter_options),)
         elif args.operator == "stateful":
-            output = statetune_cmix_bf16(x, initial, mix, key, value, **adapter_options)
+            output = pretrain_cmix_bf16(
+                x, mix, key, value,
+                initial_shift=initial, return_final_state=True, **adapter_options,
+            )
         else:
             previous = torch.cat((initial[:, None], x[:, :-1]), dim=1)
             mixed = (

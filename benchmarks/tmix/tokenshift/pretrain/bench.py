@@ -10,7 +10,6 @@ from _timing import measure_cuda
 
 from flashrwkv2.tmix.tokenshift import (
     pretrain_tmix_tokenshift_bf16,
-    statetune_tmix_tokenshift_bf16,
 )
 
 
@@ -62,7 +61,10 @@ def main() -> None:
         if args.operator == "pretrain":
             outputs = pretrain_tmix_tokenshift_bf16(x, *params)
         elif args.operator == "stateful":
-            outputs = statetune_tmix_tokenshift_bf16(x, initial_shift, *params)
+            outputs = pretrain_tmix_tokenshift_bf16(
+                x, *params,
+                initial_shift=initial_shift, return_final_state=True,
+            )
         else:
             outputs = torch_stateful(x, initial_shift, params)
         if args.backward:

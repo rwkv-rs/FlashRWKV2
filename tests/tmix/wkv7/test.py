@@ -7,9 +7,7 @@ import torch
 from flashrwkv2.tmix.wkv7 import (
     infer_tmix_wkv7_recurrent_fp16_forward_varlen,
     infer_tmix_wkv7_recurrent_fp32io16_forward_varlen,
-    prepare_tmix_wkv7_recurrent_fp32io16_state,
     prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor,
-    prepare_tmix_wkv7_recurrent_fp16_state,
     prepare_tmix_wkv7_recurrent_fp16_state_from_tensor,
     prepare_tmix_wkv7_recurrent_metadata,
 )
@@ -37,11 +35,11 @@ def _case():
 @pytest.mark.memcheck
 @pytest.mark.racecheck
 def test_public_recurrence_matches_functional_and_preserves_inactive_slots():
-    from flashrwkv2 import rl_infctx_tmix_wkv7_recurrent_bf16
+    from flashrwkv2 import pretrain_tmix_wkv7_recurrent_bf16
 
     inputs, initial, cu, slots = _case()
-    expected, expected_pool = rl_infctx_tmix_wkv7_recurrent_bf16(
-        *inputs, state_pool=initial, cu_seqlens=cu, state_indices=slots,
+    expected, final = pretrain_tmix_wkv7_recurrent_bf16(
+        *inputs, initial_state=initial[slots.long()], cu_seqlens=cu, return_final_state=True,
     )
     pool = initial.clone()
     actual = infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
@@ -49,15 +47,15 @@ def test_public_recurrence_matches_functional_and_preserves_inactive_slots():
         cu_seqlens=cu, state_indices=slots,
     )
     assert torch.equal(actual, expected)
-    assert torch.equal(pool, expected_pool)
+    assert torch.equal(pool[slots.long()], final)
     assert torch.equal(pool[[0, 2]], initial[[0, 2]])
     assert actual.dtype == torch.bfloat16
 
 
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.float16])
 def test_state_checkpoint_cow_reset_and_memory(state_dtype):
-    prepare = prepare_tmix_wkv7_recurrent_fp32io16_state if state_dtype == torch.float32 else prepare_tmix_wkv7_recurrent_fp16_state
-    state = prepare(4, 128, sequence_capacity=3)
+    prepare = prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor if state_dtype == torch.float32 else prepare_tmix_wkv7_recurrent_fp16_state_from_tensor
+    state = prepare(torch.empty(4, 2, 64, 64, device="cuda", dtype=state_dtype))
     pool = state._components()[0]
     pool.copy_(torch.randn_like(pool))
     checkpoint = state.clone()

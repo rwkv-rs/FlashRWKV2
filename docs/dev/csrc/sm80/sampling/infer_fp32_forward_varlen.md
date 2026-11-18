@@ -1,7 +1,7 @@
 # Sampling: FP32 packed varlen inference
 
-`infer_fp32_forward_varlen.cpp` keeps the existing registered interfaces for
-`setup_sampling_states`, `sampling_temperature_topk_topp_forward_varlen`, and
+`infer_fp32_forward_varlen.cpp` registers
+`setup_sampling_states` and
 `sampling_six_parameter_forward_varlen`. Python inputs remain compact FP32
 `[B,V]` logits, an explicit Philox slot pool, and unique int32 slot indices.
 Scalar, per-request, and mixed controls share the same filtering algorithm.
@@ -22,31 +22,21 @@ to uint32 weights with a total near `4.26e9`; integer prefix scans and rejection
 sampling avoid floating CDF rounding and modulo bias. Probabilities below one
 quantization unit can become zero. Device arithmetic uses FP32 and integers.
 
-For `B=1,V=65536` without penalties, one cooperative kernel distributes work
-across 32 tiles. All tiles use the same softmax maximum and denominator to
-preserve ties. Block zero refines the cutoff, using a bounded candidate cache;
-cache overflow selects the full vocabulary scan. Cooperative launch is used
-only when the device supports it and the exact shared-memory and occupancy
-requirements allow all tiles to be resident. Other shapes and penalty calls
-use one block per active row. Both paths allocate `[B,V]` FP32 probability and
-uint32 weight workspaces. No quantization or histogram tuning parameter is
-added to the public API.
-
-FlashRWKV2 retains its request semantics: slot validation runs on device;
-invalid metadata and inactive rows return `-1` before reading logits or
+Each active row uses one block. Probability and uint32 weight workspaces have shape `[B,V]`.
+Slot validation runs on device.
+Invalid metadata and inactive rows return `-1` before reading logits or
 advancing RNG. Slot mapping selects both RNG and penalty storage. After a draw,
 penalties decay and the selected token receives a frequency increment plus
 a presence increment on its first occurrence. Negative zero preserves the
 seen marker when increments cancel. This additive rule differs from the
 upstream penalty update and is intentionally retained. Zero temperature selects
 the largest penalty-adjusted logit, breaking ties by the lowest token index,
-without advancing RNG. Both scalar and live per-request controls use this rule,
-including cooperative launches. Other temperatures and top-p keep the existing
+without advancing RNG. Both scalar and live per-request controls use this rule. Other temperatures and top-p keep the existing
 clamping behavior. CUDA Graph replay can change
 active count, slots, logits, and per-request controls without recapture.
 
 Single-row calls check the active count and slot range inside the sampling
-kernel, including the cooperative path. They allocate no metadata status or
+kernel. They allocate no metadata status or
 deduplication workspace and launch no separate validation kernel. Multi-row
 calls validate the entire active batch before any state writes, using an
 open-addressed Fibonacci hash table sized to the next power of two at least
@@ -58,7 +48,7 @@ reject the whole batch, while inactive tails are ignored.
 The RNG storage layout and seeded reproducibility within a launch path remain
 supported. Integer sampling changes the token sequence relative to the old
 floating CDF implementation. Correctness tests cover fractional distributions,
-ties across tiles, cache overflow, slot isolation, penalty updates, and graph
+ties, slot isolation, penalty updates, and graph
 replay. Performance must be measured on the target GPU after correctness;
 the upstream speedup is not a measured FlashRWKV2 speedup.
 

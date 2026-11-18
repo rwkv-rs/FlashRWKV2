@@ -29,14 +29,14 @@ def _check(hidden, weight, targets, chunk_rows: int) -> None:
         raise ValueError("targets must be contiguous CUDA int64")
     if hidden.ndim != 3 or hidden.numel() == 0:
         raise ValueError("hidden must have shape [B,T,C]")
-    if weight.shape != (65536, hidden.shape[-1]):
-        raise ValueError("weight must have shape [65536,C]")
+    if weight.ndim != 2 or weight.shape[0] == 0 or weight.shape[1] != hidden.shape[-1]:
+        raise ValueError("weight must have shape [V,C]")
     if targets.numel() != hidden.shape[0] * hidden.shape[1]:
         raise ValueError("targets must contain one token per hidden row")
     if hidden.device != weight.device or hidden.device != targets.device:
         raise ValueError("head loss tensors must share a device")
     from ..._internal.state import check_cuda_condition
-    check_cuda_condition(((targets >= 0) & (targets < 65536)).all(), "targets must be in [0,65536)")
+    check_cuda_condition(((targets == -100) | ((targets >= 0) & (targets < weight.shape[0]))).all(), "targets must be -100 or in [0,V)")
     if (
         not isinstance(chunk_rows, int)
         or isinstance(chunk_rows, bool)
@@ -45,25 +45,45 @@ def _check(hidden, weight, targets, chunk_rows: int) -> None:
         raise ValueError("chunk_rows must be a positive integer")
 
 
-class _HeadL2Wrap(torch.autograd.Function):
+# A multiple of the 1024-column reduction tile keeps vocabulary statistics
+# independent of the projection working set.
+_VOCAB_TILE = 16384
+
+
+def _vocab_logits(x, weight, a, b, scale, use_nora):
+    if (a is None) != (b is None) or (b is not None and b.shape[0] != weight.shape[0]):
+        raise ValueError("adapter A and B must cover the full head vocabulary")
+    for offset in range(0, weight.shape[0], _VOCAB_TILE):
+        band = slice(offset, offset + _VOCAB_TILE)
+        logits = pretrain_head_linear_bf16(
+            x, weight[band], lora_a=a, lora_b=None if b is None else b[band],
+            lora_scale=scale, use_nora=use_nora,
+        )
+        yield offset, logits
+
+
+class _HeadCE(torch.autograd.Function):
     @staticmethod
     def forward(ctx, hidden, weight, targets, a, b, scale, use_nora, chunk_rows, backward_chunk_rows):
-        from ..._internal.logprob import logprob_stats
+        from .tilelang import finish_stats, partial_stats
 
         rows = hidden.view(-1, hidden.shape[-1])
         flat_targets = targets.view(-1)
-        logprobs = torch.empty(rows.shape[0], dtype=torch.float32, device=hidden.device)
+        loss, logsum, maximum = (hidden.new_empty(rows.shape[0], dtype=torch.float32) for _ in range(3))
         for start in range(0, rows.shape[0], chunk_rows):
-            stop = min(start + chunk_rows, rows.shape[0])
-            logits = pretrain_head_linear_bf16(
-                rows[start:stop], weight, lora_a=a, lora_b=b,
-                lora_scale=scale, use_nora=use_nora,
+            band = slice(start, start + chunk_rows)
+            target = flat_targets[band]
+            partials = [
+                partial_stats(logits.shape[1])(logits, target, offset)
+                for offset, logits in _vocab_logits(rows[band], weight, a, b, scale, use_nora)
+            ]
+            high, denominator, selected = (torch.cat(parts, dim=1) for parts in zip(*partials))
+            loss[band], logsum[band], maximum[band] = finish_stats(weight.shape[0])(
+                selected, target, high, denominator,
             )
-            logprobs[start:stop] = logprob_stats(logits, flat_targets[start:stop])[0]
-            del logits
-        ctx.save_for_backward(hidden, weight, targets, a, b)
+        ctx.save_for_backward(hidden, weight, targets, a, b, logsum, maximum)
         ctx.options = (scale, use_nora, backward_chunk_rows)
-        return -logprobs.mean()
+        return loss.view_as(targets)
 
     @staticmethod
     @once_differentiable
@@ -72,10 +92,9 @@ class _HeadL2Wrap(torch.autograd.Function):
             linear, linear_input_vjp, linear_weight_vjp_fp32,
             nora_backward, nora_forward,
         )
-        from ..._internal.logprob import logprob_stats
-        from ...loss.l2wrap_ce.tilelang import _backward as loss_backward
+        from .tilelang import ce_gradient
 
-        hidden, weight, targets, a, b = ctx.saved_tensors
+        hidden, weight, targets, a, b, logsum, maximum = ctx.saved_tensors
         scale, use_nora, chunk_rows = ctx.options
         need_x, need_w, _, need_a, need_b = ctx.needs_input_grad[:5]
         rows, flat_targets = hidden.view(-1, hidden.shape[-1]), targets.view(-1)
@@ -93,16 +112,15 @@ class _HeadL2Wrap(torch.autograd.Function):
         for start in range(0, rows.shape[0], chunk_rows):
             stop = min(start + chunk_rows, rows.shape[0])
             x, target = rows[start:stop], flat_targets[start:stop]
-            # Reuse the exact forward weights; normalize once for the whole VJP.
-            logits = pretrain_head_linear_bf16(
-                x, weight, lora_a=a_compute, lora_b=b_compute, lora_scale=scale,
-            )
-            _, logsum, maximum, argmax = logprob_stats(logits, target)
-            dy = loss_backward(weight.shape[0], "float32")(
-                logits, target, logsum, maximum, argmax,
-                grad_loss.float() * ((stop - start) / rows.shape[0]),
-            )
-            del logits
+            # Keep the VJP over the full vocabulary in its original reduction order.
+            dy = x.new_empty((x.shape[0], weight.shape[0]), dtype=torch.float32)
+            upstream = grad_loss.reshape(-1)[start:stop].contiguous()
+            for offset, logits in _vocab_logits(x, weight, a_compute, b_compute, scale, False):
+                width = logits.shape[1]
+                dy[:, offset:offset + width] = ce_gradient(width)(
+                    logits, target, logsum[start:stop], maximum[start:stop], upstream, offset,
+                )
+                del logits
             if need_x:
                 dx[start:stop] = linear_input_vjp(dy, weight)
             if need_w:
@@ -135,64 +153,68 @@ class _HeadL2Wrap(torch.autograd.Function):
         )
 
 
-@torch.library.custom_op("flashrwkv2::head_l2wrap_ce_forward", mutates_args=())
+@torch.library.custom_op("flashrwkv2::head_ce_forward", mutates_args=())
 def _compiled_head_loss(hidden: torch.Tensor, weight: torch.Tensor, targets: torch.Tensor,
                         a: torch.Tensor | None, b: torch.Tensor | None, scale: float,
-                        use_nora: bool, chunk_rows: int, backward_chunk_rows: int) -> torch.Tensor:
-    return _HeadL2Wrap.forward(
-        _AutogradContext(), hidden, weight, targets, a, b, scale, use_nora, chunk_rows, backward_chunk_rows,
+                        use_nora: bool, chunk_rows: int, backward_chunk_rows: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ctx = _AutogradContext()
+    loss = _HeadCE.forward(
+        ctx, hidden, weight, targets, a, b, scale, use_nora, chunk_rows, backward_chunk_rows,
     )
+    return loss, *ctx.saved_tensors[-2:]
 
 
 @_compiled_head_loss.register_fake
 def _compiled_head_loss_fake(hidden, weight, targets, a, b, scale, use_nora, chunk_rows, backward_chunk_rows):
-    return hidden.new_empty((), dtype=torch.float32)
+    return (hidden.new_empty(targets.shape, dtype=torch.float32),
+            hidden.new_empty(targets.numel(), dtype=torch.float32), hidden.new_empty(targets.numel(), dtype=torch.float32))
 
 
 def _compiled_head_loss_context(ctx, inputs, output):
     hidden, weight, targets, a, b, scale, use_nora, _, backward_chunk_rows = inputs
-    ctx.save_for_backward(hidden, weight, targets, a, b)
+    ctx.save_for_backward(hidden, weight, targets, a, b, *output[1:])
+    ctx.mark_non_differentiable(*output[1:])
     ctx.options = (scale, use_nora, backward_chunk_rows)
 
 
 @torch.library.custom_op(
-    "flashrwkv2::head_l2wrap_ce_backward", mutates_args=(),
-    schema="(Tensor dy, Tensor hidden, Tensor weight, Tensor targets, Tensor? a, Tensor? b, float scale, bool use_nora, int chunk_rows, bool[] needed) -> Tensor?[]",
+    "flashrwkv2::head_ce_backward", mutates_args=(),
+    schema="(Tensor dy, Tensor hidden, Tensor weight, Tensor targets, Tensor? a, Tensor? b, Tensor logsum, Tensor maximum, float scale, bool use_nora, int chunk_rows, bool[] needed) -> Tensor?[]",
 )
-def _compiled_head_loss_vjp(dy, hidden, weight, targets, a, b, scale, use_nora, chunk_rows, needed):
-    ctx = _AutogradContext(saved_tensors=(hidden, weight, targets, a, b), options=(scale, use_nora, chunk_rows),
+def _compiled_head_loss_vjp(dy, hidden, weight, targets, a, b, logsum, maximum, scale, use_nora, chunk_rows, needed):
+    ctx = _AutogradContext(saved_tensors=(hidden, weight, targets, a, b, logsum, maximum), options=(scale, use_nora, chunk_rows),
                            needs_input_grad=(*needed, False, False, False))
-    return list(_HeadL2Wrap.backward(ctx, dy)[:5])
+    return list(_HeadCE.backward(ctx, dy)[:5])
 
 
 @_compiled_head_loss_vjp.register_fake
-def _compiled_head_loss_vjp_fake(dy, hidden, weight, targets, a, b, scale, use_nora, chunk_rows, needed):
+def _compiled_head_loss_vjp_fake(dy, hidden, weight, targets, a, b, logsum, maximum, scale, use_nora, chunk_rows, needed):
     return [torch.empty_like(hidden) if needed[0] else None,
             torch.empty_like(weight) if needed[1] else None, None,
             (a.new_empty(a.shape) if use_nora else torch.empty_like(a)) if needed[3] else None,
             torch.empty_like(b) if needed[4] else None]
 
 
-def _compiled_head_loss_backward(ctx, dy):
+def _compiled_head_loss_backward(ctx, dy, unused_logsum, unused_maximum):
     return (*_compiled_head_loss_vjp(dy, *ctx.saved_tensors, *ctx.options, list(ctx.needs_input_grad[:5])), None, None, None, None)
 
 
 _compiled_head_loss.register_autograd(_compiled_head_loss_backward, setup_context=_compiled_head_loss_context)
 
 
-def pretrain_head_l2wrap_ce_bf16(
+def pretrain_head_ce_bf16(
     hidden,
     weight,
     targets,
     *,
-    chunk_rows: int = 4096,
+    chunk_rows: int = 128,
     backward_chunk_rows: int | None = None,
     lora_a=None,
     lora_b=None,
     lora_scale=1.0,
     use_nora=False,
 ):
-    """Stream head CE and accumulate parameter VJPs in FP32.
+    """Return one FP32 cross entropy per target and zero for ignored targets (-100).
 
     ``chunk_rows`` bounds the forward logits. ``backward_chunk_rows`` independently
     bounds recomputation and VJPs and defaults to ``chunk_rows``.
@@ -202,11 +224,10 @@ def pretrain_head_l2wrap_ce_bf16(
         backward_chunk_rows = chunk_rows
     elif type(backward_chunk_rows) is not int or backward_chunk_rows <= 0:
         raise ValueError("backward_chunk_rows must be a positive integer")
-    operation = _compiled_head_loss if torch.compiler.is_compiling() else _HeadL2Wrap.apply
-    return operation(
-        hidden, weight, targets, lora_a, lora_b,
-        float(lora_scale), bool(use_nora), chunk_rows, backward_chunk_rows,
-    )
+    args = (hidden, weight, targets, lora_a, lora_b, float(lora_scale), bool(use_nora), chunk_rows, backward_chunk_rows)
+    if torch.compiler.is_compiling():
+        return _compiled_head_loss(*args)[0]
+    return _HeadCE.apply(*args)
 
 
-__all__ = ["pretrain_head_l2wrap_ce_bf16"]
+__all__ = ["pretrain_head_ce_bf16"]

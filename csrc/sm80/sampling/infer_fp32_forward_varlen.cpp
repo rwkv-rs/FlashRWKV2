@@ -20,15 +20,6 @@ using IntSamplingParameter = std::variant<torch::Tensor, int64_t>;
 
 int64_t sampling_state_size_cuda();
 torch::Tensor setup_sampling_states_cuda(int64_t seed, int64_t num_slots);
-torch::Tensor sampling_temperature_topk_topp_scalar_cuda(
-    torch::Tensor logits, torch::Tensor states, torch::Tensor slot_indices,
-    double temperature, int64_t top_k, double top_p,
-    torch::Tensor num_active_samples);
-torch::Tensor sampling_temperature_topk_topp_per_request_cuda(
-    torch::Tensor logits, torch::Tensor states, torch::Tensor slot_indices,
-    torch::Tensor temperatures, torch::Tensor top_ks, torch::Tensor top_ps,
-    double temperature, int64_t top_k, double top_p,
-    torch::Tensor num_active_samples);
 torch::Tensor sampling_six_parameter_scalar_cuda(
     torch::Tensor logits, torch::Tensor penalties, torch::Tensor states,
     torch::Tensor slot_indices, double presence_penalty,
@@ -163,43 +154,6 @@ torch::Tensor setup_sampling_states(int64_t seed, int64_t num_slots) {
   return setup_sampling_states_cuda(seed, num_slots);
 }
 
-torch::Tensor sampling_temperature_topk_topp_scalar(
-    torch::Tensor logits, torch::Tensor states, torch::Tensor slot_indices,
-    double temperature, int64_t top_k, double top_p,
-    int64_t sample_capacity,
-    std::optional<torch::Tensor> num_active_samples) {
-  check_logits(logits);
-  check_state_and_slots(logits, states, slot_indices);
-  check_finite(temperature, "temperature");
-  check_finite(top_p, "top_p");
-  auto active = check_sampling_activity(
-      logits, sample_capacity, num_active_samples);
-  const c10::cuda::CUDAGuard device_guard(logits.device());
-  return sampling_temperature_topk_topp_scalar_cuda(
-      logits, states, slot_indices, temperature, top_k, top_p, active);
-}
-
-torch::Tensor sampling_temperature_topk_topp_per_request(
-    torch::Tensor logits, torch::Tensor states, torch::Tensor slot_indices,
-    FloatSamplingParameter temperatures, IntSamplingParameter top_ks,
-    FloatSamplingParameter top_ps, int64_t sample_capacity,
-    std::optional<torch::Tensor> num_active_samples) {
-  check_logits(logits);
-  check_state_and_slots(logits, states, slot_indices);
-  auto [temperature_vector, temperature] = sampling_parameter(
-      logits, temperatures, "temperatures", torch::kFloat32);
-  auto [top_k_vector, top_k] = sampling_parameter(
-      logits, top_ks, "top_ks", torch::kInt32);
-  auto [top_p_vector, top_p] = sampling_parameter(
-      logits, top_ps, "top_ps", torch::kFloat32);
-  auto active = check_sampling_activity(
-      logits, sample_capacity, num_active_samples);
-  const c10::cuda::CUDAGuard device_guard(logits.device());
-  return sampling_temperature_topk_topp_per_request_cuda(
-      logits, states, slot_indices, temperature_vector, top_k_vector, top_p_vector,
-      temperature, top_k, top_p, active);
-}
-
 torch::Tensor sampling_six_parameter_scalar(
     torch::Tensor logits, torch::Tensor penalties, torch::Tensor states,
     torch::Tensor slot_indices, double presence_penalty,
@@ -256,18 +210,6 @@ torch::Tensor sampling_six_parameter_per_request(
 void register_sampling_bindings(py::module_& module) {
   module.def("setup_sampling_states", &setup_sampling_states, py::arg("seed"),
              py::arg("num_slots"));
-  module.def("sampling_temperature_topk_topp_forward_varlen",
-             &sampling_temperature_topk_topp_scalar, py::arg("logits"),
-             py::arg("states"), py::arg("slot_indices"),
-             py::arg("temperature"), py::arg("top_k"), py::arg("top_p"),
-             py::arg("sample_capacity") = -1,
-             py::arg("num_active_samples") = py::none());
-  module.def("sampling_temperature_topk_topp_forward_varlen",
-             &sampling_temperature_topk_topp_per_request,
-             py::arg("logits"), py::arg("states"), py::arg("slot_indices"),
-             py::arg("temperatures"), py::arg("top_ks"), py::arg("top_ps"),
-             py::arg("sample_capacity") = -1,
-             py::arg("num_active_samples") = py::none());
   module.def("sampling_six_parameter_forward_varlen",
              &sampling_six_parameter_scalar, py::arg("logits"),
              py::arg("penalties"), py::arg("states"),

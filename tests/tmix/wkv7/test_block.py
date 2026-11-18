@@ -71,17 +71,18 @@ def train_layer(x, res, params, initial, shifts, head_size, v_first, adapters=No
     normalized, total = norm(
         x, params["ln1_w"], params["ln1_b"], res=res, return_res=True,
     )
-    mixed = fr.statetune_tmix_tokenshift_bf16(normalized, shifts[0], *params["mix"].unbind())
+    mixed = fr.pretrain_tmix_tokenshift_bf16(
+        normalized, *params["mix"].unbind(),
+        initial_shift=shifts[0], return_final_state=True,
+    )
     prepared = fr.pretrain_tmix_wkv_prepare_bf16(
         *mixed[:6], *(params[name] for name in ("r", "k", "v")),
         *(params[name] for name in ("w0", "w1", "w2", "a0", "a1", "a2", "g1", "g2", "k_k", "k_a")),
         v_first=v_first, v0=params["v0"], v1=params["v1"], v2=params["v2"], head_size=head_size,
         **adapter_options(adapters, use_nora, _RKV_ADAPTERS),
     )
-    cu = torch.arange(batch + 1, device="cuda", dtype=torch.int32) * length
-    recurrent, final = fr.rl_infctx_tmix_wkv7_recurrent_bf16(
-        *(t.view(-1, heads, head_size) for t in prepared[:6]),
-        state_pool=initial, cu_seqlens=cu,
+    recurrent, final = fr.pretrain_tmix_wkv7_recurrent_bf16(
+        *prepared[:6], head_size=head_size, initial_state=initial, return_final_state=True,
     )
     r, _, k, v, _, _, gate, _ = prepared
     readout = fr.pretrain_tmix_readout_bf16(
@@ -93,9 +94,9 @@ def train_layer(x, res, params, initial, shifts, head_size, v_first, adapters=No
     normalized, total = norm(
         readout, params["ln2_w"], params["ln2_b"], res=total, return_res=True,
     )
-    cmix, final_cmix = fr.statetune_cmix_bf16(
-        normalized, shifts[1], params["cmix_x"], params["cmix_k"], params["cmix_v"],
-        **adapter_options(adapters, use_nora, _CMIX_ADAPTERS),
+    cmix, final_cmix = fr.pretrain_cmix_bf16(
+        normalized, params["cmix_x"], params["cmix_k"], params["cmix_v"],
+        initial_shift=shifts[1], return_final_state=True, **adapter_options(adapters, use_nora, _CMIX_ADAPTERS),
     )
     return cmix, total, final, mixed[-1], final_cmix, prepared[-1]
 
@@ -108,7 +109,7 @@ def train_block(x, res, params, initial, shifts, targets, head_size, v_first, ad
     logits = fr.pretrain_head_linear_bf16(
         hidden, params["head"], **adapter_options(adapters, use_nora, (("head", ""),)),
     )
-    logprobs = fr.head_logprobs(logits.view(-1, logits.shape[-1]), targets.reshape(-1))
+    logprobs = -torch.nn.functional.cross_entropy(logits.view(-1, logits.shape[-1]), targets.reshape(-1), reduction="none")
     return logprobs.view_as(targets), logits, final, tmix_shift, cmix_shift
 
 
@@ -182,7 +183,7 @@ def infer_block(
     logits = fr.infer_head_linear_all_forward_varlen(
         hidden, params["head"], **adapter_options(adapters, use_nora, (("head", ""),)),
     )
-    return fr.head_logprobs(logits, targets), logits
+    return -torch.nn.functional.cross_entropy(logits.reshape(-1, logits.shape[-1]), targets.reshape(-1), reduction="none").view_as(targets), logits
 
 
 @pytest.mark.parametrize("training", (False, True))
