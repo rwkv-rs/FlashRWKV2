@@ -136,6 +136,10 @@ PYTHONPATH=benchmarks ./.venv/bin/python benchmarks/tmix/wkv7/bench.py \
   --output artifacts/wkv7-live.json
 ```
 
+The per-layer time uses the ticket shared by the model's layers. Add
+`--include-ticket-preparation` to capture and time the device-side validation and sort
+together with one WKV layer on every step.
+
 RTX 4090 and PRO 6000 use checked-in execution configurations. Each operator benchmark
 can evaluate alternatives with `--tune`. It verifies outputs and state against the
 canonical implementation before measuring CUDA Graph replay. Warm each graph shape with
