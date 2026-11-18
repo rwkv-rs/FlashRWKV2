@@ -34,22 +34,6 @@ _EXP_NEG_HALF = 0.6065306597126334
 _DECAY_EXP2 = -0.8750387749145276
 _PASSES = {tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: False}
 _COMPILE_FLAGS = ["--fmad=false"]
-# FP16 prefill tiles measured with the indexed forward on RTX 4090 and PRO 6000.
-# Late buckets also cover short batches with many tokens per sequence.
-_PREFILL_CONFIGS = {
-    (sm, channels, torch.float16, rows): (columns, 4)
-    for sm, channels, columns in ((89, 2560, 64), (89, 4096, 64), (120, 2560, 64), (120, 4096, 64))
-    for rows in (16, 64, 128, 512, 1024)
-}
-_DOT_PAIR_SOURCE = r"""
-__device__ __forceinline__ unsigned long long rwkv_dot_pair(
-    float state, float r, float a, unsigned long long acc) {
-    unsigned long long result;
-    asm("{ .reg .b64 state2, vec; mov.b64 state2,{%1,%1}; mov.b64 vec,{%2,%3}; "
-        "fma.rn.f32x2 %0,state2,vec,%4; }" : "=l"(result) : "f"(state), "f"(r), "f"(a), "l"(acc));
-    return result;
-}
-"""
 
 
 @T.macro
@@ -134,20 +118,17 @@ def _materialize_deltalog(heads):
 
 @tilelang.jit(pass_configs={**_PASSES, tilelang.PassConfigKey.TL_DISABLE_SAFE_MEMORY_ACCESS: True},
               compile_flags=_COMPILE_FLAGS)
-def _fp16_serving_kernel(heads, scale, bias_dtype, has_bias, ordered, with_log, allow_append, groups=4):
+def _fp16_serving_kernel(heads, scale, bias_dtype, has_bias, ordered, with_log, allow_append, groups=4, columns=16):
     """D64 recurrence: each warp sums fixed contiguous key groups for its value columns."""
     n, batch, slots = T.dynamic("n, batch, slots")
     lanes = 32 // groups
     keys = 64 // groups
-    columns = 16
-    threads = max(64, columns * groups)
+    threads = columns * groups
     tiles = 64 // columns
     reduction = r"""
     __device__ __forceinline__ int rwkv_claim_prefill_tile(int* phases, long long index, int tile) {
-      auto flag = reinterpret_cast<unsigned char*>(phases + index) + tile;
-      int pending = *flag;
-      *flag = 0;
-      return pending;
+      const int mask = 1 << tile;
+      return (atomicAnd(phases + index, ~mask) & mask) != 0;
     }
     template<int groups>
     __device__ __forceinline__ float rwkv_sum_groups(float x) {
@@ -249,7 +230,7 @@ def _fp16_serving_kernel(heads, scale, bias_dtype, has_bias, ordered, with_log, 
                     Pool[slot, h, k, tid] = T.cast(state[k], "float16")
             if with_log:
                 if tid == 0:
-                    Phase[slot, h] = T.if_then_else(allow_append and pending[0] == 0, 0x01010101, 0)
+                    Phase[slot, h] = T.if_then_else(allow_append and pending[0] == 0, (1 << tiles) - 1, 0)
 
     @T.prim_func
     def kernel(
@@ -342,12 +323,6 @@ def _forward_kernel(
     bias_dtype: str = "float32",
     prefetch_tokens: int = 1,
     state_dtype: str = "float32",
-    packed_dot: bool = False,
-    dense_decode: bool = False,
-    with_log: bool = False,
-    append_log: bool = False,
-    check_order: bool = False,
-    uniform_prefill: bool = False,
 ):
     n, batch = T.dynamic("n, batch")
     state_slots = T.dynamic("state_slots") if indexed else batch
@@ -355,15 +330,28 @@ def _forward_kernel(
     key_groups = dim // 64
     checkpoints = n // _CHECKPOINT + batch
     threads = columns * key_groups
-    lookahead = state_dtype == "float16" and dim == 64 and prefetch_tokens > 1
     within_loop = T.unroll if prefetch_tokens > 1 and dim <= 128 else T.serial
 
-    @T.macro
-    def forward(R, W, K, V, A, B, S0, CU, Bias, Status, Indices, Y, SN, Boundaries, Log, Phase):
-        with T.Kernel(dim // columns, heads, batch, threads=threads, prelude=_DOT_PAIR_SOURCE if packed_dot else None) as (tile, h, seq):
+    @T.prim_func
+    def kernel(
+        R: T.Tensor((n, heads, dim), "bfloat16"),
+        W: T.Tensor((n, heads, dim), "bfloat16"),
+        K: T.Tensor((n, heads, dim), "bfloat16"),
+        V: T.Tensor((n, heads, dim), "bfloat16"),
+        A: T.Tensor((n, heads, dim), "bfloat16"),
+        B: T.Tensor((n, heads, dim), "bfloat16"),
+        S0: T.Tensor((state_slots if indexed else batch, heads, dim, dim), state_dtype),
+        CU: T.Tensor((batch + 1,), "int32"),
+        Bias: T.Tensor((heads if has_bias else 0, dim), bias_dtype),
+        Status: T.Tensor((3 if has_status else 0,), "int32"),
+        Indices: T.Tensor((batch if indexed else 0,), "int32"),
+        Y: T.Tensor((n, heads, dim), "bfloat16"),
+        SN: T.Tensor((0 if indexed else batch, heads, dim, dim), state_dtype),
+        Boundaries: T.Tensor((checkpoints if save else 0, heads, dim, dim), state_dtype),
+    ):
+        with T.Kernel(dim // columns, heads, batch, threads=threads) as (tile, h, seq):
             state = T.alloc_fragment((dim, columns), "float32")
             partial = T.alloc_fragment((key_groups, columns), "float32")
-            next_dot = T.alloc_fragment((columns,), "float32")
             dot = T.alloc_fragment((columns,), "float32")
             out = T.alloc_fragment((columns,), "float32")
             rv = T.alloc_shared((prefetch_tokens * dim,), "float32")
@@ -388,16 +376,7 @@ def _forward_kernel(
                 forward_index_fn=lambda group, value: 0,
             )
             T.annotate_layout({state: layout, partial: partial_layout})
-            if dense_decode:
-                active = True
-                start = seq
-                end = seq + 1
-            elif uniform_prefill:
-                # Static validation proves every row contains full prefetch groups.
-                active = True
-                start = seq * (n // batch)
-                end = start + n // batch
-            elif has_status:
+            if has_status:
                 active = Status[0] == 0 and seq < Status[2]
                 start = T.if_then_else(active, CU[seq], 0)
                 end = T.if_then_else(active, CU[seq + 1], 0)
@@ -412,36 +391,19 @@ def _forward_kernel(
                 active = True
                 start = CU[seq]
                 end = CU[seq + 1]
-            pending = T.alloc_shared((1 if with_log else 0,), "int32")
-            next_phase = T.alloc_shared((1 if with_log else 0,), "int32")
             if indexed:
                 T.clear(state)
                 if active:
                     slot = Indices[seq]
                     for key, value in T.Parallel(dim, columns):
                         state[key, value] = S0[slot, h, key, tile * columns + value]
-                    if with_log:
-                        if T.get_thread_binding() == 0:
-                            phase = Phase[slot, h]
-                            pending[0] = phase & 1
-                            if check_order:
-                                # Alternating slot traversal can reuse the last-written dense state in L2.
-                                last = batch - 1 if dense_decode else Status[2] - 1
-                                direction = T.if_then_else(Indices[0] <= Indices[last], 2, 4)
-                                same_order = (phase & 6) == 0 or (phase & 6) == direction
-                                next_phase[0] = direction + T.if_then_else((phase & 1) == 0 and same_order, 1, 0)
-                            else:
-                                next_phase[0] = T.if_then_else(append_log and (phase & 1) == 0, 1, 0)
-                        T.sync_threads()
-                        if pending[0] != 0:
-                            _replay_deltalog(state, Log, slot, h)
             else:
                 for key, value in T.Parallel(dim, columns):
                     state[key, value] = S0[seq, h, key, tile * columns + value]
-            for chunk in T.serial(1 if dense_decode else T.ceildiv(end - start, prefetch_tokens)):
+            for chunk in T.serial(T.ceildiv(end - start, prefetch_tokens)):
                 for prefetched, key in T.Parallel(prefetch_tokens, dim):
                     token = start + chunk * prefetch_tokens + prefetched
-                    if uniform_prefill or prefetch_tokens == 1 or token < end:
+                    if prefetch_tokens == 1 or token < end:
                         offset = prefetched * dim + key
                         rv[offset] = T.cast(R[token, h, key], "float32")
                         logits = T.cast(W[token, h, key], "float32")
@@ -459,18 +421,16 @@ def _forward_kernel(
                         kv[offset] = T.cast(K[token, h, key], "float32")
                         av[offset] = T.cast(A[token, h, key], "float32")
                         bv[offset] = T.cast(B[token, h, key], "float32")
-                    elif lookahead:
-                        av[prefetched * dim + key] = 0.0
                 if prefetch_tokens > 1:
                     for prefetched, value in T.Parallel(prefetch_tokens, columns):
                         token = start + chunk * prefetch_tokens + prefetched
-                        if uniform_prefill or token < end:
+                        if token < end:
                             vs[prefetched * columns + value] = T.cast(
                                 V[token, h, tile * columns + value], "float32"
                             )
                 for within in within_loop(prefetch_tokens):
                     token = start + chunk * prefetch_tokens + within
-                    if uniform_prefill or prefetch_tokens == 1 or token < end:
+                    if prefetch_tokens == 1 or token < end:
                         if save and (token - start) % _CHECKPOINT == 0:
                             checkpoint = (
                                 start // _CHECKPOINT + seq
@@ -487,41 +447,11 @@ def _forward_kernel(
                                 )
                             else:
                                 vv[value] = vs[within * columns + value]
-                        if not lookahead or within == 0:
-                            _dot_keys(state, av, partial, dot, within * dim)
-                        else:
-                            T.copy(next_dot, dot)
+                        _dot_keys(state, av, partial, dot, within * dim)
                         _update_state(
                             state, wv, kv, vv, bv, dot, within * dim, state_dtype
                         )
-                        if lookahead and within + 1 < prefetch_tokens:
-                            # D64 has one key group. Scan r[t] and a[t+1] in
-                            # parallel over the identical rounded state.
-                            if packed_dot:
-                                pair = T.alloc_fragment((columns,), "uint64")
-                                T.clear(pair)
-                                for key in T.unroll(64):
-                                    for value in T.Parallel(columns):
-                                        current = state[key, value]
-                                        pair[value] = T.call_pure_extern(
-                                            "uint64", "rwkv_dot_pair", current,
-                                            rv[within * dim + key], av[(within + 1) * dim + key], pair[value],
-                                        )
-                                for value in T.Parallel(columns):
-                                    out[value] = T.reinterpret("float32", T.cast(pair[value], "uint32"))
-                                    next_dot[value] = T.reinterpret("float32", T.cast(pair[value] >> 32, "uint32"))
-                            else:
-                                T.clear(out)
-                                T.clear(next_dot)
-                                for key in T.unroll(64):
-                                    for value in T.Parallel(columns):
-                                        current = state[key, value]
-                                        out[value] = T.fma(current, rv[within * dim + key], out[value])
-                                        next_dot[value] = T.fma(
-                                            current, av[(within + 1) * dim + key], next_dot[value],
-                                        )
-                        else:
-                            _dot_keys(state, rv, partial, out, within * dim)
+                        _dot_keys(state, rv, partial, out, within * dim)
                         for value in T.Parallel(columns):
                             Y[token, h, tile * columns + value] = T.cast(
                                 out[value] * scale, "bfloat16"
@@ -529,66 +459,11 @@ def _forward_kernel(
             if indexed:
                 if active:
                     slot = Indices[seq]
-                    if with_log:
-                        if end > start:
-                            if append_log and (next_phase[0] & 1) != 0:
-                                for key in T.Parallel(64):
-                                    Log[slot, h, 0, key] = wv[key]
-                                    Log[slot, h, 1, key] = kv[key]
-                                    Log[slot, h, 2, key] = vv[key]
-                                    Log[slot, h, 3, key] = bv[key]
-                                    Log[slot, h, 4, key] = dot[key]
-                            else:
-                                for key, value in T.Parallel(64, 64):
-                                    S0[slot, h, key, value] = state[key, value]
-                            if T.get_thread_binding() == 0:
-                                Phase[slot, h] = next_phase[0]
-                    else:
-                        for key, value in T.Parallel(dim, columns):
-                            S0[slot, h, key, tile * columns + value] = state[key, value]
+                    for key, value in T.Parallel(dim, columns):
+                        S0[slot, h, key, tile * columns + value] = state[key, value]
             else:
                 for key, value in T.Parallel(dim, columns):
                     SN[seq, h, key, tile * columns + value] = state[key, value]
-
-    if with_log:
-        @T.prim_func
-        def logged_kernel(
-            R: T.Tensor((n, heads, dim), "bfloat16"),
-            W: T.Tensor((n, heads, dim), "bfloat16"),
-            K: T.Tensor((n, heads, dim), "bfloat16"),
-            V: T.Tensor((n, heads, dim), "bfloat16"),
-            A: T.Tensor((n, heads, dim), "bfloat16"),
-            B: T.Tensor((n, heads, dim), "bfloat16"),
-            S0: T.Tensor((state_slots if indexed else batch, heads, dim, dim), state_dtype),
-            CU: T.Tensor((batch + 1,), "int32"),
-            Bias: T.Tensor((heads if has_bias else 0, dim), bias_dtype),
-            Status: T.Tensor((3 if has_status else 0,), "int32"),
-            Indices: T.Tensor((batch if indexed else 0,), "int32"),
-            Y: T.Tensor((n, heads, dim), "bfloat16"),
-            Log: T.Tensor((state_slots, heads, 5, 64), "float32"),
-            Phase: T.Tensor((state_slots, heads), "int32"),
-        ):
-            forward(R, W, K, V, A, B, S0, CU, Bias, Status, Indices, Y, S0, S0, Log, Phase)
-        return logged_kernel
-
-    @T.prim_func
-    def kernel(
-        R: T.Tensor((n, heads, dim), "bfloat16"),
-        W: T.Tensor((n, heads, dim), "bfloat16"),
-        K: T.Tensor((n, heads, dim), "bfloat16"),
-        V: T.Tensor((n, heads, dim), "bfloat16"),
-        A: T.Tensor((n, heads, dim), "bfloat16"),
-        B: T.Tensor((n, heads, dim), "bfloat16"),
-        S0: T.Tensor((state_slots if indexed else batch, heads, dim, dim), state_dtype),
-        CU: T.Tensor((batch + 1,), "int32"),
-        Bias: T.Tensor((heads if has_bias else 0, dim), bias_dtype),
-        Status: T.Tensor((3 if has_status else 0,), "int32"),
-        Indices: T.Tensor((batch if indexed else 0,), "int32"),
-        Y: T.Tensor((n, heads, dim), "bfloat16"),
-        SN: T.Tensor((0 if indexed else batch, heads, dim, dim), state_dtype),
-        Boundaries: T.Tensor((checkpoints if save else 0, heads, dim, dim), state_dtype),
-    ):
-        forward(R, W, K, V, A, B, S0, CU, Bias, Status, Indices, Y, SN, Boundaries, S0, CU)
 
     return kernel
 
@@ -1317,11 +1192,6 @@ def _recurrent_config(r, batch, state_dtype, columns, prefetch):
         device = device_class(r.device)
         if _fixed_strategy_device(device):
             tile = (64, 4)
-            if state_dtype == torch.float16:
-                sm = device[1] * 10 + device[2]
-                bucket = 1 << (r.shape[0] - 1).bit_length()
-                key = (sm, r.shape[1] * r.shape[2], state_dtype, bucket)
-                tile = _PREFILL_CONFIGS.get(key, tile)
     return tile[0] if columns is None else columns, tile[1] if prefetch is None else prefetch
 
 
@@ -1342,8 +1212,6 @@ def _infer_recurrent(
     block_values=None,
     prefetch_tokens=None,
     row_order=None,
-    dense_decode=False,
-    uniform_prefill=False,
     delta_buffers=None,
     append_log=False,
 ):
@@ -1392,26 +1260,16 @@ def _infer_recurrent(
         _fp16_serving_kernel(
             heads, float(scale), "bfloat16" if bias.dtype == torch.bfloat16 else "float32",
             bias.numel() != 0, order.numel() != 0, delta_buffers is not None, append_log,
-        )(*[r, decay_logits, k, v, a, b], state_pool, cu_seqlens, bias, status, state_indices,
+        )(r, decay_logits, k, v, a, b, state_pool, cu_seqlens, bias, status, state_indices,
           output, order, log, phase)
         return output
 
     block_values, prefetch_tokens = _recurrent_config(
         r, batch, state_pool.dtype, block_values, prefetch_tokens,
     )
-    if delta_buffers is not None:
-        # A single CTA owns the log phase and all 64 columns of each indexed head.
-        block_values = 64
-        if append_log:
-            prefetch_tokens = 1
-    _, heads, dim = r.shape
     bias = _bias_tensor(r, decay_bias)
     output = torch.empty_like(v)
-    if delta_buffers is None:
-        empty = state_pool.new_empty((0, heads, dim, dim))
-        auxiliary = (empty, empty)
-    else:
-        auxiliary = delta_buffers
+    empty = state_pool.new_empty((0, heads, dim, dim))
     _forward_kernel(
         heads,
         dim,
@@ -1424,12 +1282,6 @@ def _infer_recurrent(
         "bfloat16" if bias.dtype == torch.bfloat16 else "float32",
         prefetch_tokens,
         str(state_pool.dtype).removeprefix("torch."),
-        packed_dot=(state_pool.dtype == torch.float16 and dim == 64 and prefetch_tokens > 1
-                    and device_class(r.device)[1:3] == (12, 0)),
-        dense_decode=dense_decode,
-        with_log=delta_buffers is not None, append_log=append_log,
-        uniform_prefill=uniform_prefill,
-        check_order=append_log and batch >= 128 and device_class(r.device)[1:3] == (12, 0),
     )(
         r,
         decay_logits,
@@ -1443,7 +1295,7 @@ def _infer_recurrent(
         status,
         state_indices,
         output,
-        *auxiliary,
+        empty, empty,
     )
     return output
 

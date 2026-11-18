@@ -182,7 +182,9 @@ def main():
 
                 # The benchmark can also load earlier package revisions via PYTHONPATH.
                 selector = getattr(wkv7, "_recurrent_config", None)
-                if selector is not None:
+                if args.state_dtype == "float16" and heads in (40, 64) and dim == 64 and hasattr(ticket, "_row_order"):
+                    dispatch = {"reason": "device-ordered rows, per-slot FP16 decode and tiled prefill"}
+                elif selector is not None:
                     columns, prefetch = selector(values[0], batch, pool.dtype, None, None)
                     if length == 1:
                         reason = "one token per sequence"
