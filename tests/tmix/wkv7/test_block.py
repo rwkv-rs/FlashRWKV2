@@ -66,7 +66,7 @@ _CMIX_ADAPTERS = (("cmix_k", "key_"), ("cmix_v", "value_"))
 
 
 def train_layer(x, res, params, initial, shifts, head_size, v_first, adapters=None, use_nora=False):
-    batch, length, channels = x.shape
+    channels = x.shape[-1]
     heads = channels // head_size
     normalized, total = norm(
         x, params["ln1_w"], params["ln1_b"], res=res, return_res=True,

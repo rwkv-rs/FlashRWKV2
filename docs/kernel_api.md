@@ -1,7 +1,7 @@
 # FlashRWKV2 TileLang operator contract
 
-模型前向统一使用 BF16 激活和权重、FP32 累加与归约。默认 WKV 状态为连续
-FP32 `[slots,H,D,D]`，TokenShift 状态为 BF16 `[slots,C]`。Head 输出 logits、
+模型前向统一使用 BF16 激活和权重、FP32 累加与归约。WKV 状态使用连续
+`[slots,H,D,D]`，普通 serving 在 SM89、SM120 上首选 FP16，训练和 RL rollout 使用 FP32。TokenShift 状态为 BF16 `[slots,C]`。Head 输出 logits、
 所选 token 的 logprob 与 loss 为 FP32。公共名称保留模块所有者；内部 primitive 不从根包导出。
 
 ## Numerical contract
@@ -40,7 +40,7 @@ TMix 公共阶段固定为 `tokenshift -> wkv_prepare -> wkv7 -> readout`。
 | `infer_tmix_postnorm_tokenshift_forward_varlen` | res/ln、六路 mix，返回 `(res_out, r, w, k, v, a, g)`，原位更新 shift pool |
 | `infer_tmix_wkv_prepare_forward_varlen` | R/K/V、低秩 W/A/G/V、VRes 与 KK/A，返回 `(r, decay_logits, key, value, recurrent_a, recurrent_b, gate, v_first)` |
 | `infer_tmix_wkv7_recurrent_fp32io16_forward_varlen` | BF16 `[N,H,D]` 六路输入、FP32 state handle、packed metadata；返回 BF16 WKV 并原位更新状态 |
-| `infer_tmix_wkv7_recurrent_fp16_forward_varlen` | 可选低精度推理；BF16 六路输入、FP16 state handle、FP32 算术；每 token 后将 state 舍入为 FP16 |
+| `infer_tmix_wkv7_recurrent_fp16_forward_varlen` | SM89、SM120 普通 serving 首选；BF16 六路输入、FP16 state handle、FP32 算术；每 token 后将 state 舍入为 FP16 |
 | `infer_tmix_readout_forward_varlen` | head ln、RKV residual、gate 和 output projection，返回 BF16；WKV 输入也可为 FP32 |
 | `infer_cmix_forward_varlen` | res/ln、TokenShift、key projection、ReLU²、value projection；返回 `(res_out, cmix_out)`，原位更新 shift pool |
 | `infer_post_norm_output_forward_varlen(x, res, weight, bias, *, eps=1e-5)` | 对 BF16 residual sum 作 FP32 ln，返回 BF16 |
