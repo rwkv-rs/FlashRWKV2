@@ -34,8 +34,10 @@ class _TmixWkv7RecurrentState:
         slots, heads, dim, _ = state_pool.shape
         self._delta = None
         if state_pool.dtype == torch.float16 and dim == 64 and heads in (40, 64):
+            props = torch.cuda.get_device_properties(state_pool.device)
+            compact = heads == 64 and (props.major, props.minor, props.multi_processor_count) == (8, 9, 128)
             self._delta = (
-                state_pool.new_empty((slots, heads, 5, dim), dtype=torch.float32),
+                state_pool.new_empty((slots, heads, 3 if compact else 5, dim), dtype=torch.float32),
                 state_pool.new_zeros((slots, heads), dtype=torch.int32),
             )
 
@@ -67,7 +69,7 @@ class _TmixWkv7RecurrentState:
     def _drain(self, indices):
         if self._delta is not None and indices.numel():
             from .tilelang import _materialize_deltalog
-            _materialize_deltalog(self._state_pool.shape[1])(self._state_pool, *self._delta, indices)
+            _materialize_deltalog(self._state_pool.shape[1], self._delta[0].shape[2])(self._state_pool, *self._delta, indices)
 
     def _drain_all(self):
         if self._delta is not None:
