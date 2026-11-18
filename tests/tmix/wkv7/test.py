@@ -422,7 +422,7 @@ def test_fp16_deltalog_graph_replays_live_slot_counts_and_rejects_invalid_tails(
 @pytest.mark.parametrize("batch", [16, 257])
 def test_live_mixed_prefill_matches_token_decode_after_row_reordering(batch):
     torch.manual_seed(137)
-    heads, dim, capacity = 64, 64, batch + 17
+    heads, dim, capacity = 64, 64, batch + max(17, batch)
     slots = torch.randperm(batch, device="cuda", dtype=torch.int32)
     cu = torch.zeros(batch + 1, device="cuda", dtype=torch.int32)
     tokens = torch.zeros(1, device="cuda", dtype=torch.int32)
@@ -450,8 +450,11 @@ def test_live_mixed_prefill_matches_token_decode_after_row_reordering(batch):
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
         output = launch()
+    # Eight-token prompts change the decode traversal on the large Ada graph.
+    prompts = (batch + 7) // 8
+    mixed = [1] * (batch - prompts) + [8] * prompts
     for lengths in ([1] * batch, [1] * batch, [1] * (batch - 1) + [17],
-                    [1] * batch, [5, 2, 7, 4, 3] + [1] * (batch - 9)):
+                    [1] * batch, mixed, [5, 2, 7, 4, 3] + [1] * (batch - 9)):
         slots.copy_(slots.roll(3))
         lengths_gpu = torch.tensor(lengths, device="cuda", dtype=torch.int32)
         offsets = torch.cat((lengths_gpu.new_zeros(1), lengths_gpu.cumsum(0, dtype=torch.int32)))

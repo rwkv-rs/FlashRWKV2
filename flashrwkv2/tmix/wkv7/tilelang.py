@@ -404,13 +404,18 @@ def _fp16_serving_kernel(heads, scale, bias_dtype, has_bias, ordered, with_log, 
                 tasks = prefill_tasks
             else:
                 tasks = Status[2] + (tiles - 1) * tiled
-            for offset in T.serial(T.ceildiv(tasks - priority, width)):
-                rank = priority + offset * width + (prefill_tasks if rows == "decode" else 0)
+            visits = T.cast(priority < tasks, "int32") if rows == "decode" else T.ceildiv(tasks - priority, width)
+            for offset in T.serial(visits):
+                rank = priority + offset * width
                 narrow = rank < tiles * tiled
                 is_prefill = True if rows == "prefill" else False if rows == "decode" else rank < prefill_tasks
                 direction = Reverse[0] if alternate else 0
-                seq = T.call_pure_extern("int32", "rwkv_row", Order.access_ptr("r"), rank, tiled,
-                                         num_prefills, Status[2], direction, int(ordered))
+                if rows == "decode":
+                    index = T.if_then_else(direction != 0, Status[2] - 1 - priority, num_prefills + priority)
+                    seq = Order[index] if ordered else index
+                else:
+                    seq = T.call_pure_extern("int32", "rwkv_row", Order.access_ptr("r"), rank, tiled,
+                                             num_prefills, Status[2], direction, int(ordered))
                 start, end = CU[seq], CU[seq + 1]
                 slot = Indices[seq]
                 if not is_prefill:
