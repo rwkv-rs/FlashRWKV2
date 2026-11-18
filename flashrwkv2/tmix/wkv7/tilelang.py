@@ -149,6 +149,7 @@ def _forward_kernel(
     with_log: bool = False,
     append_log: bool = False,
     check_order: bool = False,
+    uniform_prefill: bool = False,
 ):
     n, batch = T.dynamic("n, batch")
     state_slots = T.dynamic("state_slots") if indexed else batch
@@ -193,6 +194,11 @@ def _forward_kernel(
                 active = True
                 start = seq
                 end = seq + 1
+            elif uniform_prefill:
+                # Static validation proves every row contains full prefetch groups.
+                active = True
+                start = seq * (n // batch)
+                end = start + n // batch
             elif has_status:
                 active = Status[0] == 0 and seq < Status[2]
                 start = T.if_then_else(active, CU[seq], 0)
@@ -237,7 +243,7 @@ def _forward_kernel(
             for chunk in T.serial(1 if dense_decode else T.ceildiv(end - start, prefetch_tokens)):
                 for prefetched, key in T.Parallel(prefetch_tokens, dim):
                     token = start + chunk * prefetch_tokens + prefetched
-                    if prefetch_tokens == 1 or token < end:
+                    if uniform_prefill or prefetch_tokens == 1 or token < end:
                         offset = prefetched * dim + key
                         rv[offset] = T.cast(R[token, h, key], "float32")
                         logits = T.cast(W[token, h, key], "float32")
@@ -260,13 +266,13 @@ def _forward_kernel(
                 if prefetch_tokens > 1:
                     for prefetched, value in T.Parallel(prefetch_tokens, columns):
                         token = start + chunk * prefetch_tokens + prefetched
-                        if token < end:
+                        if uniform_prefill or token < end:
                             vs[prefetched * columns + value] = T.cast(
                                 V[token, h, tile * columns + value], "float32"
                             )
                 for within in within_loop(prefetch_tokens):
                     token = start + chunk * prefetch_tokens + within
-                    if prefetch_tokens == 1 or token < end:
+                    if uniform_prefill or prefetch_tokens == 1 or token < end:
                         if save and (token - start) % _CHECKPOINT == 0:
                             checkpoint = (
                                 start // _CHECKPOINT + seq
@@ -1138,6 +1144,7 @@ def _infer_recurrent(
     block_values=None,
     prefetch_tokens=None,
     dense_decode=False,
+    uniform_prefill=False,
     delta_buffers=None,
     append_log=False,
 ):
@@ -1200,6 +1207,7 @@ def _infer_recurrent(
                     and device_class(r.device)[1:3] == (12, 0)),
         dense_decode=dense_decode,
         with_log=delta_buffers is not None, append_log=append_log,
+        uniform_prefill=uniform_prefill,
         check_order=append_log and batch >= 128 and device_class(r.device)[1:3] == (12, 0),
     )(
         r,
