@@ -45,7 +45,7 @@ def compare(heads, batch, verify_only, slot_order):
     def dense_step(i):
         return _infer_recurrent(
             *inputs[i], pool, cu, slots[i], tickets[i]._status(),
-            block_values=64, prefetch_tokens=1, dense_decode=True,
+            block_values=64, prefetch_tokens=1, row_order=tickets[i]._row_order(),
         )
 
     def serving_step(i):

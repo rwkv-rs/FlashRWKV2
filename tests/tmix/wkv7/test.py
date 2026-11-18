@@ -413,3 +413,61 @@ def test_fp16_deltalog_graph_replays_live_slot_counts_and_rejects_invalid_tails(
     assert torch.isnan(output).all()
     state.materialize_slots_(all_slots)
     assert torch.equal(raw.view(torch.int16), reference.view(torch.int16))
+
+
+@pytest.mark.cuda_graph
+@pytest.mark.parametrize("batch", [16, 257])
+def test_live_mixed_prefill_matches_token_decode_after_row_reordering(batch):
+    torch.manual_seed(137)
+    heads, dim, capacity = 64, 64, batch + 17
+    slots = torch.randperm(batch, device="cuda", dtype=torch.int32)
+    cu = torch.zeros(batch + 1, device="cuda", dtype=torch.int32)
+    tokens = torch.zeros(1, device="cuda", dtype=torch.int32)
+    sequences = torch.zeros_like(tokens)
+    raw = torch.randn(batch, heads, dim, dim, device="cuda").mul_(.03).half()
+    reference = raw.clone()
+    state = prepare_tmix_wkv7_recurrent_fp16_state_from_tensor(raw)
+    control = prepare_tmix_wkv7_recurrent_fp16_state_from_tensor(reference)
+    xs = [torch.empty(capacity, heads, dim, device="cuda", dtype=torch.bfloat16) for _ in range(6)]
+
+    def launch():
+        ticket = prepare_tmix_wkv7_recurrent_metadata(
+            cu, slots, token_capacity=capacity, sequence_capacity=batch, max_seqlen_capacity=17,
+            state_pool_size=batch, num_active_tokens=tokens, num_active_sequences=sequences,
+        )
+        return infer_tmix_wkv7_recurrent_fp16_forward_varlen(
+            *xs, state=state, cu_seqlens=cu, state_indices=slots, validated_metadata=ticket,
+        )
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        launch()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        output = launch()
+    for lengths in ([1] * (batch - 1) + [17], [5, 2, 7] + [1] * (batch - 7)):
+        lengths_gpu = torch.tensor(lengths, device="cuda", dtype=torch.int32)
+        offsets = torch.cat((lengths_gpu.new_zeros(1), lengths_gpu.cumsum(0, dtype=torch.int32)))
+        active, rows = sum(lengths), len(lengths)
+        cu[:rows + 1].copy_(offsets)
+        tokens.fill_(active)
+        sequences.fill_(rows)
+        for x in xs:
+            x.fill_(float("nan"))
+            x[:active].normal_(std=.05)
+        graph.replay()
+        for t in range(max(lengths)):
+            selected = torch.where(lengths_gpu > t)[0]
+            positions = offsets[selected].long() + t
+            step_slots = slots[selected].contiguous()
+            single_offsets = torch.arange(len(selected) + 1, device="cuda", dtype=torch.int32)
+            y = infer_tmix_wkv7_recurrent_fp16_forward_varlen(
+                *(x[positions] for x in xs), state=control, cu_seqlens=single_offsets, state_indices=step_slots,
+            )
+            assert torch.equal(output[positions].view(torch.int16), y.view(torch.int16))
+        assert output[active:].isnan().all()
+    state.materialize_slots_(slots)
+    control.materialize_slots_(slots)
+    assert torch.equal(raw.view(torch.int16), reference.view(torch.int16))

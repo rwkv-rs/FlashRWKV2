@@ -74,11 +74,13 @@ FP32 tensor。每次调用返回时状态完整写回。
 `prepare_tmix_wkv7_recurrent_fp16_state_from_tensor` 绑定连续 CUDA FP16 tensor。
 `infer_tmix_wkv7_recurrent_fp16_forward_varlen` 使用 BF16 token I/O、FP32 递推和归约，
 每个 token 后将逻辑 state 舍入为 FP16。不同 batch、分段和 CUDA Graph 使用相同舍入规则。
+对 D64、H40/H64，两个点积都在四个连续的 16-key 组内使用 FP32 FMA 顺序累加，
+然后按 `(s0 + s1) + (s2 + s3)` 合并。该求和顺序同时用于单行、混合 batch 和单 token decode。
 
 D64、H40 或 H64 的 FP16 handle 为每个 slot、每个头分配五个长度为 64 的 FP32 向量和一个
 int32 phase，共 1,284 字节。批量 decode 可以把一步更新留在日志，下次读取该 slot 时按原
-FP32 顺序重放并舍入。SM120 大批量 decode 在 slot 遍历方向切换时直接写回，
-使相邻调用可复用仍在 L2 中的基态。H64 模型的 32 层每序列共用 16 MiB 基态和约 2.508 MiB 日志。
+FP32 顺序重放并舍入。同一批次里的单 token 行独立决定追加或写回，长行优先执行。
+H64 模型的 32 层每序列共用 16 MiB 基态和约 2.508 MiB 日志。
 其他几何和 FP32 handle 的私有字节数为零。容量规划使用 `memory_layout["bytes_per_slot"]`，
 其中包括基态和日志，`fixed_workspace_nbytes` 为零。
 
@@ -97,6 +99,8 @@ CUDA Graph 使用 `token_capacity`、`sequence_capacity`、`max_seqlen_capacity`
 两个 CUDA INT32 scalar `num_active_tokens`、`num_active_sequences`。同一 graph
 内所有 stateful 算子共享 ticket；每次 replay 验证有效前缀。零 active warmup 不
 修改 state，非法 metadata 也不修改 state。inactive 输出为 NaN，不应被下游消费。
+验证器在设备上按有效行长度降序排列执行顺序，结果由各层共享，输出仍按输入行排列。
+FP16 prefill 按四个 token 一块处理整块，每行最后单独处理 0–3 个 token。
 
 ## Training
 

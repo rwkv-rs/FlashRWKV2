@@ -7,6 +7,8 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
 
+#include <cub/block/block_radix_sort.cuh>
+
 #include <limits>
 #include <utility>
 
@@ -27,14 +29,17 @@ __global__ void validate_recurrent_metadata_kernel(
     int* __restrict__ seen_slots,
     int* __restrict__ query_start_loc_snapshot,
     int* __restrict__ state_indices_snapshot,
-    int* __restrict__ validation_summary) {
+    int* __restrict__ validation_summary,
+    int* __restrict__ order) {
   __shared__ int shared_status;
   __shared__ int active_tokens;
   __shared__ int active_sequences;
   __shared__ int actual_max_seqlen;
+  __shared__ int prefill_rows;
   if (threadIdx.x == 0) {
     shared_status = 0;
     actual_max_seqlen = 0;
+    prefill_rows = 0;
     active_tokens = num_active_tokens == nullptr ? total_tokens
                                                   : num_active_tokens[0];
     active_sequences = num_active_sequences == nullptr
@@ -98,6 +103,8 @@ __global__ void validate_recurrent_metadata_kernel(
     } else if (token_end - token_start > max_seqlen) {
       error |= kSequenceTooLong;
     }
+    if (order != nullptr && error == 0 && token_end - token_start > 1)
+      atomicAdd(&prefill_rows, 1);
     if (validation_summary != nullptr && error == 0)
       atomicMax(&actual_max_seqlen, token_end - token_start);
 
@@ -142,6 +149,24 @@ __global__ void validate_recurrent_metadata_kernel(
       status[2] = 0;
     }
   }
+  if (order != nullptr) {
+    if (threadIdx.x == 0) order[num_sequences] = shared_status == 0 ? prefill_rows : 0;
+    // Sort once for all WKV layers. Stable ties keep the scheduler's decode order.
+    if (num_sequences <= blockDim.x) {
+      using Sort = cub::BlockRadixSort<int, 256, 1, int>;
+      __shared__ typename Sort::TempStorage sort_storage;
+      int row[1] = {static_cast<int>(threadIdx.x)};
+      int length[1] = {row[0] < active_sequences && shared_status == 0
+                           ? validated_query_start_loc[row[0] + 1] - validated_query_start_loc[row[0]]
+                           : 0};
+      Sort(sort_storage).SortDescending(length, row);
+      if (threadIdx.x < num_sequences) order[threadIdx.x] = row[0];
+    } else {
+      for (int i = threadIdx.x; i < num_sequences; i += blockDim.x)
+        order[i] = i < active_sequences && shared_status == 0
+            ? validated_query_start_loc[i + 1] - validated_query_start_loc[i] : 0;
+    }
+  }
 }
 
 void check_graph_scalar(
@@ -180,6 +205,9 @@ PreparedRecurrentMetadata launch_recurrent_metadata_validation(
       ? torch::empty_like(state_indices)
       : state_indices;
   constexpr int threads = 256;
+  const bool sort_rows = num_sequences > 1 && max_seqlen > 1 &&
+      !(snapshot && total_tokens == num_sequences);
+  auto order = sort_rows ? torch::empty({num_sequences + 1}, state_indices.options()) : seen_slots.narrow(0, 0, 0);
   validate_recurrent_metadata_kernel<<<
       1,
       threads,
@@ -200,13 +228,18 @@ PreparedRecurrentMetadata launch_recurrent_metadata_validation(
       seen_slots.data_ptr<int>(),
       snapshot ? query_start_loc_snapshot.data_ptr<int>() : nullptr,
       snapshot ? state_indices_snapshot.data_ptr<int>() : nullptr,
-      validation_summary.defined() ? validation_summary.data_ptr<int>() : nullptr);
+      validation_summary.defined() ? validation_summary.data_ptr<int>() : nullptr,
+      sort_rows ? order.data_ptr<int>() : nullptr);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+  if (sort_rows && num_sequences > threads) {
+    auto rows = order.narrow(0, 0, num_sequences);
+    rows.copy_(at::argsort(rows, /*stable=*/true, /*dim=*/0, /*descending=*/true));
+  }
   return PreparedRecurrentMetadata{
       std::move(query_start_loc_snapshot),
       std::move(state_indices_snapshot),
       std::move(status),
-      std::move(seen_slots)};
+      std::move(seen_slots), std::move(order)};
 }
 
 }  // namespace
