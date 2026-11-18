@@ -92,8 +92,8 @@ pytest and every operator benchmark on the PRO 6000 against the installed wheel.
 Each run uploads its distributions, JUnit XML, device metadata and benchmark results.
 Trusted repository PRs run on the self-hosted GPU. Daily runs cover the main branch.
 
-For a release, dispatch **Quality Gate** on the release tag to include Compute Sanitizer
-memcheck and racecheck. Download its `dist-<commit>` artifact to `artifacts/dist` on the
+For a release, dispatch **Quality Gate** on the release tag for the Torch 2.11–2.14 compatibility matrix and
+Compute Sanitizer memcheck and racecheck. Download its `dist-<commit>` artifact to `artifacts/dist` on the
 RTX 4090 checkout of that tag and use the same wheel for independent acceptance:
 
 ```bash

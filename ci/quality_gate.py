@@ -13,6 +13,7 @@ from importlib.metadata import distribution
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+TORCH_VERSIONS = ("2.11.0", "2.12.0", "2.13.0", "2.14.1")
 
 
 def run(args, **kwargs):
@@ -42,15 +43,28 @@ def benchmarks(output):
             yield owner, script, []
 
 
+def release_compatibility(output, env):
+    # Use child interpreters so each test loads only its own Torch libraries.
+    for version in TORCH_VERSIONS:
+        run(["uv", "pip", "install", "--python", sys.executable, f"torch=={version}"], cwd=ROOT)
+        run([sys.executable, "-I", "-m", "pytest", "-q", "-m", "cuda", "-k",
+             "fullgraph or zero_temperature_is_deterministic_greedy or recurrent_forward_reference_and_grad_mode",
+             "-o", f"pythonpath={ROOT / 'tests'} {ROOT / 'benchmarks'}",
+             f"--junitxml={output / ('torch-' + version + '.xml')}", str(ROOT / "tests")], cwd=output, env=env)
+
+
 def validate(args):
+    output = args.output.resolve()
+    output.mkdir(exist_ok=True, parents=True)
+    env = dict(os.environ, PYTHONPATH=str(ROOT / "benchmarks"))
+    if args.release:
+        release_compatibility(output, env)
     import torch
 
     props = torch.cuda.get_device_properties(0)
     arch = f"sm{props.major}{props.minor}"
     if (arch, props.multi_processor_count) not in {("sm89", 128), ("sm120", 188)}:
         raise ValueError(f"unexpected acceptance device: {props.name}")
-    output = args.output.resolve()
-    output.mkdir(exist_ok=True, parents=True)
     report = output / f"{arch}.json"
     report.unlink(missing_ok=True)
     hashes = packages(args.dist)
@@ -58,7 +72,6 @@ def validate(args):
     install = json.loads(distribution("flashrwkv2").read_text("direct_url.json"))
     if install.get("archive_info", {}).get("hashes", {}).get("sha256") != wheel_sha:
         raise ValueError("install the wheel from the supplied distribution directory before validation")
-    env = dict(os.environ, PYTHONPATH=str(ROOT / "benchmarks"))
     junit = output / "pytest.xml"
     run([sys.executable, "-I", "-m", "pytest", "-q", "-o",
          f"pythonpath={ROOT / 'tests'} {ROOT / 'benchmarks'}", f"--junitxml={junit}",
@@ -81,6 +94,7 @@ def validate(args):
     report.write_text(json.dumps({"commit": revision(), "packages": hashes, "gpu": props.name,
                                  "architecture": arch, "sm_count": props.multi_processor_count,
                                  "torch": str(torch.__version__), "passed": passed, "sanitizers": args.release,
+                                 "compatibility": TORCH_VERSIONS if args.release else [],
                                  "benchmarks": measured}, indent=2) + "\n")
 
 
@@ -91,7 +105,8 @@ def verify(args):
         report = json.loads((args.output / f"{arch}.json").read_text())
         if not (report["commit"] == revision() and report["packages"] == expected
                 and (report["architecture"], report["sm_count"]) == (arch, sms)
-                and report["sanitizers"] is True and report["passed"] > 0 and report["benchmarks"] == cases):
+                and report["sanitizers"] is True and report["passed"] > 0
+                and report["compatibility"] == list(TORCH_VERSIONS) and report["benchmarks"] == cases):
             raise ValueError(f"{arch} acceptance does not match the release commit and distributions")
 
 
