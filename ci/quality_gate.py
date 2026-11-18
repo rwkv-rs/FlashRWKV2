@@ -9,6 +9,7 @@ import os
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
+import zipfile
 from importlib.metadata import distribution
 from pathlib import Path
 
@@ -58,7 +59,13 @@ def validate(args):
     output.mkdir(exist_ok=True, parents=True)
     env = dict(os.environ, PYTHONPATH=str(ROOT / "benchmarks"))
     if args.release:
-        release_compatibility(output, env)
+        try:
+            release_compatibility(output, env)
+        finally:
+            run(["uv", "sync", "--frozen", "--no-install-project", "--group", "dev"], cwd=ROOT)
+            wheel, = args.dist.glob("*.whl")
+            run(["uv", "pip", "install", "--python", sys.executable, "--no-deps",
+                 "--reinstall", str(wheel.resolve())], cwd=ROOT)
     import torch
 
     props = torch.cuda.get_device_properties(0)
@@ -68,10 +75,13 @@ def validate(args):
     report = output / f"{arch}.json"
     report.unlink(missing_ok=True)
     hashes = packages(args.dist)
-    wheel_sha = next(value for name, value in hashes.items() if name.endswith(".whl"))
-    install = json.loads(distribution("flashrwkv2").read_text("direct_url.json"))
-    if install.get("archive_info", {}).get("hashes", {}).get("sha256") != wheel_sha:
-        raise ValueError("install the wheel from the supplied distribution directory before validation")
+    wheel, = args.dist.glob("*.whl")
+    installed = distribution("flashrwkv2")
+    with zipfile.ZipFile(wheel) as archive:
+        for name in archive.namelist():
+            if (name.startswith("flashrwkv2/") and not name.endswith("/")
+                    and installed.locate_file(name).read_bytes() != archive.read(name)):
+                raise ValueError(f"installed file differs from {wheel.name}: {name}")
     junit = output / "pytest.xml"
     run([sys.executable, "-I", "-m", "pytest", "-q", "-o",
          f"pythonpath={ROOT / 'tests'} {ROOT / 'benchmarks'}", f"--junitxml={junit}",
