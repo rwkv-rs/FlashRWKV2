@@ -276,11 +276,12 @@ def _infer_forward_varlen(
     status = ticket._status()
     batch = state_indices.numel()
     max_length = ticket._max_seqlen()
-    # Smaller pools cannot contain a qualifying decode batch. H40 at high
-    # concurrency benefits from immediate writeback on reordered slot traces.
+    # H40 uses immediate high-concurrency writeback on SM89. Blackwell can
+    # retain the log for steady traversal and detect a change in slot order.
     delta = state._delta if state._state_pool.shape[0] >= 16 else None
-    append = (delta is not None and max_length == 1 and batch >= 16
-              and (r.shape[1] == 64 or batch <= 64))
+    append = delta is not None and max_length == 1 and batch >= 16
+    if append and r.shape[1] == 40 and batch > 64:
+        append = torch.cuda.get_device_capability(r.device) == (12, 0)
     return _infer_recurrent(
         r, decay_logits, k, v, a, b, state._state_pool, cu_seqlens,
         state_indices, status, scale=scale, decay_bias=decay_bias,
