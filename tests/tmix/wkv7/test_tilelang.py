@@ -2,6 +2,7 @@
 
 """Shared-forward invariance and an independent real-valued recurrence VJP."""
 
+import hashlib
 import math
 
 import pytest
@@ -108,9 +109,9 @@ def test_optional_fp16_tuning_preserves_inference_outputs(dim, has_bias):
     assert torch.equal(initial.view(torch.int16), original.view(torch.int16))
 
 
-def _case(dim, lengths, *, heads=2, requires_grad=False, logits=-2.0):
+def _case(dim, lengths, *, requires_grad=False, logits=-2.0):
     generator = torch.Generator(device="cuda").manual_seed(1729 + dim)
-    n = sum(lengths)
+    n, heads = sum(lengths), 2
 
     def rand(*shape):
         return torch.randn(*shape, device="cuda", generator=generator)
@@ -160,15 +161,31 @@ def _reference(values, initial, lengths, bias, scale, *, state_dtype=None, dtype
     return output, torch.stack(final_states)
 
 
-def test_fp16_serving_prefill_and_decode_match_independent_reference():
+@pytest.mark.parametrize(("heads", "output_hash", "state_hash"), [
+    (40, "b3f83f10611f881afdd181b9ec04551ca484a59c60a64ff35c789503155ec073",
+         "ec30d6319d689b473527f6d82e5375182517e5aaafeacd03f025f0f980d90ce1"),
+    (64, "6425684306d2564f13cc25d088e35ac4f65d7ce2fe3a43442937e20dc3a60c21",
+         "ac6d8645c9ab412ba52a760f89b36d29f2f3ddc672ecf34a4bbb6a5c44feba08"),
+])
+def test_fp16_serving_prefill_and_decode_match_independent_reference(heads, output_hash, state_hash):
     from flashrwkv2 import (
         infer_tmix_wkv7_recurrent_fp16_forward_varlen,
         prepare_tmix_wkv7_recurrent_fp16_state_from_tensor,
     )
 
     lengths = (1, 17, 5)
-    values, initial, cu, bias = _case(64, lengths, heads=64)
-    pool = initial.half()
+    # Integer inputs generated on the host give both GPUs the same bytes.
+    generator = torch.Generator().manual_seed(173041)
+
+    def sample(shape, scale, dtype):
+        raw = torch.randint(-256, 256, shape, dtype=torch.int32, generator=generator, device="cpu")
+        return (raw.float() * scale).to(dtype).cuda()
+
+    values = [sample((sum(lengths), heads, 64), scale, torch.bfloat16)
+              for scale in (2**-11, 2**-7, 2**-11, 2**-11, 2**-11, 2**-11)]
+    pool = sample((len(lengths), heads, 64, 64), 2**-13, torch.float16)
+    bias = sample((heads, 64), 2**-10, torch.bfloat16)
+    cu = torch.tensor([0, 1, 18, 23], device="cuda", dtype=torch.int32)
     expected = _reference(values, pool, lengths, bias, .75, state_dtype=torch.float16, dtype=torch.float64)
     handle = prepare_tmix_wkv7_recurrent_fp16_state_from_tensor(pool)
     slots = torch.arange(len(lengths), device="cuda", dtype=torch.int32)
@@ -176,8 +193,9 @@ def test_fp16_serving_prefill_and_decode_match_independent_reference():
         *values, state=handle, cu_seqlens=cu, state_indices=slots, decay_bias=bias, scale=.75,
     )
     handle.materialize_slots_(slots)
-    for result, reference in zip((actual, pool), expected, strict=True):
+    for result, reference, digest in zip((actual, pool), expected, (output_hash, state_hash), strict=True):
         torch.testing.assert_close(result, reference, atol=2e-4, rtol=8e-3)
+        assert hashlib.sha256(result.cpu().contiguous().view(torch.uint8).numpy().tobytes()).hexdigest() == digest
 
 
 @pytest.mark.parametrize("dim", [64, 128, 256])
