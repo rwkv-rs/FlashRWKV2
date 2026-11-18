@@ -8,6 +8,7 @@ BF16 control runs and FP16 production runs through its owning FP32IO16 state.
 import argparse
 import json
 from functools import partial
+from itertools import accumulate
 from pathlib import Path
 
 import torch
@@ -51,7 +52,10 @@ def main():
     parser.add_argument(
         "--shapes", nargs="+", choices=tuple(SHAPES), default=list(SHAPES)
     )
-    parser.add_argument("--cases", nargs="+", default=CASES)
+    parser.add_argument("--cases", nargs="+", default=CASES,
+                        help="packed BxT terms in scheduler order, e.g. 255x1+1x256")
+    parser.add_argument("--metadata", choices=("static", "live"), default="static")
+    parser.add_argument("--slot-order", choices=("sequential", "random"), default="sequential")
     parser.add_argument("--decay-bias", action="store_true")
     parser.add_argument("--tune", action="store_true")
     parser.add_argument("--state-dtype", choices=("float32", "float16"), default="float32")
@@ -102,14 +106,19 @@ def main():
     for shape in args.shapes:
         heads, dim = SHAPES[shape]
         for case in args.cases:
-            batch, length = (int(value) for value in case.split("x"))
-            if batch <= 0 or length <= 0:
-                parser.error("--cases must contain positive BxT dimensions")
+            lengths = []
+            for term in case.split("+"):
+                count, size = (int(value) for value in term.split("x"))
+                if count <= 0 or size <= 0:
+                    parser.error("--cases must contain positive BxT dimensions")
+                lengths.extend([size] * count)
+            offsets_cpu = [0, *accumulate(lengths)]
+            batch, length, tokens = len(lengths), max(lengths), offsets_cpu[-1]
             # Reset per case so selecting a subset or tuning does not change
             # the logical values used by a different implementation.
             torch.manual_seed(args.seed)
             values = tuple(
-                (torch.randn(batch * length, heads, dim, device="cuda") * scale)
+                (torch.randn(tokens, heads, dim, device="cuda") * scale)
                 .bfloat16()
                 .half()
                 .to(dtype)
@@ -126,15 +135,19 @@ def main():
                 pool.copy_(initial)
 
             reset()
-            cu = torch.arange(batch + 1, device="cuda", dtype=torch.int32) * length
-            slots = torch.arange(batch, device="cuda", dtype=torch.int32)
-            ticket = prepare_tmix_wkv7_recurrent_metadata(
-                cu,
-                slots,
-                total_tokens=batch * length,
-                state_pool_size=batch,
-                max_seqlen=length,
-            )
+            cu = torch.tensor(offsets_cpu, device="cuda", dtype=torch.int32)
+            slots = (torch.randperm(batch, device="cuda", dtype=torch.int32)
+                     if args.slot_order == "random" else torch.arange(batch, device="cuda", dtype=torch.int32))
+            slot_ids = slots.tolist()
+            if args.metadata == "live":
+                metadata_args = dict(
+                    token_capacity=tokens, sequence_capacity=batch, max_seqlen_capacity=length,
+                    num_active_tokens=torch.tensor([tokens], device="cuda", dtype=torch.int32),
+                    num_active_sequences=torch.tensor([batch], device="cuda", dtype=torch.int32),
+                )
+            else:
+                metadata_args = dict(total_tokens=tokens, max_seqlen=length)
+            ticket = prepare_tmix_wkv7_recurrent_metadata(cu, slots, state_pool_size=batch, **metadata_args)
             bias = (
                 torch.randn(heads, dim, device="cuda").bfloat16().half().to(dtype)
                 if args.decay_bias
@@ -185,28 +198,29 @@ def main():
             errors = {"output_relative_l2": 0.0, "state_relative_l2": 0.0}
             # DeltaLog and ordinary CUDA providers can differ within the
             # baseline's 4e-3 relative-L2 contract. TileLang must be bitwise equal.
-            for row in range(batch):
-                single_pool = initial[row : row + 1].clone()
+            for row, size in enumerate(lengths):
+                slot_id = slot_ids[row]
+                single_pool = initial[slot_id : slot_id + 1].clone()
                 single = prepare_state(single_pool)
-                offsets = torch.tensor([0, length], device="cuda", dtype=torch.int32)
+                offsets = torch.tensor([0, size], device="cuda", dtype=torch.int32)
                 slot = torch.zeros(1, device="cuda", dtype=torch.int32)
                 single_ticket = prepare_tmix_wkv7_recurrent_metadata(
                     offsets,
                     slot,
-                    total_tokens=length,
+                    total_tokens=size,
                     state_pool_size=1,
-                    max_seqlen=length,
+                    max_seqlen=size,
                 )
                 actual = infer(
                     *(
-                        value[row * length : (row + 1) * length].contiguous()
+                        value[offsets_cpu[row] : offsets_cpu[row + 1]].contiguous()
                         for value in values
                     ),
                     state=single,
                     cu_seqlens=offsets,
                     state_indices=slot,
                     decay_bias=bias,
-                    max_seqlen=length,
+                    max_seqlen=size,
                     validated_metadata=single_ticket,
                 )
                 single.materialize_slots_(slot)
@@ -214,9 +228,9 @@ def main():
                     (
                         "output_relative_l2",
                         actual,
-                        expected[row * length : (row + 1) * length],
+                        expected[offsets_cpu[row] : offsets_cpu[row + 1]],
                     ),
-                    ("state_relative_l2", single_pool[0], expected_state[row]),
+                    ("state_relative_l2", single_pool[0], expected_state[slot_id]),
                 ):
                     error = float(
                         (result.float() - reference.float()).norm()
@@ -252,7 +266,8 @@ def main():
                 "state_dtype": str(pool.dtype).removeprefix("torch."),
                 "state_memory_layout": state.memory_layout,
                 "metadata": {
-                    "total_tokens": batch * length,
+                    "total_tokens": tokens,
+                    "ticket": args.metadata, "slot_order": args.slot_order,
                     "sequences": batch,
                     "state_pool_size": batch,
                     "max_seqlen": length,
