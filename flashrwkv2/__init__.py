@@ -18,7 +18,6 @@ def _extension():
         _sys.modules[f"{__name__}._C"] = _C
     return _C
 
-from ._internal.tuning import get_tuning_cache_dir, prepare_tuning
 
 from .cmix import infer_cmix_forward_varlen, pretrain_cmix_bf16
 from .embedding import infer_embedding_ln0_forward_varlen
@@ -51,8 +50,6 @@ from .tmix.wkv7 import (
 from .tmix.wkv_prepare import infer_tmix_wkv_prepare_forward_varlen, pretrain_tmix_wkv_prepare_bf16
 
 __all__ = [
-    "get_tuning_cache_dir",
-    "prepare_tuning",
     "pretrain_tmix_wkv_prepare_bf16",
     "pretrain_head_linear_bf16",
     "infer_cmix_forward_varlen",

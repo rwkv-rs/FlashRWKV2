@@ -35,33 +35,10 @@ PUBLIC_PREFIXES = (
 )
 
 
-@pytest.fixture
-def tuning_cache(monkeypatch, tmp_path):
-    from flashrwkv2._internal import tuning
-
-    monkeypatch.setattr(tuning, "_profile_root", lambda: tmp_path)
-    monkeypatch.setattr(tuning, "_LOADED", {})
-    monkeypatch.setattr(tuning, "_WARNED", set())
-    return tuning
-
-
-def test_tuning_compiler_identity_without_cuda_toolkit(monkeypatch):
-    from flashrwkv2._internal import tuning
-
-    monkeypatch.setattr(importlib.import_module("tilelang.env"), "CUDA_HOME", "")
-    tuning._compiler_identity.cache_clear()
-    try:
-        versions, _ = tuning._compiler_identity()
-        assert versions[0] is None
-        assert versions[1]
-    finally:
-        tuning._compiler_identity.cache_clear()
-
-
 def test_tuning_device_class_shares_ordinals_but_separates_products(monkeypatch):
     import torch
 
-    from flashrwkv2._internal import tuning
+    from flashrwkv2._internal import execution as tuning
 
     monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: SimpleNamespace(
         name="RTX 4090" if device < 2 else "RTX 4090 D",
@@ -79,7 +56,7 @@ def test_tuning_device_class_shares_ordinals_but_separates_products(monkeypatch)
 def test_tuning_default_root_ignores_torch_and_xdg(monkeypatch, tmp_path, override):
     from pathlib import Path
 
-    from flashrwkv2._internal import tuning
+    from flashrwkv2._internal import execution as tuning
 
     if override is None:
         monkeypatch.delenv("FLASHRWKV2_CACHE_DIR", raising=False)
@@ -87,226 +64,22 @@ def test_tuning_default_root_ignores_torch_and_xdg(monkeypatch, tmp_path, overri
         monkeypatch.setenv("FLASHRWKV2_CACHE_DIR", override)
     monkeypatch.setenv("TORCH_HOME", str(tmp_path / "torch"))
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg"))
-    tuning.get_tuning_cache_dir.cache_clear()
+    tuning.native_cache_root.cache_clear()
     try:
-        assert tuning.get_tuning_cache_dir() == Path.home() / ".cache" / "flashrwkv2"
+        assert tuning.native_cache_root() == Path.home() / ".cache" / "flashrwkv2"
         assert not tmp_path.joinpath("torch").exists()
         assert not tmp_path.joinpath("xdg").exists()
     finally:
-        tuning.get_tuning_cache_dir.cache_clear()
+        tuning.native_cache_root.cache_clear()
 
 
 def test_fixed_strategy_is_qualified_by_architecture_and_sm_count():
-    from flashrwkv2._internal.tuning import _fixed_strategy_device
+    from flashrwkv2._internal.execution import _fixed_strategy_device
 
     assert _fixed_strategy_device(("4090", 8, 9, 128))
     assert _fixed_strategy_device(("PRO 6000", 12, 0, 188))
     assert not _fixed_strategy_device(("4090 D", 8, 9, 114))
     assert not _fixed_strategy_device(("other", 12, 0, 170))
-
-
-@pytest.mark.parametrize("mode", ("inspect", "require", "tune"))
-def test_preparation_reports_fixed_and_profiled_workloads(tuning_cache, monkeypatch, mode):
-    tuning = tuning_cache
-    key = (("test", 8, 9, 128), 512)
-    fixed = ((64, 128, 2, 64), (128, 128, 2, 64))
-    tuning.save_config("linear", key, (16, 64, 2, 32))
-    read, observed = tuning._read_profile, []
-    def read_profile(owner, encoded):
-        observed.append(owner)
-        return read(owner, encoded)
-    def unexpected():
-        pytest.fail("an available configuration must not tune")
-    monkeypatch.setattr(tuning, "_read_profile", read_profile)
-    calls = [lambda c=c: tuning.get_config({}, "linear", key, c, tune=unexpected, fixed=True) for c in fixed]
-    calls.append(lambda: tuning.get_config({}, "linear", key, tune=unexpected))
-    report = tuning.prepare_tuning([*calls, *calls], mode=mode)
-    assert report["complete"] and observed == ["linear"]
-    assert report["counts"] == {"fixed": 2, "hit": 1, "missing": 0, "tuned": 0}
-    monkeypatch.setattr(tuning, "_capturing", lambda: True)
-    assert calls[0]() == fixed[0]
-
-
-def test_fixed_benchmark_overrides_only_its_target_and_restores_it(tuning_cache):
-    tuning = tuning_cache
-    key = (("test", 8, 9, 128), 1)
-    other = (("test", 8, 9, 128), 2)
-    fixed = (16, 64, 2, 128)
-    candidate = (16, 32, 2, 256)
-    configs = {key: candidate, other: candidate}
-
-    def dispatch(owner, workload):
-        return tuning.get_config(configs, owner, workload, fixed, fixed=True)
-
-    def benchmark():
-        assert dispatch("linear", key) == candidate
-        assert dispatch("linear", other) == fixed
-        assert dispatch("tmix/wkv_prepare", key) == fixed
-        return 42
-
-    assert tuning.benchmark_config("linear", key, lambda: dispatch("linear", key)) == fixed
-    active = tuning._TUNING.set(True)
-    try:
-        assert tuning.benchmark_config("linear", key, benchmark) == 42
-        assert dispatch("linear", key) == fixed
-        with pytest.raises(RuntimeError, match="benchmark failed"):
-            def fail():
-                assert dispatch("linear", key) == candidate
-                raise RuntimeError("benchmark failed")
-
-            tuning.benchmark_config("linear", key, fail)
-        assert dispatch("linear", key) == fixed
-    finally:
-        tuning._TUNING.reset(active)
-
-
-def test_tuning_missing_then_published_is_visible_in_same_process(tuning_cache):
-    tuning = tuning_cache
-    key = (("test", 8, 9, 128), 32, "torch.bfloat16")
-    configs = {}
-    call = lambda: tuning.get_config(configs, "linear", key, (16, 64, 2, 32))
-    fixed = lambda: tuning.get_config({}, "linear", key, (64, 64, 2, 32), fixed=True)
-    before = tuning.prepare_tuning([fixed, call], mode="inspect")
-    assert not before["complete"]
-    assert before["counts"]["missing"] == before["counts"]["fixed"] == 1
-    assert key not in configs
-    tuning.save_config("linear", key, (32, 64, 2, 64))
-    after = tuning.prepare_tuning([call])
-    assert after["complete"] and after["counts"]["hit"] == 1
-    assert call() == (32, 64, 2, 64)
-
-
-def test_tuning_prepare_reloads_external_publication_and_detects_removal(tuning_cache):
-    tuning = tuning_cache
-    key = (("test", 8, 9, 128), 32)
-    call = lambda: tuning.get_config({}, "linear", key)
-    tuning.save_config("linear", key, (16, 64, 2, 32))
-    tuning.prepare_tuning([call])
-    path = tuning._profile_path("linear", tuning._encode(key))
-    record = json.loads(path.read_text())
-    record["config"] = [32, 64, 2, 64]
-    path.write_text(json.dumps(record))
-    refreshed = tuning.prepare_tuning([call])
-    assert refreshed["records"][0]["config"] == (32, 64, 2, 64)
-    path.unlink()
-    with pytest.raises(RuntimeError, match="missing verified tuning profile"):
-        tuning.prepare_tuning([call])
-
-
-def test_tuning_require_and_capture_fail_before_using_missing_key(tuning_cache, monkeypatch):
-    tuning = tuning_cache
-    key = (("test", 8, 9, 128), 128)
-    calls = []
-    def call():
-        return tuning.get_config({}, "linear", key, tune=lambda: calls.append(1))
-    with pytest.raises(RuntimeError, match="missing verified tuning profile"):
-        tuning.prepare_tuning([call])
-    assert not calls
-    monkeypatch.setattr(tuning, "_capturing", lambda: True)
-    with pytest.raises(RuntimeError, match="outside CUDA Graph"):
-        tuning.prepare_tuning([call], mode="tune")
-    with pytest.raises(RuntimeError, match="unprepared tuning key"):
-        call()
-    assert not calls
-    monkeypatch.setattr(tuning, "_capturing", lambda: False)
-    with pytest.warns(RuntimeWarning, match="untuned default"):
-        assert call() is None
-    with monkeypatch.context() as patch:
-        patch.setattr(tuning, "_capturing", lambda: True)
-        patch.setattr(tuning, "_read_profile", lambda *args: pytest.fail("capture must not read profiles"))
-        assert call() is None
-    config = (32, 64, 2, 64)
-    tuning.save_config("linear", key, config)
-    with monkeypatch.context() as patch:
-        patch.setattr(tuning, "_capturing", lambda: True)
-        with pytest.raises(RuntimeError, match="unprepared tuning key"):
-            call()
-    assert tuning.prepare_tuning([call])["complete"]
-    monkeypatch.setattr(tuning, "_capturing", lambda: True)
-    monkeypatch.setattr(tuning, "_read_profile", lambda *args: pytest.fail("capture must use the prepared profile"))
-    assert call() == config
-
-
-def test_tuning_prepares_once_and_reports_actual_dispatch(tuning_cache):
-    tuning = tuning_cache
-    key = (("test", 12, 0, 188), 128)
-    count = []
-    @tuning.tuning_operation
-    def tune():
-        assert tuning._TUNING.get()
-        count.append(1)
-        tuning.save_config("linear", key, (32, 64, 2, 64))
-    def call():
-        assert tuning.get_config({}, "linear", key, tune=tune) == (32, 64, 2, 64)
-    report = tuning.prepare_tuning([call, call], mode="tune")
-    assert count == [1] and not tuning._TUNING.get()
-    assert report["counts"]["tuned"] == 1
-    assert report["records"][0]["key"][0] == ["test", 12, 0, 188]
-    assert tuning.prepare_tuning([call], mode="tune")["counts"]["hit"] == 1
-    assert count == [1]
-
-
-def test_tuning_preparation_includes_worker_thread_dispatch(tuning_cache):
-    tuning = tuning_cache
-    def call():
-        tuning.get_config({}, "linear", (("test", 12, 0, 188), 1))
-        worker = threading.Thread(target=lambda: tuning.get_config({}, "linear", (("test", 12, 0, 188), 2)))
-        worker.start()
-        worker.join(timeout=10)
-        assert not worker.is_alive()
-    report = tuning.prepare_tuning([call], mode="inspect")
-    assert report["counts"]["missing"] == 2
-    assert not report["complete"]
-
-
-@pytest.mark.parametrize("contents", ["{", "[]", '{"bitwise_equal":false}', '{"config":[0]}'])
-def test_tuning_corrupt_record_fails_closed(tuning_cache, contents):
-    tuning = tuning_cache
-    key = (("test", 8, 9, 128), 1)
-    path = tuning._profile_path("linear", tuning._encode(key))
-    path.parent.mkdir(parents=True)
-    path.write_text(contents)
-    with pytest.raises(ValueError):
-        tuning.prepare_tuning([lambda: tuning.get_config({}, "linear", key)])
-
-
-def test_tuning_processes_share_single_writer_and_ignore_torch_cache(tmp_path):
-    script = """
-import json, os, time
-from pathlib import Path
-from flashrwkv2 import prepare_tuning
-from flashrwkv2._internal import tuning
-key = (("test", 12, 0, 188), 64)
-def tune():
-    with (tuning.get_tuning_cache_dir() / "writers").open("a") as output:
-        output.write("writer\\n")
-    time.sleep(.1)
-    tuning.save_config("linear", key, (32, 64, 2, 64))
-report = prepare_tuning([lambda: tuning.get_config({}, "linear", key, tune=tune)], mode="tune")
-print(json.dumps(report))
-"""
-    processes = []
-    for ordinal in range(3):
-        environment = dict(os.environ, FLASHRWKV2_CACHE_DIR=str(tmp_path / "shared"),
-                           TORCH_HOME=str(tmp_path / f"torch-{ordinal}"),
-                           XDG_CACHE_HOME=str(tmp_path / f"xdg-{ordinal}"))
-        processes.append(subprocess.Popen([sys.executable, "-c", script], env=environment,
-                                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
-    reports = []
-    try:
-        for process in processes:
-            output, error = process.communicate(timeout=45)
-            assert process.returncode == 0, error
-            reports.append(json.loads(output))
-    finally:
-        for process in processes:
-            if process.poll() is None:
-                process.kill()
-                process.wait(timeout=5)
-    assert (tmp_path / "shared" / "writers").read_text() == "writer\n"
-    assert sum(report["counts"]["tuned"] for report in reports) == 1
-    assert sum(report["counts"]["hit"] for report in reports) == 2
-    assert len({report["records"][0]["path"] for report in reports}) == 1
 
 
 def test_cpu_import_does_not_compile_or_create_cache(tmp_path) -> None:
@@ -367,7 +140,7 @@ def test_compile_boundary_accepts_homogeneous_sm89() -> None:
 
 def _mock_runtime_build(monkeypatch, tmp_path, *, fail_once: bool = False):
     from flashrwkv2 import compile as compiler
-    from flashrwkv2._internal import tuning
+    from flashrwkv2._internal import execution as tuning
 
     calls = {"build": 0}
     monkeypatch.setattr(compiler, "_RESULT", None)
@@ -385,7 +158,7 @@ def _mock_runtime_build(monkeypatch, tmp_path, *, fail_once: bool = False):
     )
     monkeypatch.setattr(
         tuning,
-        "get_tuning_cache_dir",
+        "native_cache_root",
         lambda: tmp_path / "cache",
     )
 
@@ -473,11 +246,7 @@ def test_source_digest_tracks_shared_native_headers(tmp_path) -> None:
 
 def test_root_exports_module_operators_by_identity() -> None:
     import flashrwkv2
-    from flashrwkv2._internal import tuning
-
-    expected: dict[str, object] = {
-        name: getattr(tuning, name) for name in ("get_tuning_cache_dir", "prepare_tuning")
-    }
+    expected: dict[str, object] = {}
     for module_name in PUBLIC_MODULES:
         module = importlib.import_module(module_name)
         for name in module.__all__:
@@ -491,42 +260,10 @@ def test_root_exports_module_operators_by_identity() -> None:
         assert getattr(flashrwkv2, name) is operator
 
 
-def test_preparation_compiles_family_once_and_reports_variants(tuning_cache, monkeypatch):
-    cache, calls = {}, []
-    def compiler(*args):
-        return object()
-    compiler.func = SimpleNamespace(__name__="observed_kernel")
-    def compile_candidates(keys, result, spec):
-        calls.extend(keys)
-        result.update((key, object()) for key in keys)
-    monkeypatch.setattr(tuning_cache, "compile_candidates", compile_candidates)
-    def run():
-        tuning_cache.get_config({}, "linear", ("family",), (16, 64, 2, 32), fixed=True)
-        tuning_cache.prepare_variants("linear", ("shape",), lambda: ((1,), (2,)), cache, None)
-        tuning_cache.prepared_kernel("test", compiler, (1,), ((2,),))
-    report = tuning_cache.prepare_tuning([run, run])
-    assert calls == [(1,), (2,)]
-    assert report["complete"]
-    assert report["compilation"] == {"families": 2, "required_variants": 4,
-                                     "available_variants": 4, "complete": True}
-
-
-def test_preparation_rejects_failed_required_variant(tuning_cache, monkeypatch):
-    monkeypatch.setattr(tuning_cache, "compile_candidates", lambda *args: None)
-    def spec(*key):
-        raise RuntimeError("required kernel failed")
-    def run():
-        tuning_cache.get_config({}, "linear", ("family",), (16, 64, 2, 32), fixed=True)
-        tuning_cache.prepare_variants("linear", ("shape",), lambda: ((1,),), {}, spec)
-    with pytest.raises(RuntimeError, match="required kernel failed"):
-        tuning_cache.prepare_tuning([run])
-    assert tuning_cache._SESSION is None
-
-
 def test_candidate_batches_preserve_distinct_compiler_options(monkeypatch):
     import tilelang
 
-    from flashrwkv2._internal.tuning import compile_candidates
+    from _tuning import compile_candidates
 
     calls, cache = [], {}
     def compile_batch(programs, **options):

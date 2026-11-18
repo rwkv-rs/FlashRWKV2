@@ -145,8 +145,10 @@ def main() -> None:
 
     tuning = {}
     if args.tune:
-        from flashrwkv2._internal.linear import _NoRA, linear, tune_linear
-        from flashrwkv2.tmix.readout.tilelang import readout, tune_readout
+        from _tuning import tune_linear, tune_readout
+
+        from flashrwkv2._internal.linear import _NoRA, linear
+        from flashrwkv2.tmix.readout.tilelang import readout
 
         tuning["readout"] = tune_readout(*tune_inputs)
         if projection:

@@ -51,7 +51,7 @@ def main() -> None:
     bias = torch.zeros_like(weight)
     tuning = None
     if args.tune:
-        from flashrwkv2.post_norm.tilelang import tune_norm
+        from _tuning import tune_norm
 
         tuning = tune_norm(x, weight, bias, res=res)
     timing = measure_cuda(

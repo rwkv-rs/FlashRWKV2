@@ -56,7 +56,9 @@ def benchmark(args):
         inputs = (x, a, b)
     tuning = {}
     if args.tune:
-        from flashrwkv2._internal.linear import _NoRA, linear, tune_linear
+        from _tuning import tune_linear
+
+        from flashrwkv2._internal.linear import _NoRA, linear
 
         tuning["base"] = tune_linear(x, weight, torch.float32)
         if adapters:

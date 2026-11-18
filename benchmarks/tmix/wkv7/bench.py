@@ -142,7 +142,7 @@ def main():
             )
             tuning = None
             if args.tune:
-                from flashrwkv2.tmix.wkv7.tilelang import tune_tmix_wkv7_recurrent
+                from _tuning import tune_tmix_wkv7_recurrent
 
                 tuning = tune_tmix_wkv7_recurrent(
                     *values,

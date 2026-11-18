@@ -8,7 +8,7 @@ from flashrwkv2.tmix.readout.tilelang import readout
 
 @pytest.mark.parametrize("fault", ("stats", "production"))
 def test_readout_tuning_rejects_changed_statistics_or_production(monkeypatch, fault):
-    from flashrwkv2._internal import tuning
+    import _tuning as tuning
     from flashrwkv2.tmix.readout import tilelang as implementation
 
     x = torch.ones(3, 64, dtype=torch.bfloat16)
@@ -41,9 +41,8 @@ def test_readout_tuning_rejects_changed_statistics_or_production(monkeypatch, fa
     monkeypatch.setattr(implementation, "_forward", forward)
     monkeypatch.setattr(implementation, "_ROW_CONFIGS", {})
     monkeypatch.setattr(tuning, "select_config", select_config)
-    monkeypatch.setattr(tuning, "save_config", lambda *args: None)
     monkeypatch.setattr(implementation, "device_class", lambda device: "test")
-    implementation.tune_readout(x, x, x, x, vector, vector, vector, x)
+    tuning.tune_readout(x, x, x, x, vector, vector, vector, x)
     assert implementation._ROW_CONFIGS[implementation._config_key(x, 64)] == 1
 
 

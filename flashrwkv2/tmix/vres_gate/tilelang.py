@@ -6,7 +6,7 @@ import tilelang.language as T
 import torch
 
 from ..._internal.elementwise import sum_partials
-from ..._internal.tuning import _AutogradContext
+from ..._internal.execution import _AutogradContext
 
 
 @tilelang.jit(pass_configs={"tl.enable_fast_math": False})

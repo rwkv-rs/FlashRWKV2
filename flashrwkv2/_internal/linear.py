@@ -13,7 +13,7 @@ from numbers import Real
 import torch
 from torch.autograd.function import once_differentiable
 
-from .tuning import _AutogradContext, _fixed_strategy_device, device_class, prepare_variants, tuning_operation, workload_bucket
+from .execution import _AutogradContext, _fixed_strategy_device, device_class, workload_bucket
 
 _PASS_CONFIG = {"tl.disable_wgmma": True, "tl.enable_fast_math": False}
 _DEFAULT_CONFIG = (16, 64, 2, 32)
@@ -243,23 +243,6 @@ def _projection_config(rows, channels, outputs, device, *, aligned_k=True):
     return m, n, stages, span
 
 
-def _projection_variants(channels, outputs, device):
-    """Evaluate static-K selection at every possible row transition."""
-    sms = torch.cuda.get_device_properties(device).multi_processor_count
-    boundaries = {1, 16, 17}
-    for m, n in _projection_tiles(outputs, sms):
-        threshold = (
-            math.ceil(sms / sum(math.ceil(o / n) for o in outputs)) - 1
-        ) * m + 1
-        for point in (m // 2 + 1, threshold):
-            boundaries.update((max(1, point - 1), max(1, point), max(1, point + 1)))
-    return tuple(
-        dict.fromkeys(
-            _projection_config(r, channels, outputs, device) for r in sorted(boundaries)
-        )
-    )
-
-
 def _fixed_projection_config(x, weight):
     if _fixed_strategy_device(device_class(x.device)) and weight.stride() in (
         (x.shape[1], 1),
@@ -287,7 +270,6 @@ def _forward(x, weight, bias, output_dtype, config=None, *, dynamic_k=False):
             if dynamic_k
             else _fixed_projection_config(x, weight)
         )
-        from .tuning import get_config
 
         selection_key = _key(x, weight, output_dtype, bias)
         if dynamic_k:
@@ -298,14 +280,7 @@ def _forward(x, weight, bias, output_dtype, config=None, *, dynamic_k=False):
                 "dynamic_k",
                 aligned_k,
             )
-        config = get_config(
-            _TUNED_CONFIGS,
-            "linear",
-            selection_key,
-            fixed,
-            tune=lambda: tune_linear(x, weight, output_dtype, bias=bias),
-            fixed=fixed is not None,
-        )
+        config = _TUNED_CONFIGS.get(selection_key, fixed)
         if config is None:
             config = _projection_config(
                 x.shape[0], (x.shape[1],), (weight.shape[0],), x.device
@@ -323,30 +298,6 @@ def _forward(x, weight, bias, output_dtype, config=None, *, dynamic_k=False):
         input_major,
         info[1] * 10 + info[2],
     ) + ((True, aligned_k) if dynamic_k else ())
-    if automatic and fixed is not None:
-        family = key[:5] + key[6:9] + ((True, x.shape[0]) if dynamic_k else ())
-
-        def variants():
-            if dynamic_k:
-                return tuple(
-                    key[:5]
-                    + (
-                        _projection_config(
-                            x.shape[0], None, (weight.shape[0],), x.device, aligned_k=a
-                        ),
-                    )
-                    + key[6:9]
-                    + (True, a)
-                    for a in (False, True)
-                )
-            return tuple(
-                key[:5] + (c,) + key[6:]
-                for c in _projection_variants(
-                    (x.shape[1],), (weight.shape[0],), x.device
-                )
-            )
-
-        prepare_variants("linear", family, variants, _COMPILED_KERNELS, _compile_spec)
     kernel = _compiled(*key)
     return kernel(x, physical_weight, physical_weight if bias is None else bias)
 
@@ -744,123 +695,3 @@ def adapter_linear(
     update = linear(features, b.to(torch.bfloat16), output_dtype=torch.float32)
     operation = _compiled_adapter_add if torch.compiler.is_compiling() else _AdapterAdd.apply
     return operation(result, update, scale)
-
-
-@torch.no_grad()
-@tuning_operation
-def tune_linear(x, weight, output_dtype=None, *, bias=None, benchmark=None):
-    """Measure output tiles without changing the canonical MMA reduction.
-
-    This explicit warmup uses the actual device and shape. Each candidate must
-    equal the canonical kernel in FP32 and the production output dtype, including
-    independent one-row FP32 replays, before its latency can select it. Results
-    apply to this process, device model, and bias dtype. An optional zero-argument
-    ``benchmark`` measures the owning forward operator with each candidate in
-    its dispatch cache, preserving the operator's working set during tuning.
-    """
-    from .tuning import (
-        benchmark_config,
-        compile_candidates,
-        projection_configs,
-        projection_finalists,
-        save_config,
-        select_config,
-    )
-
-    output_dtype = torch.bfloat16 if output_dtype is None else output_dtype
-    linear(x, weight, bias, output_dtype)
-    x = _aligned(x.reshape(-1, x.shape[-1]).contiguous())
-    weight = _aligned(weight)
-    bias = None if bias is None else _aligned(bias.contiguous())
-    check_dtypes = tuple(dict.fromkeys((torch.float32, output_dtype)))
-    reference = tuple(
-        _forward(x, weight, bias, dtype, _DEFAULT_CONFIG) for dtype in check_dtypes
-    )
-    probes = sorted({0, x.shape[0] // 2, x.shape[0] - 1})
-    for row in probes:
-        single = _forward(
-            x[row : row + 1], weight, bias, torch.float32, _DEFAULT_CONFIG
-        )
-        if not torch.equal(reference[0][row : row + 1], single):
-            raise RuntimeError("canonical linear failed FP32 batch invariance")
-    major, minor = torch.cuda.get_device_capability(x.device)
-    input_major = weight.stride(0) == 1
-    weight_strides = (weight.t() if input_major else weight).stride()
-    measurements = {}
-
-    def run(config):
-        if benchmark is None:
-            return _forward(x, weight, bias, output_dtype, config)
-        key = _key(x, weight, output_dtype, bias)
-        _TUNED_CONFIGS[key] = config
-        return benchmark_config("linear", key, benchmark)
-
-    for _ in range(2):
-        eligible = projection_configs(
-            x.shape[0], (x.shape[1],), (weight.shape[0],), x.device,
-            measurements.values(),
-        )
-        if not eligible:
-            break
-        rejected = []
-        keys = (
-            (
-                weight.shape[0], x.shape[1], _dtype_name(dtype),
-                _dtype_name(bias.dtype) if bias is not None else "bfloat16",
-                bias is not None, config, weight_strides, input_major,
-                major * 10 + minor,
-            )
-            for config in eligible for dtype in check_dtypes
-        )
-        compile_candidates(keys, _COMPILED_KERNELS, _compile_spec)
-        compiled = []
-        for config in eligible:
-            try:
-                for dtype in check_dtypes:
-                    _compiled(
-                        weight.shape[0],
-                        x.shape[1],
-                        _dtype_name(dtype),
-                        _dtype_name(bias.dtype) if bias is not None else "bfloat16",
-                        bias is not None,
-                        config,
-                        weight_strides,
-                        input_major,
-                        major * 10 + minor,
-                    )
-            except RuntimeError as error:
-                # Only compilation is recoverable here. Launch and correctness
-                # failures below must still stop tuning.
-                rejected.append({"config": config, "compile_error": str(error)})
-            else:
-                compiled.append(config)
-        _, checked = select_config(
-            compiled,
-            run,
-            check=lambda config: tuple(
-                _forward(x, weight, bias, dtype, config) for dtype in check_dtypes
-            ),
-            reference=reference,
-        )
-        measurements.update((item["config"], item) for item in checked + rejected)
-    # Finalists use the formal benchmark's graph length. Short graphs can rank
-    # copy spans differently from a sustained benchmark.
-    best_config, checked = select_config(
-        projection_finalists(measurements.values()),
-        run,
-        check=lambda config: tuple(
-            _forward(x, weight, bias, dtype, config) for dtype in check_dtypes
-        ),
-        reference=reference,
-        repeat=1000,
-    )
-    measurements.update((item["config"], item) for item in checked)
-    best_ms = measurements[best_config]["milliseconds"]
-    _TUNED_CONFIGS[_key(x, weight, output_dtype, bias)] = best_config
-    save_config("linear", _key(x, weight, output_dtype, bias), best_config)
-    return {
-        "config": best_config,
-        "milliseconds": best_ms,
-        "timing_scope": "operator" if benchmark is not None else "projection",
-        "candidates": list(measurements.values()),
-    }

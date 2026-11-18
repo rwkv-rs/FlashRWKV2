@@ -7,12 +7,10 @@ import tilelang
 import tilelang.language as T
 import torch
 
-from ..._internal.tuning import (
+from ..._internal.execution import (
     _AutogradContext,
     _fixed_strategy_device,
     device_class,
-    prepared_kernel,
-    tuning_operation,
     workload_bucket,
 )
 
@@ -190,23 +188,15 @@ def _backward(
 
 
 def _readout_group(x, r, k, v, r_k, weight, bias, gate, head_size, eps):
-    from ..._internal.tuning import get_config
 
     rows = x.numel() // x.shape[-1]
     fixed = (4 if rows == 1 else 8) if head_size == 64 and _fixed_strategy_device(device_class(x.device)) else None
-    return get_config(
-        _ROW_CONFIGS, "tmix/readout", _config_key(x, head_size),
-        1 if fixed is None else fixed,
-        tune=lambda: tune_readout(x, r, k, v, r_k, weight, bias, gate, head_size, eps),
-        fixed=fixed is not None,
-    )
+    return _ROW_CONFIGS.get(_config_key(x, head_size), 1 if fixed is None else fixed)
 
 
 def _prepared_forward(x, head_size, eps, save, group):
     options = (x.shape[-1], head_size, eps, str(x.dtype).split(".")[-1], save)
-    fixed = head_size == 64 and _fixed_strategy_device(device_class(x.device))
-    variants = ((*options, g) for g in (4, 8)) if fixed else ()
-    return prepared_kernel("tmix/readout", _forward, (*options, group), variants)
+    return _forward(*options, group)
 
 
 class _Readout(torch.autograd.Function):
@@ -227,9 +217,7 @@ class _Readout(torch.autograd.Function):
 
         group = min(32, tilelang.next_power_of_2(max(1, dy.shape[0] // 128)))
         needed = ctx.needs_input_grad[4:7]
-        gradients = list(prepared_kernel("tmix/readout", _backward, (*ctx.options, group, needed),
-            ((*ctx.options, g, needed) for g in (1, 2, 4, 8, 16, 32))
-            if ctx.options[1] == 64 and _fixed_strategy_device(device_class(dy.device)) else ())( dy.contiguous(), *ctx.saved_tensors))
+        gradients = list(_backward(*ctx.options, group, needed)( dy.contiguous(), *ctx.saved_tensors))
         for i, need in zip((4, 5, 6), needed):
             gradients[i] = sum_partials(gradients[i]) if need else None
         return (*gradients, None, None)
@@ -324,40 +312,3 @@ def readout(
         group = _readout_group(*args, head_size, eps)
         output, _ = _prepared_forward(x, head_size, float(eps), False, group)( *args)
     return output.view_as(x)
-
-
-@torch.no_grad()
-@tuning_operation
-def tune_readout(x, r, k, v, r_k, weight, bias, gate, head_size=64, eps=64e-5):
-    """Measure grouped heads; each head retains one warp and its reduction tree."""
-    from ..._internal.tuning import save_config, select_config
-
-    readout(x, r, k, v, r_k, weight, bias, gate, head_size, eps)
-    c = x.shape[-1]
-    args = (
-        x.view(-1, c), r.view(-1, c), k.view(-1, c), v.view(-1, c),
-        r_k.view(c), weight.view(c), bias.view(c), gate.view(-1, c),
-    )
-    dtype = str(x.dtype).split(".")[-1]
-
-    def run(group, inputs=args):
-        return _forward(c, head_size, eps, dtype, False, group)(*inputs)[0]
-
-    def check(group, inputs=args):
-        training = _forward(c, head_size, eps, dtype, rows_per_block=group)(*inputs)
-        return (*training, run(group, inputs))
-
-    training = _forward(c, head_size, eps, dtype)(*args)
-    # FP32 ln/RKV statistics remain part of candidate acceptance; the actual
-    # no-statistics production output must also equal the training result.
-    reference = (*training, training[0])
-    for row in sorted({0, args[0].shape[0] // 2, args[0].shape[0] - 1}):
-        single_args = tuple(t[row:row + 1] if t.ndim == 2 else t for t in args)
-        single = check(1, single_args)
-        if not all(torch.equal(full[row:row + 1], one) for full, one in zip(reference, single, strict=True)):
-            raise RuntimeError("canonical readout failed batch invariance")
-
-    best, measurements = select_config((1, 2, 4, 8, 16), run, check=check, reference=reference)
-    _ROW_CONFIGS[_config_key(args[0], head_size)] = best
-    save_config("tmix/readout", _config_key(args[0], head_size), best)
-    return measurements

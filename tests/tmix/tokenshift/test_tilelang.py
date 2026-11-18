@@ -34,7 +34,7 @@ def reference(x, mixes, offsets, initial):
 @pytest.mark.parametrize("live", (False, True))
 @pytest.mark.parametrize("fault", ("functional_output", "functional_final", "status_output", "status_final"))
 def test_tokenshift_tuning_checks_both_variants_with_active_metadata(monkeypatch, live, fault):
-    from flashrwkv2._internal import tuning
+    import _tuning as tuning
     from flashrwkv2.tmix.tokenshift import tilelang as implementation
 
     x = torch.ones(5, 64, dtype=torch.bfloat16)
@@ -73,15 +73,14 @@ def test_tokenshift_tuning_checks_both_variants_with_active_metadata(monkeypatch
     monkeypatch.setattr(implementation, "_forward", forward)
     monkeypatch.setattr(implementation, "_BLOCK_CONFIGS", {})
     monkeypatch.setattr(tuning, "select_config", select_config)
-    monkeypatch.setattr(tuning, "save_config", lambda *args: None)
     monkeypatch.setattr(implementation, "device_class", lambda device: "test")
-    implementation.tune_tokenshift(x, mixes, cu, initial, _status=status)
+    tuning.tune_tokenshift(x, mixes, cu, initial, _status=status)
     assert implementation._BLOCK_CONFIGS[implementation._config_key(x, mixes, 4)] == 256
 
 
 @pytest.mark.parametrize("status", ((1, 3, 2), (0, 0, 0), (0, 6, 2), (0, 3, 5)))
 def test_tokenshift_tuning_requires_valid_nonempty_active_sample(status):
-    from flashrwkv2.tmix.tokenshift.tilelang import tune_tokenshift
+    from _tuning import tune_tokenshift
 
     with pytest.raises(ValueError, match="valid nonempty active"):
         tune_tokenshift(
@@ -94,7 +93,7 @@ def test_tokenshift_tuning_requires_valid_nonempty_active_sample(status):
 
 
 def test_fused_tuning_rejects_changed_pool_and_preserves_caller_state(monkeypatch):
-    from flashrwkv2._internal import tuning
+    import _tuning as tuning
     from flashrwkv2.tmix.tokenshift import tilelang as implementation
 
     x = torch.ones(3, 64, dtype=torch.bfloat16)
@@ -130,9 +129,8 @@ def test_fused_tuning_rejects_changed_pool_and_preserves_caller_state(monkeypatc
     monkeypatch.setattr(implementation, "_fused_forward", forward)
     monkeypatch.setattr(implementation, "_FUSED_CONFIGS", {})
     monkeypatch.setattr(tuning, "select_config", select_config)
-    monkeypatch.setattr(tuning, "save_config", lambda *args: None)
     monkeypatch.setattr(implementation, "device_class", lambda device: "test")
-    implementation.tune_fused_tokenshift(x, x, x[0], x[0], mixes, pool, indices, status)
+    tuning.tune_fused_tokenshift(x, x, x[0], x[0], mixes, pool, indices, status)
     assert torch.count_nonzero(pool) == 0
     assert implementation._FUSED_CONFIGS[implementation._config_key(x, mixes, x.shape[0])] == 1
 

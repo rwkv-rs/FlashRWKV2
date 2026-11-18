@@ -26,7 +26,7 @@ jobs:
     timeout-minutes: 15
     outputs:
       version: ${{ steps.identity.outputs.version }}
-      source_tree_sha: ${{ steps.plan.outputs.source_tree_sha }}
+      commit: ${{ steps.identity.outputs.commit }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -48,47 +48,24 @@ jobs:
           PY
           )"
           test "$RELEASE_TAG" = "v$version"
+          echo "commit=$(timeout 10s git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
-      - name: Require full validation, all Torch versions, and cold compilation
-        id: plan
-        run: |
-          timeout 60s python3 ci/quality_gate.py plan \
-            --base "$(timeout 30s git rev-parse HEAD^)" \
-            --head "$(timeout 30s git rev-parse HEAD)" --mode full --extended \
-            --output release/plan.json --github-output "$GITHUB_OUTPUT"
-      - name: Resolve the tested source distribution bundle
-        id: reuse
+      - name: Download distributions and acceptance for the release commit
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+          COMMIT: ${{ steps.identity.outputs.commit }}
         run: |
-          timeout 300s python3 ci/quality_gate.py resolve \
-            --plan release/plan.json --repository "$GITHUB_REPOSITORY" \
-            --current-run "$GITHUB_RUN_ID" --output release/reuse.json \
-            --github-output "$GITHUB_OUTPUT"
-          timeout 30s python3 - <<'PY'
-          import json
-          from pathlib import Path
-          if not json.loads(Path('release/reuse.json').read_text())['complete']:
-              raise SystemExit('release requires a successful full extended Quality Gate for this exact source tree')
-          PY
-      - uses: actions/download-artifact@v4
-        with:
-          name: ${{ steps.reuse.outputs.artifact }}
-          run-id: ${{ steps.reuse.outputs.run_id }}
-          github-token: ${{ github.token }}
-          path: release/tested
-      - name: Verify both architectures, full performance, versions, and original SHA256
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
-        run: |
-          timeout 300s python3 ci/quality_gate.py release \
-            --plan release/plan.json --bundle release/tested \
-            --repository "$GITHUB_REPOSITORY" --tag "$RELEASE_TAG" \
-            --output release/payload
+          run=$(timeout 60s gh run list --workflow pro6000-gpu.yml --branch "$TAG" --commit "$COMMIT" \
+            --event workflow_dispatch --status success --limit 1 --json databaseId --jq '.[0].databaseId // empty')
+          test -n "$run"
+          timeout 180s gh run download "$run" -n "dist-$COMMIT" -D release/payload/dist
+          timeout 180s gh run download "$run" -n "gpu-$COMMIT" -D release/results
+          timeout 90s gh release download "$TAG" --pattern sm89.json -D release/results
+          timeout 30s python3 ci/quality_gate.py verify --dist release/payload/dist --output release/results
       - uses: actions/upload-artifact@v4
         with:
-          name: flashrwkv2-release-v7-${{ steps.plan.outputs.source_tree_sha }}
+          name: flashrwkv2-release-${{ steps.identity.outputs.commit }}
           path: release/payload/
           if-no-files-found: error
           retention-days: 90
@@ -108,7 +85,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: flashrwkv2-release-v7-${{ needs.prepare.outputs.source_tree_sha }}
+          name: flashrwkv2-release-${{ needs.prepare.outputs.commit }}
           path: release/payload
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
@@ -123,7 +100,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: flashrwkv2-release-v7-${{ needs.prepare.outputs.source_tree_sha }}
+          name: flashrwkv2-release-${{ needs.prepare.outputs.commit }}
           path: release/payload
       - name: Compare public files with the tested originals
         env:

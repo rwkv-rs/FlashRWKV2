@@ -7,12 +7,9 @@ import tilelang
 import tilelang.language as T
 import torch
 
-from .._internal.tuning import (
+from .._internal.execution import (
     _AutogradContext,
-    _fixed_strategy_device,
     device_class,
-    prepared_kernel,
-    tuning_operation,
     workload_bucket,
 )
 
@@ -22,10 +19,6 @@ _ROW_CONFIGS = {}
 def _config_key(x, has_res):
     rows = workload_bucket(x.numel() // x.shape[-1])
     return (device_class(x.device), (rows, x.shape[-1]), has_res)
-
-
-def _fixed_rows(x):
-    return _fixed_strategy_device(device_class(x.device))
 
 
 def _row_layout(channels, rows_per_block):
@@ -191,12 +184,8 @@ class _Norm(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, weight, bias, res, eps):
         total = torch.empty_like(x) if res is not None else x
-        from .._internal.tuning import get_config
-        rows_per_block = get_config(
-            _ROW_CONFIGS, "post_norm", _config_key(x, res is not None), 1,
-            tune=lambda: tune_norm(x, weight, bias, eps, res), fixed=_fixed_rows(x),
-        )
-        y, mean, rstd = prepared_kernel("post_norm", _forward, (x.shape[-1], eps, res is not None, True, True, rows_per_block))(
+        rows_per_block = _ROW_CONFIGS.get(_config_key(x, res is not None), 1)
+        y, mean, rstd = _forward(x.shape[-1], eps, res is not None, True, True, rows_per_block)(
             x, res if res is not None else x, weight, bias, total
         )
         ctx.save_for_backward(total, weight, mean, rstd)
@@ -214,10 +203,7 @@ class _Norm(torch.autograd.Function):
 
         group = min(32, tilelang.next_power_of_2(max(1, total.shape[0] // 128)))
         need_weight, need_bias = ctx.needs_input_grad[1:3]
-        dx, dw, db = prepared_kernel("post_norm", _backward,
-            (total.shape[-1], dsum is not None, group, need_weight, need_bias),
-            ((total.shape[-1], dsum is not None, g, need_weight, need_bias) for g in (1, 2, 4, 8, 16, 32))
-            if _fixed_rows(total) else ())(
+        dx, dw, db = _backward(total.shape[-1], dsum is not None, group, need_weight, need_bias)(
             dy, dsum.contiguous() if dsum is not None else dy, weight, total, mean, rstd
         )
         return (
@@ -231,15 +217,11 @@ class _Norm(torch.autograd.Function):
     schema="(Tensor x, Tensor weight, Tensor bias, Tensor? res, float eps, bool save, bool return_res) -> (Tensor, Tensor?, Tensor, Tensor)",
 )
 def _compiled_norm(x, weight, bias, res, eps, save, return_res):
-    from .._internal.tuning import get_config
     _check_inputs(x, weight, bias, res, eps)
     store = res is not None and (save or return_res)
     total = torch.empty_like(x) if store else x.new_empty((0, x.shape[-1]))
-    group = get_config(
-        _ROW_CONFIGS, "post_norm", _config_key(x, res is not None), 1,
-        tune=lambda: tune_norm(x, weight, bias, eps, res), fixed=_fixed_rows(x),
-    )
-    y, mean, rstd = prepared_kernel("post_norm", _forward, (x.shape[-1], eps, res is not None, save, store, group))(
+    group = _ROW_CONFIGS.get(_config_key(x, res is not None), 1)
+    y, mean, rstd = _forward(x.shape[-1], eps, res is not None, save, store, group)(
         x, x if res is None else res, weight, bias, total,
     )
     result_sum = total if store else x.clone() if return_res else None
@@ -336,60 +318,8 @@ def norm(
         store_res = return_res and res is not None
         total = torch.empty_like(flat) if store_res else flat
         buffer = total if store_res else flat.new_empty((0, x.shape[-1]))
-        from .._internal.tuning import get_config
-        rows_per_block = get_config(
-            _ROW_CONFIGS, "post_norm", _config_key(flat, res is not None), 1,
-            tune=lambda: tune_norm(x, weight, bias, eps, res), fixed=_fixed_rows(flat),
-        )
-        y, _, _ = prepared_kernel("post_norm", _forward, (x.shape[-1], float(eps), res is not None, False, store_res, rows_per_block))(
+        rows_per_block = _ROW_CONFIGS.get(_config_key(flat, res is not None), 1)
+        y, _, _ = _forward(x.shape[-1], float(eps), res is not None, False, store_res, rows_per_block)(
             flat, flat_res if flat_res is not None else flat, weight, bias, buffer
         )
     return (y.view_as(x), total.view_as(x)) if return_res else y.view_as(x)
-
-
-@torch.no_grad()
-@tuning_operation
-def tune_norm(x, weight, bias, eps=1e-5, res=None):
-    """Select row grouping while preserving the canonical per-row FP32 tree."""
-    from .._internal.tuning import save_config, select_config
-
-    norm(x, weight, bias, eps, res)
-    flat = x.view(-1, x.shape[-1])
-    other = flat if res is None else res.view_as(flat)
-    summed = torch.empty_like(flat) if res is not None else flat
-    buffer = flat.new_empty((0, flat.shape[-1]))
-
-    def run(group, values=flat, residual=other):
-        return _forward(flat.shape[-1], eps, res is not None, False, False, group)(
-            values, residual, weight, bias, buffer
-        )[0]
-
-    def check(group, values=flat, residual=other):
-        total = torch.empty_like(values) if res is not None else values
-        training = _forward(flat.shape[-1], eps, res is not None, rows_per_block=group)(
-            values, residual, weight, bias, total
-        )
-        outputs = (*training, run(group, values, residual))
-        if res is not None:
-            stored = torch.empty_like(values)
-            production = _forward(flat.shape[-1], eps, True, False, True, group)(
-                values, residual, weight, bias, stored
-            )[0]
-            outputs += (production, stored)
-        return outputs
-
-    training = _forward(flat.shape[-1], eps, res is not None)(flat, other, weight, bias, summed)
-    # Keep FP32 statistics in the check and compare both production stores
-    # directly with the canonical training result.
-    reference = (*training, training[0])
-    if res is not None:
-        reference += (training[0], summed.clone())
-    for row in sorted({0, flat.shape[0] // 2, flat.shape[0] - 1}):
-        single = check(1, flat[row:row + 1], other[row:row + 1])
-        if not all(torch.equal(full[row:row + 1], one) for full, one in zip(reference, single, strict=True)):
-            raise RuntimeError("canonical norm failed batch invariance")
-
-    best, measurements = select_config((1, 2, 4), run, check=check, reference=reference)
-    _ROW_CONFIGS[_config_key(flat, res is not None)] = best
-    save_config("post_norm", _config_key(flat, res is not None), best)
-    return measurements
