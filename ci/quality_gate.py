@@ -66,8 +66,8 @@ VALIDATION_INPUT_PATHS = (
 BLOCK_TEST = "tests/tmix/wkv7/test_block.py"
 COMPATIBILITY_PATHS = (
     BLOCK_TEST,
-    "tests/tmix/wkv7/statetune",
     "tests/tmix/wkv7/test_tilelang.py",
+    "tests/head/ce",
     "tests/head/l2wrap_ce",
     "tests/loss/l2wrap_ce",
     "tests/tmix/wkv_prepare",
@@ -1308,9 +1308,12 @@ def _self_test() -> None:
     }
 
     def result(suite):
+        paths = _suite_paths(plan, suite)
+        scoped = {node: marks for node, marks in collected.items()
+                  if _paths_cover(paths, [node.split("::")[0]])}
         selected = {
             node: marks
-            for node, marks in collected.items()
+            for node, marks in scoped.items()
             if (suite == "cpu") == (not marks)
         }
         return {
@@ -1324,10 +1327,10 @@ def _self_test() -> None:
                 )
             },
             "suite": suite,
-            "paths": ["tests"],
+            "paths": paths,
             "environment": {"target": "cpu"} if suite == "cpu" else env,
             "wheel_sha256": None if suite == "cpu" else artifacts["wheel"]["sha256"],
-            "collected": collected,
+            "collected": scoped,
             "selected": selected,
             "reports": {
                 node: {

@@ -5,8 +5,8 @@ from __future__ import annotations
 import torch
 from torch.autograd.function import once_differentiable
 
-from ..linear import pretrain_head_linear_bf16
 from ..._internal.tuning import _AutogradContext
+from ..linear import pretrain_head_linear_bf16
 
 
 def _check(hidden, weight, targets, chunk_rows: int) -> None:
@@ -69,8 +69,11 @@ class _HeadL2Wrap(torch.autograd.Function):
     @once_differentiable
     def backward(ctx, grad_loss):
         from ..._internal.linear import (
-            linear, linear_input_vjp, linear_weight_vjp_fp32,
-            nora_backward, nora_forward,
+            linear,
+            linear_input_vjp,
+            linear_weight_vjp_fp32,
+            nora_backward,
+            nora_forward,
         )
         from ..._internal.logprob import logprob_stats
         from ...loss.l2wrap_ce.tilelang import _backward as loss_backward

@@ -90,27 +90,16 @@ def pretrain_tmix_tokenshift_bf16(
     x_v: torch.Tensor,
     x_a: torch.Tensor,
     x_g: torch.Tensor,
+    *,
+    initial_shift: torch.Tensor | None = None,
+    return_final_state: bool = False,
 ) -> tuple[torch.Tensor, ...]:
-    """BF16 six-way shifted TimeMix with zero initial state."""
-    return _training_tokenshift(x, None, (x_r, x_w, x_k, x_v, x_a, x_g))[:-1]
-
-
-def statetune_tmix_tokenshift_bf16(
-    x: torch.Tensor,
-    initial_shift: torch.Tensor,
-    x_r: torch.Tensor,
-    x_w: torch.Tensor,
-    x_k: torch.Tensor,
-    x_v: torch.Tensor,
-    x_a: torch.Tensor,
-    x_g: torch.Tensor,
-) -> tuple[torch.Tensor, ...]:
-    """BF16 six-way TimeMix with differentiable chunk-boundary shift state."""
-    return _training_tokenshift(x, initial_shift, (x_r, x_w, x_k, x_v, x_a, x_g))
+    """BF16 six-way shifted TimeMix with an optional differentiable initial state."""
+    outputs = _training_tokenshift(x, initial_shift, (x_r, x_w, x_k, x_v, x_a, x_g))
+    return outputs if return_final_state else outputs[:-1]
 
 
 __all__ = [
     "infer_tmix_postnorm_tokenshift_forward_varlen",
     "pretrain_tmix_tokenshift_bf16",
-    "statetune_tmix_tokenshift_bf16",
 ]

@@ -57,8 +57,9 @@ def test_head_l2wrap_rejects_invalid_target() -> None:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.cuda
 def test_chunked_head_nora_gradients():
-    from flashrwkv2 import pretrain_head_linear_bf16, pretrain_l2wrap_ce_bf16
     from utils import assert_relative_rmse
+
+    from flashrwkv2 import pretrain_head_linear_bf16, pretrain_l2wrap_ce_bf16
 
     torch.manual_seed(83)
     hidden = (

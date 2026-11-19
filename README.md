@@ -1,15 +1,24 @@
 # FlashRWKV2
 
-FlashRWKV2 is a TileLang operator library for RWKV-7 with a shared BF16
-training and inference forward, FP32 accumulation, and FP32 recurrent state. Its public
+FlashRWKV2 is a TileLang operator library for RWKV-7. Training and inference use
+BF16 token inputs and outputs with FP32 accumulation. Training uses FP32 recurrent state. Its public
 inference API exposes the highest semantic fusion islands used by the model;
 kernel composition and shape-dependent dispatch remain internal. Complete
 models, schedulers, and training frameworks remain the responsibility of
 downstream projects.
 
-An optional FP16-state inference mode halves state storage while keeping BF16
-token IO and FP32 arithmetic. It does not promise bitwise equality with FP32
-training. The default FP32-state path retains training precision and parity.
+For serving on SM89 and SM120, prefer FP16 recurrent state for both prefill and
+decode. This path uses BF16 token IO and FP32 arithmetic, and rounds state to
+FP16 after every token. For D64 with 40 or 64 heads, prefill and decode use the same
+four groups of 16 keys for each dot product. A live metadata ticket schedules longer
+prefill rows first, and each decode slot can append to its DeltaLog independently.
+With one to three prefill rows, four blocks share each head's value columns.
+With four or more prefill rows, one block handles a whole head.
+On the 128-SM RTX 4090, H64 stores up to two exact DeltaLog records per head
+and slot (1,540 bytes). The other H40/H64 configurations store one record (1,284 bytes). Use the handle's `memory_layout`
+when budgeting concurrency. Call `materialize_slots_(indices)` before reading
+or copying the externally bound tensor. Training, RL rollout and its evaluation
+and sampling search use FP32 state to reproduce the learner's logprobs.
 
 ## Requirements
 
@@ -72,9 +81,8 @@ compiled_model = torch.compile(
 ```
 
 Prepare tuning with eager forward-and-backward calls before compiling or
-capturing. StateTune chunk metadata is prepared once with
-`prepare_tmix_wkv7_statetune_metadata` and supplied through `prepared_metadata`;
-see the [training contract](docs/kernel_api.md#training).
+capturing. Dense and packed training accept optional FP32 initial state and can
+return final state for the next chunk. See the [training contract](docs/kernel_api.md#training).
 
 ## Tests
 
@@ -168,6 +176,19 @@ PYTHONPATH=benchmarks ./.venv/bin/python benchmarks/tmix/wkv7/bench.py \
   --output artifacts/wkv7-recurrent-bf16.json
 ```
 
+To measure chunked serving with decode rows first and randomly assigned slots:
+
+```bash
+PYTHONPATH=benchmarks ./.venv/bin/python benchmarks/tmix/wkv7/bench.py \
+  --shapes h64d64 --state-dtype float16 --timing-mode graph --metadata live \
+  --slot-order random --state-pool-size 320 --cases 255x1+1x4 255x1+1x256 1x1024 \
+  --output artifacts/wkv7-live.json
+```
+
+The per-layer time uses the ticket shared by the model's layers. Add
+`--include-ticket-preparation` to capture and time the device-side validation and sort
+together with one WKV layer on every step.
+
 Deterministic strategies on RTX 4090 (SM89/128 SM) and PRO 6000 (SM120/188 SM)
 prepare bounded kernel variants for dynamic batch/token workloads. Supply real
 first/later-layer, decode/prefill and training-backward calls with their actual
@@ -176,13 +197,14 @@ layouts and gradient requirements:
 ```python
 from flashrwkv2 import prepare_tuning
 
-report = prepare_tuning(warmup_calls, mode="tune")
+report = prepare_tuning(warmup_calls, mode="require")
 assert report["complete"]
 ```
 
-Prepare before torch.compile specialization and CUDA Graph capture. Other paths
-retain verified profiles and bounded tuning. After upgrading, prepare again;
-compatible TileLang binaries can be reused. See the
+Prepare before torch.compile specialization and CUDA Graph capture. The fixed
+paths work with an empty tuning profile cache. For other paths, use `mode="tune"`
+to generate missing verified profiles. After upgrading, prepare again to reuse
+compatible TileLang binaries. See the
 [preparation and cache contract](docs/kernel_api.md#tuning-and-acceptance) for
 coverage, state ownership, validation and performance results.
 

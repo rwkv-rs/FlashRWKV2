@@ -21,6 +21,7 @@ struct PreparedRecurrentMetadata {
   torch::Tensor state_indices;
   torch::Tensor status;
   torch::Tensor workspace;
+  torch::Tensor row_order;
 };
 
 void check_cuda_contiguous(const torch::Tensor& tensor, const char* name);

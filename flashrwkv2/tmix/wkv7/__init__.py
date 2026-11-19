@@ -26,20 +26,30 @@ def _validate_state(state, dtypes=(torch.float32,)):
 class _TmixWkv7RecurrentState:
     """Owned or externally bound state pool, including prefix-cache COW."""
 
-    __slots__ = ("_state_pool",)
+    __slots__ = ("_delta", "_state_pool")
 
     def __init__(self, state_pool):
         _validate_state(state_pool, (torch.float32, torch.float16))
         self._state_pool = state_pool
+        slots, heads, dim, _ = state_pool.shape
+        self._delta = None
+        if state_pool.dtype == torch.float16 and dim == 64 and heads in (40, 64):
+            props = torch.cuda.get_device_properties(state_pool.device)
+            compact = heads == 64 and (props.major, props.minor, props.multi_processor_count) == (8, 9, 128)
+            self._delta = (
+                state_pool.new_empty((slots, heads, 6 if compact else 5, dim), dtype=torch.float32),
+                state_pool.new_zeros((slots, heads), dtype=torch.int32),
+            )
 
     @property
     def memory_layout(self):
-        total = self._state_pool.numel() * self._state_pool.element_size()
-        per_slot = total // self._state_pool.shape[0]
+        slots = self._state_pool.shape[0]
+        base = self._state_pool.nbytes // slots
+        private = sum(t.nbytes for t in self._delta) // slots if self._delta is not None else 0
         return {
-            "base_bytes_per_slot": per_slot, "private_bytes_per_slot": 0,
-            "bytes_per_slot": per_slot, "fixed_workspace_nbytes": 0,
-            "total_nbytes": total,
+            "base_bytes_per_slot": base, "private_bytes_per_slot": private,
+            "bytes_per_slot": base + private, "fixed_workspace_nbytes": 0,
+            "total_nbytes": (base + private) * slots,
         }
 
     def _components(self):
@@ -51,15 +61,28 @@ class _TmixWkv7RecurrentState:
             or indices.device != self._state_pool.device or not indices.is_contiguous()
         ):
             raise ValueError("state indices must be contiguous CUDA int32 [B] on the state device")
-        if torch.any((indices < 0) | (indices >= self._state_pool.shape[0])).item():
-            raise ValueError("state indices must be within the state pool")
-        return indices.long()
+        from ..._internal.state import check_cuda_condition
+        check_cuda_condition(((indices >= 0) & (indices < self._state_pool.shape[0])).all(),
+                             "state indices must be within the state pool")
+        return indices
+
+    def _drain(self, indices):
+        if self._delta is not None and indices.numel():
+            from .tilelang import _materialize_deltalog
+            _materialize_deltalog(self._state_pool.shape[1], self._delta[0].shape[2])(self._state_pool, *self._delta, indices)
+
+    def _drain_all(self):
+        if self._delta is not None:
+            self._drain(torch.arange(self._state_pool.shape[0], device=self._state_pool.device, dtype=torch.int32))
 
     def clone(self):
+        self._drain_all()
         return type(self)(self._state_pool.clone())
 
     def clone_slots(self, state_indices):
-        return type(self)(self._state_pool.index_select(0, self._indices(state_indices)))
+        indices = self._indices(state_indices)
+        self._drain(indices)
+        return type(self)(self._state_pool.index_select(0, indices))
 
     def copy_slots_(self, source, source_indices, destination_indices):
         if (
@@ -71,19 +94,27 @@ class _TmixWkv7RecurrentState:
         src, dst = source._indices(source_indices), self._indices(destination_indices)
         if src.numel() != dst.numel():
             raise ValueError("source and destination slot counts must match")
-        if dst.unique().numel() != dst.numel():
-            raise ValueError("destination state indices must be unique")
+        from ..._internal.state import check_cuda_condition
+        ordered = dst.sort().values
+        check_cuda_condition((ordered[1:] != ordered[:-1]).all(), "destination state indices must be unique")
+        source._drain(src)
         values = source._state_pool.index_select(0, src)
+        dst = dst.long()
         self._state_pool.index_copy_(0, dst, values)
+        if self._delta is not None:
+            self._delta[1].index_fill_(0, dst, 0)
         return self
 
     def reset_slots_(self, state_indices):
-        self._state_pool.index_fill_(0, self._indices(state_indices), 0)
+        indices = self._indices(state_indices).long()
+        self._state_pool.index_fill_(0, indices, 0)
+        if self._delta is not None:
+            self._delta[1].index_fill_(0, indices, 0)
         return self
 
     def materialize_slots_(self, state_indices):
-        """Recurrent state is materialized after every call."""
-        self._indices(state_indices)
+        """Write the logical state of the selected slots to the bound tensor."""
+        self._drain(self._indices(state_indices))
         return self
 
     def copy_(self, source):
@@ -93,31 +124,17 @@ class _TmixWkv7RecurrentState:
             or source._state_pool.dtype != self._state_pool.dtype
         ):
             raise ValueError("source and destination state shapes, dtype and device must match")
+        source._drain_all()
         self._state_pool.copy_(source._state_pool)
+        if self._delta is not None:
+            self._delta[1].zero_()
         return self
 
     def zero_(self):
         self._state_pool.zero_()
+        if self._delta is not None:
+            self._delta[1].zero_()
         return self
-
-
-def _prepare_state(
-    state_pool_size, channels, *, sequence_capacity, head_size=64, device=None,
-    dtype,
-):
-    if any(not isinstance(value, int) or isinstance(value, bool) or value <= 0
-           for value in (state_pool_size, channels, sequence_capacity, head_size)):
-        raise ValueError("state dimensions and sequence_capacity must be positive integers")
-    if head_size not in (64, 128, 256) or channels % head_size:
-        raise ValueError("head_size must be 64, 128, or 256 and divide channels")
-    if device is None:
-        device = torch.device("cuda", torch.cuda.current_device())
-    elif isinstance(device, int):
-        device = torch.device("cuda", device)
-    return _TmixWkv7RecurrentState(torch.zeros(
-        state_pool_size, channels // head_size, head_size, head_size,
-        device=device, dtype=dtype,
-    ))
 
 
 def prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor(state):
@@ -125,26 +142,8 @@ def prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor(state):
     return _TmixWkv7RecurrentState(state)
 
 
-def prepare_tmix_wkv7_recurrent_fp32io16_state(
-    state_pool_size, channels, *, sequence_capacity, head_size=64, device=None,
-):
-    return _prepare_state(
-        state_pool_size, channels, sequence_capacity=sequence_capacity,
-        head_size=head_size, device=device, dtype=torch.float32,
-    )
-
-
-def prepare_tmix_wkv7_recurrent_fp16_state(
-    state_pool_size, channels, *, sequence_capacity, head_size=64, device=None,
-):
-    """Allocate optional FP16 inference state; training keeps FP32 state."""
-    return _prepare_state(
-        state_pool_size, channels, sequence_capacity=sequence_capacity,
-        head_size=head_size, device=device, dtype=torch.float16,
-    )
-
-
 def prepare_tmix_wkv7_recurrent_fp16_state_from_tensor(state):
+    """Bind FP16 state. Materialize slots before reading the external tensor."""
     _validate_state(state, (torch.float16,))
     return _TmixWkv7RecurrentState(state)
 
@@ -277,9 +276,17 @@ def _infer_forward_varlen(
     cu_seqlens = ticket._query_start_loc_snapshot()
     state_indices = ticket._state_indices_snapshot()
     status = ticket._status()
+    batch = state_indices.numel()
+    # The device chooses append or writeback independently for each physical slot.
+    delta = state._delta if state._state_pool.shape[0] >= 16 else None
+    append = delta is not None and batch >= 16
+    if append and r.shape[1] == 40 and batch > 64:
+        append = torch.cuda.get_device_capability(r.device) == (12, 0)
     return _infer_recurrent(
         r, decay_logits, k, v, a, b, state._state_pool, cu_seqlens,
         state_indices, status, scale=scale, decay_bias=decay_bias,
+        row_order=ticket._row_order(),
+        delta_buffers=delta, append_log=append,
     )
 
 
@@ -304,10 +311,7 @@ def infer_tmix_wkv7_recurrent_fp16_forward_varlen(
     state, cu_seqlens, state_indices, scale=1.0, decay_bias=None,
     max_seqlen=None, validated_metadata=None,
 ):
-    """Optional inference: BF16 token IO, FP32 arithmetic, FP16 state per token.
-
-    This mode does not promise bitwise equality with the FP32 training state.
-    """
+    """Serving prefill and decode with BF16 IO and FP32 arithmetic, rounding state to FP16 per token."""
     return _infer_forward_varlen(
         r, decay_logits, k, v, a, b, state=state, cu_seqlens=cu_seqlens,
         state_indices=state_indices, scale=scale, decay_bias=decay_bias,
@@ -321,8 +325,8 @@ def rl_infctx_tmix_wkv7_recurrent_bf16(
     state_pool, cu_seqlens, state_indices=None, scale=1.0, decay_bias=None,
 ):
     """Differentiable packed recurrence and final FP32 state for RL/Infctx."""
-    from .tilelang import tmix_wkv7_recurrent
     from ..._internal.state import check_cuda_condition
+    from .tilelang import tmix_wkv7_recurrent
 
     _validate_state(state_pool)
     if (
@@ -360,16 +364,13 @@ def rl_infctx_tmix_wkv7_recurrent_bf16(
     )
     return output, state_pool.index_copy(0, indices, final)
 
-
 from .pretrain import pretrain_tmix_wkv7_recurrent_bf16
 
 __all__ = [
     "infer_tmix_wkv7_recurrent_fp16_forward_varlen",
     "infer_tmix_wkv7_recurrent_fp32io16_forward_varlen",
-    "prepare_tmix_wkv7_recurrent_fp32io16_state",
-    "prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor",
-    "prepare_tmix_wkv7_recurrent_fp16_state",
     "prepare_tmix_wkv7_recurrent_fp16_state_from_tensor",
+    "prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor",
     "prepare_tmix_wkv7_recurrent_metadata",
     "pretrain_tmix_wkv7_recurrent_bf16",
     "rl_infctx_tmix_wkv7_recurrent_bf16",

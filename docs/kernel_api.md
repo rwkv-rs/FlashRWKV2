@@ -1,8 +1,8 @@
 # FlashRWKV2 TileLang operator contract
 
-模型前向统一使用 BF16 激活和权重、FP32 累加与归约。默认 WKV 状态为连续
-FP32 `[slots,H,D,D]`，TokenShift 状态为 BF16 `[slots,C]`。Head 输出 logits、
-`head_logprobs` 与 loss 为 FP32。公共名称保留模块所有者；内部 primitive 不从根包导出。
+模型前向统一使用 BF16 激活和权重、FP32 累加与归约。WKV 状态使用连续
+`[slots,H,D,D]`，普通 serving 在 SM89、SM120 上首选 FP16，训练和 RL rollout 使用 FP32。TokenShift 状态为 BF16 `[slots,C]`。Head 输出 logits、
+所选 token 的 logprob 与 loss 为 FP32。公共名称保留模块所有者；内部 primitive 不从根包导出。
 
 ## Numerical contract
 
@@ -23,10 +23,12 @@ y[v] = scale * sum_k r[k] * state[k,v]
 ```
 
 `head_size` 支持 64、128、256。前向一致性按位比较输出、state 和所选 token 的
-logprob；梯度使用独立 FP32 参考与相对误差验证。WKV 反向从保存的 chunk 起始状态
-重放前向，并在短片段内逆序求 VJP；不同 value tile 的部分梯度通过 FP32 原子加累积，
-调度顺序会造成极小的舍入差异。前向输出和 state 逐位比较，反向沿用独立 VJP 测试的
-`atol=2e-5, rtol=2e-2` 容差。只有需要梯度时才保存 checkpoint。
+logprob，梯度使用独立 FP32 参考与相对误差验证。WKV 反向每 16 token 使用一份
+FP32 checkpoint。较长的 64 维 head 先重放每步的 `sa` 向量，再从 checkpoint
+按前向算术重放短窗口内的 FP32 state。每个梯度由负责该 key 或 value 的线程直接写出。
+当 batch-head 并行度较低时，长序列按 4096 token 分段，先用实际 cotangent 计算
+state 梯度边界，再并行计算各段 VJP。通用路径保留 shared-memory state history 和 FP32 原子归约。
+只有需要梯度时才保存 checkpoint。
 
 ## Inference
 
@@ -38,15 +40,12 @@ TMix 公共阶段固定为 `tokenshift -> wkv_prepare -> wkv7 -> readout`。
 | `infer_tmix_postnorm_tokenshift_forward_varlen` | res/ln、六路 mix，返回 `(res_out, r, w, k, v, a, g)`，原位更新 shift pool |
 | `infer_tmix_wkv_prepare_forward_varlen` | R/K/V、低秩 W/A/G/V、VRes 与 KK/A，返回 `(r, decay_logits, key, value, recurrent_a, recurrent_b, gate, v_first)` |
 | `infer_tmix_wkv7_recurrent_fp32io16_forward_varlen` | BF16 `[N,H,D]` 六路输入、FP32 state handle、packed metadata；返回 BF16 WKV 并原位更新状态 |
-| `infer_tmix_wkv7_recurrent_fp16_forward_varlen` | 可选低精度推理；BF16 六路输入、FP16 state handle、FP32 算术；每 token 后将 state 舍入为 FP16 |
+| `infer_tmix_wkv7_recurrent_fp16_forward_varlen` | SM89、SM120 普通 serving 首选；BF16 六路输入、FP16 state handle、FP32 算术；每 token 后将 state 舍入为 FP16 |
 | `infer_tmix_readout_forward_varlen` | head ln、RKV residual、gate 和 output projection，返回 BF16；WKV 输入也可为 FP32 |
 | `infer_cmix_forward_varlen` | res/ln、TokenShift、key projection、ReLU²、value projection；返回 `(res_out, cmix_out)`，原位更新 shift pool |
 | `infer_post_norm_output_forward_varlen(x, res, weight, bias, *, eps=1e-5)` | 对 BF16 residual sum 作 FP32 ln，返回 BF16 |
 | `infer_head_linear_all_forward_varlen(x, weight)` | `[N,C]` BF16 hidden 与 `[V,C]` BF16 weight，返回 FP32 `[N,V]` |
-| `infer_head_linear_last_forward_varlen(x, weight, *, tokens_count)` | 调用方已选出的末尾 hidden rows，返回对应 FP32 logits |
-| `head_logprobs(logits, targets)` | 连续 FP32 `[...,V]` logits 和同前缀形状的 INT64 targets，返回 FP32 所选 token logprobs |
-| `infer_sampling_temperature_topk_topp_forward_varlen` | FP32 logits、RNG pool、slot indices，返回 token ids；零温度确定性 argmax 不更新 RNG，正温度抽样更新 RNG |
-| `infer_sampling_six_parameter_forward_varlen` | 同上，另含 presence/frequency penalties 与 penalty decay |
+| `infer_sampling_six_parameter_forward_varlen` | FP32 logits、penalty pool、RNG pool 和 slot indices，返回 token ids 并更新请求状态 |
 
 WKV 推理参数为：
 
@@ -69,24 +68,28 @@ CMix 推理的 value weight 保持 `[F,C]` runtime 布局；训练入口为 `[C,
 
 ## State and packed metadata
 
-`prepare_tmix_wkv7_recurrent_fp32io16_state(state_pool_size, channels, *,
-sequence_capacity, head_size=64, device=None)` 分配零初始化 FP32 pool。
 `prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor(state)` 绑定已有连续 CUDA
 FP32 tensor。每次调用返回时状态完整写回。
 
-`prepare_tmix_wkv7_recurrent_fp16_state` 和
-`prepare_tmix_wkv7_recurrent_fp16_state_from_tensor` 提供相同的容量参数及 lifecycle，
-但 pool 使用 FP16，显存占用为 FP32 的一半。它们只供
-`infer_tmix_wkv7_recurrent_fp16_forward_varlen` 使用，token 输入和输出仍为 BF16，
-递推算术和归约仍为 FP32；每个 token 更新后将 state 舍入为 FP16。
-该可选路径在不同 batch、prefill 分段、decode 和 CUDA Graph 间保持自身的逐位一致性，
-不承诺与 FP32 训练轨迹逐位一致。训练、RL/Infctx 和 state tuning 继续要求 FP32 state。
+`prepare_tmix_wkv7_recurrent_fp16_state_from_tensor` 绑定连续 CUDA FP16 tensor。
+`infer_tmix_wkv7_recurrent_fp16_forward_varlen` 使用 BF16 token I/O、FP32 递推和归约，
+每个 token 后将逻辑 state 舍入为 FP16。不同 batch、分段和 CUDA Graph 使用相同舍入规则。
+对 D64、H40/H64，两个点积都在四个连续的 16-key 组内使用 FP32 FMA 顺序累加，
+然后按 `(s0 + s1) + (s2 + s3)` 合并。该求和顺序同时用于单行、混合 batch 和单 token decode。
 
-handle 提供 `clone()`、`copy_()`、`zero_()`、`clone_slots(indices)`、
-`copy_slots_(source, source_indices, destination_indices)` 和 `reset_slots_(indices)`。
-slot copy 具有同时复制语义，支持同池重叠 COW；目标 slots 必须唯一。
-`materialize_slots_` 保留 lifecycle 调用入口，FP32 状态本身已物化。
-`memory_layout` 报告实际 bytes per slot 和 total bytes。
+D64、H40/H64 的 FP16 handle 按 slot 和头分配 DeltaLog。128 个 SM 的 RTX 4090 在 H64 下
+每条记录保存四个 BF16 操作数和一个 FP32 点积。每个头最多保留两条记录，加上 int32 phase 共 1,540 字节。
+其他 H40/H64 配置保存五个长度为 64 的 FP32 向量和一个 int32 phase，共 1,284 字节。批量 decode 追加记录，下一次读取该 slot 时按原
+FP32 顺序重放并舍入。同一批次里的单 token 行独立决定追加或写回，长行优先执行。
+H64 模型的 32 层每序列共用 16 MiB 基态，双记录日志占 3.008 MiB，五向量日志占 2.508 MiB。
+其他几何和 FP32 handle 的私有字节数为零。容量规划使用 `memory_layout["bytes_per_slot"]`，
+其中包括基态和日志，`fixed_workspace_nbytes` 为零。
+
+读取、复制或导出底层绑定 tensor 之前，对读出的槽位调用 `materialize_slots_(indices)`。
+在替换、丢弃或重新绑定同一个底层 tensor 之前，同样需要物化仍要保留的槽位。
+handle 的 `clone()`、`clone_slots(indices)`、`copy_()`、`copy_slots_(source, src, dst)`、
+`zero_()` 和 `reset_slots_(indices)` 会处理日志。slot copy 支持同池重叠 COW，目标槽位须唯一。
+训练、RL rollout、eval 和采样搜索使用 FP32 state。
 
 静态 `prepare_tmix_wkv7_recurrent_metadata(cu_seqlens, state_indices, *,
 state_pool_size, total_tokens, max_seqlen=None)` 验证序列边界、slot 范围和唯一性，
@@ -97,22 +100,28 @@ CUDA Graph 使用 `token_capacity`、`sequence_capacity`、`max_seqlen_capacity`
 两个 CUDA INT32 scalar `num_active_tokens`、`num_active_sequences`。同一 graph
 内所有 stateful 算子共享 ticket；每次 replay 验证有效前缀。零 active warmup 不
 修改 state，非法 metadata 也不修改 state。inactive 输出为 NaN，不应被下游消费。
+验证器在设备上按有效行长度降序排列执行顺序，结果由各层共享，输出仍按输入行排列。
+FP16 prefill 按四个 token 一块处理整块，每行最后单独处理 0–3 个 token。
+当有效 prefill 有 1–3 行，每个头的 value 列分给四个 CTA。达到四行时，每个 CTA
+处理一个完整头，以复用该行的输入向量。decode 行继续独立读写各自的日志。
 
 ## Training
 
 | API | 说明 |
 |---|---|
-| `pretrain_tmix_tokenshift_bf16` / `statetune_tmix_tokenshift_bf16` | 六路 TokenShift；stateful 形式返回混合输出和 final shift |
+| `pretrain_tmix_tokenshift_bf16` | 六路 TokenShift；stateful 形式返回混合输出和 final shift |
 | `pretrain_tmix_wkv_prepare_bf16` | 训练权重布局与 `w0` bias，输出共享 BF16 prepare 结果 |
-| `pretrain_tmix_wkv7_recurrent_bf16` | `[B,T,C]`、零初始状态，返回同形状 BF16 输出 |
-| `statetune_tmix_wkv7_recurrent_fp32io16` | 指定 segment 和初始 FP32 state，返回 `(output, final_state)` |
-| `rl_infctx_tmix_wkv7_recurrent_bf16` | packed 六路输入、`state_pool`、`cu_seqlens`、可选 `state_indices`，返回 `(output, final_pool)`；输入和 state 可求梯度 |
+| `pretrain_tmix_wkv7_recurrent_bf16` | dense `[B,T,C]` 或带 cu_seqlens 的 packed `[N,H,D]`，支持任意长度和可微 FP32 初始状态 |
+| `rl_infctx_tmix_wkv7_recurrent_bf16` | packed 六路输入、`state_pool`、`cu_seqlens`、可选 `state_indices`，返回 `(output, final_pool)`；未选中槽位保持原值，输入和 state 可求梯度 |
 | `pretrain_tmix_readout_bf16` | head ln、RKV residual、gate，可选 output projection |
-| `pretrain_cmix_bf16` / `statetune_cmix_bf16` | ChannelMix 与可微初始/最终 shift state |
-| `pretrain_tmix_a_gate_bf16` / `pretrain_tmix_kk_pre_bf16` / `pretrain_tmix_vres_gate_bf16` | prepare 组成部分，复用相同前向 |
+| `pretrain_cmix_bf16` | ChannelMix 与可微初始/最终 shift state |
 | `pretrain_head_linear_bf16` | BF16 hidden/weight，返回 FP32 logits |
-| `pretrain_l2wrap_ce_bf16` | FP32 CE，梯度包含 train_temp L2Wrap 项 |
-| `pretrain_head_l2wrap_ce_bf16` | `chunk_rows` 限制词表投影工作集，反向重算当前 chunk |
+| `pretrain_head_ce_bf16` | `chunk_rows` 限制前向词表投影工作集，按 targets 形状返回 FP32 交叉熵，-100 对应零 loss 和梯度，`backward_chunk_rows` 可独立设置反向重算和 VJP 的行数，默认沿用 `chunk_rows` |
+| `pretrain_l2wrap_ce_bf16` | 对任意前置维度的 logits 计算 FP32 交叉熵，梯度包含 train_temp L2Wrap 项 |
+| `pretrain_head_l2wrap_ce_bf16` | 分段投影并计算带 train_temp L2Wrap 梯度的 FP32 交叉熵 |
+
+WKV 的公共 state 布局使用相同的 key/value head 宽度。FLA 的非等宽
+key/value 路径需要独立的 state 布局和 readout 验证。
 
 投影支持 LoRA/NoRA：A `[R,K]`、B `[O,R]`，参数可为 BF16/FP32。
 NoRA 为 `A / (norm(A, dim=0) + 1e-6)`，FP32 归一化与反向，BF16 投影；
@@ -141,28 +150,10 @@ compiled_model = torch.compile(
 等反向投影 key。准备函数负责清理梯度并恢复可变 state；调优完成后再开始参数更新。
 支持 PyTorch 2.11–2.14；metadata/sampling native 扩展使用 C++20 编译。
 
-StateTune 在编译或 capture 前验证 chunk metadata：
-
-```python
-from flashrwkv2 import (
-    prepare_tmix_wkv7_statetune_metadata,
-    statetune_tmix_wkv7_recurrent_fp32io16,
-)
-
-metadata = prepare_tmix_wkv7_statetune_metadata(
-    sequence_chunk_offsets, chunk_token_starts, chunk_token_ends,
-    total_tokens=r.shape[0],
-)
-output, final_state = statetune_tmix_wkv7_recurrent_fp32io16(
-    initial_state, sequence_chunk_offsets, chunk_token_starts, chunk_token_ends,
-    r, decay_logits, k, v, a, b, prepared_metadata=metadata,
-)
-```
-
-返回的 metadata record 持有独立 CUDA INT32 `cu_seqlens` 和 `total_tokens`。
-使用期间保持 offsets 不变；序列分段或 token 总数变化时重新准备并重新捕获。
-传入 `prepared_metadata` 后，执行路径使用该 record，不再读取原始 chunk 数组。
-未传入时，eager 调用仍在每次执行前验证并转换原有 chunk 参数。
+以 `initial_state` 传入初始 WKV state。设置 `return_final_state=True` 返回
+`(output, final_state)`。packed 输入使用连续 CUDA int32 `cu_seqlens`，
+从 0 起单调非减，末元素为 token 总数。TokenShift 和 CMix 以
+`initial_shift` 传入 shift state，同样通过 `return_final_state` 取出最终 state。
 
 ## Tuning and acceptance
 
@@ -186,7 +177,7 @@ workloads. Norm and Readout preserve their existing statistics/residual semantic
 from flashrwkv2 import prepare_tuning
 
 # Real calls with disposable/reset state; include backward when training.
-report = prepare_tuning(warmup_calls, mode="tune")
+report = prepare_tuning(warmup_calls, mode="require")
 assert report["complete"]
 # Restore serving state, then specialize torch.compile and capture CUDA Graphs.
 ```
@@ -211,7 +202,12 @@ and CUDA Graph capture shapes are separate initialization responsibilities.
 | PostNorm / TokenShift forward | 1 |
 | PostNorm / TokenShift / Readout backward, per gradient requirement | 6 |
 | Readout / WKV forward, head size 64 and FP32 WKV state | 2 |
-| WKV backward; state transfer per gather/scatter direction | 1 |
+| WKV backward, head size 64 without status masking | 5 |
+| Other WKV backward; state transfer per gather/scatter direction | 1 |
+
+Head-size-64 backward prepares shared replay, direct checkpoint replay and the
+segment-boundary kernels for the observed bias and scaling form. A short
+training warmup covers the packed-token and batch-head dispatch thresholds.
 
 Single-variant auxiliary kernels are warmed by the real calls. A required compile
 failure aborts preparation with its owner and key; it is never silently skipped.

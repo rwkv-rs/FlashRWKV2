@@ -2,6 +2,7 @@
 
 """Shared-forward invariance and an independent real-valued recurrence VJP."""
 
+import hashlib
 import math
 
 import pytest
@@ -135,18 +136,18 @@ def _case(dim, lengths, *, requires_grad=False, logits=-2.0):
     return values, state, cu, bias
 
 
-def _reference(values, initial, lengths, bias, scale, *, state_dtype=None):
-    """Independent FP32 PyTorch graph, including the declared BF16 boundary."""
-    r, logits, k, v, a, b = (value.float() for value in values)
+def _reference(values, initial, lengths, bias, scale, *, state_dtype=None, dtype=torch.float32):
+    """Mathematical recurrence with explicit token and state rounding boundaries."""
+    r, logits, k, v, a, b = (value.to(dtype) for value in values)
     if bias is not None:
-        logits = (logits + bias).to(torch.bfloat16).float()
+        logits = (logits + bias).to(torch.bfloat16).to(dtype)
     # Use the mathematical exp/sigmoid formula, independently of the kernel's
     # exp2 implementation. The tiny activation error is below BF16 VJP noise.
     retention = torch.exp(-math.exp(-0.5) * torch.sigmoid(logits))
     outputs, final_states = [], []
     offset = 0
     for sequence, length in enumerate(lengths):
-        state = initial[sequence].float()
+        state = initial[sequence].to(dtype)
         for token in range(offset, offset + length):
             sa = torch.einsum("hkv,hk->hv", state, a[token])
             state = (
@@ -155,7 +156,7 @@ def _reference(values, initial, lengths, bias, scale, *, state_dtype=None):
                 + k[token, :, :, None] * v[token, :, None, :]
             )
             if state_dtype is not None:
-                state = state.to(state_dtype).float()
+                state = state.to(state_dtype).to(dtype)
             outputs.append(
                 (torch.einsum("hkv,hk->hv", state, r[token]) * scale).to(torch.bfloat16)
             )
@@ -163,6 +164,43 @@ def _reference(values, initial, lengths, bias, scale, *, state_dtype=None):
         offset += length
     output = torch.stack(outputs) if outputs else torch.empty_like(values[0])
     return output, torch.stack(final_states)
+
+
+@pytest.mark.parametrize(("heads", "output_hash", "state_hash"), [
+    (40, "b3f83f10611f881afdd181b9ec04551ca484a59c60a64ff35c789503155ec073",
+         "ec30d6319d689b473527f6d82e5375182517e5aaafeacd03f025f0f980d90ce1"),
+    (64, "6425684306d2564f13cc25d088e35ac4f65d7ce2fe3a43442937e20dc3a60c21",
+         "ac6d8645c9ab412ba52a760f89b36d29f2f3ddc672ecf34a4bbb6a5c44feba08"),
+])
+def test_fp16_serving_prefill_and_decode_match_independent_reference(heads, output_hash, state_hash):
+    from flashrwkv2 import (
+        infer_tmix_wkv7_recurrent_fp16_forward_varlen,
+        prepare_tmix_wkv7_recurrent_fp16_state_from_tensor,
+    )
+
+    lengths = (1, 17, 5)
+    # Integer inputs generated on the host give both GPUs the same bytes.
+    generator = torch.Generator().manual_seed(173041)
+
+    def sample(shape, scale, dtype):
+        raw = torch.randint(-256, 256, shape, dtype=torch.int32, generator=generator, device="cpu")
+        return (raw.float() * scale).to(dtype).cuda()
+
+    values = [sample((sum(lengths), heads, 64), scale, torch.bfloat16)
+              for scale in (2**-11, 2**-7, 2**-11, 2**-11, 2**-11, 2**-11)]
+    pool = sample((len(lengths), heads, 64, 64), 2**-13, torch.float16)
+    bias = sample((heads, 64), 2**-10, torch.bfloat16)
+    cu = torch.tensor([0, 1, 18, 23], device="cuda", dtype=torch.int32)
+    expected = _reference(values, pool, lengths, bias, .75, state_dtype=torch.float16, dtype=torch.float64)
+    handle = prepare_tmix_wkv7_recurrent_fp16_state_from_tensor(pool)
+    slots = torch.arange(len(lengths), device="cuda", dtype=torch.int32)
+    actual = infer_tmix_wkv7_recurrent_fp16_forward_varlen(
+        *values, state=handle, cu_seqlens=cu, state_indices=slots, decay_bias=bias, scale=.75,
+    )
+    handle.materialize_slots_(slots)
+    for result, reference, digest in zip((actual, pool), expected, (output_hash, state_hash), strict=True):
+        torch.testing.assert_close(result, reference, atol=2e-4, rtol=8e-3)
+        assert hashlib.sha256(result.cpu().contiguous().view(torch.uint8).numpy().tobytes()).hexdigest() == digest
 
 
 @pytest.mark.parametrize("dim", [64, 128, 256])
@@ -292,6 +330,62 @@ def test_recurrent_independent_vjp(dim, logits, cotangent, prefetch_tokens):
         )
 
 
+@pytest.mark.parametrize(("lengths", "logits"), [((0, 4097, 33), -2.0), ((3, 4129), -8.0)])
+def test_recurrent_direct_vjp_matches_checkpoint_replay(lengths, logits):
+    from utils import assert_relative_rmse
+
+    values, state, cu, bias = _case(64, lengths, requires_grad=True, logits=logits)
+    dy = torch.randn_like(values[0])
+    ds = torch.randn_like(state)
+    status = torch.tensor([0, values[0].shape[0], len(lengths)], device=cu.device, dtype=cu.dtype)
+    candidate = tmix_wkv7_recurrent(*values, state, cu, decay_bias=bias, scale=.75)
+    reference = tmix_wkv7_recurrent(
+        *values, state, cu, decay_bias=bias, scale=.75, _status=status,
+    )
+    for actual, expected in zip(candidate, reference, strict=True):
+        assert torch.equal(actual, expected)
+    inputs = (*values, state, bias)
+    actual_grads = torch.autograd.grad(candidate, inputs, (dy, ds))
+    expected_grads = torch.autograd.grad(reference, inputs, (dy, ds))
+    for actual, expected in zip(actual_grads, expected_grads, strict=True):
+        assert_relative_rmse(actual, expected)
+
+
+def test_recurrent_backward_replays_state_before_large_updates():
+    tokens = 4096
+    values = [torch.zeros(tokens, 1, 64, device="cuda", dtype=torch.bfloat16) for _ in range(6)]
+    values[1].fill_(-32.0)
+    values[2][-1, 0, 0] = 2.0**20
+    values[3][-1, 0, 0] = 2.0**20
+    values[0].requires_grad_()
+    state = torch.zeros(1, 1, 64, 64, device="cuda")
+    state[0, 0, 0, 0] = 1.0
+    cu = torch.tensor([0, tokens], device="cuda", dtype=torch.int32)
+    output, _ = tmix_wkv7_recurrent(*values, state, cu)
+    dy = torch.zeros_like(output)
+    dy[-2, 0, 0] = 1.0
+    (dr,) = torch.autograd.grad(output, values[0], dy)
+    assert dr[-2, 0, 0].item() == 1.0
+
+
+def test_recurrent_segment_boundaries_propagate_actual_cotangent():
+    tokens = 4224
+    values = [torch.zeros(tokens, 1, 64, device="cuda", dtype=torch.bfloat16) for _ in range(6)]
+    values[1].fill_(-32.0)
+    values[4][-128:, 0, 0] = 1.0
+    values[5][-128:, 0, 0] = 1.0
+    for value in values:
+        value.requires_grad_()
+    state = torch.zeros(1, 1, 64, 64, device="cuda", requires_grad=True)
+    cu = torch.tensor([0, tokens], device="cuda", dtype=torch.int32)
+    output, final = tmix_wkv7_recurrent(*values, state, cu)
+    gradients = torch.autograd.grad(
+        (output, final), (*values, state), (torch.zeros_like(output), torch.zeros_like(final)),
+    )
+    for gradient in gradients:
+        assert torch.count_nonzero(gradient).item() == 0
+
+
 def test_recurrent_final_state_only_and_empty_sequences():
     values, state, cu, bias = _case(64, (0, 0), requires_grad=True)
     y, final = tmix_wkv7_recurrent(*values, state, cu, decay_bias=bias)
@@ -328,6 +422,8 @@ def test_recurrent_checkpoint_backward_sanitizer(prefetch_tokens):
 @pytest.mark.parametrize("prefetch_tokens", [1, 4])
 def test_recurrent_status_masks_inactive_capacity_and_invalid_metadata(prefetch_tokens):
     values, state, _, bias = _case(64, (3, 1, 1))
+    for tensor in values:
+        tensor[3:].fill_(float("nan"))
     # Only the first sequence is active; inactive CU entries are deliberately
     # invalid and must never determine a token range.
     cu = torch.tensor([0, 3, -999, 1000000], device="cuda", dtype=torch.int32)

@@ -8,7 +8,7 @@ import json
 import torch
 from _timing import measure_cuda
 
-from flashrwkv2.head.l2wrap_ce import pretrain_head_l2wrap_ce_bf16
+from flashrwkv2.head.ce import pretrain_head_ce_bf16
 
 
 def main() -> None:
@@ -18,6 +18,8 @@ def main() -> None:
     parser.add_argument("--channels", type=int, default=64)
     parser.add_argument("--adapter-rank", type=int, default=0)
     parser.add_argument("--backward", action="store_true")
+    parser.add_argument("--backward-only", action="store_true")
+    parser.add_argument("--backward-chunk-rows", type=int)
     parser.add_argument("--chunk-rows", type=int, default=4096)
     parser.add_argument(
         "--train-base",
@@ -27,10 +29,8 @@ def main() -> None:
     parser.add_argument("--timing-mode", choices=("eager", "graph"), default="eager")
     parser.add_argument("--seed", type=int, default=113)
     args = parser.parse_args()
-    if args.timing_mode == "graph":
-        parser.error(
-            "HeadL2Wrap validates targets with .item() and requires eager timing"
-        )
+    if args.backward_only and not args.backward:
+        parser.error("--backward-only requires --backward")
     if args.train_base and not args.backward:
         parser.error("--train-base requires --backward")
     if args.chunk_rows <= 0:
@@ -54,6 +54,8 @@ def main() -> None:
         65536, (args.batch * args.tokens,), device=device, dtype=torch.int64
     )
     options = {"chunk_rows": args.chunk_rows}
+    if args.backward_chunk_rows is not None:
+        options["backward_chunk_rows"] = args.backward_chunk_rows
     inputs = [hidden] if args.backward else []
     if weight.requires_grad:
         inputs.append(weight)
@@ -68,38 +70,57 @@ def main() -> None:
         if args.backward:
             inputs.extend((a, b))
 
-    def run():
-        loss = pretrain_head_l2wrap_ce_bf16(hidden, weight, targets, **options)
-        if args.backward:
-            torch.autograd.grad(loss, inputs)
-        return loss
+    timing_counts = {"warmup": 5, "launches_per_batch": 1} if args.backward_only or args.timing_mode == "graph" else {}
+    stream = torch.cuda.current_stream()
+    if args.timing_mode == "graph":
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        prepared_loss = (
+            pretrain_head_ce_bf16(hidden, weight, targets, **options)
+            if args.backward_only else None
+        )
 
-    # Compile and allocate once before measuring the memory of one operation.
-    sample = run()
-    loss_dtype = str(sample.dtype).removeprefix("torch.")
-    del sample
-    torch.cuda.synchronize()
-    baseline_bytes = torch.cuda.memory_allocated()
-    torch.cuda.reset_peak_memory_stats()
-    run()
-    torch.cuda.synchronize()
-    peak_bytes = torch.cuda.max_memory_allocated()
-    memory = {
-        "scope": "one forward/backward call after warmup"
-        if args.backward
-        else "one forward call after warmup",
-        "baseline_allocated_bytes": baseline_bytes,
-        "peak_allocated_bytes": peak_bytes,
-        "peak_increment_bytes": peak_bytes - baseline_bytes,
-    }
-    timing = measure_cuda(run, timing_mode=args.timing_mode)
+        def run():
+            loss = (
+                prepared_loss if args.backward_only
+                else pretrain_head_ce_bf16(hidden, weight, targets, **options)
+            )
+            if args.backward:
+                torch.autograd.grad(loss.mean(), inputs, retain_graph=args.backward_only)
+            return loss
+
+        # Compile and allocate once before measuring the memory of one operation.
+        sample = run()
+        loss_dtype = str(sample.dtype).removeprefix("torch.")
+        del sample
+        torch.cuda.synchronize()
+        baseline_bytes = torch.cuda.memory_allocated()
+        torch.cuda.reset_peak_memory_stats()
+        run()
+        torch.cuda.synchronize()
+        peak_bytes = torch.cuda.max_memory_allocated()
+        memory = {
+            "scope": "one backward call after warmup" if args.backward_only else (
+                "one forward/backward call after warmup" if args.backward else "one forward call after warmup"
+            ),
+            "baseline_allocated_bytes": baseline_bytes,
+            "peak_allocated_bytes": peak_bytes,
+            "peak_increment_bytes": peak_bytes - baseline_bytes,
+        }
+        timing = measure_cuda(run, timing_mode=args.timing_mode, **timing_counts)
     print(
         json.dumps(
             {
-                "operator": "pretrain_head_l2wrap_ce_bf16",
+                "operator": "pretrain_head_ce_bf16",
                 "seed": args.seed,
-                "forward_backward": args.backward,
+                "gpu": torch.cuda.get_device_name(),
+                "cuda": torch.version.cuda,
+                "torch": torch.__version__,
+                "forward_backward": args.backward and not args.backward_only,
+                "backward_only": args.backward_only,
                 "chunk_rows": args.chunk_rows,
+                "backward_chunk_rows": (args.backward_chunk_rows or args.chunk_rows) if args.backward else None,
                 "base_weight": "trainable" if args.train_base else "frozen",
                 "input_dtype": str(hidden.dtype).removeprefix("torch."),
                 "base_weight_dtype": str(weight.dtype).removeprefix("torch."),
@@ -108,9 +129,6 @@ def main() -> None:
                 "profile": (
                     f"batch={args.batch}/tokens={args.tokens}/channels={args.channels}/adapter_rank={args.adapter_rank}/backward={args.backward}/train_base={args.train_base}/chunk_rows={args.chunk_rows}"
                 ),
-                "steady_state": "autograd graphs are recreated for each forward/backward call"
-                if args.backward
-                else "forward outputs are discarded after each launch",
                 **timing,
             }
         )

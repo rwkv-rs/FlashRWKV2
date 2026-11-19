@@ -13,7 +13,6 @@ from utils import TorchOperationRecorder
 import flashrwkv2
 from flashrwkv2 import (
     infer_sampling_six_parameter_forward_varlen,
-    infer_sampling_temperature_topk_topp_forward_varlen,
     setup_sampling_states,
 )
 
@@ -38,9 +37,8 @@ def test_reproducible_state_pool() -> None:
 @pytest.mark.cuda_graph
 @pytest.mark.memcheck
 @pytest.mark.racecheck
-@pytest.mark.parametrize("provider", ["scalar", "per_request", "six_parameter"])
 @pytest.mark.parametrize("batch,vocab", [(1, 8), (3, 8), (1, 65536)])
-def test_zero_temperature_is_deterministic_greedy(provider, batch, vocab) -> None:
+def test_zero_temperature_is_deterministic_greedy(batch, vocab) -> None:
     logits = torch.full((batch, vocab), -8.0, device="cuda")
     # Exact ties select the first index; close maxima must never be sampled.
     logits[:, 2] = 3.016162157058716
@@ -50,18 +48,11 @@ def test_zero_temperature_is_deterministic_greedy(provider, batch, vocab) -> Non
     states = setup_sampling_states(20261022, batch + 2)
     penalties = torch.zeros(batch + 2, vocab, device="cuda")
     controls = {"temperature": 0.0, "top_k": -1}
-    if provider == "per_request":
-        controls["temperature"] = torch.zeros(batch, device="cuda")
-    if provider == "six_parameter":
-        controls.update(presence_penalty=0.25, frequency_penalty=0.5, penalty_decay=0.5)
+    controls.update(presence_penalty=0.25, frequency_penalty=0.5, penalty_decay=0.5)
 
     def sample():
-        if provider == "six_parameter":
-            return infer_sampling_six_parameter_forward_varlen(
-                logits, penalties, states, slots, **controls
-            )
-        return infer_sampling_temperature_topk_topp_forward_varlen(
-            logits, states, slots, **controls
+        return infer_sampling_six_parameter_forward_varlen(
+            logits, penalties, states, slots, **controls
         )
 
     sample()
@@ -75,12 +66,11 @@ def test_zero_temperature_is_deterministic_greedy(provider, batch, vocab) -> Non
     for _ in range(4):
         adjusted = logits - expected_penalties[slots.long()]
         expected = adjusted.argmax(dim=-1).to(torch.int32)
-        if provider == "six_parameter":
-            for row, slot in enumerate(slots.tolist()):
-                index = expected[row].item()
-                seen = expected_penalties[slot, index].item() != 0
-                expected_penalties[slot].mul_(0.5)
-                expected_penalties[slot, index] += 0.5 + (0.0 if seen else 0.25)
+        for row, slot in enumerate(slots.tolist()):
+            index = expected[row].item()
+            seen = expected_penalties[slot, index].item() != 0
+            expected_penalties[slot].mul_(0.5)
+            expected_penalties[slot, index] += 0.5 + (0.0 if seen else 0.25)
         graph.replay()
         assert torch.equal(output, expected)
         assert torch.equal(states, initial_rng)
@@ -130,45 +120,6 @@ def test_zero_temperature_live_controls_and_inactive_rows() -> None:
                 assert torch.count_nonzero(penalties[slot]).item() == 0
 
 
-@pytest.mark.memcheck
-@pytest.mark.racecheck
-def test_scalar_and_per_request_top1_match_with_indexed_slots() -> None:
-    logits = torch.tensor(
-        [
-            [0.0, 4.0, 1.0, -2.0, 0.5, 0.0, -1.0, 2.0],
-            [3.0, 0.0, 1.0, -2.0, 0.5, 5.0, -1.0, 2.0],
-        ],
-        dtype=torch.float32,
-        device="cuda",
-    )
-    slot_indices = _slots([3, 1])
-    scalar_states = setup_sampling_states(7, 5)
-    vector_states = scalar_states.clone()
-    scalar = infer_sampling_temperature_topk_topp_forward_varlen(
-        logits, scalar_states, slot_indices, top_k=1
-    )
-    vector = infer_sampling_temperature_topk_topp_forward_varlen(
-        logits,
-        vector_states,
-        slot_indices,
-        temperature=torch.ones(2, device="cuda"),
-        top_k=torch.ones(2, dtype=torch.int32, device="cuda"),
-        top_p=torch.ones(2, device="cuda"),
-    )
-    expected = logits.argmax(dim=-1).to(torch.int32)
-    assert torch.equal(scalar, expected)
-    assert torch.equal(vector, expected)
-    assert torch.equal(scalar, vector)
-    inactive = torch.tensor([0, 2, 4], device="cuda")
-    baseline = setup_sampling_states(7, 5)
-    assert torch.equal(
-        scalar_states.index_select(0, inactive), baseline.index_select(0, inactive)
-    )
-    assert torch.equal(
-        vector_states.index_select(0, inactive), baseline.index_select(0, inactive)
-    )
-
-
 def test_six_parameter_penalty_semantics_and_slot_isolation() -> None:
     logits = torch.tensor(
         [
@@ -214,18 +165,6 @@ def test_six_parameter_penalty_semantics_and_slot_isolation() -> None:
     assert penalties[1, 5].item() == pytest.approx(0.225)
 
 
-def test_top_p_zero_and_nonfinite_logits_are_safe_top1() -> None:
-    logits = torch.tensor(
-        [[float("nan"), float("inf"), float("-inf"), 1.0, 0.0, 0.0, 0.0, 0.0]],
-        dtype=torch.float32,
-        device="cuda",
-    )
-    output = infer_sampling_temperature_topk_topp_forward_varlen(
-        logits, setup_sampling_states(3, 1), _slots([0]), top_p=0.0
-    )
-    assert output.item() == 1
-
-
 def test_presence_marker_survives_cancelled_penalties() -> None:
     logits = torch.tensor([[0.0, 8.0, 0.0, 0.0]], device="cuda")
     penalties = torch.zeros_like(logits)
@@ -254,21 +193,6 @@ def test_presence_marker_survives_cancelled_penalties() -> None:
     )
     assert second.item() == 1
     assert penalties[0, 1].item() == pytest.approx(-0.3)
-
-
-def test_empirical_distribution_without_scipy() -> None:
-    batch_size = 4096
-    row = torch.tensor([0.0, 0.5, 1.0, -0.5, -1.0, 0.25, 0.75, -0.25], device="cuda")
-    logits = row.expand(batch_size, -1).contiguous()
-    samples = infer_sampling_temperature_topk_topp_forward_varlen(
-        logits,
-        setup_sampling_states(2026, batch_size),
-        torch.arange(batch_size, dtype=torch.int32, device="cuda"),
-    )
-    observed = torch.bincount(samples.to(torch.int64), minlength=row.numel()).float()
-    observed /= batch_size
-    expected = row.softmax(dim=0)
-    assert torch.max(torch.abs(observed - expected)).item() < 0.035
 
 
 @pytest.mark.cuda_graph
@@ -384,36 +308,40 @@ def test_sampling_cuda_graph_dynamic_active_rows_are_side_effect_free() -> None:
 
 def test_rejects_invalid_inputs_before_launch() -> None:
     states = setup_sampling_states(1, 2)
+    penalties = torch.zeros(2, 8, device="cuda")
     slots = _slots([0, 1])
     with pytest.raises(ValueError, match="CUDA float32"):
-        infer_sampling_temperature_topk_topp_forward_varlen(
-            torch.zeros(2, 8), states, slots
+        infer_sampling_six_parameter_forward_varlen(
+            torch.zeros(2, 8), penalties, states, slots
         )
     with pytest.raises(ValueError, match="divisible by 4"):
-        infer_sampling_temperature_topk_topp_forward_varlen(
-            torch.zeros(2, 10, device="cuda"), states, slots
+        infer_sampling_six_parameter_forward_varlen(
+            torch.zeros(2, 10, device="cuda"), penalties, states, slots
         )
     with pytest.raises(ValueError, match="shape"):
-        infer_sampling_temperature_topk_topp_forward_varlen(
-            torch.zeros(2, 8, device="cuda"), states, _slots([0])
+        infer_sampling_six_parameter_forward_varlen(
+            torch.zeros(2, 8, device="cuda"), penalties, states, _slots([0])
         )
     with pytest.raises(ValueError, match="dtype"):
-        infer_sampling_temperature_topk_topp_forward_varlen(
+        infer_sampling_six_parameter_forward_varlen(
             torch.zeros(2, 8, device="cuda"),
+            penalties,
             states,
             slots,
             top_k=torch.ones(2, dtype=torch.int64, device="cuda"),
         )
     with pytest.raises(ValueError, match="must be on"):
-        infer_sampling_temperature_topk_topp_forward_varlen(
+        infer_sampling_six_parameter_forward_varlen(
             torch.zeros(2, 8, device="cuda"),
+            penalties,
             states,
             slots,
             top_p=torch.ones(2),
         )
     with pytest.raises(ValueError, match="shape"):
-        infer_sampling_temperature_topk_topp_forward_varlen(
+        infer_sampling_six_parameter_forward_varlen(
             torch.zeros(2, 8, device="cuda"),
+            penalties,
             states,
             slots,
             temperature=torch.ones(3, device="cuda"),
@@ -445,18 +373,16 @@ def test_sampling_resource_usage() -> None:
     hot = {
         name: body
         for name, body in blocks
-        if "sampling_kernel" in name or "sampling_cooperative_kernel" in name
+        if "sampling_kernel" in name
     }
-    assert len(hot) == 3, sorted(hot)
+    assert len(hot) == 1, sorted(hot)
     for name, body in hot.items():
         fields = {
             key: int(value)
             for key, value in re.findall(r"(REG|STACK|LOCAL):(\d+)", body)
         }
         assert fields["REG"] <= 64, (name, fields)
-        # Cooperative grid barriers use a small call stack, independently of spills.
-        stack_limit = 64 if "sampling_cooperative_kernel" in name else 0
-        assert fields["STACK"] <= stack_limit, (name, fields)
+        assert fields["STACK"] == 0, (name, fields)
         assert fields["LOCAL"] == 0, (name, fields)
 
 
@@ -479,52 +405,23 @@ def _fractional_probabilities(
     return filtered / filtered.sum()
 
 
-@pytest.mark.parametrize(
-    "provider,vocab_size",
-    [
-        ("scalar", 8),
-        ("per_request", 8),
-        ("six_parameter", 8),
-        ("per_request", 65536),
-        ("mixed", 8),
-        ("mixed", 65536),
-    ],
-)
-def test_single_request_launches_only_the_sampling_kernel(
-    provider: str, vocab_size: int
-) -> None:
+def test_single_request_launches_only_the_sampling_kernel() -> None:
+    vocab_size = 8
     logits = torch.full((1, vocab_size), -80.0, device="cuda")
     logits[0, 1] = 8.0
     states = setup_sampling_states(31, 8192)
     slots = _slots([8191])
-    penalties = (
-        torch.zeros(8192, vocab_size, device="cuda")
-        if provider == "six_parameter"
-        else None
-    )
+    penalties = torch.zeros(8192, vocab_size, device="cuda")
     controls = {"top_k": 1}
-    if provider == "per_request":
-        controls = {
-            "temperature": torch.ones(1, device="cuda"),
-            "top_k": _slots([1]),
-            "top_p": torch.ones(1, device="cuda"),
-        }
-    if provider == "mixed":
-        controls = {"temperature": torch.ones(1, device="cuda"), "top_k": 1}
     with torch.profiler.profile(
         activities=[
             torch.profiler.ProfilerActivity.CPU,
             torch.profiler.ProfilerActivity.CUDA,
         ]
     ) as profile:
-        if penalties is None:
-            output = infer_sampling_temperature_topk_topp_forward_varlen(
-                logits, states, slots, **controls
-            )
-        else:
-            output = infer_sampling_six_parameter_forward_varlen(
-                logits, penalties, states, slots, **controls
-            )
+        output = infer_sampling_six_parameter_forward_varlen(
+            logits, penalties, states, slots, **controls
+        )
         torch.cuda.synchronize()
     assert output.item() == 1
     kernels = [
@@ -537,7 +434,7 @@ def test_single_request_launches_only_the_sampling_kernel(
     )
     assert (
         sum(
-            "sampling_kernel" in name or "sampling_cooperative_kernel" in name
+            "sampling_kernel" in name
             for name in kernels
         )
         == 1
@@ -547,12 +444,10 @@ def test_single_request_launches_only_the_sampling_kernel(
 @pytest.mark.memcheck
 @pytest.mark.racecheck
 @pytest.mark.parametrize(
-    "six_parameter,vector_mask",
-    [(False, mask) for mask in (1, 2, 4, 3, 5, 6)]
-    + [(True, mask) for mask in (1, 2, 4, 8, 16, 32, 21, 42)],
+    "vector_mask", (1, 2, 4, 8, 16, 32, 21, 42),
 )
 def test_mixed_controls_match_vectors_without_materializing_scalars(
-    six_parameter: bool, vector_mask: int,
+    vector_mask: int,
 ) -> None:
     torch.manual_seed(47)
     batch_size, vocab_size, num_slots = 3, 32, 8
@@ -563,13 +458,12 @@ def test_mixed_controls_match_vectors_without_materializing_scalars(
     penalties = torch.randn(num_slots, vocab_size, device="cuda").mul_(0.1)
     vector_penalties = penalties.clone()
     values = {"temperature": 0.8, "top_k": 9, "top_p": 0.7}
-    if six_parameter:
-        values = {
-            "presence_penalty": 0.2,
-            "frequency_penalty": 0.3,
-            "penalty_decay": 0.9,
-            **values,
-        }
+    values = {
+        "presence_penalty": 0.2,
+        "frequency_penalty": 0.3,
+        "penalty_decay": 0.9,
+        **values,
+    }
     vectors = {
         name: torch.full(
             (batch_size,), value, device="cuda",
@@ -581,23 +475,13 @@ def test_mixed_controls_match_vectors_without_materializing_scalars(
         name: vectors[name] if vector_mask & (1 << index) else value
         for index, (name, value) in enumerate(values.items())
     }
-    if six_parameter:
-        expected = infer_sampling_six_parameter_forward_varlen(
-            logits, vector_penalties, vector_states, slots, **vectors
-        )
-    else:
-        expected = infer_sampling_temperature_topk_topp_forward_varlen(
-            logits, vector_states, slots, **vectors
-        )
+    expected = infer_sampling_six_parameter_forward_varlen(
+        logits, vector_penalties, vector_states, slots, **vectors
+    )
     with TorchOperationRecorder() as recorder:
-        if six_parameter:
-            actual = infer_sampling_six_parameter_forward_varlen(
-                logits, penalties, states, slots, **controls
-            )
-        else:
-            actual = infer_sampling_temperature_topk_topp_forward_varlen(
-                logits, states, slots, **controls
-            )
+        actual = infer_sampling_six_parameter_forward_varlen(
+            logits, penalties, states, slots, **controls
+        )
         torch.cuda.synchronize()
     assert torch.equal(actual, expected)
     assert torch.equal(states, vector_states)
@@ -608,8 +492,7 @@ def test_mixed_controls_match_vectors_without_materializing_scalars(
 @pytest.mark.cuda_graph
 @pytest.mark.memcheck
 @pytest.mark.racecheck
-@pytest.mark.parametrize("six_parameter", [False, True])
-def test_mixed_controls_graph_replay_reads_live_vectors(six_parameter: bool) -> None:
+def test_mixed_controls_graph_replay_reads_live_vectors() -> None:
     logits = torch.tensor([[0.0, 2.0, 4.0, 6.0]], device="cuda")
     slots = _slots([3])
     states = setup_sampling_states(59, 4)
@@ -617,16 +500,11 @@ def test_mixed_controls_graph_replay_reads_live_vectors(six_parameter: bool) -> 
     top_k = _slots([1])
     temperature = torch.ones(1, device="cuda")
     controls = {"temperature": temperature, "top_k": top_k, "top_p": 1.0}
-    if six_parameter:
-        controls.update(presence_penalty=0.1, frequency_penalty=0.2, penalty_decay=0.9)
+    controls.update(presence_penalty=0.1, frequency_penalty=0.2, penalty_decay=0.9)
 
     def sample():
-        if six_parameter:
-            return infer_sampling_six_parameter_forward_varlen(
-                logits, penalties, states, slots, **controls
-            )
-        return infer_sampling_temperature_topk_topp_forward_varlen(
-            logits, states, slots, **controls
+        return infer_sampling_six_parameter_forward_varlen(
+            logits, penalties, states, slots, **controls
         )
 
     sample()
@@ -645,9 +523,7 @@ def test_mixed_controls_graph_replay_reads_live_vectors(six_parameter: bool) -> 
 @pytest.mark.cuda_graph
 @pytest.mark.memcheck
 @pytest.mark.racecheck
-@pytest.mark.parametrize("provider", ["scalar", "per_request", "six_parameter"])
 def test_single_request_dynamic_activity_preserves_rng_and_penalties(
-    provider: str,
 ) -> None:
     logits = torch.tensor([[0.0, 8.0, 0.0, 0.0]], device="cuda")
     states = setup_sampling_states(41, 16)
@@ -655,30 +531,15 @@ def test_single_request_dynamic_activity_preserves_rng_and_penalties(
     penalties = torch.zeros(16, 4, device="cuda")
     slots, active = _slots([15]), _slots([1])
     controls = {"top_k": 1}
-    if provider == "per_request":
-        controls = {
-            "temperature": torch.ones(1, device="cuda"),
-            "top_k": _slots([1]),
-            "top_p": torch.ones(1, device="cuda"),
-        }
 
     def call() -> torch.Tensor:
-        if provider == "six_parameter":
-            return infer_sampling_six_parameter_forward_varlen(
-                logits,
-                penalties,
-                states,
-                slots,
-                presence_penalty=0.5,
-                frequency_penalty=0.25,
-                sample_capacity=1,
-                num_active_samples=active,
-                **controls,
-            )
-        return infer_sampling_temperature_topk_topp_forward_varlen(
+        return infer_sampling_six_parameter_forward_varlen(
             logits,
+            penalties,
             states,
             slots,
+            presence_penalty=0.5,
+            frequency_penalty=0.25,
             sample_capacity=1,
             num_active_samples=active,
             **controls,
@@ -695,8 +556,7 @@ def test_single_request_dynamic_activity_preserves_rng_and_penalties(
     assert output.item() == 1
     assert torch.equal(states[:15], initial[:15])
     assert not torch.equal(states[15], initial[15])
-    if provider == "six_parameter":
-        assert penalties[15, 1].item() == pytest.approx(0.75)
+    assert penalties[15, 1].item() == pytest.approx(0.75)
     for count, slot in ((0, -1), (-1, 15), (2, 15), (1, -1), (1, 16)):
         active.fill_(count)
         slots.fill_(slot)
@@ -782,7 +642,6 @@ def test_sampling_hash_collisions_and_invalid_batches_preserve_state() -> None:
     assert torch.equal(states[unchanged], before[unchanged])
 
 
-@pytest.mark.parametrize("provider", ["scalar", "per_request", "six_parameter"])
 @pytest.mark.parametrize(
     "values,top_k,top_p",
     [
@@ -796,7 +655,7 @@ def test_sampling_hash_collisions_and_invalid_batches_preserve_state() -> None:
     ],
 )
 def test_fractional_filter_distribution(
-    provider: str, values: list[float], top_k: int, top_p: float
+    values: list[float], top_k: int, top_p: float
 ) -> None:
     batch_size = 8192
     row = torch.tensor(values, dtype=torch.float32)
@@ -804,134 +663,10 @@ def test_fractional_filter_distribution(
     slots = torch.arange(batch_size - 1, -1, -1, dtype=torch.int32, device="cuda")
     states = setup_sampling_states(31415, batch_size)
     controls = {"top_k": top_k, "top_p": top_p}
-    if provider == "per_request":
-        controls = {
-            "temperature": torch.ones(batch_size, device="cuda"),
-            "top_k": torch.full((batch_size,), top_k, device="cuda", dtype=torch.int32),
-            "top_p": torch.full((batch_size,), top_p, device="cuda"),
-        }
-    if provider == "six_parameter":
-        samples = infer_sampling_six_parameter_forward_varlen(
-            logits, torch.zeros_like(logits), states, slots, **controls
-        )
-    else:
-        samples = infer_sampling_temperature_topk_topp_forward_varlen(
-            logits, states, slots, **controls
-        )
+    samples = infer_sampling_six_parameter_forward_varlen(
+        logits, torch.zeros_like(logits), states, slots, **controls
+    )
     observed = torch.bincount(samples.long(), minlength=row.numel()).cpu().double()
     expected = _fractional_probabilities(row, top_k, top_p)
     assert observed[expected == 0].sum() == 0
     assert torch.max(torch.abs(observed / batch_size - expected)) < 0.025
-
-
-@pytest.mark.memcheck
-@pytest.mark.racecheck
-@pytest.mark.cuda_graph
-def test_cooperative_sampling_dynamic_activity_and_slots() -> None:
-    logits = torch.full((1, 65536), -80.0, device="cuda")
-    logits[0, 44000] = 8.0
-    slots = _slots([3])
-    active = _slots([1])
-    states = setup_sampling_states(2718, 5)
-    initial = states.clone()
-    top_ks = _slots([1])
-    temperatures = torch.ones(1, device="cuda")
-    top_ps = torch.ones(1, device="cuda")
-
-    # Warm up the cooperative specialization before stream capture.
-    infer_sampling_temperature_topk_topp_forward_varlen(logits, states, slots, top_k=1)
-    states.copy_(initial)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        output = infer_sampling_temperature_topk_topp_forward_varlen(
-            logits,
-            states,
-            slots,
-            temperature=temperatures,
-            top_k=top_ks,
-            top_p=top_ps,
-            sample_capacity=1,
-            num_active_samples=active,
-        )
-    graph.replay()
-    torch.cuda.synchronize()
-    assert output.item() == 44000
-    assert not torch.equal(states[3], initial[3])
-    assert torch.equal(states[[0, 1, 2, 4]], initial[[0, 1, 2, 4]])
-
-    active.zero_()
-    slots.fill_(99)
-    before = states.clone()
-    graph.replay()
-    torch.cuda.synchronize()
-    assert output.item() == -1
-    assert torch.equal(states, before)
-
-    # Invalid active metadata also exits before every cooperative grid barrier.
-    active.fill_(1)
-    graph.replay()
-    torch.cuda.synchronize()
-    assert output.item() == -1
-    assert torch.equal(states, before)
-
-    slots.fill_(1)
-    logits[0, 44000] = -80.0
-    logits[0, 60001] = 9.0
-    graph.replay()
-    torch.cuda.synchronize()
-    assert output.item() == 60001
-    assert not torch.equal(states[1], before[1])
-    assert torch.equal(states[[0, 2, 3, 4]], before[[0, 2, 3, 4]])
-
-
-@pytest.mark.parametrize("case", ["ties", "dense_ties", "fractional"])
-@pytest.mark.cuda_graph
-def test_cooperative_ties_and_candidate_cache_overflow(case: str) -> None:
-    vocab_size, draws_per_replay, replays = 65536, 16, 128
-    dense_ties = case == "dense_ties"
-    logits = torch.full((1, vocab_size), -80.0, device="cuda")
-    # Dense ties exceed the per-thread candidate cache during histogram refinement.
-    candidates = (
-        torch.arange(vocab_size, device="cuda")
-        if dense_ties
-        else torch.tensor([17, 2051, 16388, 44000, 65535], device="cuda")
-    )
-    logits[0, candidates] = 0.0
-    top_k, top_p = 1, 1.0
-    values = torch.zeros(candidates.numel())
-    if case == "fractional":
-        values = torch.tensor([0.0, -0.28768207, -0.69314718, -1.38629436, -80.0])
-        logits[0, candidates] = values.cuda()
-        top_k, top_p = -1, 0.55
-    states = setup_sampling_states(1618, 4)
-    slots = _slots([2])
-    infer_sampling_temperature_topk_topp_forward_varlen(
-        logits, states, slots, top_k=top_k, top_p=top_p
-    )
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        outputs = torch.stack(
-            [
-                infer_sampling_temperature_topk_topp_forward_varlen(
-                    logits, states, slots, top_k=top_k, top_p=top_p
-                )
-                for _ in range(draws_per_replay)
-            ]
-        ).flatten()
-    samples = torch.empty((replays, draws_per_replay), dtype=torch.int32, device="cuda")
-    for index in range(replays):
-        graph.replay()
-        samples[index].copy_(outputs)
-    torch.cuda.synchronize()
-    flat = samples.flatten().long()
-    if dense_ties:
-        groups = flat // 2048
-        expected = 1.0 / 32
-        bins = 32
-    else:
-        assert torch.isin(flat, candidates).all()
-        groups = torch.searchsorted(candidates, flat)
-        expected = _fractional_probabilities(values, top_k, top_p).cuda()
-        bins = candidates.numel()
-    observed = torch.bincount(groups, minlength=bins).double() / flat.numel()
-    assert torch.max(torch.abs(observed - expected)) < 0.045

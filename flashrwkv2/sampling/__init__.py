@@ -41,7 +41,7 @@ def _validate_hot_inputs(
     logits: torch.Tensor,
     states: torch.Tensor,
     slot_indices: torch.Tensor,
-    penalties: torch.Tensor | None = None,
+    penalties: torch.Tensor,
 ) -> None:
     if not isinstance(logits, torch.Tensor):
         raise TypeError("logits must be a torch.Tensor")
@@ -70,8 +70,9 @@ def _validate_hot_inputs(
         raise ValueError("slot_indices must be contiguous CUDA int32 with shape [B]")
     if states.device != logits.device or slot_indices.device != logits.device:
         raise ValueError("states and slot_indices must share logits' CUDA device")
-    if penalties is not None and (
-        penalties.dtype != torch.float32
+    if (
+        not isinstance(penalties, torch.Tensor)
+        or penalties.dtype != torch.float32
         or not penalties.is_cuda
         or not penalties.is_contiguous()
         or penalties.shape != (states.shape[0], vocab_size)
@@ -120,59 +121,6 @@ def setup_sampling_states(seed: int, num_slots: int) -> torch.Tensor:
     if not isinstance(num_slots, int) or isinstance(num_slots, bool) or num_slots <= 0:
         raise ValueError("num_slots must be a positive int")
     return _extension().setup_sampling_states(seed, num_slots)
-
-
-def infer_sampling_temperature_topk_topp_forward_varlen(
-    logits: torch.Tensor,
-    states: torch.Tensor,
-    slot_indices: torch.Tensor,
-    *,
-    temperature: float | torch.Tensor = 1.0,
-    top_k: int | torch.Tensor = -1,
-    top_p: float | torch.Tensor = 1.0,
-    sample_capacity: int | None = None,
-    num_active_samples: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Sample one compact logits row per output-producing request.
-
-    ``slot_indices`` is validated on device. With ``sample_capacity`` and a
-    live ``num_active_samples`` scalar, inactive rows emit ``-1`` without
-    reading logits or advancing their request RNG.
-    """
-
-    _validate_hot_inputs(logits, states, slot_indices)
-    launch_capacity, active_samples = _validate_activity(
-        logits, sample_capacity, num_active_samples
-    )
-    batch_size = logits.shape[0]
-    return _extension().sampling_temperature_topk_topp_forward_varlen(
-        logits,
-        states,
-        slot_indices,
-        _parameter(
-            temperature,
-            name="temperature",
-            batch_size=batch_size,
-            dtype=torch.float32,
-            device=logits.device,
-        ),
-        _parameter(
-            top_k,
-            name="top_k",
-            batch_size=batch_size,
-            dtype=torch.int32,
-            device=logits.device,
-        ),
-        _parameter(
-            top_p,
-            name="top_p",
-            batch_size=batch_size,
-            dtype=torch.float32,
-            device=logits.device,
-        ),
-        launch_capacity,
-        active_samples,
-    )
 
 
 def infer_sampling_six_parameter_forward_varlen(
@@ -241,6 +189,5 @@ def infer_sampling_six_parameter_forward_varlen(
 
 __all__ = [
     "infer_sampling_six_parameter_forward_varlen",
-    "infer_sampling_temperature_topk_topp_forward_varlen",
     "setup_sampling_states",
 ]

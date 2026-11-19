@@ -335,10 +335,14 @@ def prepare_variants(owner, family, variants, cache, spec):
     session["compilation"][(owner, family)] = keys
 
 
+def _preparing_kernels():
+    return _SESSION is not None and not _TUNING.get()
+
+
 def prepared_kernel(owner, compiler, args, variants=()):
     """Compile bounded JIT alternatives only during explicit preparation."""
     session = _SESSION
-    if session is not None and not _TUNING.get():
+    if _preparing_kernels():
         keys = tuple(sorted({args, *variants}))
         family = owner, compiler.func.__name__, keys
         if family not in session["compilation"]:

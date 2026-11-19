@@ -9,7 +9,6 @@ from utils import TorchOperationRecorder
 from flashrwkv2.cmix import (
     infer_cmix_forward_varlen,
     pretrain_cmix_bf16,
-    statetune_cmix_bf16,
 )
 from flashrwkv2.tmix.wkv7 import prepare_tmix_wkv7_recurrent_metadata
 
@@ -340,7 +339,7 @@ def test_statetune_cmix_matches_torch_forward_backward(
         .to(torch.bfloat16)
         .requires_grad_()
     )
-    actual = statetune_cmix_bf16(x, initial, x_k, key, value)
+    actual = pretrain_cmix_bf16(x, x_k, key, value, initial_shift=initial, return_final_state=True)
 
     x_ref = x.detach().clone().requires_grad_()
     initial_ref = initial.detach().clone().requires_grad_()
@@ -401,7 +400,7 @@ def test_statetune_cmix_chunk_composition() -> None:
         .to(torch.bfloat16)
         .requires_grad_()
     )
-    whole = statetune_cmix_bf16(x, initial, x_k, key, value)
+    whole = pretrain_cmix_bf16(x, x_k, key, value, initial_shift=initial, return_final_state=True)
     upstream = [torch.randn_like(output) for output in whole]
     whole_grads = torch.autograd.grad(
         whole, (x, initial, x_k, key, value), grad_outputs=upstream
@@ -412,19 +411,13 @@ def test_statetune_cmix_chunk_composition() -> None:
     x_k_chunked = x_k.detach().clone().requires_grad_()
     key_chunked = key.detach().clone().requires_grad_()
     value_chunked = value.detach().clone().requires_grad_()
-    first = statetune_cmix_bf16(
-        x_chunked[:, :split].contiguous(),
-        initial_chunked,
-        x_k_chunked,
-        key_chunked,
-        value_chunked,
+    first = pretrain_cmix_bf16(
+        x_chunked[:, :split].contiguous(), x_k_chunked, key_chunked, value_chunked,
+        initial_shift=initial_chunked, return_final_state=True,
     )
-    second = statetune_cmix_bf16(
-        x_chunked[:, split:].contiguous(),
-        first[1],
-        x_k_chunked,
-        key_chunked,
-        value_chunked,
+    second = pretrain_cmix_bf16(
+        x_chunked[:, split:].contiguous(), x_k_chunked, key_chunked, value_chunked,
+        initial_shift=first[1], return_final_state=True,
     )
     chunked = (torch.cat((first[0], second[0]), dim=1), second[1])
     chunked_grads = torch.autograd.grad(
@@ -445,7 +438,7 @@ def test_statetune_cmix_rejects_cpu_and_invalid_shape() -> None:
     key = torch.zeros(32, 8, dtype=torch.bfloat16)
     value = torch.zeros(8, 32, dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="CUDA"):
-        statetune_cmix_bf16(x, initial, x_k, key, value)
+        pretrain_cmix_bf16(x, x_k, key, value, initial_shift=initial, return_final_state=True)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -459,7 +452,7 @@ def test_statetune_cmix_rejects_misaligned_vec2_input() -> None:
     value = torch.zeros(8, 32, device=device, dtype=torch.bfloat16)
     assert initial.is_contiguous() and initial.data_ptr() % 4 == 2
     with pytest.raises(ValueError, match="4-byte aligned"):
-        statetune_cmix_bf16(x, initial, x_k, key, value)
+        pretrain_cmix_bf16(x, x_k, key, value, initial_shift=initial, return_final_state=True)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -472,25 +465,29 @@ def test_statetune_cmix_rejects_invalid_cuda_contracts() -> None:
     key = torch.zeros(32, 8, device=device, dtype=torch.bfloat16)
     value = torch.zeros(8, 32, device=device, dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="CUDA bfloat16"):
-        statetune_cmix_bf16(x.float(), initial, x_k, key, value)
+        pretrain_cmix_bf16(x.float(), x_k, key, value, initial_shift=initial, return_final_state=True)
     with pytest.raises(ValueError, match="CUDA bfloat16"):
-        statetune_cmix_bf16(x, initial.half(), x_k, key, value)
+        pretrain_cmix_bf16(x, x_k, key, value, initial_shift=initial.half(), return_final_state=True)
     with pytest.raises(ValueError, match="shape|contiguous"):
-        statetune_cmix_bf16(x.transpose(1, 2), initial, x_k, key, value)
+        pretrain_cmix_bf16(x.transpose(1, 2), x_k, key, value, initial_shift=initial, return_final_state=True)
     with pytest.raises(ValueError, match="non-empty"):
-        statetune_cmix_bf16(x[:, :0], initial, x_k, key, value)
+        pretrain_cmix_bf16(x[:, :0], x_k, key, value, initial_shift=initial, return_final_state=True)
     with pytest.raises(ValueError, match="initial_shift must have shape"):
-        statetune_cmix_bf16(x, initial[:, :-2].contiguous(), x_k, key, value)
+        pretrain_cmix_bf16(
+            x, x_k, key, value,
+            initial_shift=initial[:, :-2].contiguous(), return_final_state=True,
+        )
     with pytest.raises(ValueError, match="CMix projection"):
-        statetune_cmix_bf16(x, initial, x_k, key[:-1].contiguous(), value)
+        pretrain_cmix_bf16(x, x_k, key[:-1].contiguous(), value, initial_shift=initial, return_final_state=True)
 
     odd_x = torch.zeros(1, 2, 7, device=device, dtype=torch.bfloat16)
     odd_initial = torch.zeros(1, 7, device=device, dtype=torch.bfloat16)
     odd_x_k = torch.zeros(7, device=device, dtype=torch.bfloat16)
     odd_key = torch.zeros(28, 7, device=device, dtype=torch.bfloat16)
     odd_value = torch.zeros(7, 28, device=device, dtype=torch.bfloat16)
-    odd_output, odd_final = statetune_cmix_bf16(
-        odd_x, odd_initial, odd_x_k, odd_key, odd_value
+    odd_output, odd_final = pretrain_cmix_bf16(
+        odd_x, odd_x_k, odd_key, odd_value,
+        initial_shift=odd_initial, return_final_state=True,
     )
     assert torch.equal(odd_output, odd_x)
     assert torch.equal(odd_final, odd_initial)
@@ -498,7 +495,7 @@ def test_statetune_cmix_rejects_invalid_cuda_contracts() -> None:
     if torch.cuda.device_count() > 1:
         foreign = x_k.to("cuda:1")
         with pytest.raises(ValueError, match="share x's device"):
-            statetune_cmix_bf16(x, initial, foreign, key, value)
+            pretrain_cmix_bf16(x, foreign, key, value, initial_shift=initial, return_final_state=True)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -533,7 +530,10 @@ def test_cmix_nora_training(stateful):
         "value_use_nora": True,
     }
     if stateful:
-        output, next_shift = statetune_cmix_bf16(x, initial, mix, key, value, **options)
+        output, next_shift = pretrain_cmix_bf16(
+            x, mix, key, value,
+            initial_shift=initial, return_final_state=True, **options,
+        )
     else:
         output = pretrain_cmix_bf16(x, mix, key, value, **options)
     xr, mr, kar, kbr, var, vbr = refs[:6]
@@ -594,12 +594,9 @@ def test_cmix_training_packed_and_decode_are_bitwise_equal(channels):
     training, expected_state = [], initial.clone()
     for sequence in range(len(lengths)):
         start, end = offsets[sequence : sequence + 2]
-        output, final = statetune_cmix_bf16(
-            normalized[start:end].unsqueeze(0),
-            initial[slot_ids[sequence] : slot_ids[sequence] + 1],
-            mix,
-            key,
-            value.t(),
+        output, final = pretrain_cmix_bf16(
+            normalized[start:end].unsqueeze(0), mix, key, value.t(),
+            initial_shift=initial[slot_ids[sequence] : slot_ids[sequence] + 1], return_final_state=True,
         )
         training.append(output.squeeze(0))
         expected_state[slot_ids[sequence]] = final[0]

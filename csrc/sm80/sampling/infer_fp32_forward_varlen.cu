@@ -6,7 +6,6 @@
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
-#include <cooperative_groups.h>
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
 
@@ -155,20 +154,19 @@ __device__ __forceinline__ void update_sampling_penalties(int V, float* penaltie
   }
 }
 
-template <bool Penalties>
 __device__ __forceinline__ void sampling_greedy(int V, const float* logits, float* penalties,
                                               int* outputs, const int* slot_indices,
                                               SamplingControls controls) {
   const int row = blockIdx.x, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
   logits += int64_t(row) * V;
-  if constexpr (Penalties) penalties += int64_t(slot_indices[row]) * V;
+  penalties += int64_t(slot_indices[row]) * V;
   __shared__ float maxima[32];
   __shared__ unsigned indices[32];
   float maximum = -FLT_MAX;
   unsigned selected = static_cast<unsigned>(V);
   for (int i = threadIdx.x; i < V; i += blockDim.x) {
     float value = safe_float(logits[i]);
-    if constexpr (Penalties) value -= penalties[i];
+    value -= penalties[i];
     value = safe_float(value);
     if (value > maximum || (value == maximum && unsigned(i) < selected)) {
       maximum = value;
@@ -188,26 +186,23 @@ __device__ __forceinline__ void sampling_greedy(int V, const float* logits, floa
   __syncthreads();
   selected = indices[0];
   if (threadIdx.x == 0) outputs[row] = selected;
-  if constexpr (Penalties)
-    update_sampling_penalties(V, penalties, selected, controls.presence, controls.frequency,
+  update_sampling_penalties(V, penalties, selected, controls.presence, controls.frequency,
                               controls.decay);
 }
 
-template <bool Penalties, bool Cooperative = false, int CachedCandidates = 0>
 __device__ __forceinline__ void sampling_body(int V, const float* logits, float* penalties,
                                               int* outputs, RAND* states, float* probs,
                                               unsigned* weights, float inv_temperature, int top_k,
                                               float top_p, float presence, float repetition,
                                               float decay, HistogramLayout layout,
-                                              const unsigned* first_histogram = nullptr,
-                                              const int* slot_indices = nullptr) {
+                                              const int* slot_indices) {
   const int t = threadIdx.x, b = blockIdx.x;
   const int slot = slot_indices == nullptr ? b : slot_indices[b];
   states += slot;
   logits += int64_t(b) * V;
   probs += int64_t(b) * V;
   weights += int64_t(b) * V;
-  if constexpr (Penalties) penalties += int64_t(slot) * V;
+  penalties += int64_t(slot) * V;
   __shared__ float fscratch[1024 / 32];
   __shared__ unsigned iscratch[1024 / 32];
   const int histogram_stride = layout.max_bins + 1;
@@ -215,8 +210,6 @@ __device__ __forceinline__ void sampling_body(int V, const float* logits, float*
   extern __shared__ __align__(8) unsigned char histogram_storage[];
   unsigned* mass = reinterpret_cast<unsigned*>(histogram_storage);
   unsigned* counts = reinterpret_cast<unsigned*>(mass + layout.shards * histogram_stride);
-  float* candidate_cache = reinterpret_cast<float*>(counts + layout.shards * histogram_stride);
-  unsigned candidate_count = 0, candidate_overflow = 0;
   __shared__ unsigned prefix, above_count;
   __shared__ unsigned histogram_scan[32];
   __shared__ unsigned count_scan[32];
@@ -227,49 +220,46 @@ __device__ __forceinline__ void sampling_body(int V, const float* logits, float*
   __shared__ int selected, owner;
   __shared__ unsigned residual;
 
-  if constexpr (!Cooperative) {
-    float maximum = -FLT_MAX;
+  float maximum = -FLT_MAX;
 
-    for (int i = t; i < V / 4; i += blockDim.x) {
-      float4 x = reinterpret_cast<const float4*>(logits)[i];
-      float4 penalty;
-      if constexpr (Penalties) penalty = reinterpret_cast<const float4*>(penalties)[i];
+  for (int i = t; i < V / 4; i += blockDim.x) {
+    float4 x = reinterpret_cast<const float4*>(logits)[i];
+    float4 penalty = reinterpret_cast<const float4*>(penalties)[i];
 #pragma unroll
-      for (int j = 0; j < 4; ++j) {
-        float v = safe_float(reinterpret_cast<float*>(&x)[j]);
-        if constexpr (Penalties) v -= reinterpret_cast<float*>(&penalty)[j];
-        v = safe_float(v * inv_temperature);
-        reinterpret_cast<float*>(&x)[j] = v;
-        maximum = fmaxf(maximum, v);
-      }
-      reinterpret_cast<float4*>(probs)[i] = x;
+    for (int j = 0; j < 4; ++j) {
+      float v = safe_float(reinterpret_cast<float*>(&x)[j]);
+      v -= reinterpret_cast<float*>(&penalty)[j];
+      v = safe_float(v * inv_temperature);
+      reinterpret_cast<float*>(&x)[j] = v;
+      maximum = fmaxf(maximum, v);
     }
+    reinterpret_cast<float4*>(probs)[i] = x;
+  }
 
-    maximum = block_reduce<float, true>(maximum, fscratch);
-    float denominator = 0.f;
+  maximum = block_reduce<float, true>(maximum, fscratch);
+  float denominator = 0.f;
 
-    for (int i = t; i < V / 4; i += blockDim.x) {
-      float4 x = reinterpret_cast<const float4*>(probs)[i];
-      float sum = 0.f;
+  for (int i = t; i < V / 4; i += blockDim.x) {
+    float4 x = reinterpret_cast<const float4*>(probs)[i];
+    float sum = 0.f;
 #pragma unroll
-      for (int j = 0; j < 4; ++j) {
-        float p = exp2f(reinterpret_cast<float*>(&x)[j] - maximum);
-        reinterpret_cast<float*>(&x)[j] = p;
-        sum += p;
-      }
-      reinterpret_cast<float4*>(probs)[i] = x;
-      denominator += sum;
+    for (int j = 0; j < 4; ++j) {
+      float p = exp2f(reinterpret_cast<float*>(&x)[j] - maximum);
+      reinterpret_cast<float*>(&x)[j] = p;
+      sum += p;
     }
+    reinterpret_cast<float4*>(probs)[i] = x;
+    denominator += sum;
+  }
 
-    denominator = block_reduce(denominator, fscratch);
-    const float inv_denominator = 1.f / denominator;
+  denominator = block_reduce(denominator, fscratch);
+  const float inv_denominator = 1.f / denominator;
 
-    for (int i = t; i < V / 4; i += blockDim.x) {
-      float4 x = reinterpret_cast<const float4*>(probs)[i];
+  for (int i = t; i < V / 4; i += blockDim.x) {
+    float4 x = reinterpret_cast<const float4*>(probs)[i];
 #pragma unroll
-      for (int j = 0; j < 4; ++j) reinterpret_cast<float*>(&x)[j] *= inv_denominator;
-      reinterpret_cast<float4*>(probs)[i] = x;
-    }
+    for (int j = 0; j < 4; ++j) reinterpret_cast<float*>(&x)[j] *= inv_denominator;
+    reinterpret_cast<float4*>(probs)[i] = x;
   }
   if (t == 0) {
     prefix = 0;
@@ -284,10 +274,6 @@ __device__ __forceinline__ void sampling_body(int V, const float* logits, float*
   if (top_k < V || top_p < 1.) {
     for (int level = 0; level < layout.passes; ++level) {
       const int shift = layout.shifts[level], bins = 1 << layout.widths[level];
-      unsigned overflow = 1;
-      if constexpr (CachedCandidates > 0) {
-        if (level >= 2) overflow = block_reduce(candidate_overflow, iscratch);
-      }
       for (int bin = t; bin < bins; bin += blockDim.x) {
         for (int shard = 0; shard < layout.shards; ++shard) {
           const int index = shard * histogram_stride + bin;
@@ -298,54 +284,23 @@ __device__ __forceinline__ void sampling_body(int V, const float* logits, float*
       __syncthreads();
       const unsigned boundary = prefix;
       const int shard = (t >> 5) % layout.shards;
-      if (Cooperative && level == 0) {
-        const int tiles = (V + 2047) / 2048;
-        const int stored_bins = bins / 2;
-        const unsigned* h = first_histogram + int64_t(b) * tiles * stored_bins * 2;
-        for (int bin = t; bin < bins; bin += blockDim.x) {
-          unsigned sum = 0;
-          unsigned count = 0;
-          for (int tile = 0; bin < stored_bins && tile < tiles; ++tile) {
-            uint2 value = reinterpret_cast<const uint2*>(h)[tile * stored_bins + bin];
-            sum += value.x;
-            count += value.y;
-          }
-          mass[bin] = sum;
-          counts[bin] = count;
+      auto insert = [&](float p) {
+        unsigned bits = __float_as_uint(p);
+        if (level == 0 || (bits >> (shift + layout.widths[level])) ==
+                              (boundary >> (shift + layout.widths[level]))) {
+          int bin = shard * histogram_stride + ((bits >> shift) & (bins - 1));
+          unsigned q;
+          q = __float2uint_rn(p * mass_scale);
+          atomicAdd(mass + bin, q);
+          atomicAdd(counts + bin, 1u);
         }
-      } else {
-        auto insert = [&](float p) {
-          unsigned bits = __float_as_uint(p);
-          if (level == 0 || (bits >> (shift + layout.widths[level])) ==
-                                (boundary >> (shift + layout.widths[level]))) {
-            if constexpr (CachedCandidates > 0) {
-              if (level == 1) {
-                if (candidate_count < CachedCandidates)
-                  candidate_cache[candidate_count * blockDim.x + t] = p;
-                else
-                  candidate_overflow = 1;
-                ++candidate_count;
-              }
-            }
-            int bin = shard * histogram_stride + ((bits >> shift) & (bins - 1));
-            unsigned q;
-            q = __float2uint_rn(p * mass_scale);
-            atomicAdd(mass + bin, q);
-            atomicAdd(counts + bin, 1u);
-          }
-        };
-        if (CachedCandidates > 0 && level >= 2 && !overflow) {
-          for (int i = 0; i < int(candidate_count); ++i)
-            insert(candidate_cache[i * blockDim.x + t]);
-        } else {
-          for (int i = t; i < V / 4; i += blockDim.x) {
-            float4 x = reinterpret_cast<const float4*>(probs)[i];
-            insert(x.x);
-            insert(x.y);
-            insert(x.z);
-            insert(x.w);
-          }
-        }
+      };
+      for (int i = t; i < V / 4; i += blockDim.x) {
+        float4 x = reinterpret_cast<const float4*>(probs)[i];
+        insert(x.x);
+        insert(x.y);
+        insert(x.z);
+        insert(x.w);
       }
       __syncthreads();
       // Scan contiguous descending bin chunks in parallel. Only the
@@ -408,14 +363,6 @@ __device__ __forceinline__ void sampling_body(int V, const float* logits, float*
     }
   }
   const float threshold = __uint_as_float(prefix);
-  if constexpr (Cooperative) {
-    if (t == 0) {
-      unsigned* control = const_cast<unsigned*>(first_histogram);
-      control[0] = __float_as_uint(threshold);
-      control[1] = __float_as_uint(compensation);
-    }
-    return;
-  }
   float retained = 0.f;
 
   for (int i = t; i < V / 4; i += blockDim.x) {
@@ -492,9 +439,7 @@ __device__ __forceinline__ void sampling_body(int V, const float* logits, float*
   }
   __syncthreads();
   if (t == 0) outputs[b] = selected;
-  if constexpr (Penalties) {
-    update_sampling_penalties(V, penalties, selected, presence, repetition, decay);
-  }
+  update_sampling_penalties(V, penalties, selected, presence, repetition, decay);
 }
 
 __device__ __forceinline__ bool sampling_row_is_active(int row, const int* slot_indices,
@@ -507,7 +452,6 @@ __device__ __forceinline__ bool sampling_row_is_active(int row, const int* slot_
   return active == 1 && slot_indices[0] >= 0 && slot_indices[0] < num_slots;
 }
 
-template <bool Penalties>
 __global__ void __launch_bounds__(1024, 1)
     sampling_kernel(int V, const float* logits, float* penalties, int* outputs, RAND* states,
                     float* probs, unsigned* weights, SamplingControls controls,
@@ -520,200 +464,13 @@ __global__ void __launch_bounds__(1024, 1)
   }
   controls = sampling_row_controls(controls, row, V);
   if (controls.temperature == 0.f) {
-    sampling_greedy<Penalties>(V, logits, penalties, outputs, slot_indices, controls);
+    sampling_greedy(V, logits, penalties, outputs, slot_indices, controls);
     return;
   }
-  sampling_body<Penalties>(V, logits, penalties, outputs, states, probs, weights,
+  sampling_body(V, logits, penalties, outputs, states, probs, weights,
                            1.4426950408889634f / controls.temperature, controls.top_k,
                            controls.top_p, controls.presence, controls.frequency, controls.decay,
-                           layout, nullptr, slot_indices);
-}
-
-// B=1,V=65536 cooperative fast path. Every exponential uses one global
-// maximum, so equal logits retain equal probabilities across tiles.
-__device__ __forceinline__ void cooperative_max(int V, const float* logits, float* probs,
-                                                float* partials, float inv_temperature) {
-  const int t = threadIdx.x, tile = blockIdx.x, begin = tile * 2048, end = min(begin + 2048, V);
-  __shared__ float scratch[32];
-  float maximum = -FLT_MAX;
-  for (int i = begin + 4 * t; i < end; i += 4 * blockDim.x) {
-    float4 x = reinterpret_cast<const float4*>(logits)[i / 4];
-#pragma unroll
-    for (int j = 0; j < 4; ++j) {
-      float v = safe_float(safe_float(reinterpret_cast<float*>(&x)[j]) * inv_temperature);
-      maximum = fmaxf(maximum, v);
-      reinterpret_cast<float*>(&x)[j] = v;
-    }
-    reinterpret_cast<float4*>(probs)[i / 4] = x;
-  }
-  maximum = block_reduce<float, true>(maximum, scratch);
-  if (t == 0) partials[2 * tile] = maximum;
-}
-__device__ __forceinline__ void global_exp_body(int V, float* probs, float* partials) {
-  const int t = threadIdx.x, tile = blockIdx.x, tiles = (V + 2047) / 2048;
-  __shared__ float scratch[32];
-  float maximum = t < tiles ? partials[2 * t] : -FLT_MAX;
-  maximum = block_reduce<float, true>(maximum, scratch);
-  const int begin = tile * 2048, end = min(begin + 2048, V);
-  float sum = 0.f;
-  for (int i = begin + 4 * t; i < end; i += 4 * blockDim.x) {
-    float4 x = reinterpret_cast<float4*>(probs)[i / 4];
-#pragma unroll
-    for (int j = 0; j < 4; ++j) {
-      float p = exp2f(reinterpret_cast<float*>(&x)[j] - maximum);
-      sum += p;
-      reinterpret_cast<float*>(&x)[j] = p;
-    }
-    reinterpret_cast<float4*>(probs)[i / 4] = x;
-  }
-  sum = block_reduce(sum, scratch);
-  if (t == 0) partials[2 * tile + 1] = sum;
-}
-
-__device__ __forceinline__ void cooperative_normalize_histogram(int V, float* probs,
-                                                                const float* partials,
-                                                                unsigned* histograms, int width,
-                                                                int shift, bool needed) {
-  const int t = threadIdx.x, tile = blockIdx.x, tiles = (V + 2047) / 2048, bins = 1 << (width - 1);
-  __shared__ float scratch[32];
-  extern __shared__ unsigned storage[];
-  unsigned* mass = storage;
-  unsigned* counts = storage + bins;
-  const float denominator = block_reduce(t < tiles ? partials[2 * t + 1] : 0.f, scratch);
-  const float scale = 1.f / denominator;
-  if (needed)
-    for (int bin = t; bin < bins; bin += blockDim.x) {
-      mass[bin] = 0;
-      counts[bin] = 0;
-    }
-  __syncthreads();
-  const int begin = tile * 2048, end = min(begin + 2048, V);
-  for (int i = begin + 4 * t; i < end; i += 4 * blockDim.x) {
-    float4 x = reinterpret_cast<float4*>(probs)[i / 4];
-#pragma unroll
-    for (int j = 0; j < 4; ++j) {
-      float p = reinterpret_cast<float*>(&x)[j] * scale;
-      reinterpret_cast<float*>(&x)[j] = p;
-      if (needed) {
-        int bin = __float_as_uint(p) >> shift;
-        atomicAdd(mass + bin, __float2uint_rn(p * 0x1p31f));
-        atomicAdd(counts + bin, 1u);
-      }
-    }
-    reinterpret_cast<float4*>(probs)[i / 4] = x;
-  }
-  __syncthreads();
-  if (needed) {
-    unsigned* h = histograms + int64_t(tile) * bins * 2;
-    for (int bin = t; bin < bins; bin += blockDim.x) {
-      h[2 * bin] = mass[bin];
-      h[2 * bin + 1] = counts[bin];
-    }
-  }
-}
-__global__ void __launch_bounds__(1024, 1)
-    sampling_cooperative_kernel(int V, const float* logits, int* outputs, RAND* states,
-                                float* probs, unsigned* weights, float* partials,
-                                unsigned* histograms, HistogramLayout layout,
-                                const int* slot_indices, int64_t num_slots,
-                                const int* num_active_samples, SamplingControls controls) {
-  if (!sampling_row_is_active(0, slot_indices, num_slots, num_active_samples, nullptr)) {
-    if (blockIdx.x == 0 && threadIdx.x == 0) outputs[0] = -1;
-    return;
-  }
-  controls = sampling_row_controls(controls, 0, V);
-  if (controls.temperature == 0.f) {
-    if (blockIdx.x == 0)
-      sampling_greedy<false>(V, logits, nullptr, outputs, slot_indices, controls);
-    return;
-  }
-  const float inv_temperature = 1.4426950408889634f / controls.temperature;
-  const int k = controls.top_k;
-  const float p = controls.top_p;
-  states += slot_indices[0];
-  // All tiles share a maximum and denominator, preserving ties across tiles.
-  cooperative_max(V, logits, probs, partials, inv_temperature);
-  cooperative_groups::this_grid().sync();
-  global_exp_body(V, probs, partials);
-  cooperative_groups::this_grid().sync();
-  cooperative_normalize_histogram(V, probs, partials, histograms, layout.widths[0],
-                                  layout.shifts[0], k < V || p < 1.f);
-  cooperative_groups::this_grid().sync();
-  // Refine the histogram in block zero and publish the cutoff and tie fraction.
-  if (blockIdx.x == 0) {
-    sampling_body<false, true, 8>(V, logits, nullptr, outputs, states, probs, weights,
-                                  inv_temperature, k, p, 0.f, 0.f, 0.f, layout, histograms);
-  }
-  cooperative_groups::this_grid().sync();
-  // Apply the cutoff, then quantize using the mass retained by the whole grid.
-  const int t = threadIdx.x, tile = blockIdx.x, tiles = 32;
-  const float threshold = __uint_as_float(histograms[0]),
-              compensation = __uint_as_float(histograms[1]);
-  const int i = tile * 512 + t;
-  float4 x = make_float4(0.f, 0.f, 0.f, 0.f);
-  if (t < 512) {
-    x = reinterpret_cast<float4*>(probs)[i];
-#pragma unroll
-    for (int j = 0; j < 4; ++j) {
-      float p = reinterpret_cast<float*>(&x)[j];
-      reinterpret_cast<float*>(&x)[j] =
-          p > threshold ? p : (p == threshold ? p * compensation : 0.f);
-    }
-  }
-  __shared__ float fscratch[32];
-  __shared__ unsigned iscratch[32];
-  float retained = block_reduce(x.x + x.y + x.z + x.w, fscratch);
-  if (t == 0) partials[tile] = retained;
-  cooperative_groups::this_grid().sync();
-  retained = block_reduce(t < tiles ? partials[t] : 0.f, fscratch);
-  const float factor = retained > 0.f ? 4.26e9f / retained : 0.f;
-  uint4 w = make_uint4(0, 0, 0, 0);
-  if (t < 512) {
-#pragma unroll
-    for (int j = 0; j < 4; ++j) {
-      const float value = reinterpret_cast<float*>(&x)[j];
-      reinterpret_cast<unsigned*>(&w)[j] =
-          unsigned(isfinite(factor) ? value * factor : (value / retained) * 4.26e9f);
-    }
-    reinterpret_cast<uint4*>(weights)[i] = w;
-  }
-  unsigned tile_weight = block_reduce(w.x + w.y + w.z + w.w, iscratch);
-  if (t == 0) histograms[2 + tile] = tile_weight;
-  cooperative_groups::this_grid().sync();
-  // Select a tile by integer mass, then select a token within that tile.
-  if (tile == 0) {
-    __shared__ unsigned total, random, residual, chosen;
-    unsigned local = t < tiles ? histograms[2 + t] : 0;
-    unsigned cumulative = block_scan(local, iscratch);
-    if (t == blockDim.x - 1) total = cumulative;
-    __syncthreads();
-    if (!total) {
-      if (t == 0) outputs[0] = 0;
-      return;
-    }
-    if (t == 0) random = random_below32(states, total);
-    __syncthreads();
-    if (local && random >= cumulative - local && random < cumulative) {
-      chosen = t;
-      residual = random - (cumulative - local);
-    }
-    __syncthreads();
-    w = t < 512 ? reinterpret_cast<uint4*>(weights)[chosen * 512 + t] : make_uint4(0, 0, 0, 0);
-    local = w.x + w.y + w.z + w.w;
-    cumulative = block_scan(local, iscratch);
-    if (local && residual >= cumulative - local && residual < cumulative) {
-      unsigned r = residual - (cumulative - local);
-#pragma unroll
-      for (int j = 0; j < 4; ++j) {
-        unsigned q = reinterpret_cast<unsigned*>(&w)[j];
-        if (r < q) {
-          outputs[0] = chosen * 2048 + 4 * t + j;
-          break;
-        }
-        r -= q;
-      }
-    }
-  }
+                           layout, slot_indices);
 }
 
 }  // namespace
@@ -807,34 +564,7 @@ SamplingMetadata prepare_sampling_metadata(const at::Tensor& logits, const at::T
 }
 
 constexpr int SAMPLING_THREADS = 1024;
-constexpr int SAMPLING_TILES = 32;
 constexpr size_t HISTOGRAM_BYTES = 2 * 2049 * 2 * sizeof(unsigned);
-constexpr size_t COOPERATIVE_BYTES = HISTOGRAM_BYTES + 8 * SAMPLING_THREADS * sizeof(float);
-
-bool sampling_cooperative_available(int device) {
-  static thread_local int configured_device = -1;
-  static thread_local bool available = false;
-  if (configured_device != device) {
-    const auto* properties = at::cuda::getDeviceProperties(device);
-    cudaFuncAttributes attributes{};
-    C10_CUDA_CHECK(cudaFuncGetAttributes(&attributes, sampling_cooperative_kernel));
-    available = properties->cooperativeLaunch && properties->sharedMemPerBlockOptin >=
-                                                     COOPERATIVE_BYTES + attributes.sharedSizeBytes;
-    if (available) {
-      C10_CUDA_CHECK(cudaFuncSetAttribute(sampling_cooperative_kernel,
-                                          cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                          COOPERATIVE_BYTES));
-      int active_blocks;
-      C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-          &active_blocks, sampling_cooperative_kernel, SAMPLING_THREADS, COOPERATIVE_BYTES));
-      available = active_blocks * properties->multiProcessorCount >= SAMPLING_TILES;
-    }
-    configured_device = device;
-  }
-  return available;
-}
-
-template <bool Penalties>
 at::Tensor sampling_forward(at::Tensor logits, at::Tensor penalties, at::Tensor states,
                             at::Tensor slot_indices, at::Tensor num_active_samples,
                             SamplingControls controls) {
@@ -856,29 +586,14 @@ at::Tensor sampling_forward(at::Tensor logits, at::Tensor penalties, at::Tensor 
   const int* slots = slot_indices.data_ptr<int>();
   const int* status = metadata.status.defined() ? metadata.status.data_ptr<int>() : nullptr;
   const int* active = num_active_samples.defined() ? num_active_samples.data_ptr<int>() : nullptr;
-  if constexpr (!Penalties) {
-    if (B == 1 && V == 65536 && sampling_cooperative_available(logits.get_device())) {
-      auto partials = at::empty({2 * SAMPLING_TILES}, logits.options());
-      auto histograms = at::empty({SAMPLING_TILES * 512 * 2}, logits.options().dtype(at::kInt));
-      float* part = partials.data_ptr<float>();
-      unsigned* hist = reinterpret_cast<unsigned*>(histograms.data_ptr<int>());
-      void* args[] = {&V,    &l,      &out,   &rng,       &prob,   &w,       &part,
-                      &hist, &layout, &slots, &num_slots, &active, &controls};
-      C10_CUDA_CHECK(cudaLaunchCooperativeKernel(
-          reinterpret_cast<void*>(sampling_cooperative_kernel), dim3(SAMPLING_TILES),
-          dim3(SAMPLING_THREADS), args, COOPERATIVE_BYTES, stream));
-      C10_CUDA_KERNEL_LAUNCH_CHECK();
-      return output;
-    }
-  }
   static thread_local int configured_device = -1;
   if (configured_device != logits.get_device()) {
     C10_CUDA_CHECK(cudaFuncSetAttribute(
-        sampling_kernel<Penalties>, cudaFuncAttributeMaxDynamicSharedMemorySize, HISTOGRAM_BYTES));
+        sampling_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, HISTOGRAM_BYTES));
     configured_device = logits.get_device();
   }
-  sampling_kernel<Penalties><<<B, SAMPLING_THREADS, HISTOGRAM_BYTES, stream>>>(
-      V, l, Penalties ? penalties.data_ptr<float>() : nullptr, out, rng, prob, w, controls, layout,
+  sampling_kernel<<<B, SAMPLING_THREADS, HISTOGRAM_BYTES, stream>>>(
+      V, l, penalties.data_ptr<float>(), out, rng, prob, w, controls, layout,
       slots, num_slots, active, status);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return output;
@@ -901,27 +616,6 @@ SamplingControls sampling_scalar_controls(double presence, double frequency, dou
 
 }  // namespace
 
-at::Tensor sampling_temperature_topk_topp_scalar_cuda(at::Tensor logits, at::Tensor states,
-                                                      at::Tensor slot_indices, double temperature,
-                                                      int64_t top_k, double top_p,
-                                                      at::Tensor num_active_samples) {
-  auto controls = sampling_scalar_controls(0., 0., 1., temperature, top_k, top_p,
-                                           static_cast<int>(logits.size(1)));
-  return sampling_forward<false>(logits, {}, states, slot_indices, num_active_samples, controls);
-}
-
-at::Tensor sampling_temperature_topk_topp_per_request_cuda(
-    at::Tensor logits, at::Tensor states, at::Tensor slot_indices,
-    at::Tensor temperatures, at::Tensor top_ks, at::Tensor top_ps,
-    double temperature, int64_t top_k, double top_p, at::Tensor num_active_samples) {
-  auto controls = sampling_scalar_controls(0., 0., 1., temperature, top_k, top_p,
-                                           static_cast<int>(logits.size(1)));
-  controls.temperatures = temperatures.defined() ? temperatures.data_ptr<float>() : nullptr;
-  controls.top_ks = top_ks.defined() ? top_ks.data_ptr<int>() : nullptr;
-  controls.top_ps = top_ps.defined() ? top_ps.data_ptr<float>() : nullptr;
-  return sampling_forward<false>(logits, {}, states, slot_indices, num_active_samples, controls);
-}
-
 at::Tensor sampling_six_parameter_scalar_cuda(at::Tensor logits, at::Tensor penalties,
                                               at::Tensor states, at::Tensor slot_indices,
                                               double presence_penalty, double frequency_penalty,
@@ -931,7 +625,7 @@ at::Tensor sampling_six_parameter_scalar_cuda(at::Tensor logits, at::Tensor pena
   auto controls =
       sampling_scalar_controls(presence_penalty, frequency_penalty, penalty_decay, temperature,
                                top_k, top_p, static_cast<int>(logits.size(1)));
-  return sampling_forward<true>(logits, penalties, states, slot_indices, num_active_samples,
+  return sampling_forward(logits, penalties, states, slot_indices, num_active_samples,
                                 controls);
 }
 
@@ -950,6 +644,6 @@ at::Tensor sampling_six_parameter_per_request_cuda(
   controls.temperatures = temperatures.defined() ? temperatures.data_ptr<float>() : nullptr;
   controls.top_ks = top_ks.defined() ? top_ks.data_ptr<int>() : nullptr;
   controls.top_ps = top_ps.defined() ? top_ps.data_ptr<float>() : nullptr;
-  return sampling_forward<true>(logits, penalties, states, slot_indices, num_active_samples,
+  return sampling_forward(logits, penalties, states, slot_indices, num_active_samples,
                                 controls);
 }

@@ -59,6 +59,7 @@ class RecurrentMetadataTicket final {
       torch::Tensor state_indices_snapshot,
       torch::Tensor status,
       torch::Tensor workspace,
+      torch::Tensor row_order,
       torch::Tensor num_active_tokens,
       torch::Tensor num_active_sequences,
       int64_t total_tokens,
@@ -72,6 +73,7 @@ class RecurrentMetadataTicket final {
         state_indices_snapshot_(std::move(state_indices_snapshot)),
         status_(std::move(status)),
         workspace_(std::move(workspace)),
+        row_order_(std::move(row_order)),
         num_active_tokens_(std::move(num_active_tokens)),
         num_active_sequences_(std::move(num_active_sequences)),
         query_start_loc_version_(tensor_version(query_start_loc_)),
@@ -151,6 +153,8 @@ class RecurrentMetadataTicket final {
 
   const torch::Tensor& status() const { return status_; }
 
+  const torch::Tensor& row_order() const { return row_order_; }
+
   int64_t max_seqlen() const { return max_seqlen_; }
 
   bool graph_mode() const { return graph_mode_; }
@@ -170,6 +174,7 @@ class RecurrentMetadataTicket final {
   torch::Tensor state_indices_snapshot_;
   torch::Tensor status_;
   torch::Tensor workspace_;
+  torch::Tensor row_order_;
   torch::Tensor num_active_tokens_;
   torch::Tensor num_active_sequences_;
   std::optional<uint32_t> query_start_loc_version_;
@@ -234,7 +239,7 @@ std::shared_ptr<RecurrentMetadataTicket> prepare_tmix_wkv7_recurrent_metadata(
       std::move(query_start_loc), std::move(state_indices),
       std::move(prepared.query_start_loc),
       std::move(prepared.state_indices), std::move(prepared.status),
-      std::move(prepared.workspace), torch::Tensor(), torch::Tensor(),
+      std::move(prepared.workspace), std::move(prepared.row_order), torch::Tensor(), torch::Tensor(),
       total_tokens, state_pool_size, max_seqlen, false, stream);
 }
 
@@ -284,7 +289,7 @@ std::shared_ptr<RecurrentMetadataTicket> prepare_tmix_wkv7_recurrent_graph_metad
       std::move(query_start_loc), std::move(state_indices),
       std::move(prepared.query_start_loc),
       std::move(prepared.state_indices), std::move(prepared.status),
-      std::move(prepared.workspace), std::move(num_active_tokens),
+      std::move(prepared.workspace), std::move(prepared.row_order), std::move(num_active_tokens),
       std::move(num_active_sequences), token_capacity, state_pool_size,
       max_seqlen_capacity, true, stream);
 }
@@ -322,6 +327,7 @@ void register_recurrent_metadata_bindings(py::module_& module) {
           [](const std::shared_ptr<RecurrentMetadataTicket>& ticket) {
             return ticket->status();
           })
+      .def("_row_order", &RecurrentMetadataTicket::row_order)
       .def(
           "_max_seqlen",
           [](const std::shared_ptr<RecurrentMetadataTicket>& ticket) {
