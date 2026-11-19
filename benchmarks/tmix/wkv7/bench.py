@@ -8,6 +8,7 @@ BF16 control runs and FP16 production runs through its owning FP32IO16 state.
 import argparse
 import json
 from functools import partial
+from inspect import signature
 from itertools import accumulate
 from pathlib import Path
 
@@ -197,9 +198,18 @@ def main():
                 # The benchmark can also load earlier package revisions via PYTHONPATH.
                 selector = getattr(wkv7, "_recurrent_config", None)
                 if args.state_dtype == "float16" and heads in (40, 64) and dim == 64 and hasattr(ticket, "_row_order"):
-                    dispatch = {"reason": "device-ordered rows, per-slot decode, tiled or full-head prefill by active prefill count"}
+                    reason = "per-slot decode, tiled or full-head prefill by active prefill count"
+                    delta = getattr(state, "_delta", None)
+                    if delta is not None and delta[0].shape[2] == 6 and batch >= 128:
+                        reason = "Ada two-record log with alternating decode traversal"
+                        if ticket._row_order().numel():
+                            reason += " and separate prefill/decode streams"
+                    dispatch = {"reason": reason}
                 elif selector is not None:
-                    columns, prefetch = selector(values[0], batch, None, None)
+                    options = {"columns": None, "prefetch": None}
+                    if "state_dtype" in signature(selector).parameters:
+                        options["state_dtype"] = pool.dtype
+                    columns, prefetch = selector(values[0], batch, **options)
                     if length == 1:
                         reason = "one token per sequence"
                     elif prefetch > 1:

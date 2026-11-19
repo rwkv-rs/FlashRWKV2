@@ -159,7 +159,10 @@ compiled_model = torch.compile(
 
 RTX 4090 and PRO 6000 use deterministic projection tiles selected from the model geometry,
 SM count and shared memory limit. D64 WKV selects decode or prefill from the checked-in
-execution configurations. Each program retains its original FP32 reduction and state cast.
+execution configurations. FP32 training and matched FP32 rollout retain the same
+reduction order and state cast. H40 and H64 D64 FP16 serving use four 16-term FMA
+chains and a balanced FP32 sum for each dot product, so rounding can differ from
+the earlier 64-term chain.
 The WKV benchmark records the selected value tile, token prefetch and workload reason before capture.
 The operator benchmark's `--tune` option verifies candidate outputs and state before timing.
 Its report contains the winning configuration and individual measurements.

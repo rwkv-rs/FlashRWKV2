@@ -80,9 +80,10 @@ compiled_model = torch.compile(
 )
 ```
 
-Prepare tuning with eager forward-and-backward calls before compiling or
-capturing. Dense and packed training accept optional FP32 initial state and can
-return final state for the next chunk. See the [training contract](docs/kernel_api.md#training).
+Warm the forward and backward on the capture stream with the actual shapes,
+then restore state and gradients before capture. Dense and packed training
+accept optional FP32 initial state and can return final state for the next
+chunk. See the [training contract](docs/kernel_api.md#training).
 
 ## Tests
 
@@ -114,10 +115,18 @@ PATH="$PWD/.venv/bin:$PATH" timeout 18500s .venv/bin/python -I ci/quality_gate.p
   --release --dist artifacts/dist --output artifacts/sm89
 ```
 
-Attach `artifacts/sm89/sm89.json` to the draft release. The manual **PyPI release**
-workflow verifies the tag, main ancestry, both GPU reports and the SHA-256 of each
-original distribution. Publishing the GitHub release publishes those files using PyPI
-trusted publishing and checks their public digests.
+Download `sm120.json` from the tagged GPU artifact into `artifacts/sm89` and
+verify both reports before publishing the draft release:
+
+```bash
+timeout 60s .venv/bin/python -I ci/quality_gate.py verify \
+  --dist artifacts/dist --output artifacts/sm89
+```
+
+Attach `artifacts/sm89/sm89.json` to the draft release. On publication, the
+**PyPI release** workflow verifies the tag, main ancestry, both GPU reports and
+the original distribution hashes. It publishes through PyPI trusted publishing
+and checks the public digests.
 
 ## Benchmarks
 

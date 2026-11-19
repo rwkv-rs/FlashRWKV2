@@ -40,11 +40,16 @@ def benchmarks(output):
                     "--state-dtype", dtype, "--shapes", "h40d64", "h64d64", "--timing-mode", "graph",
                     "--output", str(output / ("wkv7-" + dtype + ".json")),
                 ]
+            yield owner + "/float16-live-mixed", script, [
+                "--state-dtype", "float16", "--shapes", "h64d64", "--cases", "255x1+1x256",
+                "--metadata", "live", "--timing-mode", "graph", "--slot-order", "random",
+                "--output", str(output / "wkv7-float16-live-mixed.json"),
+            ]
         else:
             yield owner, script, []
 
 
-def pytest_cuda(output, env, name, *, marks="cuda", keywords=None, prefix=()):
+def pytest_cases(output, env, name, *, marks="cuda", keywords=None, prefix=()):
     junit = output / f"{name}.xml"
     options = [] if keywords is None else ["-k", keywords]
     run([*prefix, sys.executable, "-I", "-m", "pytest", "-q", "-m", marks, *options,
@@ -52,7 +57,7 @@ def pytest_cuda(output, env, name, *, marks="cuda", keywords=None, prefix=()):
          f"--junitxml={junit}", str(ROOT / "tests")], cwd=output, env=env)
     count = sum(case.find("skipped") is None for case in ET.parse(junit).iter("testcase"))
     if count == 0:
-        raise ValueError(f"{name} did not execute any CUDA tests")
+        raise ValueError(f"{name} did not execute any tests with marker expression {marks!r}")
     return count
 
 
@@ -61,7 +66,7 @@ def release_compatibility(output, env):
     cases = {}
     for version in TORCH_VERSIONS:
         run(["uv", "pip", "install", "--python", sys.executable, f"torch=={version}"], cwd=ROOT)
-        cases[version] = pytest_cuda(
+        cases[version] = pytest_cases(
             output, env, f"torch-{version}",
             keywords="fullgraph or zero_temperature_is_deterministic_greedy or recurrent_forward_reference_and_grad_mode",
         )
@@ -97,11 +102,12 @@ def validate(args):
             if (name.startswith("flashrwkv2/") and not name.endswith("/")
                     and installed.locate_file(name).read_bytes() != archive.read(name)):
                 raise ValueError(f"installed file differs from {wheel.name}: {name}")
-    passed = pytest_cuda(output, env, "pytest")
+    passed = pytest_cases(output, env, "pytest")
+    resource_passed = pytest_cases(output, env, "pytest-resource", marks="resource and not cuda")
     sanitizers = {}
     if args.release:
         for tool in ("memcheck", "racecheck"):
-            sanitizers[tool] = pytest_cuda(
+            sanitizers[tool] = pytest_cases(
                 output, env, tool, marks=f"cuda and {tool}",
                 prefix=("compute-sanitizer", "--tool", tool, "--error-exitcode", "1"),
             )
@@ -112,7 +118,8 @@ def validate(args):
         measured.append(case)
     report.write_text(json.dumps({"commit": revision(), "packages": hashes, "gpu": props.name,
                                  "architecture": arch, "sm_count": props.multi_processor_count,
-                                 "torch": str(torch.__version__), "passed": passed, "sanitizers": sanitizers,
+                                 "torch": str(torch.__version__), "passed": passed,
+                                 "resource_passed": resource_passed, "sanitizers": sanitizers,
                                  "compatibility": compatibility,
                                  "benchmarks": measured}, indent=2) + "\n")
 
@@ -125,6 +132,7 @@ def verify(args):
         if not (report["commit"] == revision() and report["packages"] == expected
                 and (report["architecture"], report["sm_count"]) == (arch, sms)
                 and report["passed"] > 0
+                and report["resource_passed"] > 0
                 and set(report["sanitizers"]) == {"memcheck", "racecheck"}
                 and all(count > 0 for count in report["sanitizers"].values())
                 and set(report["compatibility"]) == set(TORCH_VERSIONS)
