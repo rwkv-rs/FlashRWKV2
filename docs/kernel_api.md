@@ -137,7 +137,7 @@ FP16 checkpoint 包含该 slot 已追加的 DeltaLog 更新，状态与普通 se
 from flashrwkv2.mtp import DraftLoop
 
 loop = DraftLoop.from_state_dict(sidecar_weights, lm_head_weight, depth=4, eps=1e-5)
-eager_ids = loop(hidden, token_ids, embed)
+eager_ids = loop(hidden, token_ids, embed).clone()
 loop.capture(embed)
 graph_ids = loop.replay(hidden, token_ids)
 ```
