@@ -105,6 +105,53 @@ FP16 prefill 按四个 token 一块处理整块，每行最后单独处理 0–3
 当有效 prefill 有 1–3 行，每个头的 value 列分给四个 CTA。达到四行时，每个 CTA
 处理一个完整头，以复用该行的输入向量。decode 行继续独立读写各自的日志。
 
+### 推理状态导出
+
+两个 WKV 推理入口默认返回 BF16 输出。传入 `save=True` 时返回
+`(output, boundaries)`，每个 checkpoint 保存**处理对应 token 之前**的 WKV state。
+`checkpoint_interval` 为正整数，默认 16。以当前调用的 token 容量 `N`、
+sequence 容量 `B` 和 interval `S` 计算形状 `[N // S + B, H, D, D]`。
+调用方可传入同设备、连续且与 state pool 同 dtype 的 `boundaries`，否则由入口分配。
+
+对第 `i` 条序列，设 `start = cu_seqlens[i]`。当序列内 token 偏移 `j` 能被
+`S` 整除时，写入 `boundaries[start // S + i + j // S]`。
+图重放只写入 live metadata 描述的有效 checkpoint，容量空洞保留原值。
+FP16 checkpoint 包含该 slot 已追加的 DeltaLog 更新，状态与普通 serving 使用相同的归约顺序。
+
+`infer_tmix_postnorm_tokenshift_forward_varlen` 和 `infer_cmix_forward_varlen` 的
+`save_normalized` 接收同设备、连续的 BF16 `[N,C]` 缓冲区，写入每个有效 token
+的 res 后 ln 结果。T=1 融合路径与通用 packed 路径均写出该 token 作为序列末尾时
+的 shift state。调用方为导出缓冲区提供与输入和对应 pool 独立的存储。
+
+对 MTP verifier 设 `checkpoint_interval=1`，令 `m` 为保留的已处理 token 数。
+
+- `m = 0` 时，从 `boundaries[start + i]` 恢复 WKV state，并使用 verifier
+  调用前保留的 TMix 和 CMix shift state。
+- `0 < m < length` 时，从 `boundaries[start + i + m]` 恢复 WKV state，并从
+  各自的 `save_normalized[start + m - 1]` 恢复 TMix 和 CMix shift state。
+- `m = length` 时，使用算子已写回的 pool。
+
+### LightMTP DraftLoop
+
+```python
+from flashrwkv2.mtp import DraftLoop
+
+loop = DraftLoop.from_state_dict(sidecar_weights, lm_head_weight, depth=4, eps=1e-5)
+eager_ids = loop(hidden, token_ids, embed).clone()
+loop.capture(embed)
+graph_ids = loop.replay(hidden, token_ids)
+```
+
+该入口使用单个 LightMTP block，读取 sidecar 的 `block.*` 权重。
+`lm_head_weight` 为共享 `[V,C]` 权重，设备和 dtype 已符合要求时复用其存储。
+`hidden` 为 CUDA BF16 `[1,C]` 或 `[C]`，`token_ids` 为同设备 INT64
+`[1]` 或标量。调用方传入的 `embed` 接收 `[1]` 并返回同设备 BF16 `[1,C]`。
+每步使用 FP32 logits 选出下一个 draft token。
+
+`capture` 在 graph 外预热算子并绑定 embedding。每次 `forward` 或 `replay` 返回同一
+INT64 `[1,depth]` 缓冲区，跨调用保留时使用 `clone()`。同一实例串行使用，
+模块移动到新设备后重新 capture。目标模型验证和状态回退由调用方负责。
+
 ## Training
 
 | API | 说明 |

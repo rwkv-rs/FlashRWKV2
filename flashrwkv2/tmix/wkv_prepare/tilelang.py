@@ -463,7 +463,7 @@ def _group_spec(
         ),
         {
             "out_idx": [12, 13],
-            "target": {"kind": "cuda", "arch": f"sm_{arch}"},
+            "target": {"kind": "cuda", "arch": f"sm_{arch}a" if arch == 90 else f"sm_{arch}"},
             "pass_configs": flags,
         },
     )

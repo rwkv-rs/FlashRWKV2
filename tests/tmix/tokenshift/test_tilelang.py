@@ -45,7 +45,7 @@ def test_tokenshift_tuning_checks_both_variants_with_active_metadata(monkeypatch
     launches = []
 
     def forward(channels, count, index_dtype, block=256, use_status=False):
-        def kernel(values, mixes, offsets, initial_shift, active):
+        def kernel(values, mixes, offsets, initial_shift, active, _normalized):
             launches.append(use_status)
             if not use_status:
                 assert offsets.tolist() == ([0, 1, 3, 3, 3] if live else [0, 1, 3, 4, 5])
@@ -104,8 +104,7 @@ def test_fused_tuning_rejects_changed_pool_and_preserves_caller_state(monkeypatc
 
     def forward(channels, count, eps, rows_per_block=1):
         def kernel(x, res, weight, bias, *parameters_and_state):
-            assert len(parameters_and_state) == 9
-            scratch, indices, _status = parameters_and_state[-3:]
+            scratch, indices, _status, _normalized = parameters_and_state[-4:]
             scratch[indices.long()] = 2 if rows_per_block == 2 else 1
             return torch.ones_like(x), torch.ones(count, *x.shape, dtype=x.dtype)
         return kernel
@@ -197,7 +196,7 @@ def test_tokenshift_crosses_grid_y_limit():
     x = torch.randn(65536, 8, device="cuda", dtype=torch.bfloat16)
     cu = torch.tensor([0, x.shape[0]], device=x.device, dtype=torch.int32)
     zero = x.new_zeros((1, x.shape[1]))
-    output, final = _forward(8, 1, "int32")(x, zero, cu, zero, cu[:0])
+    output, final = _forward(8, 1, "int32")(x, zero, cu, zero, cu[:0], x[:0])
     dx, _, _ = _backward(8, 1, "int32", rows_per_block=1, need_mix=False)(
         output, zero, x, zero, cu, zero,
     )
@@ -232,7 +231,7 @@ def test_fused_t1_matches_training_and_preserves_inactive_slots(channels, count,
     for group in (1, 2, 4):
         pool = original.clone()
         actual_total, actual = _fused_forward(channels, count, 1e-5, group)(
-            x, res, weight, bias, *mix_args, pool, indices, status
+            x, res, weight, bias, *mix_args, pool, indices, status, x[:0],
         )
         assert torch.equal(total, actual_total)
         assert torch.equal(torch.stack(expected), actual)
@@ -287,7 +286,7 @@ def test_dynamic_batch_reuses_tokenshift_and_state_kernels(monkeypatch, use_stat
         status = indices.new_tensor([0, rows, batch])
         initial = gather_state(pool, indices, status)
         cu = indices.new_tensor(offsets)
-        output, final = forward(x, mixes, cu, initial, status if use_status else cu[:0])
+        output, final = forward(x, mixes, cu, initial, status if use_status else cu[:0], x[:0])
         expected = reference(x, mixes, offsets, initial) if rows else (output.new_empty(count, rows, channels)[0], initial)
         assert torch.equal(output[0], expected[0])
         assert torch.equal(final, expected[-1])
