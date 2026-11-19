@@ -10,7 +10,6 @@ import torch
 import torch.nn.functional as F
 from _timing import measure_cuda
 
-import flashrwkv2
 from flashrwkv2.mtp import DraftLoop
 
 
@@ -77,7 +76,6 @@ def main() -> None:
     parser.add_argument("--vocab", type=int, default=65536)
     parser.add_argument("--depth", type=int, default=4)
     parser.add_argument("--seed", type=int, default=20261116)
-    parser.add_argument("--tune", action="store_true")
     args = parser.parse_args()
     torch.manual_seed(args.seed)
     block, head, embedding = _weights(args.hidden, args.intermediate, args.vocab)
@@ -94,7 +92,6 @@ def main() -> None:
     def eager():
         return loop(hidden, token, embed)
 
-    tuning = flashrwkv2.prepare_tuning([eager], mode="tune") if args.tune else None
     loop.capture(embed)
     variants = {
         "torch_eager": lambda: torch_draft(hidden, token),
@@ -126,7 +123,6 @@ def main() -> None:
         "seed": args.seed,
         "head_read_bytes_per_draft_loop": args.depth * head.nbytes,
         "draft_ids": expected.tolist(),
-        "tuning": tuning,
     }))
 
 

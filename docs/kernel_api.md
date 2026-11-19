@@ -145,8 +145,7 @@ graph_ids = loop.replay(hidden, token_ids)
 `[1]` 或标量。调用方传入的 `embed` 接收 `[1]` 并返回同设备 BF16 `[1,C]`。
 每步使用 FP32 logits 选出下一个 draft token。
 
-`capture` 在 graph 外预热算子并绑定 embedding。非固定配置可先用
-`prepare_tuning` 预热给定模型尺寸。每次 `forward` 或 `replay` 返回同一
+`capture` 在 graph 外预热算子并绑定 embedding。每次 `forward` 或 `replay` 返回同一
 INT64 `[1,depth]` 缓冲区，跨调用保留时使用 `clone()`。同一实例串行使用，
 模块移动到新设备后重新 capture。目标模型验证和状态回退由调用方负责。
 
