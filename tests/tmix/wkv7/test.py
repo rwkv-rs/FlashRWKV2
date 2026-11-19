@@ -297,18 +297,21 @@ def test_static_metadata_validates_once_and_reads_only_a_summary() -> None:
 
 @pytest.mark.memcheck
 @pytest.mark.racecheck
-def test_fp16_deltalog_materializes_reads_and_preserves_overlapping_copies():
+@pytest.mark.parametrize("heads", [40, 64])
+def test_fp16_deltalog_materializes_reads_and_preserves_overlapping_copies(heads):
     from flashrwkv2.tmix.wkv7.tilelang import _infer_recurrent
 
     torch.manual_seed(67)
-    batch, heads, dim = 16, 40, 64
+    batch, dim = 16, 64
     slots = torch.arange(batch, device="cuda", dtype=torch.int32)
     bias = torch.randn(heads, dim, device="cuda", dtype=torch.bfloat16)
     raw = torch.randn(batch + 2, heads, dim, dim, device="cuda").mul_(0.03).half()
     initial, reference = raw.clone(), raw.clone()
     state = prepare_tmix_wkv7_recurrent_fp16_state_from_tensor(raw)
     base = heads * dim * dim * raw.element_size()
-    private = heads * (5 * dim + 1) * 4
+    props = torch.cuda.get_device_properties(raw.device)
+    compact = heads == 64 and (props.major, props.minor, props.multi_processor_count) == (8, 9, 128)
+    private = heads * (1540 if compact else 1284)
     assert state.memory_layout == {
         "base_bytes_per_slot": base, "private_bytes_per_slot": private,
         "bytes_per_slot": base + private, "fixed_workspace_nbytes": 0,
@@ -419,7 +422,7 @@ def test_fp16_deltalog_graph_replays_live_slot_counts_and_rejects_invalid_tails(
 @pytest.mark.parametrize("batch", [16, 257])
 def test_live_mixed_prefill_matches_token_decode_after_row_reordering(batch):
     torch.manual_seed(137)
-    heads, dim, capacity = 64, 64, batch + 17
+    heads, dim, capacity = 64, 64, batch + max(17, batch)
     slots = torch.randperm(batch, device="cuda", dtype=torch.int32)
     cu = torch.zeros(batch + 1, device="cuda", dtype=torch.int32)
     tokens = torch.zeros(1, device="cuda", dtype=torch.int32)
@@ -447,7 +450,12 @@ def test_live_mixed_prefill_matches_token_decode_after_row_reordering(batch):
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
         output = launch()
-    for lengths in ([1] * batch, [1] * (batch - 1) + [17], [5, 2, 7, 4, 3] + [1] * (batch - 9)):
+    # Eight-token prompts change the decode traversal on the large Ada graph.
+    prompts = (batch + 7) // 8
+    mixed = [1] * (batch - prompts) + [8] * prompts
+    for lengths in ([1] * batch, [1] * batch, [1] * (batch - 1) + [17],
+                    [1] * batch, mixed, [5, 2, 7, 4, 3] + [1] * (batch - 9)):
+        slots.copy_(slots.roll(3))
         lengths_gpu = torch.tensor(lengths, device="cuda", dtype=torch.int32)
         offsets = torch.cat((lengths_gpu.new_zeros(1), lengths_gpu.cumsum(0, dtype=torch.int32)))
         active, rows = sum(lengths), len(lengths)

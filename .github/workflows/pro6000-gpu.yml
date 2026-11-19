@@ -25,6 +25,7 @@ jobs:
     timeout-minutes: 25
     outputs:
       trusted: ${{ steps.trust.outputs.trusted }}
+      gpu_required: ${{ steps.trust.outputs.gpu_required }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -36,9 +37,18 @@ jobs:
           script: |
             if (context.eventName !== 'pull_request') {
               core.setOutput('trusted', 'true');
+              core.setOutput('gpu_required', 'true');
               return;
             }
             const pull = context.payload.pull_request;
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              ...context.repo, pull_number: pull.number, per_page: 100,
+            });
+            const doc = path => path === 'README.md' || /^docs\/.*\.md$/.test(path);
+            const docsOnly = files.length > 0 && files.length === pull.changed_files &&
+              files.every(file => doc(file.filename) &&
+                (!file.previous_filename || doc(file.previous_filename)));
+            core.setOutput('gpu_required', String(!docsOnly));
             let trusted = pull.head.repo?.full_name === process.env.GITHUB_REPOSITORY &&
               new Set(['OWNER', 'MEMBER', 'COLLABORATOR']).has(pull.author_association);
             if (!trusted && pull.head.repo?.full_name === process.env.GITHUB_REPOSITORY &&
@@ -66,7 +76,7 @@ jobs:
   gpu:
     name: GPU validation
     needs: package
-    if: needs.package.outputs.trusted == 'true'
+    if: needs.package.outputs.trusted == 'true' && needs.package.outputs.gpu_required == 'true'
     runs-on: [self-hosted, linux, x64, rwkv-sha-pro6000x8]
     timeout-minutes: 360
     concurrency:
@@ -113,8 +123,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
-      - name: Require package and GPU success
+      - name: Require package success and GPU coverage for runtime changes
         env:
           PACKAGE: ${{ needs.package.result }}
           GPU: ${{ needs.gpu.result }}
-        run: test "$PACKAGE" = success && test "$GPU" = success
+          GPU_REQUIRED: ${{ needs.package.outputs.gpu_required }}
+        run: |
+          test "$PACKAGE" = success
+          if [ "$GPU_REQUIRED" != false ]; then test "$GPU" = success; fi

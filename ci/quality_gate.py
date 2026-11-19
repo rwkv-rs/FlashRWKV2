@@ -44,23 +44,38 @@ def benchmarks(output):
             yield owner, script, []
 
 
+def pytest_cuda(output, env, name, *, marks="cuda", keywords=None, prefix=()):
+    junit = output / f"{name}.xml"
+    options = [] if keywords is None else ["-k", keywords]
+    run([*prefix, sys.executable, "-I", "-m", "pytest", "-q", "-m", marks, *options,
+         "-o", f"pythonpath={ROOT / 'tests'} {ROOT / 'benchmarks'}",
+         f"--junitxml={junit}", str(ROOT / "tests")], cwd=output, env=env)
+    count = sum(case.find("skipped") is None for case in ET.parse(junit).iter("testcase"))
+    if count == 0:
+        raise ValueError(f"{name} did not execute any CUDA tests")
+    return count
+
+
 def release_compatibility(output, env):
     # Use child interpreters so each test loads only its own Torch libraries.
+    cases = {}
     for version in TORCH_VERSIONS:
         run(["uv", "pip", "install", "--python", sys.executable, f"torch=={version}"], cwd=ROOT)
-        run([sys.executable, "-I", "-m", "pytest", "-q", "-m", "cuda", "-k",
-             "fullgraph or zero_temperature_is_deterministic_greedy or recurrent_forward_reference_and_grad_mode",
-             "-o", f"pythonpath={ROOT / 'tests'} {ROOT / 'benchmarks'}",
-             f"--junitxml={output / ('torch-' + version + '.xml')}", str(ROOT / "tests")], cwd=output, env=env)
+        cases[version] = pytest_cuda(
+            output, env, f"torch-{version}",
+            keywords="fullgraph or zero_temperature_is_deterministic_greedy or recurrent_forward_reference_and_grad_mode",
+        )
+    return cases
 
 
 def validate(args):
     output = args.output.resolve()
     output.mkdir(exist_ok=True, parents=True)
     env = dict(os.environ, PYTHONPATH=str(ROOT / "benchmarks"))
+    compatibility = {}
     if args.release:
         try:
-            release_compatibility(output, env)
+            compatibility = release_compatibility(output, env)
         finally:
             run(["uv", "sync", "--frozen", "--no-install-project", "--group", "dev"], cwd=ROOT)
             wheel, = args.dist.glob("*.whl")
@@ -82,20 +97,14 @@ def validate(args):
             if (name.startswith("flashrwkv2/") and not name.endswith("/")
                     and installed.locate_file(name).read_bytes() != archive.read(name)):
                 raise ValueError(f"installed file differs from {wheel.name}: {name}")
-    junit = output / "pytest.xml"
-    run([sys.executable, "-I", "-m", "pytest", "-q", "-o",
-         f"pythonpath={ROOT / 'tests'} {ROOT / 'benchmarks'}", f"--junitxml={junit}",
-         str(ROOT / "tests")], cwd=output, env=env)
-    suite = ET.parse(junit).getroot().find("testsuite")
-    passed = int(suite.attrib["tests"]) - int(suite.attrib["skipped"])
-    if passed <= 0:
-        raise ValueError("pytest must execute tests on the acceptance device")
+    passed = pytest_cuda(output, env, "pytest")
+    sanitizers = {}
     if args.release:
         for tool in ("memcheck", "racecheck"):
-            run(["compute-sanitizer", "--tool", tool, "--error-exitcode", "1",
-                 sys.executable, "-I", "-m", "pytest", "-q", "-o",
-                 f"pythonpath={ROOT / 'tests'} {ROOT / 'benchmarks'}", "-m", tool, str(ROOT / "tests")],
-                cwd=output, env=env)
+            sanitizers[tool] = pytest_cuda(
+                output, env, tool, marks=f"cuda and {tool}",
+                prefix=("compute-sanitizer", "--tool", tool, "--error-exitcode", "1"),
+            )
     measured = []
     for case, script, flags in benchmarks(output):
         with (output / (case.replace("/", "-") + ".log")).open("w") as log:
@@ -103,8 +112,8 @@ def validate(args):
         measured.append(case)
     report.write_text(json.dumps({"commit": revision(), "packages": hashes, "gpu": props.name,
                                  "architecture": arch, "sm_count": props.multi_processor_count,
-                                 "torch": str(torch.__version__), "passed": passed, "sanitizers": args.release,
-                                 "compatibility": TORCH_VERSIONS if args.release else [],
+                                 "torch": str(torch.__version__), "passed": passed, "sanitizers": sanitizers,
+                                 "compatibility": compatibility,
                                  "benchmarks": measured}, indent=2) + "\n")
 
 
@@ -115,8 +124,12 @@ def verify(args):
         report = json.loads((args.output / f"{arch}.json").read_text())
         if not (report["commit"] == revision() and report["packages"] == expected
                 and (report["architecture"], report["sm_count"]) == (arch, sms)
-                and report["sanitizers"] is True and report["passed"] > 0
-                and report["compatibility"] == list(TORCH_VERSIONS) and report["benchmarks"] == cases):
+                and report["passed"] > 0
+                and set(report["sanitizers"]) == {"memcheck", "racecheck"}
+                and all(count > 0 for count in report["sanitizers"].values())
+                and set(report["compatibility"]) == set(TORCH_VERSIONS)
+                and all(count > 0 for count in report["compatibility"].values())
+                and report["benchmarks"] == cases):
             raise ValueError(f"{arch} acceptance does not match the release commit and distributions")
 
 

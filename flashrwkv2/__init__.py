@@ -18,14 +18,15 @@ def _extension():
         _sys.modules[f"{__name__}._C"] = _C
     return _C
 
-
 from .cmix import infer_cmix_forward_varlen, pretrain_cmix_bf16
 from .embedding import infer_embedding_ln0_forward_varlen
 from .head.ce import pretrain_head_ce_bf16
+from .head.l2wrap_ce import pretrain_head_l2wrap_ce_bf16
 from .head.linear import (
-    pretrain_head_linear_bf16,
     infer_head_linear_all_forward_varlen,
+    pretrain_head_linear_bf16,
 )
+from .loss.l2wrap_ce import pretrain_l2wrap_ce_bf16
 from .post_norm import infer_post_norm_output_forward_varlen
 from .sampling import (
     infer_sampling_six_parameter_forward_varlen,
@@ -42,16 +43,18 @@ from .tmix.tokenshift import (
 from .tmix.wkv7 import (
     infer_tmix_wkv7_recurrent_fp16_forward_varlen,
     infer_tmix_wkv7_recurrent_fp32io16_forward_varlen,
-    prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor,
     prepare_tmix_wkv7_recurrent_fp16_state_from_tensor,
+    prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor,
     prepare_tmix_wkv7_recurrent_metadata,
     pretrain_tmix_wkv7_recurrent_bf16,
+    rl_infctx_tmix_wkv7_recurrent_bf16,
 )
-from .tmix.wkv_prepare import infer_tmix_wkv_prepare_forward_varlen, pretrain_tmix_wkv_prepare_bf16
+from .tmix.wkv_prepare import (
+    infer_tmix_wkv_prepare_forward_varlen,
+    pretrain_tmix_wkv_prepare_bf16,
+)
 
 __all__ = [
-    "pretrain_tmix_wkv_prepare_bf16",
-    "pretrain_head_linear_bf16",
     "infer_cmix_forward_varlen",
     "infer_embedding_ln0_forward_varlen",
     "infer_head_linear_all_forward_varlen",
@@ -62,14 +65,19 @@ __all__ = [
     "infer_tmix_wkv7_recurrent_fp16_forward_varlen",
     "infer_tmix_wkv7_recurrent_fp32io16_forward_varlen",
     "infer_tmix_wkv_prepare_forward_varlen",
-    "prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor",
     "prepare_tmix_wkv7_recurrent_fp16_state_from_tensor",
+    "prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor",
     "prepare_tmix_wkv7_recurrent_metadata",
     "pretrain_cmix_bf16",
     "pretrain_head_ce_bf16",
+    "pretrain_head_l2wrap_ce_bf16",
+    "pretrain_head_linear_bf16",
+    "pretrain_l2wrap_ce_bf16",
     "pretrain_tmix_readout_bf16",
     "pretrain_tmix_tokenshift_bf16",
     "pretrain_tmix_wkv7_recurrent_bf16",
+    "pretrain_tmix_wkv_prepare_bf16",
+    "rl_infctx_tmix_wkv7_recurrent_bf16",
     "setup_sampling_states",
 ]
 

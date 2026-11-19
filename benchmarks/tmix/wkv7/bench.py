@@ -148,13 +148,15 @@ def main():
                      if args.slot_order == "random" else torch.arange(batch, device="cuda", dtype=torch.int32))
             slot_ids = slots.tolist()
             if args.metadata == "live":
-                metadata_args = dict(
-                    token_capacity=tokens, sequence_capacity=batch, max_seqlen_capacity=length,
-                    num_active_tokens=torch.tensor([tokens], device="cuda", dtype=torch.int32),
-                    num_active_sequences=torch.tensor([batch], device="cuda", dtype=torch.int32),
-                )
+                metadata_args = {
+                    "token_capacity": tokens,
+                    "sequence_capacity": batch,
+                    "max_seqlen_capacity": length,
+                    "num_active_tokens": torch.tensor([tokens], device="cuda", dtype=torch.int32),
+                    "num_active_sequences": torch.tensor([batch], device="cuda", dtype=torch.int32),
+                }
             else:
-                metadata_args = dict(total_tokens=tokens, max_seqlen=length)
+                metadata_args = {"total_tokens": tokens, "max_seqlen": length}
             prepare_ticket = partial(prepare_tmix_wkv7_recurrent_metadata, cu, slots,
                                      state_pool_size=pool_size, **metadata_args)
             ticket = prepare_ticket()
@@ -184,7 +186,7 @@ def main():
                 decay_bias=bias,
                 max_seqlen=length,
             )
-            def run():
+            def run(prepare_ticket=prepare_ticket, ticket=ticket, run_layer=run_layer):
                 batch_ticket = prepare_ticket() if args.include_ticket_preparation else ticket
                 return run_layer(validated_metadata=batch_ticket)
 
@@ -197,7 +199,7 @@ def main():
                 if args.state_dtype == "float16" and heads in (40, 64) and dim == 64 and hasattr(ticket, "_row_order"):
                     dispatch = {"reason": "device-ordered rows, per-slot decode, tiled or full-head prefill by active prefill count"}
                 elif selector is not None:
-                    columns, prefetch = selector(values[0], batch, pool.dtype, None, None)
+                    columns, prefetch = selector(values[0], batch, None, None)
                     if length == 1:
                         reason = "one token per sequence"
                     elif prefetch > 1:
@@ -206,7 +208,9 @@ def main():
                         reason = "canonical recurrent tile for this geometry"
                     dispatch = {"block_values": columns, "prefetch_tokens": prefetch, "reason": reason}
 
-            expected = run().clone()
+            # Six calls cover both traversal directions and every Ada writeback phase.
+            check_steps = 6 if args.state_dtype == "float16" and batch >= 16 and 1 in lengths else 1
+            expected_outputs = [run().clone() for _ in range(check_steps)]
             state.materialize_slots_(slots)
             expected_state = pool.clone()
             if pool_size > batch:
@@ -229,7 +233,7 @@ def main():
                     state_pool_size=1,
                     max_seqlen=size,
                 )
-                actual = infer(
+                run_single = partial(infer,
                     *(
                         value[offsets_cpu[row] : offsets_cpu[row + 1]].contiguous()
                         for value in values
@@ -241,15 +245,12 @@ def main():
                     max_seqlen=size,
                     validated_metadata=single_ticket,
                 )
+                row_slice = slice(offsets_cpu[row], offsets_cpu[row + 1])
+                checks = [("output_relative_l2", run_single(), expected[row_slice])
+                          for expected in expected_outputs]
                 single.materialize_slots_(slot)
-                for name, result, reference in (
-                    (
-                        "output_relative_l2",
-                        actual,
-                        expected[offsets_cpu[row] : offsets_cpu[row + 1]],
-                    ),
-                    ("state_relative_l2", single_pool[0], expected_state[slot_id]),
-                ):
+                checks.append(("state_relative_l2", single_pool[0], expected_state[slot_id]))
+                for name, result, reference in checks:
                     error = float(
                         (result.float() - reference.float()).norm()
                         / reference.float().norm().clamp_min(1e-12)
@@ -280,7 +281,7 @@ def main():
                 "decay_bias_dtype": None
                 if bias is None
                 else str(bias.dtype).removeprefix("torch."),
-                "output_dtype": str(expected.dtype).removeprefix("torch."),
+                "output_dtype": str(expected_outputs[0].dtype).removeprefix("torch."),
                 "state_dtype": str(pool.dtype).removeprefix("torch."),
                 "state_memory_layout": state.memory_layout,
                 "metadata": {
@@ -295,6 +296,7 @@ def main():
                 if args.implementation == "tilelang"
                 else "batch-relative-l2-passed",
                 "correctness_errors": errors,
+                "correctness_steps": check_steps,
                 "timing": timing,
             }
             if dispatch is not None:

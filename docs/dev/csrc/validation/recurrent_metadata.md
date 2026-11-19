@@ -9,7 +9,9 @@ slot 范围与唯一性。去重使用 Fibonacci hash 和 linear probing，工�
 sequence capacity 决定。状态为三个 INT32：`[error, active_tokens, active_sequences]`。
 
 混合 batch 的 ticket 还包含设备上的执行顺序和 prefill 行数。验证器按有效行长度
-稳定降序排列，长度为 1 的 decode 行排在 prefill 之后。单行以及保证全是 decode
+降序排列，长度为 1 的 decode 行排在 prefill 之后。在 128 个 SM 的 RTX 4090 上，
+当有效序列至少为 256 且 prefill 占至少一半有效 token 时，decode 行按物理 slot 排序，
+让同一份顺序在所有层上复用。其他批次保留调度器给定的 decode 顺序。单行以及保证全是 decode
 的 ticket 省去排序。所有 WKV 层共享这份顺序。
 
 静态 preparation 回读 4 个 INT32 的摘要，得到同步异常与精确 max_seqlen。

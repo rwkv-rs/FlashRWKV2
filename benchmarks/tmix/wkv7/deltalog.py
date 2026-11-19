@@ -1,9 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""Time an exact two-token FP16 DeltaLog cycle against public WKV decode.
-
-The append leaves the bound state at the start of the cycle. The merge replays
-that update, rounds to FP16, then applies and materializes the second update.
-"""
+"""Time a full writeback and traversal cycle against materialized FP16 decode."""
 
 import argparse
 import json
@@ -21,15 +17,17 @@ from flashrwkv2.tmix.wkv7.tilelang import _infer_recurrent
 
 
 def compare(heads, batch, verify_only, slot_order):
-    steps = [
-        torch.randn(6, batch, heads, 64, device="cuda").mul_(0.04).bfloat16()
-        for _ in range(2)
-    ]
     initial = torch.randn(batch, heads, 64, 64, device="cuda").mul_(0.05).half()
     pool = initial.clone()
     state = prepare_tmix_wkv7_recurrent_fp16_state_from_tensor(pool)
+    cycle_steps = 6 if state._delta[0].shape[2] == 6 else 2
+    steps = [
+        torch.randn(6, batch, heads, 64, device="cuda").mul_(0.04).bfloat16()
+        for _ in range(cycle_steps)
+    ]
     cu = torch.arange(batch + 1, device="cuda", dtype=torch.int32)
-    slots = [cu[:-1], cu[:-1].flip((0,)) if slot_order == "reverse" else cu[:-1]]
+    slots = [cu[:-1].flip((0,)) if slot_order == "reverse" and i % 2 else cu[:-1]
+             for i in range(cycle_steps)]
     tickets = [
         prepare_tmix_wkv7_recurrent_metadata(
             cu,
@@ -55,10 +53,10 @@ def compare(heads, batch, verify_only, slot_order):
         )
 
     def ordinary():
-        return dense_step(0), dense_step(1)
+        return tuple(dense_step(i) for i in range(cycle_steps))
 
     def serving():
-        return serving_step(0), serving_step(1)
+        return tuple(serving_step(i) for i in range(cycle_steps))
 
     def reset():
         state.zero_()
@@ -66,7 +64,7 @@ def compare(heads, batch, verify_only, slot_order):
 
     first = dense_step(0)
     mid = pool.clone()
-    reference = first, dense_step(1), pool.clone()
+    reference = (first, *(dense_step(i) for i in range(1, cycle_steps)), pool.clone())
 
     def check(outputs):
         for actual, expected in zip((*outputs, pool), reference, strict=True):
@@ -83,9 +81,9 @@ def compare(heads, batch, verify_only, slot_order):
     deferred = torch.equal(pool.view(torch.int16), initial.view(torch.int16))
     state.materialize_slots_(slots[0][::2].contiguous())
     assert torch.equal(pool[::2].view(torch.int16), mid[::2].view(torch.int16))
-    second = serving_step(1)
-    state.materialize_slots_(slots[1])
-    check((first, second))
+    outputs = (first, *(serving_step(i) for i in range(1, cycle_steps)))
+    state.materialize_slots_(slots[0])
+    check(outputs)
 
     times = (
         {}
@@ -107,6 +105,7 @@ def compare(heads, batch, verify_only, slot_order):
         "batch": batch,
         "bitwise_equal": True,
         "first_step_deferred": deferred,
+        "tokens_per_cycle": cycle_steps,
         "log_bytes_per_slot": state.memory_layout["private_bytes_per_slot"],
         **times,
     }

@@ -14,8 +14,8 @@ four groups of 16 keys for each dot product. A live metadata ticket schedules lo
 prefill rows first, and each decode slot can append to its DeltaLog independently.
 With one to three prefill rows, four blocks share each head's value columns.
 With four or more prefill rows, one block handles a whole head.
-These state pools reserve 1,284 additional bytes
-per head per slot for exact DeltaLog replay. Use the handle's `memory_layout`
+On the 128-SM RTX 4090, H64 stores up to two exact DeltaLog records per head
+and slot (1,540 bytes). The other H40/H64 configurations store one record (1,284 bytes). Use the handle's `memory_layout`
 when budgeting concurrency. Call `materialize_slots_(indices)` before reading
 or copying the externally bound tensor. Training, RL rollout and its evaluation
 and sampling search use FP32 state to reproduce the learner's logprobs.
@@ -99,7 +99,9 @@ across training/inference, prefill/decode, and batch composition.
 The required **Quality Gate** builds the wheel and sdist, runs CPU contracts, and runs
 pytest and every operator benchmark on the PRO 6000 against the installed wheel.
 Each run uploads its distributions, JUnit XML, device metadata and benchmark results.
-Trusted repository PRs run on the self-hosted GPU. Daily runs cover the main branch.
+Documentation-only PRs can pass with the package and CPU checks. Runtime changes
+require a trusted repository branch for the self-hosted GPU check. Daily runs cover
+the main branch.
 
 For a release, dispatch **Quality Gate** on the release tag for the Torch 2.11–2.14 compatibility matrix and
 Compute Sanitizer memcheck and racecheck. Download its `dist-<commit>` artifact to `artifacts/dist` on the

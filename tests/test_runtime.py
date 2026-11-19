@@ -18,7 +18,9 @@ PUBLIC_MODULES = (
     "flashrwkv2.cmix",
     "flashrwkv2.embedding",
     "flashrwkv2.head.ce",
+    "flashrwkv2.head.l2wrap_ce",
     "flashrwkv2.head.linear",
+    "flashrwkv2.loss.l2wrap_ce",
     "flashrwkv2.post_norm",
     "flashrwkv2.sampling",
     "flashrwkv2.tmix.readout",
@@ -32,6 +34,7 @@ PUBLIC_PREFIXES = (
     "infer_",
     "prepare_",
     "pretrain_",
+    "rl_infctx_",
 )
 
 

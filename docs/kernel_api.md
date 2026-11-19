@@ -77,10 +77,11 @@ FP32 tensor。每次调用返回时状态完整写回。
 对 D64、H40/H64，两个点积都在四个连续的 16-key 组内使用 FP32 FMA 顺序累加，
 然后按 `(s0 + s1) + (s2 + s3)` 合并。该求和顺序同时用于单行、混合 batch 和单 token decode。
 
-D64、H40 或 H64 的 FP16 handle 为每个 slot、每个头分配五个长度为 64 的 FP32 向量和一个
-int32 phase，共 1,284 字节。批量 decode 可以把一步更新留在日志，下次读取该 slot 时按原
+D64、H40/H64 的 FP16 handle 按 slot 和头分配 DeltaLog。128 个 SM 的 RTX 4090 在 H64 下
+每条记录保存四个 BF16 操作数和一个 FP32 点积。每个头最多保留两条记录，加上 int32 phase 共 1,540 字节。
+其他 H40/H64 配置保存五个长度为 64 的 FP32 向量和一个 int32 phase，共 1,284 字节。批量 decode 追加记录，下一次读取该 slot 时按原
 FP32 顺序重放并舍入。同一批次里的单 token 行独立决定追加或写回，长行优先执行。
-H64 模型的 32 层每序列共用 16 MiB 基态和约 2.508 MiB 日志。
+H64 模型的 32 层每序列共用 16 MiB 基态，双记录日志占 3.008 MiB，五向量日志占 2.508 MiB。
 其他几何和 FP32 handle 的私有字节数为零。容量规划使用 `memory_layout["bytes_per_slot"]`，
 其中包括基态和日志，`fixed_workspace_nbytes` 为零。
 
@@ -111,10 +112,16 @@ FP16 prefill 按四个 token 一块处理整块，每行最后单独处理 0–3
 | `pretrain_tmix_tokenshift_bf16` | 六路 TokenShift；stateful 形式返回混合输出和 final shift |
 | `pretrain_tmix_wkv_prepare_bf16` | 训练权重布局与 `w0` bias，输出共享 BF16 prepare 结果 |
 | `pretrain_tmix_wkv7_recurrent_bf16` | dense `[B,T,C]` 或带 cu_seqlens 的 packed `[N,H,D]`，支持任意长度和可微 FP32 初始状态 |
+| `rl_infctx_tmix_wkv7_recurrent_bf16` | packed 六路输入、`state_pool`、`cu_seqlens`、可选 `state_indices`，返回 `(output, final_pool)`；未选中槽位保持原值，输入和 state 可求梯度 |
 | `pretrain_tmix_readout_bf16` | head ln、RKV residual、gate，可选 output projection |
 | `pretrain_cmix_bf16` | ChannelMix 与可微初始/最终 shift state |
 | `pretrain_head_linear_bf16` | BF16 hidden/weight，返回 FP32 logits |
 | `pretrain_head_ce_bf16` | `chunk_rows` 限制前向词表投影工作集，按 targets 形状返回 FP32 交叉熵，-100 对应零 loss 和梯度，`backward_chunk_rows` 可独立设置反向重算和 VJP 的行数，默认沿用 `chunk_rows` |
+| `pretrain_l2wrap_ce_bf16` | 对任意前置维度的 logits 计算 FP32 交叉熵，梯度包含 train_temp L2Wrap 项 |
+| `pretrain_head_l2wrap_ce_bf16` | 分段投影并计算带 train_temp L2Wrap 梯度的 FP32 交叉熵 |
+
+WKV 的公共 state 布局使用相同的 key/value head 宽度。FLA 的非等宽
+key/value 路径需要独立的 state 布局和 readout 验证。
 
 投影支持 LoRA/NoRA：A `[R,K]`、B `[O,R]`，参数可为 BF16/FP32。
 NoRA 为 `A / (norm(A, dim=0) + 1e-6)`，FP32 归一化与反向，BF16 投影；
