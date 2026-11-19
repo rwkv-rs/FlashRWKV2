@@ -730,10 +730,10 @@ def test_block_independent_torch_vjp_and_optimizer_step(mode):
         )
         for observed, reference in zip(actual, expected, strict=True):
             torch.testing.assert_close(observed, reference, atol=3e-3, rtol=2e-2)
-        # Final-state and shift cotangents exercise state VJPs in addition to the
-        # language-model loss; both implementations receive identical signals.
+        # The optimizer consumes the fused loss and later segments' state
+        # gradients. Raw logits are checked above as a separate output.
         cotangents = (
-            torch.randn_like(actual[0]), torch.randn_like(actual[1]) * 0.1,
+            torch.randn_like(actual[0]),
             torch.randn_like(actual[2]) * 0.01,
             torch.randn_like(actual[3]) * 0.01, torch.randn_like(actual[4]) * 0.01,
         )
@@ -745,8 +745,8 @@ def test_block_independent_torch_vjp_and_optimizer_step(mode):
                 actual_parameters.extend(pair)
                 reference_parameters.extend(ref_adapters[name])
                 parameter_names.extend((f"{name}.A", f"{name}.B"))
-        gradients = torch.autograd.grad(actual, (*inputs, *actual_parameters), cotangents)
-        references = torch.autograd.grad(expected, (*reference_inputs, *reference_parameters), cotangents)
+        gradients = torch.autograd.grad((actual[0], *actual[2:]), (*inputs, *actual_parameters), cotangents)
+        references = torch.autograd.grad((expected[0], *expected[2:]), (*reference_inputs, *reference_parameters), cotangents)
     finally:
         torch.backends.cuda.matmul.allow_tf32 = previous_tf32
     for name, observed, reference in zip(

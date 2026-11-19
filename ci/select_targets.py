@@ -17,7 +17,9 @@ MODULES = (
     "cmix",
     "embedding",
     "head/ce",
+    "head/l2wrap_ce",
     "head/linear",
+    "loss/l2wrap_ce",
     "sampling",
     "tmix/readout",
     "tmix/tokenshift",
@@ -37,7 +39,8 @@ SHARED_PREFIXES = ("csrc/bindings.cpp", "csrc/registration.cpp", "csrc/validatio
 MODULE_CONSUMERS = {
     "post_norm": ("embedding", "cmix", "tmix/tokenshift"),
     "tmix/tokenshift": ("cmix",),
-    "head/linear": ("head/ce",),
+    "head/linear": ("head/ce", "head/l2wrap_ce"),
+    "loss/l2wrap_ce": ("head/l2wrap_ce",),
     "tmix/wkv7": ("tmix/tokenshift", "cmix"),
 }
 PACKAGE_FILES = {
@@ -64,6 +67,7 @@ SHARED_PRIMITIVE_CALLERS = {
         "cmix",
         "head/linear",
         "head/ce",
+        "head/l2wrap_ce",
         "tmix/readout",
         "tmix/wkv_prepare",
     ),
@@ -79,7 +83,10 @@ SHARED_PRIMITIVE_CALLERS = {
         "tmix/tokenshift",
         "tmix/wkv7",
         "head/ce",
+        "head/l2wrap_ce",
+        "loss/l2wrap_ce",
     ),
+    "flashrwkv2/_internal/logprob.py": ("head/l2wrap_ce", "loss/l2wrap_ce"),
     "flashrwkv2/_internal/tuning.py": MODULES,
 }
 DOC_PREFIXES = ("docs/",)
@@ -473,6 +480,7 @@ def _self_test() -> None:
     assert set(classify(["flashrwkv2/head/linear/__init__.py"]).affected_modules) == {
         "head/linear",
         "head/ce",
+        "head/l2wrap_ce",
     }
     primitive = classify(["flashrwkv2/_internal/linear.py"])
     assert set(primitive.affected_modules) == set(

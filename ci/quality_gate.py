@@ -68,6 +68,8 @@ COMPATIBILITY_PATHS = (
     BLOCK_TEST,
     "tests/tmix/wkv7/test_tilelang.py",
     "tests/head/ce",
+    "tests/head/l2wrap_ce",
+    "tests/loss/l2wrap_ce",
     "tests/tmix/wkv_prepare",
     "tests/cmix",
     "tests/sampling",

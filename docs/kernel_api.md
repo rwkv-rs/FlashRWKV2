@@ -112,10 +112,16 @@ FP16 prefill 按四个 token 一块处理整块，每行最后单独处理 0–3
 | `pretrain_tmix_tokenshift_bf16` | 六路 TokenShift；stateful 形式返回混合输出和 final shift |
 | `pretrain_tmix_wkv_prepare_bf16` | 训练权重布局与 `w0` bias，输出共享 BF16 prepare 结果 |
 | `pretrain_tmix_wkv7_recurrent_bf16` | dense `[B,T,C]` 或带 cu_seqlens 的 packed `[N,H,D]`，支持任意长度和可微 FP32 初始状态 |
+| `rl_infctx_tmix_wkv7_recurrent_bf16` | packed 六路输入、`state_pool`、`cu_seqlens`、可选 `state_indices`，返回 `(output, final_pool)`；未选中槽位保持原值，输入和 state 可求梯度 |
 | `pretrain_tmix_readout_bf16` | head ln、RKV residual、gate，可选 output projection |
 | `pretrain_cmix_bf16` | ChannelMix 与可微初始/最终 shift state |
 | `pretrain_head_linear_bf16` | BF16 hidden/weight，返回 FP32 logits |
 | `pretrain_head_ce_bf16` | `chunk_rows` 限制前向词表投影工作集，按 targets 形状返回 FP32 交叉熵，-100 对应零 loss 和梯度，`backward_chunk_rows` 可独立设置反向重算和 VJP 的行数，默认沿用 `chunk_rows` |
+| `pretrain_l2wrap_ce_bf16` | 对任意前置维度的 logits 计算 FP32 交叉熵，梯度包含 train_temp L2Wrap 项 |
+| `pretrain_head_l2wrap_ce_bf16` | 分段投影并计算带 train_temp L2Wrap 梯度的 FP32 交叉熵 |
+
+WKV 的公共 state 布局使用相同的 key/value head 宽度。FLA 的非等宽
+key/value 路径需要独立的 state 布局和 readout 验证。
 
 投影支持 LoRA/NoRA：A `[R,K]`、B `[O,R]`，参数可为 BF16/FP32。
 NoRA 为 `A / (norm(A, dim=0) + 1e-6)`，FP32 归一化与反向，BF16 投影；
