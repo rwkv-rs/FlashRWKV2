@@ -470,12 +470,12 @@ def tune_tokenshift(x, mixes, cu_seqlens, initial_shift=None, *, _status=None):
 
     def functional(block):
         return _forward(*options, block)(
-            x[:active_rows], mixes, functional_cu, initial_shift, cu_seqlens[:0]
+            x[:active_rows], mixes, functional_cu, initial_shift, cu_seqlens[:0], x[:0]
         )
 
     def production(block):
         return _forward(*options, block, True)(
-            x, mixes, cu_seqlens, initial_shift, status
+            x, mixes, cu_seqlens, initial_shift, status, x[:0]
         )
 
     def check(block):
@@ -508,7 +508,7 @@ def tune_fused_tokenshift(x, res, weight, bias, mixes, pool, indices, status, ep
 
     def run(group):
         return _fused_forward(x.shape[1], len(mixes), eps, group)(
-            x, res, weight, bias, *mix_args, scratch, indices, status
+            x, res, weight, bias, *mix_args, scratch, indices, status, x[:0]
         )
 
     def check(group):
