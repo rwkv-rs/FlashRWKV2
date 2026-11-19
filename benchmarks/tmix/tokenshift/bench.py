@@ -68,11 +68,9 @@ def main() -> None:
     )
     tuning = {}
     if args.tune:
-        from flashrwkv2.post_norm.tilelang import norm, tune_norm
-        from flashrwkv2.tmix.tokenshift.tilelang import (
-            tune_fused_tokenshift,
-            tune_tokenshift,
-        )
+        from _tuning import tune_fused_tokenshift, tune_norm, tune_tokenshift
+
+        from flashrwkv2.post_norm.tilelang import norm
 
         if args.seqlen == 1:
             tuning["fused"] = tune_fused_tokenshift(

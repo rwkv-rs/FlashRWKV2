@@ -6,21 +6,18 @@ import tilelang.language as T
 import torch
 from torch.autograd.function import once_differentiable
 
-from ..._internal.elementwise import _activation_kernel, activation, sum_partials
+from ..._internal.elementwise import _activation_kernel, sum_partials
 from ..._internal.linear import (
     _aligned,
     _forward,
     _projection_config,
-    _projection_variants,
     adapter_linear,
     linear_input_vjp,
 )
-from ..._internal.tuning import (
+from ..._internal.execution import (
     _AutogradContext,
     _fixed_strategy_device,
     device_class,
-    prepare_variants,
-    tuning_operation,
     workload_bucket,
 )
 from ..kk_pre.tilelang import prepare as prepare_key
@@ -496,16 +493,8 @@ def _group_call(xs, weights, kinds, biases, raw_mode, config, dynamic_k=False):
             if dynamic_k
             else _fixed_projection_config(xs, weights)
         )
-        from ..._internal.tuning import get_config
 
-        config = get_config(
-            _GROUP_CONFIGS,
-            "tmix/wkv_prepare",
-            _group_key(xs, weights, kinds, biases),
-            fixed,
-            tune=lambda: _tune_grouped_linear(xs, weights, kinds, biases),
-            fixed=fixed is not None,
-        )
+        config = _GROUP_CONFIGS.get(_group_key(xs, weights, kinds, biases), fixed)
         if config is None:
             config = _projection_config(
                 xs[0].shape[0],
@@ -540,36 +529,6 @@ def _group_call(xs, weights, kinds, biases, raw_mode, config, dynamic_k=False):
         major * 10 + minor,
         count,
     ) + ((True, aligned_k) if dynamic_k else ())
-    if automatic and fixed is not None:
-        family = key[:5] + key[6:10] + ((True, xs[0].shape[0]) if dynamic_k else ())
-
-        def variants():
-            if dynamic_k:
-                return tuple(
-                    key[:5]
-                    + (
-                        _projection_config(
-                            xs[0].shape[0],
-                            None,
-                            outputs[:count],
-                            xs[0].device,
-                            aligned_k=a,
-                        ),
-                    )
-                    + key[6:10]
-                    + (True, a)
-                    for a in (False, True)
-                )
-            return tuple(
-                key[:5] + (c,) + key[6:]
-                for c in _projection_variants(
-                    channels[:count], outputs[:count], xs[0].device
-                )
-            )
-
-        prepare_variants(
-            "tmix/wkv_prepare", family, variants, _GROUP_KERNELS, _group_spec
-        )
     empty = xs[0].new_empty(0)
     bias_args = tuple(empty if bias is None else bias for bias in biases)
     args = (
@@ -784,103 +743,3 @@ def _grouped_linear(xs, weights, kinds, biases):
         value.view(*shape, weight.shape[0])
         for value, weight in zip(values, weights, strict=True)
     )
-
-
-@torch.no_grad()
-@tuning_operation
-def _tune_grouped_linear(xs, weights, kinds, biases, *, benchmark=None):
-    """Verify independent FP32 accumulators and BF16 epilogues before timing."""
-    from ..._internal.tuning import (
-        benchmark_config,
-        compile_candidates,
-        projection_configs,
-        projection_finalists,
-        save_config,
-        select_config,
-    )
-
-    xs, weights, biases = _group_inputs(xs, weights, biases)
-    cache_key = _group_key(xs, weights, kinds, biases)
-    raw_reference = tuple(
-        _forward(x, weight, None, torch.float32, (16, 64, 2, 32))
-        for x, weight in zip(xs, weights, strict=True)
-    )
-    value_reference = tuple(
-        activation(raw.bfloat16(), {0: "identity", 1: "tanh", 2: "sigmoid"}[kind], bias)
-        if kind or bias is not None
-        else raw.bfloat16()
-        for raw, kind, bias in zip(raw_reference, kinds, biases, strict=True)
-    )
-    reference = (
-        *(value.view(torch.int16) for value in value_reference),
-        *(value.view(torch.int32) for value in raw_reference),
-    )
-
-    def run(config):
-        if benchmark is None:
-            return _run_groups(xs, weights, kinds, biases, config=config)[0]
-        _GROUP_CONFIGS[cache_key] = config
-        return benchmark_config("tmix/wkv_prepare", cache_key, benchmark)
-
-    def check(config):
-        values, _ = _run_groups(xs, weights, kinds, biases, config=config)
-        _, raw = _run_groups(xs, weights, kinds, biases, raw_mode=2, config=config)
-        result = [value.view(torch.int16) for value in values]
-        position = 0
-        for weight in weights:
-            size = xs[0].shape[0] * weight.shape[0]
-            value = raw[position : position + size].view(
-                xs[0].shape[0], weight.shape[0]
-            )
-            result.append(value.view(torch.int32))
-            position += size
-        return tuple(result)
-
-    measurements = {}
-    for _ in range(2):
-        eligible = projection_configs(
-            xs[0].shape[0], tuple(x.shape[1] for x in xs),
-            tuple(weight.shape[0] for weight in weights), xs[0].device,
-            measurements.values(),
-        )
-        if not eligible:
-            break
-        rejected = []
-        compile_candidates(
-            (
-                _group_call(xs, weights, kinds, biases, mode, config)[0]
-                for config in eligible
-                for mode in (0, 2)
-            ),
-            _GROUP_KERNELS,
-            _group_spec,
-        )
-        compiled = []
-        for config in eligible:
-            try:
-                for mode in (0, 2):
-                    _compiled_group(
-                        *_group_call(xs, weights, kinds, biases, mode, config)[0]
-                    )
-            except RuntimeError as error:
-                rejected.append({"config": config, "compile_error": str(error)})
-            else:
-                compiled.append(config)
-        _, checked = select_config(compiled, run, check=check, reference=reference)
-        measurements.update((item["config"], item) for item in (*checked, *rejected))
-    best, checked = select_config(
-        projection_finalists(measurements.values()),
-        run,
-        check=check,
-        reference=reference,
-        repeat=1000,
-    )
-    measurements.update((item["config"], item) for item in checked)
-    _GROUP_CONFIGS[cache_key] = best
-    save_config("tmix/wkv_prepare", cache_key, best)
-    return {
-        "config": best,
-        "milliseconds": measurements[best]["milliseconds"],
-        "timing_scope": "operator" if benchmark is not None else "grouped_projection",
-        "candidates": list(measurements.values()),
-    }

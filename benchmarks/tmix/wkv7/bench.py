@@ -8,6 +8,7 @@ BF16 control runs and FP16 production runs through its owning FP32IO16 state.
 import argparse
 import json
 from functools import partial
+from inspect import signature
 from itertools import accumulate
 from pathlib import Path
 
@@ -148,13 +149,15 @@ def main():
                      if args.slot_order == "random" else torch.arange(batch, device="cuda", dtype=torch.int32))
             slot_ids = slots.tolist()
             if args.metadata == "live":
-                metadata_args = dict(
-                    token_capacity=tokens, sequence_capacity=batch, max_seqlen_capacity=length,
-                    num_active_tokens=torch.tensor([tokens], device="cuda", dtype=torch.int32),
-                    num_active_sequences=torch.tensor([batch], device="cuda", dtype=torch.int32),
-                )
+                metadata_args = {
+                    "token_capacity": tokens,
+                    "sequence_capacity": batch,
+                    "max_seqlen_capacity": length,
+                    "num_active_tokens": torch.tensor([tokens], device="cuda", dtype=torch.int32),
+                    "num_active_sequences": torch.tensor([batch], device="cuda", dtype=torch.int32),
+                }
             else:
-                metadata_args = dict(total_tokens=tokens, max_seqlen=length)
+                metadata_args = {"total_tokens": tokens, "max_seqlen": length}
             prepare_ticket = partial(prepare_tmix_wkv7_recurrent_metadata, cu, slots,
                                      state_pool_size=pool_size, **metadata_args)
             ticket = prepare_ticket()
@@ -165,7 +168,7 @@ def main():
             )
             tuning = None
             if args.tune:
-                from flashrwkv2.tmix.wkv7.tilelang import tune_tmix_wkv7_recurrent
+                from _tuning import tune_tmix_wkv7_recurrent
 
                 tuning = tune_tmix_wkv7_recurrent(
                     *values,
@@ -184,9 +187,36 @@ def main():
                 decay_bias=bias,
                 max_seqlen=length,
             )
-            def run():
+            def run(prepare_ticket=prepare_ticket, ticket=ticket, run_layer=run_layer):
                 batch_ticket = prepare_ticket() if args.include_ticket_preparation else ticket
                 return run_layer(validated_metadata=batch_ticket)
+
+            dispatch = None
+            if is_tilelang:
+                from flashrwkv2.tmix.wkv7 import tilelang as wkv7
+
+                # The benchmark can also load earlier package revisions via PYTHONPATH.
+                selector = getattr(wkv7, "_recurrent_config", None)
+                if args.state_dtype == "float16" and heads in (40, 64) and dim == 64 and hasattr(ticket, "_row_order"):
+                    reason = "per-slot decode, tiled or full-head prefill by active prefill count"
+                    delta = getattr(state, "_delta", None)
+                    if delta is not None and delta[0].shape[2] == 6 and batch >= 128:
+                        reason = "Ada two-record log with alternating decode traversal"
+                        if ticket._row_order().numel():
+                            reason += " and separate prefill/decode streams"
+                    dispatch = {"reason": reason}
+                elif selector is not None:
+                    options = {"columns": None, "prefetch": None}
+                    if "state_dtype" in signature(selector).parameters:
+                        options["state_dtype"] = pool.dtype
+                    columns, prefetch = selector(values[0], batch, **options)
+                    if length == 1:
+                        reason = "one token per sequence"
+                    elif prefetch > 1:
+                        reason = "validated D64 multi-token prefetch"
+                    else:
+                        reason = "canonical recurrent tile for this geometry"
+                    dispatch = {"block_values": columns, "prefetch_tokens": prefetch, "reason": reason}
 
             # Six calls cover both traversal directions and every Ada writeback phase.
             check_steps = 6 if args.state_dtype == "float16" and batch >= 16 and 1 in lengths else 1
@@ -279,6 +309,8 @@ def main():
                 "correctness_steps": check_steps,
                 "timing": timing,
             }
+            if dispatch is not None:
+                record["dispatch"] = dispatch
             if tuning is not None:
                 record["tuning"] = tuning
             results.append(record)

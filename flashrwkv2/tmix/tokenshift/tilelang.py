@@ -7,15 +7,13 @@ import tilelang
 import tilelang.language as T
 import torch
 
-from ..._internal.tuning import (
+from ..._internal.execution import (
     _AutogradContext,
     device_class,
-    prepared_kernel,
-    tuning_operation,
     workload_bucket,
 )
 from ...post_norm.tilelang import _check_inputs as _check_norm
-from ...post_norm.tilelang import _fixed_rows, _normalize, _row_layout
+from ...post_norm.tilelang import _normalize, _row_layout
 
 _BLOCK_CONFIGS = {}
 _FUSED_CONFIGS = {}
@@ -135,17 +133,10 @@ def fused_post_norm_tokenshift(x, res, weight, bias, mixes, pool, indices, statu
         raise ValueError("shift state must be contiguous CUDA bfloat16 [slots,C]")
     if x.shape[1] % 2 == 0 and pool.data_ptr() % 4:
         raise ValueError("fused TokenShift state and parameters must be 4-byte aligned")
-    from ..._internal.tuning import get_config
-    group = get_config(
-        _FUSED_CONFIGS, "tmix/tokenshift/fused", _config_key(x, mixes, x.shape[0]), 1,
-        tune=lambda: tune_fused_tokenshift(x, res, weight, bias, mixes, pool, indices, status, eps),
-        fixed=(
-            len(mixes) in (1, 6) and _fixed_rows(x)
-        ),
-    )
+    group = _FUSED_CONFIGS.get(_config_key(x, mixes, x.shape[0]), 1)
     # CMix reuses its pointer for the unused TMix parameter arguments.
     mix_args = mixes + (mixes[-1],) * (6 - len(mixes))
-    total, output = prepared_kernel("tmix/tokenshift/fused", _fused_forward, (x.shape[1], len(mixes), float(eps), group))(
+    total, output = _fused_forward(x.shape[1], len(mixes), float(eps), group)(
         x, res, weight, bias, *mix_args, pool, indices, status
     )
     return total, tuple(output.unbind(0))
@@ -319,15 +310,8 @@ def _backward(
 
 
 def _tokenshift_block(x, mixes, cu, initial, status=None):
-    from ..._internal.tuning import get_config
 
-    fixed = 256 if mixes.shape[0] in (1, 6) and _fixed_rows(x) else None
-    return get_config(
-        _BLOCK_CONFIGS, "tmix/tokenshift", _config_key(x, mixes, initial.shape[0]),
-        256 if fixed is None else fixed,
-        tune=lambda: tune_tokenshift(x, mixes, cu, initial, _status=status),
-        fixed=fixed is not None,
-    )
+    return _BLOCK_CONFIGS.get(_config_key(x, mixes, initial.shape[0]), 256)
 
 
 class _TokenShift(torch.autograd.Function):
@@ -337,7 +321,7 @@ class _TokenShift(torch.autograd.Function):
             raise ValueError("tokenshift inputs must be 4-byte aligned")
         block = _tokenshift_block(x, mixes, cu_seqlens, initial)
         options = (x.shape[-1], mixes.shape[0], str(cu_seqlens.dtype).split(".")[-1], block)
-        y, final = prepared_kernel("tmix/tokenshift", _forward, options)(x, mixes, cu_seqlens, initial, cu_seqlens[:0])
+        y, final = _forward(*options)(x, mixes, cu_seqlens, initial, cu_seqlens[:0])
         ctx.save_for_backward(x, mixes, cu_seqlens, initial)
         ctx.options = options
         return y, final
@@ -349,9 +333,7 @@ class _TokenShift(torch.autograd.Function):
 
         group = min(32, tilelang.next_power_of_2(max(1, x.shape[0] // 128)))
         need_mix = ctx.needs_input_grad[1]
-        dx, dm, di = prepared_kernel("tmix/tokenshift", _backward, (*ctx.options, group, need_mix),
-            ((*ctx.options, g, need_mix) for g in (1, 2, 4, 8, 16, 32))
-            if ctx.options[1] in (1, 6) and _fixed_rows(x) else ())(
+        dx, dm, di = _backward(*ctx.options, group, need_mix)(
             dy.contiguous(), dfinal.contiguous(), x, mixes, cu, initial
         )
         gradient = sum_partials(dm.flatten(1)).view_as(mixes) if need_mix else None
@@ -439,89 +421,7 @@ def tokenshift(
         y, final = operation(x, mixes, cu_seqlens, initial_shift)
     else:
         block = _tokenshift_block(x, mixes, cu_seqlens, initial_shift, _status)
-        y, final = prepared_kernel("tmix/tokenshift", _forward, (channels, mixes.shape[0], str(cu_seqlens.dtype).split(".")[-1], block, True))(
+        y, final = _forward(channels, mixes.shape[0], str(cu_seqlens.dtype).split('.')[-1], block, True)(
             x, mixes, cu_seqlens, initial_shift, _status
         )
     return tuple(y.unbind(0)), final
-
-
-@torch.no_grad()
-@tuning_operation
-def tune_tokenshift(x, mixes, cu_seqlens, initial_shift=None, *, _status=None):
-    """Check functional/status variants and time the requested production path.
-
-    Tuning requires valid, nonempty active metadata before Graph capture.
-    A live status is read once; inactive metadata tails are excluded from the
-    functional reference, and only defined active status outputs are compared.
-    """
-    from ..._internal.tuning import save_config, select_config
-
-    mixes = _pack_mixes(x, mixes)
-    batch, channels = cu_seqlens.numel() - 1, x.shape[-1]
-    if initial_shift is None:
-        initial_shift = x.new_zeros((batch, channels))
-    if _status is None:
-        active_rows, active_batch = x.shape[0], batch
-        status = cu_seqlens.new_tensor([0, active_rows, active_batch])
-        valid = True
-    else:
-        status = _status
-        error, active_rows, active_batch = status.tolist()
-        valid = error == 0
-    if not valid or not 0 < active_rows <= x.shape[0] or not 0 < active_batch <= batch:
-        raise ValueError("TokenShift tuning requires valid nonempty active tokens and sequences")
-    tokenshift(x, mixes, cu_seqlens, initial_shift, _status=status)
-    options = (channels, mixes.shape[0], str(cu_seqlens.dtype).split(".")[-1])
-    functional_cu = cu_seqlens
-    if active_batch < batch:
-        functional_cu = cu_seqlens.clone()
-        functional_cu[active_batch + 1:] = active_rows
-
-    def functional(block):
-        return _forward(*options, block)(
-            x[:active_rows], mixes, functional_cu, initial_shift, cu_seqlens[:0]
-        )
-
-    def production(block):
-        return _forward(*options, block, True)(
-            x, mixes, cu_seqlens, initial_shift, status
-        )
-
-    def check(block):
-        output, final = production(block)
-        return (*functional(block), output[:, :active_rows], final[:active_batch])
-
-    canonical = functional(256)
-    reference = (*canonical, canonical[0], canonical[1][:active_batch])
-    run = functional if _status is None else production
-    best, measurements = select_config((256, 128, 512), run, check=check, reference=reference)
-    _BLOCK_CONFIGS[_config_key(x, mixes, batch)] = best
-    save_config("tmix/tokenshift", _config_key(x, mixes, batch), best)
-    return measurements
-
-
-@torch.no_grad()
-@tuning_operation
-def tune_fused_tokenshift(x, res, weight, bias, mixes, pool, indices, status, eps=1e-5):
-    """Tune T=1 row grouping using private state, checking outputs and final slots."""
-    from ..._internal.tuning import save_config, select_config
-
-    mixes = _pack_mixes(x, mixes, pack=False)
-    scratch = pool.clone()
-    fused_post_norm_tokenshift(x, res, weight, bias, mixes, scratch, indices, status, eps)
-    mix_args = mixes + (mixes[-1],) * (6 - len(mixes))
-
-    def run(group):
-        return _fused_forward(x.shape[1], len(mixes), eps, group)(
-            x, res, weight, bias, *mix_args, scratch, indices, status
-        )
-
-    def check(group):
-        scratch.copy_(pool)
-        total, output = run(group)
-        return total, output, scratch.clone()
-
-    best, measurements = select_config((1, 2, 4), run, check=check)
-    _FUSED_CONFIGS[_config_key(x, mixes, x.shape[0])] = best
-    save_config("tmix/tokenshift/fused", _config_key(x, mixes, x.shape[0]), best)
-    return measurements

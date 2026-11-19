@@ -6,7 +6,7 @@ import torch
 from torch.autograd.function import once_differentiable
 
 from ..linear import pretrain_head_linear_bf16
-from ..._internal.tuning import _AutogradContext
+from ..._internal.execution import _AutogradContext
 
 
 def _check(hidden, weight, targets, chunk_rows: int) -> None:

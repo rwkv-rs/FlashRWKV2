@@ -80,9 +80,10 @@ compiled_model = torch.compile(
 )
 ```
 
-Prepare tuning with eager forward-and-backward calls before compiling or
-capturing. Dense and packed training accept optional FP32 initial state and can
-return final state for the next chunk. See the [training contract](docs/kernel_api.md#training).
+Warm the forward and backward on the capture stream with the actual shapes,
+then restore state and gradients before capture. Dense and packed training
+accept optional FP32 initial state and can return final state for the next
+chunk. See the [training contract](docs/kernel_api.md#training).
 
 ## Tests
 
@@ -96,73 +97,36 @@ across training/inference, prefill/decode, and batch composition.
 
 ## CI and release acceptance
 
-`Quality Gate` is the required merge check. Ordinary PRs run CPU contracts,
-package checks when needed, and the affected owners' complete CUDA test matrices
-on PRO6000 with Torch 2.14.1. Provider changes expand to their consumers and the
-block integration suite. Kernel changes also run the selected memcheck/racecheck
-cases. Changes to dependencies, native interfaces, or runtime loading add the
-Torch 2.11–2.14 compatibility matrix. Tests load the installed source wheel;
-pytest's checkout import path is excluded from GPU validation.
+The required **Quality Gate** builds the wheel and sdist, runs CPU contracts, and runs
+pytest and every operator benchmark on the PRO 6000 against the installed wheel.
+Each run uploads its distributions, JUnit XML, device metadata and benchmark results.
+Documentation-only PRs can pass with the package and CPU checks. Runtime changes
+require a trusted repository branch for the self-hosted GPU check. Daily runs cover
+the main branch.
 
-Daily validation runs at 08:17 UTC on `main`, with full correctness, CUDA Graph,
-memcheck, and racecheck coverage. Sunday adds all supported Torch versions, a
-cold native build, and the complete benchmark/tuning suite. Daily performance
-reports measure owners changed since their latest compatible successful
-measurement. Performance failures and regressions appear in an independent
-report; they do not block the PR quality check. The Actions summary records
-actual selected/executed tests and tracks five completed PR timings against an
-initial 20-minute target for a single-owner change, excluding queue time.
-
-Successful results and original distributions share one 90-day artifact bundle.
-Identical source trees can reuse CPU results and individual GPU version results
-when the policy, environment, and complete collected test scope match. A full run can add
-missing compatibility or cold-build checks to an existing bundle. Validation
-never combines module coverage from different source revisions.
-
-Before releasing, run the `Quality Gate` workflow on the exact release tag with
-`mode=full` and `extended=true`. This produces the original wheel/sdist, full
-PRO6000 correctness and compatibility results, and a separate complete
-performance report. The `PyPI release` workflow verifies these results and
-publishes those original files. Its manual `tag` input verifies acceptance
-without publishing.
-
-RTX4090 acceptance is independent. On its checkout of the same tag, download
-the PRO6000 `flashrwkv2-quality-v7-<source-tree>` artifact to
-`artifacts/acceptance`. Use the project `.venv`, with the default Torch version,
-and the wheel from that bundle. With read access to Actions available through
-`GH_TOKEN`, the existing CI entrypoints produce the independent reports:
+For a release, dispatch **Quality Gate** on the release tag for the Torch 2.11–2.14 compatibility matrix and
+Compute Sanitizer memcheck and racecheck. Download its `dist-<commit>` artifact to `artifacts/dist` on the
+RTX 4090 checkout of that tag and use the same wheel for independent acceptance:
 
 ```bash
 timeout 600s uv sync --frozen --no-install-project --group dev
-timeout 60s .venv/bin/python ci/quality_gate.py plan \
-  --base HEAD^ --head HEAD --mode full --extended --target sm89 \
-  --output artifacts/sm89/plan.json
-timeout 60s .venv/bin/python ci/quality_gate.py package \
-  --directory artifacts/acceptance --output artifacts/sm89/package.json
-CUDA_VISIBLE_DEVICES="" timeout 600s .venv/bin/python ci/quality_gate.py test \
-  --plan artifacts/sm89/plan.json --suite cpu --output artifacts/sm89/cpu.json \
-  --reuse artifacts/acceptance/quality-manifest.json
-CUDA_VISIBLE_DEVICES=0,1 PATH="$PWD/.venv/bin:$PATH" timeout 6600s .venv/bin/python ci/quality_gate.py gpu \
-  --plan artifacts/sm89/plan.json --package artifacts/acceptance \
-  --python .venv/bin/python --output artifacts/sm89
-# Compatibility testing ends on an older Torch; restore the primary version.
-timeout 600s uv sync --frozen --no-install-project --group dev
-timeout 180s uv pip install --python .venv/bin/python --no-deps --reinstall artifacts/acceptance/dist/*.whl
-timeout 120s .venv/bin/python ci/quality_gate.py finalize \
-  --plan artifacts/sm89/plan.json --package artifacts/acceptance \
-  --validation artifacts/sm89 --output artifacts/sm89-quality-manifest.json
-CUDA_VISIBLE_DEVICES=0,1 PATH="$PWD/.venv/bin:$PATH" timeout 13800s .venv/bin/python ci/benchmark_gate.py report \
-  --quality artifacts/sm89-quality-manifest.json --package artifacts/acceptance \
-  --profile full --repository rwkv-rs/FlashRWKV2 --python .venv/bin/python \
-  --output artifacts/sm89/performance --summary artifacts/sm89/performance.md
-timeout 30s cp artifacts/sm89/performance/summary.json artifacts/sm89-performance-summary.json
+timeout 120s uv pip install --python .venv/bin/python --no-deps --reinstall artifacts/dist/*.whl
+PATH="$PWD/.venv/bin:$PATH" timeout 18500s .venv/bin/python -I ci/quality_gate.py validate \
+  --release --dist artifacts/dist --output artifacts/sm89
 ```
 
-Attach `sm89-quality-manifest.json` and `sm89-performance-summary.json` to the
-tag's draft GitHub release. Both identify the exact source tree and wheel
-SHA256; the release verifier checks RTX4090 identity, full test completion,
-compatibility, sanitizer coverage, and complete performance results on both
-architectures. Publish the release after its manual verification succeeds.
+Download `sm120.json` from the tagged GPU artifact into `artifacts/sm89` and
+verify both reports before publishing the draft release:
+
+```bash
+timeout 60s .venv/bin/python -I ci/quality_gate.py verify \
+  --dist artifacts/dist --output artifacts/sm89
+```
+
+Attach `artifacts/sm89/sm89.json` to the draft release. On publication, the
+**PyPI release** workflow verifies the tag, main ancestry, both GPU reports and
+the original distribution hashes. It publishes through PyPI trusted publishing
+and checks the public digests.
 
 ## Benchmarks
 
@@ -189,24 +153,11 @@ The per-layer time uses the ticket shared by the model's layers. Add
 `--include-ticket-preparation` to capture and time the device-side validation and sort
 together with one WKV layer on every step.
 
-Deterministic strategies on RTX 4090 (SM89/128 SM) and PRO 6000 (SM120/188 SM)
-prepare bounded kernel variants for dynamic batch/token workloads. Supply real
-first/later-layer, decode/prefill and training-backward calls with their actual
-layouts and gradient requirements:
-
-```python
-from flashrwkv2 import prepare_tuning
-
-report = prepare_tuning(warmup_calls, mode="require")
-assert report["complete"]
-```
-
-Prepare before torch.compile specialization and CUDA Graph capture. The fixed
-paths work with an empty tuning profile cache. For other paths, use `mode="tune"`
-to generate missing verified profiles. After upgrading, prepare again to reuse
-compatible TileLang binaries. See the
-[preparation and cache contract](docs/kernel_api.md#tuning-and-acceptance) for
-coverage, state ownership, validation and performance results.
+RTX 4090 and PRO 6000 use checked-in execution configurations. Each operator benchmark
+can evaluate alternatives with `--tune`. It verifies outputs and state against the
+canonical implementation before measuring CUDA Graph replay. Warm each graph shape with
+its real dtype, layouts and gradient requirements before capture and restore caller-owned
+state after warmup. See [execution configuration](docs/kernel_api.md#execution-configuration).
 
 ## License
 

@@ -47,52 +47,11 @@ def test_projection_device_code_preserves_copy_contract(arch, input_major, reduc
         assert "cp_async" in source
 
 
-@pytest.mark.cuda
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_public_tuning_profile_is_used_by_real_cuda_dispatch_in_a_fresh_process(monkeypatch, tmp_path):
-    import os
-    import subprocess
-    import sys
-
-    import flashrwkv2 as fr
-    from flashrwkv2._internal import linear, tuning
-
-    monkeypatch.setattr(linear, "_fixed_projection_config", lambda *args, **kwargs: None)
-    monkeypatch.setenv("FLASHRWKV2_CACHE_DIR", str(tmp_path / "cache"))
-    tuning.get_tuning_cache_dir.cache_clear()
-    tuning._profile_root.cache_clear()
-    try:
-        torch.manual_seed(737)
-        x = torch.randn(5, 64, device="cuda", dtype=torch.bfloat16)
-        weight = torch.randn(17, 64, device="cuda", dtype=torch.bfloat16)
-        expected = fr.infer_head_linear_all_forward_varlen(x, weight)
-        report = fr.prepare_tuning([lambda: fr.infer_head_linear_all_forward_varlen(x, weight)], mode="tune")
-        assert report["counts"]["tuned"] == 1
-        torch.save((x.cpu(), weight.cpu(), expected.cpu()), tmp_path / "inputs.pt")
-        environment = dict(os.environ, TORCH_HOME=str(tmp_path / "other-torch"),
-                           XDG_CACHE_HOME=str(tmp_path / "other-xdg"))
-        subprocess.run([sys.executable, "-c", """
-import sys, torch
-import flashrwkv2 as fr
-from flashrwkv2._internal import linear
-linear._fixed_projection_config = lambda *args, **kwargs: None
-x, weight, expected = torch.load(sys.argv[1], weights_only=True)
-x, weight = x.cuda(), weight.cuda()
-results = []
-report = fr.prepare_tuning([lambda: results.append(fr.infer_head_linear_all_forward_varlen(x, weight))])
-assert report['counts']['hit'] == 1 and report['complete'], report
-assert torch.equal(results[0].cpu().view(torch.int32), expected.view(torch.int32))
-""", str(tmp_path / "inputs.pt")], env=environment, check=True, timeout=120)
-    finally:
-        tuning.get_tuning_cache_dir.cache_clear()
-        tuning._profile_root.cache_clear()
-
-
 @cuda
 @pytest.mark.cuda
-def test_tuning_publishes_only_compiled_numerically_valid_candidates(monkeypatch, tmp_path):
+def test_tuning_publishes_only_compiled_numerically_valid_candidates(monkeypatch):
     from flashrwkv2._internal import linear as implementation
-    from flashrwkv2._internal import tuning
+    import _tuning as tuning
 
     x = torch.randn(5, 64, device="cuda", dtype=torch.bfloat16)
     weight = torch.randn(17, 64, device="cuda", dtype=torch.bfloat16)
@@ -108,52 +67,13 @@ def test_tuning_publishes_only_compiled_numerically_valid_candidates(monkeypatch
     monkeypatch.setattr(implementation, "_compiled", compiled)
     monkeypatch.setattr(implementation, "_forward", run)
     monkeypatch.setattr(implementation, "_fixed_projection_config", lambda *args: None)
-    monkeypatch.setattr(tuning, "_profile_root", lambda: tmp_path)
+    monkeypatch.setattr(implementation, "_TUNED_CONFIGS", {})
     monkeypatch.setattr(tuning, "projection_configs", lambda *args: (rejected, wrong, valid) if not tuple(args[-1]) else ())
-    result = implementation.tune_linear(x, weight)
+    result = tuning.tune_linear(x, weight)
     records = {row["config"]: row for row in result["candidates"]}
     assert "compile_error" in records[rejected]
     assert not records[wrong]["bitwise_equal"] and result["config"] == valid
-    outputs = []
-    report = tuning.prepare_tuning([lambda: outputs.append(linear(x, weight))])
-    assert report["complete"] and report["counts"]["hit"] == 1
-    assert torch.equal(outputs[0], forward(x, weight, None, torch.bfloat16, valid))
-
-
-def test_tuning_profiles_relocate_and_invalidate_with_source_changes(monkeypatch, tmp_path):
-    import shutil
-
-    from flashrwkv2._internal import tuning
-
-    package = tmp_path / "package"
-    (package / "_internal").mkdir(parents=True)
-    source = package / "_internal" / "linear.py"
-    source.write_text("scale = 1\n")
-    monkeypatch.setattr(tuning, "__file__", str(package / "_internal" / "tuning.py"))
-    monkeypatch.setenv("FLASHRWKV2_CACHE_DIR", str(tmp_path / "cache"))
-    tuning.get_tuning_cache_dir.cache_clear()
-    tuning._profile_root.cache_clear()
-    tuning._fingerprint.cache_clear()
-    key = ("profile-test-gpu", 320, 4096)
-    try:
-        tuning.save_config("linear", key, (256, 64, 2, 32))
-        original = tuning._fingerprint("linear")
-        installed = tmp_path / "installed-package"
-        shutil.copytree(package, installed)
-        monkeypatch.setattr(tuning, "__file__", str(installed / "_internal" / "tuning.py"))
-        (installed / "unrelated.py").write_text("scale = 42\n")
-        (installed / "_internal" / "linear.py").write_text('# comment\n"documentation"\nscale = 1\n')
-        tuning._fingerprint.cache_clear()
-        assert tuning._fingerprint("linear") == original
-        assert tuning._read_profile("linear", tuning._encode(key)) == (256, 64, 2, 32)
-        (installed / "_internal" / "linear.py").write_text("scale = 2\n")
-        tuning._fingerprint.cache_clear()
-        assert tuning._fingerprint("linear") != original
-        assert tuning._read_profile("linear", tuning._encode(key)) is None
-    finally:
-        tuning.get_tuning_cache_dir.cache_clear()
-        tuning._profile_root.cache_clear()
-        tuning._fingerprint.cache_clear()
+    assert torch.equal(linear(x, weight), forward(x, weight, None, torch.bfloat16, valid))
 
 
 def test_tilelang_linear_rejects_cpu():
@@ -197,7 +117,7 @@ def test_tilelang_linear_offset_views_match_aligned_operands(input_major, output
 @pytest.mark.cuda
 @pytest.mark.parametrize("shape", [(27, 64, 257), (33, 768, 96), (65, 4096, 4096), (17, 64, 65536)])
 @pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float32])
-def test_tilelang_linear_batch_and_chunk_invariance(monkeypatch, shape, output_dtype):
+def test_tilelang_linear_batch_and_chunk_invariance(shape, output_dtype):
     rows, channels, outputs = shape
     torch.manual_seed(71)
     x = torch.randn(rows, channels, device="cuda", dtype=torch.bfloat16)
@@ -219,18 +139,10 @@ def test_tilelang_linear_batch_and_chunk_invariance(monkeypatch, shape, output_d
     assert torch.equal(result[perm], linear(x[perm], weight, bias, output_dtype))
     import random
 
-    import tilelang
 
-    from flashrwkv2._internal import tuning
+    from flashrwkv2._internal import execution as tuning
     from flashrwkv2._internal.linear import _projection_config
     if tuning._fixed_strategy_device(tuning.device_class(x.device)):
-        report = tuning.prepare_tuning([lambda: linear(x[:1], weight, bias, output_dtype)])
-        assert report["complete"] and report["compilation"]["complete"]
-        def forbidden(*args, **kwargs):
-            pytest.fail("prepared rows triggered compilation, profiles or search")
-        for module, name in ((tilelang, "compile"), (tilelang, "par_compile"),
-                             (tuning, "select_config"), (tuning, "_read_profile")):
-            monkeypatch.setattr(module, name, forbidden)
         assert torch.equal(linear(x, weight.clone(), bias, output_dtype), result)
         sizes = {1, 17, 89, 90, 100, 4096, *random.Random(803).sample(range(1, 4097), 20)}
         previous = None
@@ -361,10 +273,9 @@ def test_tilelang_linear_cuda_graph():
     (96, 128, (1, 17, 31, 32, 33, 63, 64, 65, 89, 90, 100, 127, 128, 129, 1000, 1024, 4096)),
     (129, 16384, (32, 33, 64, 96, 128, 129, 1024, 4096)),
 ))
-def test_dynamic_weight_reduction_preserves_accumulators_and_graph(monkeypatch, rows, outputs, reductions, input_major):
-    import tilelang
+def test_dynamic_weight_reduction_preserves_accumulators_and_graph(rows, outputs, reductions, input_major):
 
-    from flashrwkv2._internal import tuning
+    from flashrwkv2._internal import execution as tuning
 
     if not tuning._fixed_strategy_device(tuning.device_class(torch.device("cuda"))):
         pytest.skip("dynamic reduction requires a qualified device")
@@ -377,19 +288,6 @@ def test_dynamic_weight_reduction_preserves_accumulators_and_graph(monkeypatch, 
             weight = weight.t().contiguous().t()
         reference = _forward(x, weight, None, torch.float32, config=(16, 64, 2, 32))
         cases.append((x, weight, reference))
-    # K=1 contiguous weights also have stride(0)=1, selecting the input-major layout.
-    layouts = {weight.stride(0) == 1: (x, weight) for x, weight, _ in cases}
-    report = tuning.prepare_tuning([
-        lambda x=x, weight=weight, dtype=dtype: _forward(x, weight, None, dtype, dynamic_k=True)
-        for x, weight in layouts.values() for dtype in (torch.float32, torch.bfloat16)
-    ])
-    assert report["complete"] and report["compilation"]["complete"]
-    def forbidden(*args, **kwargs):
-        pytest.fail("prepared dynamic K attempted compilation or tuning")
-    monkeypatch.setattr(tilelang, "compile", forbidden)
-    monkeypatch.setattr(tilelang, "par_compile", forbidden)
-    monkeypatch.setattr(tuning, "select_config", forbidden)
-    monkeypatch.setattr(tuning, "_read_profile", forbidden)
     for x, weight, reference in cases:
         for dtype in (torch.float32, torch.bfloat16):
             assert torch.equal(_forward(x, weight, None, dtype, dynamic_k=True), reference.to(dtype))
@@ -410,7 +308,7 @@ def test_prepared_projection_reuses_disk_cache_in_new_process():
     import sys
     from tempfile import TemporaryDirectory
 
-    from flashrwkv2._internal import tuning
+    from flashrwkv2._internal import execution as tuning
 
     if not tuning._fixed_strategy_device(tuning.device_class(torch.device("cuda"))):
         pytest.skip("deterministic strategy is qualified on tested devices")
@@ -420,7 +318,7 @@ def test_prepared_projection_reuses_disk_cache_in_new_process():
 import hashlib, json, sys
 import torch, tilelang
 from tilelang.jit.kernel import JITKernel
-from flashrwkv2._internal import linear, tuning
+from flashrwkv2._internal import linear
 phase = sys.argv[1]
 compilations = []
 original = JITKernel._compile_and_create_adapter
@@ -431,21 +329,14 @@ def compile_kernel(self, *args, **kwargs):
 JITKernel._compile_and_create_adapter = compile_kernel
 import pytest
 status = pytest.main(["-q", "-p", "no:cacheprovider",
-    "tests/tmix/wkv7/test_block.py::test_prepared_block_has_no_tilelang_compilation_for_new_tokens"])
+    "-o", "pythonpath=" + sys.argv[2] + "/tests " + sys.argv[2] + "/benchmarks",
+    sys.argv[2] + "/tests/tmix/wkv7/test_block.py::test_block_crosses_recurrent_dispatch_thresholds"])
 assert status == 0, "full inference/training block disk-cache reuse failed"
 torch.manual_seed(104)
 x = torch.randn(17, 64, device="cuda").bfloat16()
 w = torch.randn(96, 64, device="cuda").bfloat16()
 dx = torch.randn(96, 32, device="cuda").bfloat16()
 dw = torch.randn(32, 64, device="cuda").bfloat16().t()
-report = tuning.prepare_tuning([
-    lambda: linear._forward(x, w, None, torch.float32),
-    lambda: linear._forward(dx, dw, None, torch.float32, dynamic_k=True),
-])
-assert report["complete"] and report["compilation"]["complete"]
-def forbidden(*args, **kwargs):
-    raise AssertionError("prepared family attempted TileLang compilation")
-linear._compile_spec = tilelang.compile = tilelang.par_compile = forbidden
 values = []
 for rows in (89, 90, 100):
     values.append(linear._forward(x[:1].expand(rows, -1).contiguous(), w, None, torch.float32))
@@ -456,13 +347,13 @@ for k in (1, 17, 31, 32, 33, 64, 65, 89, 90, 100, 129):
 torch.cuda.synchronize()
 hashes = [hashlib.sha256(v.cpu().numpy().tobytes()).hexdigest() for v in values]
 print("CACHE_RESULT " + json.dumps({"phase": phase, "device_compilations": len(compilations),
-                                   "compilation": report["compilation"], "hashes": hashes}))
+                                   "hashes": hashes}))
 '''
     reports = []
     with TemporaryDirectory(prefix="tilelang-cold-", dir=artifacts) as cache:
         environment = {**os.environ, "TILELANG_CACHE_DIR": cache}
         for phase in ("cold", "warm"):
-            result = subprocess.run([sys.executable, "-c", script, phase], env=environment,
+            result = subprocess.run([sys.executable, "-c", script, phase, str(artifacts.parent)], env=environment,
                                     text=True, capture_output=True, check=False, timeout=600)
             assert result.returncode == 0, result.stdout + result.stderr
             report = json.loads(next(line.removeprefix("CACHE_RESULT ") for line in
@@ -471,7 +362,5 @@ print("CACHE_RESULT " + json.dumps({"phase": phase, "device_compilations": len(c
     assert reports[0]["device_compilations"] > 0
     assert reports[1]["device_compilations"] == 0
     assert reports[0]["hashes"] == reports[1]["hashes"]
-    assert reports[0]["compilation"] == reports[1]["compilation"]
     print(json.dumps({"cold_device_compilations": reports[0]["device_compilations"],
-                      "warm_device_compilations": reports[1]["device_compilations"],
-                      "compilation": reports[1]["compilation"]}))
+                      "warm_device_compilations": reports[1]["device_compilations"]}))

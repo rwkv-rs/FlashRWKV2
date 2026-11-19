@@ -9,7 +9,7 @@ from flashrwkv2.post_norm.tilelang import norm
 
 @pytest.mark.parametrize("fault", ("stats", "production", "res_output", "res_store"))
 def test_norm_tuning_rejects_changed_statistics_production_or_res(monkeypatch, fault):
-    from flashrwkv2._internal import tuning
+    import _tuning as tuning
     from flashrwkv2.post_norm import tilelang as implementation
 
     x = torch.ones(3, 64, dtype=torch.bfloat16)
@@ -49,9 +49,8 @@ def test_norm_tuning_rejects_changed_statistics_production_or_res(monkeypatch, f
     monkeypatch.setattr(implementation, "_forward", forward)
     monkeypatch.setattr(implementation, "_ROW_CONFIGS", {})
     monkeypatch.setattr(tuning, "select_config", select_config)
-    monkeypatch.setattr(tuning, "save_config", lambda *args: None)
     monkeypatch.setattr(implementation, "device_class", lambda device: "test")
-    implementation.tune_norm(x, weight, bias, res=res)
+    tuning.tune_norm(x, weight, bias, res=res)
     assert implementation._ROW_CONFIGS[implementation._config_key(x, True)] == 1
 
 

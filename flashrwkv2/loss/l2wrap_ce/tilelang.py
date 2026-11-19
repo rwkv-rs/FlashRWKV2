@@ -6,7 +6,7 @@ import tilelang.language as T
 import torch
 
 from ..._internal.logprob import logprob_stats
-from ..._internal.tuning import _AutogradContext
+from ..._internal.execution import _AutogradContext
 
 
 @tilelang.jit(pass_configs={"tl.enable_fast_math": False}, out_idx=[6])

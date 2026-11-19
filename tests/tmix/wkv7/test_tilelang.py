@@ -93,17 +93,13 @@ def test_optional_fp16_state_preserves_inference_packing_and_training_precision(
 
 @pytest.mark.parametrize("dim", [64, 128, 256])
 @pytest.mark.parametrize("has_bias", [False, True])
-def test_optional_fp16_tuning_preserves_inference_outputs(dim, has_bias, monkeypatch, tmp_path):
-    from flashrwkv2._internal import tuning
-    from flashrwkv2.tmix.wkv7 import tilelang as implementation
+def test_optional_fp16_tuning_preserves_inference_outputs(dim, has_bias):
+    import _tuning as tuning
 
     values, initial, cu, bias = _case(dim, (1, 3))
     initial = initial.half()
     original = initial.clone()
-    monkeypatch.setattr(tuning, "_profile_root", lambda: tmp_path)
-    monkeypatch.setattr(implementation, "_TUNED_CONFIGS", {})
-    tuning._LOADED.clear()
-    tuned = implementation.tune_tmix_wkv7_recurrent(
+    tuned = tuning.tune_tmix_wkv7_recurrent(
         *values, initial, cu, scale=.75, decay_bias=bias if has_bias else None,
         indexed=True,
     )
@@ -111,7 +107,6 @@ def test_optional_fp16_tuning_preserves_inference_outputs(dim, has_bias, monkeyp
     assert len(candidates) == 4
     assert all(item["bitwise_equal"] and item["milliseconds"] > 0 for item in candidates)
     assert torch.equal(initial.view(torch.int16), original.view(torch.int16))
-    tuning._LOADED.clear()
 
 
 def _case(dim, lengths, *, requires_grad=False, logits=-2.0):
@@ -498,28 +493,18 @@ def test_recurrent_indexed_pool_matches_functional_forward(dim, block_values, pr
 
 @pytest.mark.parametrize("dim", [64, 128, 256])
 @pytest.mark.parametrize("indexed", [False, True])
-def test_recurrent_tuning_preserves_both_forwards_and_caller_state(monkeypatch, tmp_path, dim, indexed):
-    from flashrwkv2._internal import tuning
-    from flashrwkv2.tmix.wkv7 import tilelang as implementation
+def test_recurrent_tuning_preserves_both_forwards_and_caller_state(dim, indexed):
+    import _tuning as tuning
 
     values, state, cu, bias = _case(dim, (1, 3))
     original = state.clone()
-    monkeypatch.setattr(tuning, "_profile_root", lambda: tmp_path)
-    tuning._LOADED.clear()
-    monkeypatch.setattr(implementation, "_TUNED_CONFIGS", {})
     expected = tmix_wkv7_recurrent(*values, state, cu, decay_bias=bias, block_values=64)
-    selected = implementation.tune_tmix_wkv7_recurrent(
+    selected = tuning.tune_tmix_wkv7_recurrent(
         *values, state, cu, decay_bias=bias, indexed=indexed,
     )
     assert selected["indexed"] == indexed
     assert all(candidate["bitwise_equal"] for candidate in selected["candidates"])
     assert torch.equal(state, original)
-    key = implementation._config_key(values[0], state.shape[0], bias, indexed=indexed)
-    other_key = implementation._config_key(values[0], state.shape[0], bias, indexed=not indexed)
-    assert implementation._TUNED_CONFIGS[key] == (
-        selected["block_values"], selected["prefetch_tokens"],
-    )
-    assert other_key not in implementation._TUNED_CONFIGS
     functional = tmix_wkv7_recurrent(*values, state, cu, decay_bias=bias)
     pool = state.clone()
     output = _infer_recurrent(
@@ -530,7 +515,6 @@ def test_recurrent_tuning_preserves_both_forwards_and_caller_state(monkeypatch, 
     )
     for actual, reference in zip((*functional, output, pool), (*expected, *expected), strict=True):
         assert torch.equal(actual, reference)
-    tuning._LOADED.clear()
 
 
 @pytest.mark.cuda_graph

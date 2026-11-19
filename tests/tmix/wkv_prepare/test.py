@@ -16,7 +16,8 @@ cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is require
 @cuda
 @pytest.mark.cuda
 def test_grouped_operator_benchmark_uses_its_candidate(monkeypatch):
-    from flashrwkv2._internal import tuning
+    import _tuning as offline
+    from flashrwkv2._internal import execution as tuning
     from flashrwkv2.tmix.wkv_prepare import tilelang as implementation
 
     if not tuning._fixed_strategy_device(tuning.device_class(torch.device("cuda"))):
@@ -25,7 +26,6 @@ def test_grouped_operator_benchmark_uses_its_candidate(monkeypatch):
     xs = tuple(torch.randn(1, channels, device="cuda", dtype=torch.bfloat16) for _ in ranks)
     weights = tuple(torch.randn(rank, channels, device="cuda", dtype=torch.bfloat16) for rank in ranks)
     kinds, biases = (1, 0, 2), (None,) * len(ranks)
-    fixed = implementation._group_call(xs, weights, kinds, biases, 0, None)[0][5]
     candidate = (16, 32, 2, 256)
     seen = []
 
@@ -34,21 +34,20 @@ def test_grouped_operator_benchmark_uses_its_candidate(monkeypatch):
         seen.append(key[5])
         return implementation._grouped_linear(xs, weights, kinds, biases)
 
-    select_config = tuning.select_config
+    select_config = offline.select_config
 
     def select_short(*args, **kwargs):
         kwargs["repeat"] = 2
         return select_config(*args, **kwargs)
 
     monkeypatch.setattr(implementation, "_GROUP_CONFIGS", {})
-    monkeypatch.setattr(tuning, "projection_configs", lambda *args: [candidate] if not list(args[-1]) else [])
-    monkeypatch.setattr(tuning, "projection_finalists", lambda *args: [candidate])
-    monkeypatch.setattr(tuning, "select_config", select_short)
-    monkeypatch.setattr(tuning, "save_config", lambda *args: None)
-    result = implementation._tune_grouped_linear(xs, weights, kinds, biases, benchmark=benchmark)
+    monkeypatch.setattr(offline, "projection_configs", lambda *args: [candidate] if not list(args[-1]) else [])
+    monkeypatch.setattr(offline, "projection_finalists", lambda *args: [candidate])
+    monkeypatch.setattr(offline, "select_config", select_short)
+    result = offline._tune_grouped_linear(xs, weights, kinds, biases, benchmark=benchmark)
     assert result["config"] == candidate and seen and set(seen) == {candidate}
     key, _ = implementation._group_call(xs, weights, kinds, biases, 0, None)
-    assert key[5] == fixed
+    assert key[5] == candidate
 
 
 def _linear_reference(x, weight, adapter=(None, None, 1.0, False)):
@@ -405,7 +404,7 @@ def test_prepare_training_batch_and_raw_decay_bias_are_bitwise_equal(
     "reduction", (17, pytest.param(32, marks=pytest.mark.racecheck), 64, 65, 89, 128, 1000, 1024),
 )
 def test_grouped_weight_vjp_preserves_accumulators_and_graph(reduction):
-    from flashrwkv2._internal import tuning
+    from flashrwkv2._internal import execution as tuning
     from flashrwkv2._internal.linear import _forward
     from flashrwkv2.tmix.wkv_prepare import tilelang as implementation
 
@@ -443,7 +442,7 @@ def test_grouped_weight_vjp_preserves_accumulators_and_graph(reduction):
 @pytest.mark.parametrize("mode", ("frozen_input", "frozen_weight", "frozen_route", "mixed_layout", "unused"))
 def test_grouped_vjp_eligibility_preserves_partial_gradients(monkeypatch, mode):
     from flashrwkv2._internal import linear as shared
-    from flashrwkv2._internal import tuning
+    from flashrwkv2._internal import execution as tuning
     from flashrwkv2.tmix.wkv_prepare import tilelang as implementation
 
     if not tuning._fixed_strategy_device(tuning.device_class(torch.device("cuda"))):
@@ -461,15 +460,11 @@ def test_grouped_vjp_eligibility_preserves_partial_gradients(monkeypatch, mode):
     def model():
         values = implementation._grouped_linear(xs, weights, (1, 2), biases)
         return values[:1] if mode == "unused" else values
-    token = tuning._TUNING.set(True)
-    try:
-        with monkeypatch.context() as patch:
-            patch.setattr(implementation, "_fixed_strategy_device", lambda *args: False)
-            patch.setattr(shared, "_fixed_strategy_device", lambda *args: False)
-            expected = model()
-            gradients = torch.autograd.grad(sum(v.float().sum() for v in expected), leaves, allow_unused=True)
-    finally:
-        tuning._TUNING.reset(token)
+    with monkeypatch.context() as patch:
+        patch.setattr(implementation, "_fixed_strategy_device", lambda *args: False)
+        patch.setattr(shared, "_fixed_strategy_device", lambda *args: False)
+        expected = model()
+        gradients = torch.autograd.grad(sum(v.float().sum() for v in expected), leaves, allow_unused=True)
     if mode == "frozen_route":
         activation_kernel = implementation._activation_kernel
         def needed_activation(channels, kind, *args):

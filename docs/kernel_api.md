@@ -145,9 +145,7 @@ compiled_model = torch.compile(
 )
 ```
 
-先用 eager 的完整 forward/backward 函数执行 `prepare_tuning`，再编译、预热和
-捕获。训练参数集合、LoRA/NoRA 模式与实际训练一致；仅 forward 不能覆盖 dX、dW
-等反向投影 key。准备函数负责清理梯度并恢复可变 state；调优完成后再开始参数更新。
+捕获 CUDA Graph 前，用实际形状、权重布局和可训练参数预热 forward/backward，再恢复 state 和梯度。
 支持 PyTorch 2.11–2.14；metadata/sampling native 扩展使用 C++20 编译。
 
 以 `initial_state` 传入初始 WKV state。设置 `return_final_state=True` 返回
@@ -157,98 +155,30 @@ compiled_model = torch.compile(
 
 ## Tuning and acceptance
 
-### Execution and preparation
+### Execution configuration
 
-Validated deterministic strategies cover RTX 4090 (SM89, 128 SMs) and
-PRO 6000 (SM120, 188 SMs), BF16 projections with BF16/FP32 outputs, and
-head-size-64 WKV with FP32 state. Other devices, mixed grouped layouts,
-FP16 state and other head sizes retain verified profiles and bounded tuning.
-The numerical contract above applies to every execution mode.
+RTX 4090 and PRO 6000 use deterministic projection tiles selected from the model geometry,
+SM count and shared memory limit. D64 WKV selects decode or prefill from the checked-in
+execution configurations. FP32 training and matched FP32 rollout retain the same
+reduction order and state cast. H40 and H64 D64 FP16 serving use four 16-term FMA
+chains and a balanced FP32 sum for each dot product, so rounding can differ from
+the earlier 64-term chain.
+The WKV benchmark records the selected value tile, token prefetch and workload reason before capture.
+The operator benchmark's `--tune` option verifies candidate outputs and state before timing.
+Its report contains the winning configuration and individual measurements.
 
-Single and grouped projections share a resource-aware tile selector based on
-output geometry, actual SM count, CTA coverage and shared-memory limits.
-BF16 weight gradients use dynamic token reduction: aligned K uses a two-stage
-pipeline, tails use synchronous single-stage copies, and both retain consecutive
-32-element MMA groups. TokenShift uses dynamic batch and 256-column blocks.
-WKV selects one-token prefetch for decode and four-token prefetch for multi-token
-workloads. Norm and Readout preserve their existing statistics/residual semantics.
-
-```python
-from flashrwkv2 import prepare_tuning
-
-# Real calls with disposable/reset state; include backward when training.
-report = prepare_tuning(warmup_calls, mode="require")
-assert report["complete"]
-# Restore serving state, then specialize torch.compile and capture CUDA Graphs.
-```
-
-Callers declare all actual shape families: static model dimensions, layouts,
-dtypes, grouped branches, bias/activation forms, output modes and gradient needs.
-Include first/later layers, decode/prefill and training backward. Rows, token counts
-and same-shape weight addresses do not define additional deterministic families.
-New layouts or trainable-parameter/output-use patterns require another preparation.
-Empty calls do not prepare future nonempty workloads.
-
-Preparation compiles every reachable variant of the observed deterministic
-families. Afterwards, changing batch/token within those families performs no
-TileLang code generation, device compilation, configuration search or timing.
-Normal eager calls compile only their selected variant. torch.compile specialization
-and CUDA Graph capture shapes are separate initialization responsibilities.
-
-| Family | Maximum variants per static geometry/semantic form |
-| --- | ---: |
-| Static-K projection | 5 |
-| Dynamic-K projection, fixed output geometry | 2 alignment classes |
-| PostNorm / TokenShift forward | 1 |
-| PostNorm / TokenShift / Readout backward, per gradient requirement | 6 |
-| Readout / WKV forward, head size 64 and FP32 WKV state | 2 |
-| WKV backward, head size 64 without status masking | 5 |
-| Other WKV backward; state transfer per gather/scatter direction | 1 |
-
-Head-size-64 backward prepares shared replay, direct checkpoint replay and the
-segment-boundary kernels for the observed bias and scaling form. A short
-training warmup covers the packed-token and batch-head dispatch thresholds.
-
-Single-variant auxiliary kernels are warmed by the real calls. A required compile
-failure aborts preparation with its owner and key; it is never silently skipped.
-`compilation` reports `families`, `required_variants`, `available_variants` and
-`complete`. Top-level `complete` also requires no missing observed configurations.
-
-### Profiles, caches and graphs
-
-`inspect` reports coverage without tuning; `require` fails on the first missing
-profile; `tune` verifies then measures missing profiles. Deterministic paths report
-`fixed` and bypass profiles/search in all modes. Other statuses are `hit`, `missing`
-and `tuned`; records contain owner, device/key, configuration, fingerprint and path.
-
-The cache root is `~/.cache/flashrwkv2`, overridden only by `FLASHRWKV2_CACHE_DIR`
-set before import. Verified profiles live under `tuning/v2/<owner>/<fingerprint>/`;
-source AST/dependencies, toolchain versions and compile flags determine validity.
-Installation paths, comments and Torch/XDG cache locations do not invalidate them.
-Native extensions and TileLang binaries have separate compatibility/cache checks.
-
-Concurrent processes lock and recheck a missing profile before atomically publishing.
-Eager calls recheck missing files; explicit preparation reloads each observed key.
-Corrupt profiles fail validation. Preparation is exclusive within a process and
-includes autograd worker dispatches; finish serving/training work before preparing.
-Legacy profiles are not migrated: rerun preparation after upgrading. TileLang's
-own compatible compilation cache remains reusable.
-
-Load profiles and compile before capture. Default-kernel warmup also supports
-capture; publishing a new configuration requires loading and warming it outside
-capture, then recapturing existing graphs. Same-shape weight replacement reuses
-compiled variants; update captured weights with `copy_` on the original storage.
-Tuning samples must contain valid, nonempty active metadata; zero-active graph
-warmup is supported separately and is not a tuning sample.
+Warm the forward and, for training, the backward for each CUDA Graph shape on its capture
+stream before capture. Restore the caller-owned state and gradients after warmup.
+The native extension cache uses `~/.cache/flashrwkv2` or `FLASHRWKV2_CACHE_DIR`.
+TileLang manages compiled binaries in its own cache.
 
 ### Validation and performance
 
-CPU runtime/profile checks: 67 passed. SM89/SM120 device-code regressions:
-12 passed.
+The following measurements describe the earlier dynamic-workload implementation.
 
 Business tests cover train/prefill/decode equivalence, independent VJPs and optimizer
 updates, state ownership, frozen/unused gradients, compiled/Graph execution,
-prepared dynamic workloads and real fresh-process profile/binary-cache reuse.
+dynamic workloads and fresh-process binary-cache reuse.
 Model geometry uses C=2048/2560/4096/4096 and W/A/G/V ranks
 96/96/256/64, 96/96/320/64, 128/128/480/96 and 192/192/384/128.
 

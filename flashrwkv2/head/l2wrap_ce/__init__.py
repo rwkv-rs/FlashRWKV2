@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 from torch.autograd.function import once_differentiable
 
-from ..._internal.tuning import _AutogradContext
+from ..._internal.execution import _AutogradContext
 from ..linear import pretrain_head_linear_bf16
 
 

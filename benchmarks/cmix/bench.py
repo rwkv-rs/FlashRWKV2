@@ -116,19 +116,19 @@ def benchmark(args):
         )
     tuning = {}
     if args.tune:
-        from flashrwkv2._internal.elementwise import activation
-        from flashrwkv2._internal.linear import (
-            _NoRA,
-            adapter_linear,
-            linear,
+        from _tuning import (
+            tune_fused_tokenshift,
             tune_linear,
+            tune_norm,
+            tune_tokenshift,
         )
-        from flashrwkv2.post_norm.tilelang import norm, tune_norm
+
+        from flashrwkv2._internal.elementwise import activation
+        from flashrwkv2._internal.linear import _NoRA, adapter_linear, linear
+        from flashrwkv2.post_norm.tilelang import norm
         from flashrwkv2.tmix.tokenshift.tilelang import (
             fused_post_norm_tokenshift,
             tokenshift,
-            tune_fused_tokenshift,
-            tune_tokenshift,
         )
 
         with torch.no_grad():

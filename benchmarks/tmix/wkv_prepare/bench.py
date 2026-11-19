@@ -76,13 +76,14 @@ def benchmark(args):
             adapter_options[f"{name}_use_nora"] = True
     tuning = {}
     if args.tune:
-        from flashrwkv2._internal.linear import _NoRA, linear, tune_linear
+        from _tuning import tune_linear
+
+        from flashrwkv2._internal.linear import _NoRA, linear
 
         source = shifted[0].detach().reshape(args.tokens, channels)
-        from flashrwkv2.tmix.wkv_prepare.tilelang import (
-            _grouped_linear,
-            _tune_grouped_linear,
-        )
+        from _tuning import _tune_grouped_linear
+
+        from flashrwkv2.tmix.wkv_prepare.tilelang import _grouped_linear
 
         dense_inputs = tuple(shifted[i].detach() for i in (0, 2, 3))
         dense_weights = tuple(weight.detach() for weight in dense)

@@ -33,7 +33,7 @@ include = ["flashrwkv2", "flashrwkv2.*"]
 
 [tool.pytest.ini_options]
 addopts = ["--import-mode=importlib", "--strict-markers"]
-pythonpath = [".", "tests"]
+pythonpath = [".", "tests", "benchmarks"]
 norecursedirs = ["tests_old", "benchmarks_old"]
 python_files = ["test.py", "test_*.py"]
 markers = [

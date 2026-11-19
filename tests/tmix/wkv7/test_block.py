@@ -196,78 +196,6 @@ def infer_block(
     return -loss.view_as(targets), logits
 
 
-@pytest.mark.parametrize("training", (False, True))
-def test_prepare_tuning_profiles_preserve_block_state_logits_and_logprobs(monkeypatch, tmp_path, training):
-    import json
-    from pathlib import Path
-
-    from flashrwkv2._internal import linear as linear_impl
-    from flashrwkv2._internal import tuning
-    from flashrwkv2.post_norm import tilelang as norm_impl
-    from flashrwkv2.tmix.readout import tilelang as readout_impl
-    from flashrwkv2.tmix.wkv7 import tilelang as wkv_impl
-    from flashrwkv2.tmix.wkv_prepare import tilelang as prepare_impl
-    for module in (linear_impl, norm_impl, readout_impl, prepare_impl, wkv_impl):
-        monkeypatch.setattr(module, "_fixed_strategy_device", lambda *args: False)
-    monkeypatch.setattr(tuning, "_profile_root", lambda: tmp_path / "new")
-    monkeypatch.setattr(tuning, "_LOADED", {})
-    torch.manual_seed(736)
-    batch, channels, head_size, length = 2, 128, 64, 5
-    params = parameters(channels)
-    x = (torch.randn(batch, length, channels, device="cuda") * .1).bfloat16().requires_grad_(training)
-    res = torch.randn_like(x) * .1
-    initial = torch.randn(batch, 2, 64, 64, device="cuda") * .01
-    shifts = [torch.randn(batch, channels, device="cuda", dtype=torch.bfloat16) * .1 for _ in range(2)]
-    slots = torch.arange(batch, device="cuda", dtype=torch.int32)
-    cu = slots.new_tensor([0, length, batch * length])
-    targets = torch.randint(257, (batch, length), device="cuda")
-    state, pools = state_pools(initial, shifts, slots, batch)
-    snapshots = []
-
-    def call():
-        for target, source in zip((state._components()[0], *pools), (initial, *shifts), strict=True):
-            target.copy_(source)
-        if training:
-            values = train_block(x, res, params, initial, shifts, targets, head_size, None)
-            gradients = torch.autograd.grad(values[0].sum(), (x, *params.values()), allow_unused=True)
-            values = (*values, *(g for g in gradients if g is not None))
-        else:
-            with torch.no_grad():
-                result = infer_block(x.flatten(0, 1), res.flatten(0, 1), params, state, pools, cu,
-                                     slots, targets.flatten(), head_size, None)
-            values = (*result, state._components()[0], *pools)
-        snapshots.append(tuple(t.detach().clone() for t in values))
-
-    before = fr.prepare_tuning([call], mode="inspect")
-    assert not before["complete"]
-    canonical = {"linear": (16, 64, 2, 32), "tmix/wkv_prepare": (16, 64, 2, 32),
-                 "tmix/wkv7": (64, 1), "tmix/tokenshift": 256,
-                 "tmix/tokenshift/fused": 1, "post_norm": 1, "tmix/readout": 1}
-    for record in before["records"]:
-        if record["status"] == "fixed":
-            continue
-        path = Path(record["path"])
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({
-            "schema": before["schema"], "owner": record["owner"],
-            "fingerprint": record["fingerprint"], "key": record["key"],
-            "config": canonical[record["owner"]], "bitwise_equal": True,
-        }))
-    prepared = fr.prepare_tuning([call], mode="require")
-    assert prepared["complete"]
-    assert prepared["counts"]["hit"] == before["counts"]["missing"]
-    assert prepared["counts"]["fixed"] == before["counts"]["fixed"]
-    tuning._LOADED.clear()
-    loaded = fr.prepare_tuning([call])
-    assert loaded["counts"]["hit"] == before["counts"]["missing"]
-    assert loaded["counts"]["fixed"] == before["counts"]["fixed"]
-    assert all(value.dtype == torch.float32 for value in snapshots[0][:3])
-    for actual in snapshots[1:]:
-        for value, reference in zip(actual, snapshots[0], strict=True):
-            dtype = torch.int32 if value.dtype == torch.float32 else torch.int16
-            assert torch.equal(value.view(dtype), reference.view(dtype))
-
-
 @pytest.mark.parametrize("adapter", ["none", "lora", "nora"])
 @pytest.mark.parametrize("backend", ["eager", "inductor"])
 @pytest.mark.cuda_graph
@@ -275,7 +203,6 @@ def test_fullgraph_training_block_preserves_outputs_gradients_and_capture(monkey
     import tilelang
     from tilelang.jit import JITImpl
 
-    from flashrwkv2._internal import tuning
 
     torch.manual_seed(738)
     params = parameters(128, rank=16, vocab=257)
@@ -306,7 +233,7 @@ def test_fullgraph_training_block_preserves_outputs_gradients_and_capture(monkey
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
-        fr.prepare_tuning([lambda: step(model)], mode="inspect")
+        step(model)
         for value in leaves:
             value.grad = None
         outputs, loss = step(model)
@@ -329,8 +256,6 @@ def test_fullgraph_training_block_preserves_outputs_gradients_and_capture(monkey
     monkeypatch.setattr(JITImpl, "compile", forbidden)
     monkeypatch.setattr(tilelang, "compile", forbidden)
     monkeypatch.setattr(tilelang, "par_compile", forbidden)
-    monkeypatch.setattr(tuning, "select_config", forbidden)
-    monkeypatch.setattr(tuning, "_read_profile", forbidden)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
         actual, loss = step(compiled)
@@ -782,11 +707,9 @@ def test_block_independent_torch_vjp_and_optimizer_step(mode):
     "channels,ranks,use_vres",
     ((2560, (96, 96, 320, 64), True), (4096, (128, 128, 480, 96), False)),
 )
-def test_prepared_block_has_no_tilelang_compilation_for_new_tokens(monkeypatch, tmp_path, channels, ranks, use_vres):
-    import tilelang
-    from tilelang.jit import JITImpl
+def test_block_crosses_recurrent_dispatch_thresholds(channels, ranks, use_vres):
 
-    from flashrwkv2._internal import tuning
+    from flashrwkv2._internal import execution as tuning
 
     if not tuning._fixed_strategy_device(tuning.device_class(torch.device("cuda"))):
         pytest.skip("deterministic strategy is qualified on tested devices")
@@ -825,25 +748,6 @@ def test_prepared_block_has_no_tilelang_compilation_for_new_tokens(monkeypatch, 
             state._components()[0][:batch], *(pool[:batch] for pool in pools),
         )
 
-    profile_root = tmp_path / "profiles"
-
-    def forbidden(*args, **kwargs):
-        pytest.fail("fixed workloads accessed a profile, searched, or compiled outside preparation")
-
-    monkeypatch.setattr(tuning, "_profile_root", lambda: profile_root)
-    monkeypatch.setattr(tuning, "_LOADED", {})
-    monkeypatch.setattr(tuning, "_read_profile", forbidden)
-    monkeypatch.setattr(tuning, "save_config", forbidden)
-    monkeypatch.setattr(tuning, "select_config", forbidden)
-    prefill, decode = inputs(32), inputs(1)
-    report = fr.prepare_tuning([
-        lambda: call(prefill, True), lambda: call(prefill, False), lambda: call(decode, False),
-    ])
-    assert report["complete"] and report["counts"]["fixed"] > 0
-    assert all(report["counts"][status] == 0 for status in ("hit", "missing", "tuned"))
-    monkeypatch.setattr(JITImpl, "compile", forbidden)
-    monkeypatch.setattr(tilelang, "compile", forbidden)
-    monkeypatch.setattr(tilelang, "par_compile", forbidden)
     # Cross both N=4096 and the B*H segmentation cutoff with unseen shapes.
     large_batch = math.ceil(128 / heads)
     for batch, length in (
@@ -855,4 +759,3 @@ def test_prepared_block_has_no_tilelang_compilation_for_new_tokens(monkeypatch, 
             bits = torch.int32 if expected.dtype == torch.float32 else torch.int16
             assert torch.equal(actual.view(bits), expected.view(bits)), (batch, length)
     torch.cuda.synchronize()
-    assert not profile_root.exists()
