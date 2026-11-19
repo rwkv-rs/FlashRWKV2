@@ -176,7 +176,10 @@ def infer_cmix_forward_varlen(
     """
     from .._internal.state import gather_state, scatter_state
     from ..post_norm.tilelang import norm
-    from ..tmix.tokenshift.tilelang import _check_save_normalized, fused_post_norm_tokenshift
+    from ..tmix.tokenshift.tilelang import (
+        _check_save_normalized,
+        fused_post_norm_tokenshift,
+    )
     from ..tmix.wkv7 import (
         _validate_launch_max_seqlen,
         prepare_tmix_wkv7_recurrent_metadata,

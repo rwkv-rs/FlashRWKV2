@@ -135,16 +135,53 @@ def test_invalid_checkpoint_requests_preserve_pool():
     initial = pool.clone()
     infer = infer_tmix_wkv7_recurrent_fp32io16_forward_varlen
     state = prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor(pool)
-    args = dict(state=state, cu_seqlens=cu, state_indices=slots, save=True)
+    args = {"state": state, "cu_seqlens": cu, "state_indices": slots, "save": True}
     for interval in (0, True, 1.5):
         with pytest.raises(ValueError, match="positive integer"):
             infer(*inputs, **args, checkpoint_interval=interval)
     for invalid in (pool[:1], pool[:2].half(), pool[:2].transpose(-1, -2)):
         with pytest.raises(ValueError, match="contiguous .* with shape"):
             infer(*inputs, **args, boundaries=invalid)
-    with pytest.raises(ValueError, match="overlap state_pool"):
+    with pytest.raises(ValueError, match="overlap"):
         infer(*inputs, **args, boundaries=pool[:2])
+    boundaries = pool.new_empty((2, 2, 64, 64))
+    bias = boundaries.flatten()[: 2 * 64].view(2, 64)
+    with pytest.raises(ValueError, match="overlap"):
+        infer(*inputs, **args, boundaries=boundaries, decay_bias=bias)
     assert torch.equal(pool, initial)
+
+
+@pytest.mark.parametrize("heads", [40, 64])
+def test_fp16_checkpoints_include_pending_decode_updates(heads):
+    _require_cuda_extension()
+    torch.manual_seed(643)
+    prepare = prepare_tmix_wkv7_recurrent_fp16_state_from_tensor
+    infer = infer_tmix_wkv7_recurrent_fp16_forward_varlen
+    slots = torch.arange(16, dtype=torch.int32, device="cuda").flip(0) + 1
+    pool = torch.randn(18, heads, 64, 64, dtype=torch.float16, device="cuda") * 0.02
+    state = prepare(pool)
+    reference_pool = pool.index_select(0, slots.long())
+    reference = prepare(reference_pool)
+    reference_slots = slots.new_tensor(range(16))
+    decode_lengths = slots.new_tensor(range(17))
+    warmup = tuple((torch.randn(16, heads, 64, device="cuda") * 0.1).bfloat16() for _ in range(6))
+    infer(*warmup, state=state, cu_seqlens=decode_lengths, state_indices=slots)
+    infer(*warmup, state=reference, cu_seqlens=decode_lengths, state_indices=reference_slots)
+    reference.materialize_slots_(reference_slots)
+    assert not torch.equal(pool.index_select(0, slots.long()), reference_pool)
+
+    inputs = tuple((torch.randn(20, heads, 64, device="cuda") * 0.1).bfloat16() for _ in range(6))
+    expected, final, checkpoints = _decode_reference(
+        infer, prepare, inputs, reference_pool, [5] + [1] * 15, reference_slots,
+    )
+    result, saved = infer(
+        *inputs, state=state, cu_seqlens=slots.new_tensor([0, *range(5, 21)]),
+        state_indices=slots, save=True, checkpoint_interval=1,
+    )
+    assert torch.equal(result, expected)
+    assert torch.equal(pool.index_select(0, slots.long()), final)
+    saved_indices = slots.new_tensor([*range(5), *range(6, 35, 2)]).long()
+    assert torch.equal(saved.index_select(0, saved_indices), torch.stack(checkpoints))
 
 
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.float16])

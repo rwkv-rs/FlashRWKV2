@@ -230,11 +230,10 @@ def _fp16_serving_kernel(
 
     @T.macro
     def step(state, vectors, Y, Boundaries, token, seq, start, h, t, group, col, dot):
-        if checkpoint_interval:
-            if (token - start) % stride == 0:
-                checkpoint = start // stride + seq + (token - start) // stride
-                for j in T.unroll(keys):
-                    Boundaries[checkpoint, h, group * keys + j, col] = T.cast(state[j], "float16")
+        if checkpoint_interval and (token - start) % stride == 0:
+            checkpoint = start // stride + seq + (token - start) // stride
+            for j in T.unroll(keys):
+                Boundaries[checkpoint, h, group * keys + j, col] = T.cast(state[j], "float16")
         accum = T.alloc_var("float32", init=0.0)
         for j in T.unroll(keys):
             accum = T.fma(state[j], vectors[t, 4, group * keys + j], accum)
@@ -252,11 +251,10 @@ def _fp16_serving_kernel(
 
     @T.macro
     def column_step(state, values, Y, Boundaries, token, seq, start, h, t, tid, sa):
-        if checkpoint_interval:
-            if (token - start) % stride == 0:
-                checkpoint = start // stride + seq + (token - start) // stride
-                for key in T.unroll(64):
-                    Boundaries[checkpoint, h, key, tid] = T.cast(state[key], "float16")
+        if checkpoint_interval and (token - start) % stride == 0:
+            checkpoint = start // stride + seq + (token - start) // stride
+            for key in T.unroll(64):
+                Boundaries[checkpoint, h, key, tid] = T.cast(state[key], "float16")
         sy = T.alloc_local((groups,), "float32")
         for g in T.unroll(groups):
             sa[g] = 0.0
