@@ -123,10 +123,13 @@ FP16 checkpoint 包含该 slot 已追加的 DeltaLog 更新，状态与普通 se
 的 res 后 ln 结果。T=1 融合路径与通用 packed 路径均写出该 token 作为序列末尾时
 的 shift state。调用方为导出缓冲区提供与输入和对应 pool 独立的存储。
 
-对 MTP verifier 设 `checkpoint_interval=1`。若只保留已处理的前 `m` 个 token
-且 `m` 小于序列长度，由 `boundaries[start + i + m]` 恢复 WKV state，并从
-各自的 `save_normalized[start + m - 1]` 恢复 TMix 和 CMix shift state。
-整段接受时，直接使用算子已写回的 pool。
+对 MTP verifier 设 `checkpoint_interval=1`，令 `m` 为保留的已处理 token 数。
+
+- `m = 0` 时，从 `boundaries[start + i]` 恢复 WKV state，并使用 verifier
+  调用前保留的 TMix 和 CMix shift state。
+- `0 < m < length` 时，从 `boundaries[start + i + m]` 恢复 WKV state，并从
+  各自的 `save_normalized[start + m - 1]` 恢复 TMix 和 CMix shift state。
+- `m = length` 时，使用算子已写回的 pool。
 
 ### LightMTP DraftLoop
 
