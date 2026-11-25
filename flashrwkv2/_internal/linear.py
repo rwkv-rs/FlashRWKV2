@@ -13,12 +13,7 @@ from numbers import Real
 import torch
 from torch.autograd.function import once_differentiable
 
-from .execution import (
-    _AutogradContext,
-    _fixed_strategy_device,
-    device_class,
-    workload_bucket,
-)
+from .execution import _AutogradContext, _fixed_strategy_device, device_class, workload_bucket
 
 _PASS_CONFIG = {"tl.disable_wgmma": True, "tl.enable_fast_math": False}
 _DEFAULT_CONFIG = (16, 64, 2, 32)

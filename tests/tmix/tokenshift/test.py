@@ -280,7 +280,7 @@ def test_infer_tokenshift_generic_packed_ragged_matches_reference() -> None:
 
     x_train, initial_train, *mixes = _clone_leaves(saved, initial[slots.long()], *params)
     packed = pretrain_tmix_tokenshift_bf16(
-        x_train, *mixes, cu_seqlens=cu.long(), initial_shift=initial_train, return_final_state=True,
+        x_train, *mixes, cu_seqlens=cu, initial_shift=initial_train, return_final_state=True,
     )
     independent = [
         pretrain_tmix_tokenshift_bf16(
