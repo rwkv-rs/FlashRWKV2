@@ -65,17 +65,13 @@ def pretrain_tmix_wkv7_recurrent_bf16(
         values = tuple(t.view(batch * tokens, heads, head_size) for t in values)
         cu_seqlens = torch.arange(batch + 1, dtype=torch.int32, device=r.device) * tokens
     else:
-        from ..._internal.state import check_cuda_condition
+        from ..._internal.state import check_cu_seqlens
 
         if cu_seqlens.ndim != 1 or cu_seqlens.numel() < 2:
             raise ValueError("cu_seqlens must have shape [B+1] with positive B")
         batch = cu_seqlens.numel() - 1
         _, heads, head_size = r.shape
-        check_cuda_condition(
-            (cu_seqlens[0] == 0) & (cu_seqlens[-1] == r.shape[0])
-            & (cu_seqlens[1:] >= cu_seqlens[:-1]).all(),
-            "cu_seqlens must be nondecreasing and span [0,N]",
-        )
+        check_cu_seqlens(cu_seqlens, r.shape[0])
     if initial_state is None:
         initial_state = r.new_zeros((batch, heads, head_size, head_size), dtype=torch.float32)
     output, final = tmix_wkv7_recurrent(

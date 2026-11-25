@@ -4,10 +4,8 @@
 import torch
 
 
-def _check_projection(
-    x, key_weight, value_weight, key_a, key_b, value_a, value_b, key_scale, value_scale
-):
-    from .._internal.linear import check_adapter_scale
+def _check_projection(x, key_weight, value_weight, adapters):
+    from .._internal.linear import check_adapter_parameters
 
     if x.ndim != 2 or x.numel() == 0:
         raise ValueError("CMix projection input must have nonempty shape [rows,C]")
@@ -18,127 +16,22 @@ def _check_projection(
         or key_weight.shape[0] == 0
         or value_weight.shape != (channels, key_weight.shape[0])
     ):
-        raise ValueError(
-            "CMix projection requires key_weight [F,C] and value_weight [C,F]"
-        )
-    if any(
-        t.dtype != torch.bfloat16 or not t.is_cuda or t.device != x.device
-        for t in (x, key_weight, value_weight)
-    ):
-        raise ValueError(
-            "CMix projection inputs and weights must share a CUDA bfloat16 device"
-        )
-    for name, weight, a, b, scale in (
-        ("key", key_weight, key_a, key_b, key_scale),
-        ("value", value_weight, value_a, value_b, value_scale),
-    ):
-        if (a is None) != (b is None):
-            raise ValueError(f"CMix {name} adapter A and B must be provided together")
-        if a is not None and (
-            a.ndim != 2
-            or a.shape[0] == 0
-            or a.shape[1] != weight.shape[1]
-            or b.shape != (weight.shape[0], a.shape[0])
-            or any(
-                t.dtype not in (torch.bfloat16, torch.float32) or t.device != x.device
-                for t in (a, b)
-            )
-        ):
-            raise ValueError(
-                f"CMix {name} adapter requires CUDA BF16/FP32 A [rank,in] and B [out,rank]"
-            )
-        if a is not None:
-            check_adapter_scale(scale)
+        raise ValueError("CMix projection requires key_weight [F,C] and value_weight [C,F]")
+    if any(t.dtype != torch.bfloat16 or t.device != x.device for t in (key_weight, value_weight)):
+        raise ValueError("CMix weights must be bfloat16 and share x's device")
+    return tuple(
+        (a, b, check_adapter_parameters(a, b, scale, weight, x.device), use_nora)
+        for weight, (a, b, scale, use_nora) in zip((key_weight, value_weight), adapters, strict=True)
+    )
 
 
-def _project(
-    mixed,
-    key_weight,
-    value_weight,
-    key_lora_a=None,
-    key_lora_b=None,
-    value_lora_a=None,
-    value_lora_b=None,
-    key_lora_scale=1.0,
-    value_lora_scale=1.0,
-    key_use_nora=False,
-    value_use_nora=False,
-):
+def _project(mixed, key_weight, value_weight, adapters):
     from .._internal.elementwise import activation
     from .._internal.linear import adapter_linear
 
-    _check_projection(
-        mixed,
-        key_weight,
-        value_weight,
-        key_lora_a,
-        key_lora_b,
-        value_lora_a,
-        value_lora_b,
-        key_lora_scale,
-        value_lora_scale,
-    )
-    features = adapter_linear(
-        mixed,
-        key_weight,
-        key_lora_a,
-        key_lora_b,
-        key_lora_scale,
-        key_use_nora,
-    )
-    return adapter_linear(
-        activation(features, "relu2"),
-        value_weight,
-        value_lora_a,
-        value_lora_b,
-        value_lora_scale,
-        value_use_nora,
-    )
-
-
-def _cmix(
-    x,
-    initial_shift,
-    cu_seqlens,
-    x_k,
-    key_weight,
-    value_weight,
-    key_lora_a=None,
-    key_lora_b=None,
-    value_lora_a=None,
-    value_lora_b=None,
-    key_lora_scale=1.0,
-    value_lora_scale=1.0,
-    key_use_nora=False,
-    value_use_nora=False,
-    *,
-    status=None,
-    save_normalized=None,
-):
-    from ..tmix.tokenshift.tilelang import tokenshift
-
-    mixed, final_shift = tokenshift(
-        x,
-        (x_k,),
-        cu_seqlens,
-        initial_shift,
-        _status=status,
-        _save_normalized=save_normalized,
-    )
-    output = _project(
-        mixed[0],
-        key_weight,
-        value_weight,
-        key_lora_a,
-        key_lora_b,
-        value_lora_a,
-        value_lora_b,
-        key_lora_scale,
-        value_lora_scale,
-        key_use_nora,
-        value_use_nora,
-    )
-    return output, final_shift
+    key_adapter, value_adapter = adapters
+    features = adapter_linear(mixed, key_weight, *key_adapter, _validated=True)
+    return adapter_linear(activation(features, "relu2"), value_weight, *value_adapter, _validated=True)
 
 
 def infer_cmix_forward_varlen(
@@ -174,108 +67,22 @@ def infer_cmix_forward_varlen(
     ``save_normalized`` optionally receives the BF16 shift state of each
     active input row.
     """
-    from .._internal.state import gather_state, scatter_state
-    from ..post_norm.tilelang import norm
-    from ..tmix.tokenshift.tilelang import (
-        _check_save_normalized,
-        fused_post_norm_tokenshift,
-    )
-    from ..tmix.wkv7 import (
-        _validate_launch_max_seqlen,
-        prepare_tmix_wkv7_recurrent_metadata,
-    )
+    from ..tmix.tokenshift import _postnorm_tokenshift_varlen
 
-    _check_projection(
-        x,
-        key_weight,
-        value_weight.t(),
-        key_lora_a,
-        key_lora_b,
-        value_lora_a,
-        value_lora_b,
-        key_lora_scale,
-        value_lora_scale,
+    value_weight = value_weight.t()
+    adapters = _check_projection(
+        x, key_weight, value_weight,
+        adapters=(
+            (key_lora_a, key_lora_b, key_lora_scale, key_use_nora),
+            (value_lora_a, value_lora_b, value_lora_scale, value_use_nora),
+        ),
     )
-    if (
-        shift_state_pool.dtype != torch.bfloat16
-        or not shift_state_pool.is_cuda
-        or not shift_state_pool.is_contiguous()
-        or shift_state_pool.ndim != 2
-        or shift_state_pool.shape[1] != x.shape[-1]
-        or shift_state_pool.device != x.device
-    ):
-        raise ValueError("shift_state_pool must be contiguous CUDA bfloat16 [slots,C]")
-    _check_save_normalized(
-        save_normalized, x, res, weight, bias, x_k, shift_state_pool,
-        key_weight, value_weight, key_lora_a, key_lora_b, value_lora_a, value_lora_b,
+    return _postnorm_tokenshift_varlen(
+        x, res, weight, bias, (x_k,), shift_state_pool, cu_seqlens, state_indices,
+        max_seqlen, eps, validated_metadata, save_normalized=save_normalized,
+        save_inputs=(key_weight, value_weight, key_lora_a, key_lora_b, value_lora_a, value_lora_b),
+        project=lambda mixed: _project(mixed[0], key_weight, value_weight, adapters),
     )
-    ticket = validated_metadata
-    if ticket is None:
-        ticket = prepare_tmix_wkv7_recurrent_metadata(
-            cu_seqlens,
-            state_indices,
-            total_tokens=x.shape[0],
-            state_pool_size=shift_state_pool.shape[0],
-            max_seqlen=max_seqlen,
-        )
-    ticket._check_compatible(
-        cu_seqlens,
-        state_indices,
-        x.shape[0],
-        shift_state_pool.shape[0],
-        _validate_launch_max_seqlen(max_seqlen),
-    )
-    cu_seqlens = ticket._query_start_loc_snapshot()
-    state_indices = ticket._state_indices_snapshot()
-    status = ticket._status()
-    if ticket._max_seqlen() == 1 and x.shape[0] == state_indices.numel():
-        residual, mixed = fused_post_norm_tokenshift(
-            x,
-            res,
-            weight,
-            bias,
-            (x_k,),
-            shift_state_pool,
-            state_indices,
-            status,
-            eps,
-            save_normalized=save_normalized,
-        )
-        return residual, _project(
-            mixed[0],
-            key_weight,
-            value_weight.t(),
-            key_lora_a,
-            key_lora_b,
-            value_lora_a,
-            value_lora_b,
-            key_lora_scale,
-            value_lora_scale,
-            key_use_nora,
-            value_use_nora,
-        )
-    normalized, residual = norm(x, weight, bias, eps, res, return_res=True)
-    initial = gather_state(shift_state_pool, state_indices, status)
-    output, final = _cmix(
-        normalized,
-        initial,
-        cu_seqlens,
-        x_k,
-        key_weight,
-        value_weight.t(),
-        key_lora_a,
-        key_lora_b,
-        value_lora_a,
-        value_lora_b,
-        key_lora_scale,
-        value_lora_scale,
-        key_use_nora,
-        value_use_nora,
-        status=status,
-        save_normalized=save_normalized,
-    )
-    scatter_state(shift_state_pool, final, state_indices, status)
-    return residual, output
 
 
 def pretrain_cmix_bf16(
@@ -297,32 +104,25 @@ def pretrain_cmix_bf16(
     value_use_nora=False,
 ):
     """Apply ChannelMix to dense [B,T,C] or packed [N,C] rows with differentiable shift state."""
+    from ..tmix.tokenshift.tilelang import tokenshift
+
+    packed = cu_seqlens is not None
+    rows = x
     if cu_seqlens is None:
-        if x.ndim != 3 or x.numel() == 0:
-            raise ValueError("CMix training input must have non-empty shape [B,T,C]")
+        if x.ndim != 3:
+            raise ValueError("CMix training input must have shape [B,T,C]")
         batch, tokens, _ = x.shape
         cu_seqlens = torch.arange(batch + 1, device=x.device, dtype=torch.int32) * tokens
-    else:
-        from ..tmix.tokenshift import _validate_packed_training_input
-
-        _validate_packed_training_input(x, cu_seqlens)
-    output, final = _cmix(
-        x.flatten(0, -2),
-        initial_shift,
-        cu_seqlens,
-        x_k,
-        key_weight,
-        value_weight,
-        key_lora_a,
-        key_lora_b,
-        value_lora_a,
-        value_lora_b,
-        key_lora_scale,
-        value_lora_scale,
-        key_use_nora,
-        value_use_nora,
+        rows = x.flatten(0, -2)
+    adapters = _check_projection(
+        rows, key_weight, value_weight,
+        adapters=(
+            (key_lora_a, key_lora_b, key_lora_scale, key_use_nora),
+            (value_lora_a, value_lora_b, value_lora_scale, value_use_nora),
+        ),
     )
-    output = output.view_as(x)
+    (mixed,), final = tokenshift(rows, (x_k,), cu_seqlens, initial_shift, _check_cu=packed)
+    output = _project(mixed, key_weight, value_weight, adapters).view_as(x)
     return (output, final) if return_final_state else output
 
 

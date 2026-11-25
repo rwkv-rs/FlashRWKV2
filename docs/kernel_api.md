@@ -197,12 +197,11 @@ compiled_model = torch.compile(
 
 以 `initial_state` 传入初始 WKV state。设置 `return_final_state=True` 返回
 `(output, final_state)`。packed 输入使用连续 CUDA int32 `cu_seqlens`，
-从 0 起单调非减，末元素为 token 总数。TokenShift 和 CMix 以
-`initial_shift` 传入 shift state，同样通过 `return_final_state` 取出最终 state。
-这两个算子省略 `cu_seqlens` 时接受 dense `[B,T,C]`，传入时接受 packed
-`[N,C]`，混合输出或投影输出与输入同形状。packed 训练的三个算子共用同一组
-`cu_seqlens`。省略初始 state 时，每段都从零开始。若传入或返回 shift state，
-其形状为 `[B,C]`，其中 `B = cu_seqlens.numel() - 1`。
+从 0 起单调非减，末元素为 token 总数。
+
+TokenShift 和 CMix 接受 dense `[B,T,C]` 或 packed `[N,C]`。两个算子也接受
+CUDA int64 offsets，与 WKV 一起使用时三个算子共用同一组 int32 `cu_seqlens`。
+shift state 形状为 `[B,C]`，省略 `initial_shift` 时每段从零开始。
 
 ## Tuning and acceptance
 
