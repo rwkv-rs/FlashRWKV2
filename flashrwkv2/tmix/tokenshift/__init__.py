@@ -35,20 +35,33 @@ def infer_tmix_postnorm_tokenshift_forward_varlen(
     ``save_normalized`` optionally receives the BF16 shift state of each
     active input row, including rows before the end of each sequence.
     """
+    if x.ndim != 2:
+        raise ValueError("x must have packed shape [total_tokens,C]")
+    total, mixed = _postnorm_tokenshift_varlen(
+        x, res, weight, bias, (x_r, x_w, x_k, x_v, x_a, x_g),
+        shift_state_pool, cu_seqlens, state_indices, max_seqlen, eps, validated_metadata,
+        save_normalized=save_normalized,
+    )
+    return (total, *mixed)
+
+
+def _postnorm_tokenshift_varlen(
+    x, res, weight, bias, mixes, shift_state_pool, cu_seqlens, state_indices,
+    max_seqlen, eps, validated_metadata, *, save_normalized=None, save_inputs=(), project=None,
+):
     from ..._internal.state import gather_state, scatter_state
     from ...post_norm.tilelang import norm
     from .tilelang import _check_save_normalized, fused_post_norm_tokenshift, tokenshift
 
-    if x.ndim != 2:
-        raise ValueError("x must have packed shape [total_tokens,C]")
     if (
         shift_state_pool.ndim != 2 or shift_state_pool.shape[1] != x.shape[1]
         or shift_state_pool.dtype != torch.bfloat16 or not shift_state_pool.is_cuda
         or not shift_state_pool.is_contiguous() or shift_state_pool.device != x.device
     ):
         raise ValueError("shift_state_pool must be contiguous CUDA bfloat16 [slots,C]")
-    mixes = (x_r, x_w, x_k, x_v, x_a, x_g)
-    _check_save_normalized(save_normalized, x, res, weight, bias, *mixes, shift_state_pool)
+    _check_save_normalized(
+        save_normalized, x, res, weight, bias, *mixes, shift_state_pool, *save_inputs,
+    )
     launch_max = _validate_launch_max_seqlen(max_seqlen)
     ticket = validated_metadata
     if ticket is None:
@@ -61,32 +74,22 @@ def infer_tmix_postnorm_tokenshift_forward_varlen(
     )
     cu = ticket._query_start_loc_snapshot()
     indices, status = ticket._state_indices_snapshot(), ticket._status()
-    if ticket._max_seqlen() == 1 and x.shape[0] == indices.numel():
+    fused = ticket._max_seqlen() == 1 and x.shape[0] == indices.numel()
+    if fused:
         total, mixed = fused_post_norm_tokenshift(
             x, res, weight, bias, mixes, shift_state_pool, indices, status, eps,
             save_normalized=save_normalized,
         )
-        return (total, *mixed)
-    normalized, total = norm(x, weight, bias, eps, res, return_res=True)
-    initial = gather_state(shift_state_pool, indices, status)
-    mixed, final = tokenshift(
-        normalized, mixes, cu, initial, _status=status, _save_normalized=save_normalized,
-    )
-    scatter_state(shift_state_pool, final, indices, status)
-    return (total, *mixed)
-
-
-def _training_tokenshift(x, initial_shift, mixes):
-    from .tilelang import tokenshift
-
-    if x.ndim != 3 or x.numel() == 0:
-        raise ValueError("x must have non-empty shape [B,T,C]")
-    if not x.is_contiguous():
-        raise ValueError("x must be contiguous CUDA bfloat16 [B,T,C]")
-    batch, length, channels = x.shape
-    cu = torch.arange(batch + 1, device=x.device, dtype=torch.int32) * length
-    outputs, final = tokenshift(x.view(-1, channels), mixes, cu, initial_shift)
-    return tuple(output.view_as(x) for output in outputs) + (final,)
+    else:
+        normalized, total = norm(x, weight, bias, eps, res, return_res=True)
+        initial = gather_state(shift_state_pool, indices, status)
+        mixed, final = tokenshift(
+            normalized, mixes, cu, initial, _status=status, _save_normalized=save_normalized,
+        )
+    output = mixed if project is None else project(mixed)
+    if not fused:
+        scatter_state(shift_state_pool, final, indices, status)
+    return total, output
 
 
 def pretrain_tmix_tokenshift_bf16(
@@ -99,11 +102,25 @@ def pretrain_tmix_tokenshift_bf16(
     x_g: torch.Tensor,
     *,
     initial_shift: torch.Tensor | None = None,
+    cu_seqlens: torch.Tensor | None = None,
     return_final_state: bool = False,
 ) -> tuple[torch.Tensor, ...]:
-    """BF16 six-way shifted TimeMix with an optional differentiable initial state."""
-    outputs = _training_tokenshift(x, initial_shift, (x_r, x_w, x_k, x_v, x_a, x_g))
-    return outputs if return_final_state else outputs[:-1]
+    """Mix dense [B,T,C] or packed [N,C] rows with one initial shift per sequence."""
+    from .tilelang import tokenshift
+
+    packed = cu_seqlens is not None
+    rows = x
+    if cu_seqlens is None:
+        if x.ndim != 3:
+            raise ValueError("x must have shape [B,T,C]")
+        batch, length, channels = x.shape
+        cu_seqlens = torch.arange(batch + 1, device=x.device, dtype=torch.int32) * length
+        rows = x.view(batch * length, channels)
+
+    mixes = (x_r, x_w, x_k, x_v, x_a, x_g)
+    outputs, final = tokenshift(rows, mixes, cu_seqlens, initial_shift, _check_cu=packed)
+    mixed = tuple(output.view_as(x) for output in outputs)
+    return (*mixed, final) if return_final_state else mixed
 
 
 __all__ = [

@@ -143,18 +143,13 @@ def _fused_forward(
 def fused_post_norm_tokenshift(
     x, res, weight, bias, mixes, pool, indices, status, eps=1e-5, *, save_normalized=None,
 ):
-    """Fuse T=1 ln and indexed TokenShift for TMix's six or CMix's one mix."""
+    """Fuse T=1 ln and indexed TokenShift with a caller-validated state pool."""
     _check_norm(x, weight, bias, res, eps)
     mixes = _pack_mixes(x, mixes, pack=False)
     if (
         x.ndim != 2 or indices.shape != (x.shape[0],)
     ):
         raise ValueError("fused TokenShift expects one packed row per sequence and mixes [K,C]")
-    if (
-        pool.ndim != 2 or pool.shape[1] != x.shape[1] or pool.dtype != torch.bfloat16
-        or pool.device != x.device or not pool.is_contiguous()
-    ):
-        raise ValueError("shift state must be contiguous CUDA bfloat16 [slots,C]")
     if x.shape[1] % 2 == 0 and pool.data_ptr() % 4:
         raise ValueError("fused TokenShift state and parameters must be 4-byte aligned")
     group = _FUSED_CONFIGS.get(_config_key(x, mixes, x.shape[0]), 1)
@@ -421,6 +416,7 @@ def tokenshift(
     cu_seqlens: torch.Tensor,
     initial_shift: torch.Tensor | None = None,
     *,
+    _check_cu: bool = False,
     _status: torch.Tensor | None = None,
     _save_normalized: torch.Tensor | None = None,
 ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
@@ -445,6 +441,10 @@ def tokenshift(
         raise ValueError("initial_shift must have shape [B,C]")
     if any(t.device != x.device or not t.is_contiguous() for t in (*tensors, cu_seqlens)):
         raise ValueError("tokenshift inputs and metadata must be contiguous and share a device")
+    if _check_cu:
+        from ..._internal.state import check_cu_seqlens
+
+        check_cu_seqlens(cu_seqlens, x.shape[0])
     if _status is not None and channels % 2 == 0 and any(t.data_ptr() % 4 for t in tensors):
         raise ValueError("tokenshift inputs must be 4-byte aligned")
     if _status is None:

@@ -156,12 +156,12 @@ INT64 `[1,depth]` 缓冲区，跨调用保留时使用 `clone()`。同一实例�
 
 | API | 说明 |
 |---|---|
-| `pretrain_tmix_tokenshift_bf16` | 六路 TokenShift；stateful 形式返回混合输出和 final shift |
+| `pretrain_tmix_tokenshift_bf16` | dense 或 packed 六路 TokenShift，可选可微初始/最终 shift state |
 | `pretrain_tmix_wkv_prepare_bf16` | 训练权重布局与 `w0` bias，输出共享 BF16 prepare 结果 |
 | `pretrain_tmix_wkv7_recurrent_bf16` | dense `[B,T,C]` 或带 cu_seqlens 的 packed `[N,H,D]`，支持任意长度和可微 FP32 初始状态 |
 | `rl_infctx_tmix_wkv7_recurrent_bf16` | packed 六路输入、`state_pool`、`cu_seqlens`、可选 `state_indices`，返回 `(output, final_pool)`；未选中槽位保持原值，输入和 state 可求梯度 |
 | `pretrain_tmix_readout_bf16` | head ln、RKV residual、gate，可选 output projection |
-| `pretrain_cmix_bf16` | ChannelMix 与可微初始/最终 shift state |
+| `pretrain_cmix_bf16` | dense 或 packed ChannelMix，可选可微初始/最终 shift state |
 | `pretrain_head_linear_bf16` | BF16 hidden/weight，返回 FP32 logits |
 | `pretrain_head_ce_bf16` | `chunk_rows` 限制前向词表投影工作集，按 targets 形状返回 FP32 交叉熵，-100 对应零 loss 和梯度，`backward_chunk_rows` 可独立设置反向重算和 VJP 的行数，默认沿用 `chunk_rows` |
 | `pretrain_l2wrap_ce_bf16` | 对任意前置维度的 logits 计算 FP32 交叉熵，梯度包含 train_temp L2Wrap 项 |
@@ -197,8 +197,12 @@ compiled_model = torch.compile(
 
 以 `initial_state` 传入初始 WKV state。设置 `return_final_state=True` 返回
 `(output, final_state)`。packed 输入使用连续 CUDA int32 `cu_seqlens`，
-从 0 起单调非减，末元素为 token 总数。TokenShift 和 CMix 以
-`initial_shift` 传入 shift state，同样通过 `return_final_state` 取出最终 state。
+从 0 起单调非减，末元素为 token 总数。这三项值域约束由异步 CUDA 断言检查，
+违反约束会使当前 CUDA context 失效，需要重启进程。
+
+TokenShift 和 CMix 接受 dense `[B,T,C]` 或 packed `[N,C]`，与 WKV 共用同一组
+int32 `cu_seqlens`。
+shift state 形状为 `[B,C]`，省略 `initial_shift` 时每段从零开始。
 
 ## Tuning and acceptance
 

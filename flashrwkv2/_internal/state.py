@@ -6,13 +6,21 @@ import tilelang.language as T
 import torch
 
 
-
 def check_cuda_condition(condition, message):
     """Validate device metadata without host reads in compiled/captured calls."""
     if torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing():
         torch._assert_async(condition, message)
     elif not bool(condition.item()):
         raise ValueError(message)
+
+
+def check_cu_seqlens(cu_seqlens, total_tokens):
+    """Assert packed boundaries on the device before launching a training kernel."""
+    torch._assert_async(
+        (cu_seqlens[0] == 0) & (cu_seqlens[-1] == total_tokens)
+        & (cu_seqlens[1:] >= cu_seqlens[:-1]).all(),
+        "cu_seqlens must be nondecreasing and span [0,N]",
+    )
 
 
 @tilelang.jit(pass_configs={"tl.enable_fast_math": False})

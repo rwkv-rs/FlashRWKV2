@@ -616,8 +616,7 @@ def linear(x, weight, bias=None, output_dtype=None):
         raise ValueError(
             "linear expects x [...,in_features], weight [out_features,in_features]"
         )
-    output_dtype = torch.bfloat16 if output_dtype is None else output_dtype
-    if output_dtype not in (torch.bfloat16, torch.float32):
+    if output_dtype not in (None, torch.bfloat16, torch.float32):
         raise ValueError("linear output_dtype must be bfloat16 or float32")
     if bias is not None and (
         bias.shape != (weight.shape[0],)
@@ -625,6 +624,11 @@ def linear(x, weight, bias=None, output_dtype=None):
         or bias.dtype not in (torch.bfloat16, torch.float32)
     ):
         raise ValueError("linear bias must be [out_features], BF16/FP32, on x's device")
+    return _linear(x, weight, bias, output_dtype)
+
+
+def _linear(x, weight, bias=None, output_dtype=None):
+    output_dtype = torch.bfloat16 if output_dtype is None else output_dtype
     operation = _compiled_linear if torch.compiler.is_compiling() else _Linear.apply
     result = operation(
         x.reshape(-1, x.shape[-1]).contiguous(),
@@ -645,6 +649,25 @@ def check_adapter_scale(scale):
     return value
 
 
+def check_adapter_parameters(a, b, scale, weight, device):
+    if (a is None) != (b is None):
+        raise ValueError("adapter A and B must be provided together")
+    if a is None:
+        return scale
+    if (
+        a.ndim != 2
+        or a.shape[0] == 0
+        or a.shape[1] != weight.shape[1]
+        or b.shape != (weight.shape[0], a.shape[0])
+        or a.device != device
+        or b.device != device
+        or a.dtype not in (torch.bfloat16, torch.float32)
+        or b.dtype not in (torch.bfloat16, torch.float32)
+    ):
+        raise ValueError("adapter expects A [rank,in], B [out,rank], CUDA BF16/FP32")
+    return check_adapter_scale(scale)
+
+
 def adapter_linear(
     x,
     weight,
@@ -655,6 +678,7 @@ def adapter_linear(
     output_dtype=None,
     *,
     base_result=None,
+    _validated=False,
 ):
     """Project through a base weight and differentiable LoRA/NoRA parameters.
 
@@ -662,28 +686,17 @@ def adapter_linear(
     training contract. Both modes round A/B and the intermediate features to
     BF16. The adapter's second projection, scaling and addition use FP32.
     """
-    if (a is None) != (b is None):
-        raise ValueError("adapter A and B must be provided together")
+    project = _linear if _validated else linear
+    if not _validated:
+        scale = check_adapter_parameters(a, b, scale, weight, x.device)
     if a is None:
         return (
-            linear(x, weight, output_dtype=output_dtype)
+            project(x, weight, output_dtype=output_dtype)
             if base_result is None
             else base_result
         )
-    if (
-        a.ndim != 2
-        or b.ndim != 2
-        or a.shape[1] != weight.shape[1]
-        or b.shape != (weight.shape[0], a.shape[0])
-        or a.device != x.device
-        or b.device != x.device
-        or a.dtype not in (torch.bfloat16, torch.float32)
-        or b.dtype not in (torch.bfloat16, torch.float32)
-    ):
-        raise ValueError("adapter expects A [rank,in], B [out,rank], CUDA BF16/FP32")
-    scale = check_adapter_scale(scale)
     result = (
-        linear(x, weight, output_dtype=output_dtype)
+        project(x, weight, output_dtype=output_dtype)
         if base_result is None
         else base_result
     )
@@ -691,7 +704,7 @@ def adapter_linear(
         normalized = _compiled_nora(a)[0] if torch.compiler.is_compiling() else _NoRA.apply(a)
     else:
         normalized = a.to(torch.bfloat16)
-    features = linear(x, normalized)
-    update = linear(features, b.to(torch.bfloat16), output_dtype=torch.float32)
+    features = project(x, normalized)
+    update = project(features, b.to(torch.bfloat16), output_dtype=torch.float32)
     operation = _compiled_adapter_add if torch.compiler.is_compiling() else _AdapterAdd.apply
     return operation(result, update, scale)
