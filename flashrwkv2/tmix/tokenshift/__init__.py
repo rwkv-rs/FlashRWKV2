@@ -47,7 +47,7 @@ def infer_tmix_postnorm_tokenshift_forward_varlen(
 
 def _postnorm_tokenshift_varlen(
     x, res, weight, bias, mixes, shift_state_pool, cu_seqlens, state_indices,
-    max_seqlen, eps, validated_metadata, *, save_normalized=None, save_inputs=(), project=None,
+    max_seqlen, eps, validated_metadata, *, save_normalized=None, save_inputs=(),
 ):
     from ..._internal.state import gather_state, scatter_state
     from ...post_norm.tilelang import norm
@@ -74,22 +74,19 @@ def _postnorm_tokenshift_varlen(
     )
     cu = ticket._query_start_loc_snapshot()
     indices, status = ticket._state_indices_snapshot(), ticket._status()
-    fused = ticket._max_seqlen() == 1 and x.shape[0] == indices.numel()
-    if fused:
-        total, mixed = fused_post_norm_tokenshift(
+    if ticket._max_seqlen() == 1 and x.shape[0] == indices.numel():
+        return fused_post_norm_tokenshift(
             x, res, weight, bias, mixes, shift_state_pool, indices, status, eps,
             save_normalized=save_normalized,
         )
-    else:
-        normalized, total = norm(x, weight, bias, eps, res, return_res=True)
-        initial = gather_state(shift_state_pool, indices, status)
-        mixed, final = tokenshift(
-            normalized, mixes, cu, initial, _status=status, _save_normalized=save_normalized,
-        )
-    output = mixed if project is None else project(mixed)
-    if not fused:
-        scatter_state(shift_state_pool, final, indices, status)
-    return total, output
+
+    normalized, total = norm(x, weight, bias, eps, res, return_res=True)
+    initial = gather_state(shift_state_pool, indices, status)
+    mixed, final = tokenshift(
+        normalized, mixes, cu, initial, _status=status, _save_normalized=save_normalized,
+    )
+    scatter_state(shift_state_pool, final, indices, status)
+    return total, mixed
 
 
 def pretrain_tmix_tokenshift_bf16(

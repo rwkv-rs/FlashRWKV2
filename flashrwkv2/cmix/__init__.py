@@ -64,6 +64,7 @@ def infer_cmix_forward_varlen(
 
     The inference value weight retains its runtime [F,C] layout. A transpose
     view feeds the same projection as the training [C,F] weight.
+    Projection weights and adapters must use storage separate from ``shift_state_pool``.
     ``save_normalized`` optionally receives the BF16 shift state of each
     active input row.
     """
@@ -77,12 +78,12 @@ def infer_cmix_forward_varlen(
             (value_lora_a, value_lora_b, value_lora_scale, value_use_nora),
         ),
     )
-    return _postnorm_tokenshift_varlen(
+    residual, (mixed,) = _postnorm_tokenshift_varlen(
         x, res, weight, bias, (x_k,), shift_state_pool, cu_seqlens, state_indices,
         max_seqlen, eps, validated_metadata, save_normalized=save_normalized,
         save_inputs=(key_weight, value_weight, key_lora_a, key_lora_b, value_lora_a, value_lora_b),
-        project=lambda mixed: _project(mixed[0], key_weight, value_weight, adapters),
     )
+    return residual, _project(mixed, key_weight, value_weight, adapters)
 
 
 def pretrain_cmix_bf16(
