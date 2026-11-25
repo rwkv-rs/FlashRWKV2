@@ -48,6 +48,39 @@ def test_pretrain_tokenshift_forward_backward() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.cuda
+def test_pretrain_tokenshift_packed_matches_independent_sequences() -> None:
+    torch.manual_seed(71)
+    lengths = (1, 4, 3)
+    cu_seqlens = torch.tensor([0, 1, 5, 8], device="cuda", dtype=torch.int32)
+    x = (torch.randn(sum(lengths), 64, device="cuda", dtype=torch.bfloat16) * 0.125).requires_grad_()
+    mixes = tuple(
+        torch.randn(64, device=x.device, dtype=x.dtype).mul_(0.125).requires_grad_()
+        for _ in range(6)
+    )
+    packed = pretrain_tmix_tokenshift_bf16(
+        x, *mixes, cu_seqlens=cu_seqlens, return_final_state=True,
+    )
+    independent = [
+        pretrain_tmix_tokenshift_bf16(sample.unsqueeze(0), *mixes, return_final_state=True)
+        for sample in x.split(lengths)
+    ]
+    dense = tuple(torch.cat(parts, dim=-2).squeeze(0) for parts in zip(*independent, strict=True))
+    for actual, expected in zip(packed, dense, strict=True):
+        assert torch.equal(actual, expected)
+
+    upstream = tuple(torch.randn_like(output) for output in packed)
+    packed_grads = torch.autograd.grad(packed, (x, *mixes), upstream)
+    dense_grads = torch.autograd.grad(dense, (x, *mixes), upstream)
+    assert torch.equal(packed_grads[0], dense_grads[0])
+    for actual, expected in zip(packed_grads[1:], dense_grads[1:], strict=True):
+        torch.testing.assert_close(actual, expected, atol=0.004, rtol=0.02)
+
+    with pytest.raises(ValueError, match="nondecreasing"):
+        pretrain_tmix_tokenshift_bf16(x, *mixes, cu_seqlens=cu_seqlens.new_tensor([0, 5, 1, 8]))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.cuda
 @pytest.mark.parametrize("batch_size", (1, 2))
 @pytest.mark.parametrize("seqlen", (1, 2, 7, 16, 31))
 @pytest.mark.parametrize("zero_shift", (False, True))

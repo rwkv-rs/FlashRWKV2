@@ -76,17 +76,22 @@ def infer_tmix_postnorm_tokenshift_forward_varlen(
     return (total, *mixed)
 
 
-def _training_tokenshift(x, initial_shift, mixes):
-    from .tilelang import tokenshift
+def _validate_packed_training_input(x: torch.Tensor, cu_seqlens: torch.Tensor) -> None:
+    from ..._internal.state import check_cuda_condition
 
-    if x.ndim != 3 or x.numel() == 0:
-        raise ValueError("x must have non-empty shape [B,T,C]")
-    if not x.is_contiguous():
-        raise ValueError("x must be contiguous CUDA bfloat16 [B,T,C]")
-    batch, length, channels = x.shape
-    cu = torch.arange(batch + 1, device=x.device, dtype=torch.int32) * length
-    outputs, final = tokenshift(x.view(-1, channels), mixes, cu, initial_shift)
-    return tuple(output.view_as(x) for output in outputs) + (final,)
+    if x.ndim != 2 or x.numel() == 0:
+        raise ValueError("x must have non-empty packed shape [N,C]")
+    if (
+        cu_seqlens.ndim != 1 or cu_seqlens.numel() < 2
+        or cu_seqlens.dtype != torch.int32 or not cu_seqlens.is_cuda
+        or cu_seqlens.device != x.device or not cu_seqlens.is_contiguous()
+    ):
+        raise ValueError("cu_seqlens must be contiguous CUDA int32 [B+1] on the x device")
+    check_cuda_condition(
+        (cu_seqlens[0] == 0) & (cu_seqlens[-1] == x.shape[0])
+        & (cu_seqlens[1:] >= cu_seqlens[:-1]).all(),
+        "cu_seqlens must be nondecreasing and span [0,N]",
+    )
 
 
 def pretrain_tmix_tokenshift_bf16(
@@ -99,11 +104,26 @@ def pretrain_tmix_tokenshift_bf16(
     x_g: torch.Tensor,
     *,
     initial_shift: torch.Tensor | None = None,
+    cu_seqlens: torch.Tensor | None = None,
     return_final_state: bool = False,
 ) -> tuple[torch.Tensor, ...]:
-    """BF16 six-way shifted TimeMix with an optional differentiable initial state."""
-    outputs = _training_tokenshift(x, initial_shift, (x_r, x_w, x_k, x_v, x_a, x_g))
-    return outputs if return_final_state else outputs[:-1]
+    """Mix dense [B,T,C] or packed [N,C] rows with one initial shift per sequence."""
+    from .tilelang import tokenshift
+
+    if cu_seqlens is None:
+        if x.ndim != 3 or x.numel() == 0:
+            raise ValueError("x must have non-empty shape [B,T,C]")
+        if not x.is_contiguous():
+            raise ValueError("x must be contiguous CUDA bfloat16 [B,T,C]")
+        batch, length, _ = x.shape
+        cu_seqlens = torch.arange(batch + 1, device=x.device, dtype=torch.int32) * length
+    else:
+        _validate_packed_training_input(x, cu_seqlens)
+
+    mixes = (x_r, x_w, x_k, x_v, x_a, x_g)
+    outputs, final = tokenshift(x.flatten(0, -2), mixes, cu_seqlens, initial_shift)
+    mixed = tuple(output.view_as(x) for output in outputs)
+    return (*mixed, final) if return_final_state else mixed
 
 
 __all__ = [

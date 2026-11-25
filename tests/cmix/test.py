@@ -331,6 +331,31 @@ def test_pretrain_cmix_forward_backward(t, c) -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.cuda
+def test_pretrain_cmix_packed_matches_independent_sequences() -> None:
+    torch.manual_seed(57)
+    lengths = (1, 4, 3)
+    cu_seqlens = torch.tensor([0, 1, 5, 8], device="cuda", dtype=torch.int32)
+    c = 32
+    x, x_k, key, value = (
+        torch.randn(shape, device="cuda", dtype=torch.bfloat16).mul_(0.125).requires_grad_()
+        for shape in ((sum(lengths), c), (c,), (4 * c, c), (c, 4 * c))
+    )
+    packed = pretrain_cmix_bf16(x, x_k, key, value, cu_seqlens=cu_seqlens)
+    dense = torch.cat([
+        pretrain_cmix_bf16(sample.unsqueeze(0), x_k, key, value).squeeze(0)
+        for sample in x.split(lengths)
+    ])
+    assert torch.equal(packed, dense)
+
+    upstream = torch.randn_like(packed)
+    packed_grads = torch.autograd.grad(packed, (x, x_k, key, value), upstream)
+    dense_grads = torch.autograd.grad(dense, (x, x_k, key, value), upstream)
+    for actual, expected in zip(packed_grads, dense_grads, strict=True):
+        torch.testing.assert_close(actual, expected, atol=0.004, rtol=0.02)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.cuda
 @pytest.mark.parametrize("batch_size", (1, 2))
 @pytest.mark.parametrize("seqlen", (1, 2, 7, 16, 31))
 @pytest.mark.parametrize("zero_shift", (False, True))

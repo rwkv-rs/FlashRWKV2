@@ -285,6 +285,7 @@ def pretrain_cmix_bf16(
     value_weight,
     *,
     initial_shift=None,
+    cu_seqlens: torch.Tensor | None = None,
     return_final_state=False,
     key_lora_a=None,
     key_lora_b=None,
@@ -295,15 +296,20 @@ def pretrain_cmix_bf16(
     key_use_nora=False,
     value_use_nora=False,
 ):
-    """Use differentiable initial/final TokenShift state for chunked training."""
-    if x.ndim != 3 or x.numel() == 0:
-        raise ValueError("CMix training input must have non-empty shape [B,T,C]")
-    batch, tokens, channels = x.shape
-    cu = torch.arange(batch + 1, device=x.device, dtype=torch.int32) * tokens
+    """Apply ChannelMix to dense [B,T,C] or packed [N,C] rows with differentiable shift state."""
+    if cu_seqlens is None:
+        if x.ndim != 3 or x.numel() == 0:
+            raise ValueError("CMix training input must have non-empty shape [B,T,C]")
+        batch, tokens, _ = x.shape
+        cu_seqlens = torch.arange(batch + 1, device=x.device, dtype=torch.int32) * tokens
+    else:
+        from ..tmix.tokenshift import _validate_packed_training_input
+
+        _validate_packed_training_input(x, cu_seqlens)
     output, final = _cmix(
-        x.reshape(-1, channels),
+        x.flatten(0, -2),
         initial_shift,
-        cu,
+        cu_seqlens,
         x_k,
         key_weight,
         value_weight,
