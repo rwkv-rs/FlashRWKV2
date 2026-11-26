@@ -277,6 +277,7 @@ def load_extension() -> CompileResult:
             return _RESULT
 
         import torch
+
         from ._internal.execution import native_cache_root
 
         root = source_root()

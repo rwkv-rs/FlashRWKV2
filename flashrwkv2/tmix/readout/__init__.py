@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: MIT
+"""TMix readout: head LayerNorm, RKV residual, output gate, and projection."""
 
 from __future__ import annotations
 
@@ -24,18 +25,16 @@ def infer_tmix_readout_forward_varlen(
     max_seqlen: int | None = None,
     output_use_nora: bool = False,
 ) -> torch.Tensor:
-    """BF16 head ln, RKV res, gate and output projection with FP32 accumulators."""
+    """Packed BF16 head LN, RKV residual, gate, and output projection with FP32 accumulators."""
     from ..._internal.linear import adapter_linear
     from .tilelang import readout
 
+    del batch_size, max_seqlen
     if wkv_output.ndim != 2:
         raise ValueError("wkv_output must have packed shape [total_tokens,C]")
-    prelinear = readout(
-        wkv_output, receptance, key, value, r_k, ln_weight, ln_bias, gate, head_size,
-    )
+    prelinear = readout(wkv_output, receptance, key, value, r_k, ln_weight, ln_bias, gate, head_size)
     return adapter_linear(
-        prelinear, output_weight, output_lora_a, output_lora_b,
-        output_lora_scale, output_use_nora,
+        prelinear, output_weight, output_lora_a, output_lora_b, output_lora_scale, output_use_nora,
     )
 
 

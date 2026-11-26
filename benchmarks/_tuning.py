@@ -109,7 +109,7 @@ def select_config(candidates, run, *, check=None, reference=None, warmup=3, repe
         actual = check(config)
         values = (actual,) if isinstance(actual, torch.Tensor) else tuple(actual)
         equal = len(values) == len(expected) and all(
-            torch.equal(value, target) for value, target in zip(values, expected)
+            torch.equal(value, target) for value, target in zip(values, expected, strict=True)
         )
         record = {"config": config, "bitwise_equal": equal}
         measurements.append(record)

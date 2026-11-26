@@ -7,6 +7,12 @@ import torch
 from torch.autograd.function import once_differentiable
 
 from ..._internal.elementwise import _activation_kernel, sum_partials
+from ..._internal.execution import (
+    _AutogradContext,
+    _fixed_strategy_device,
+    device_class,
+    workload_bucket,
+)
 from ..._internal.linear import (
     _aligned,
     _forward,
@@ -14,14 +20,13 @@ from ..._internal.linear import (
     adapter_linear,
     linear_input_vjp,
 )
-from ..._internal.execution import (
-    _AutogradContext,
-    _fixed_strategy_device,
-    device_class,
-    workload_bucket,
-)
 from ..kk_pre.tilelang import prepare as prepare_key
 from ..vres_gate.tilelang import vres
+
+# Activation epilogues and saved pre-activation raw modes for grouped BF16 linears.
+_ACT_IDENTITY, _ACT_TANH, _ACT_SIGMOID = 0, 1, 2
+_ACT_NAMES = {_ACT_IDENTITY: "identity", _ACT_TANH: "tanh", _ACT_SIGMOID: "sigmoid"}
+_RAW_NONE, _RAW_ACTIVATED_BF16, _RAW_ALL_FP32 = 0, 1, 2
 
 
 def prepare(
@@ -81,7 +86,7 @@ def prepare(
     dense_inputs = (x_r, x_k, x_v)
     dense_weights = (receptance_weight, key_weight, value_weight)
     projected = _grouped_linear(
-        dense_inputs, dense_weights, (0, 0, 0), (None, None, None)
+        dense_inputs, dense_weights, (_ACT_IDENTITY, _ACT_IDENTITY, _ACT_IDENTITY), (None, None, None)
     )
     r, key, value = (
         adapter_linear(x, weight, a, b, scale, nora, base_result=base)
@@ -91,18 +96,18 @@ def prepare(
     )
     inputs, first_weights = (x_w, x_a, x_g), (w1, a1, g1)
     second_weights = (w2, a2, g2)
-    kinds, biases = (1, 0, 2), (w0, a0, None)
+    kinds, biases = (_ACT_TANH, _ACT_IDENTITY, _ACT_SIGMOID), (w0, a0, None)
     if v_first is not None:
         inputs += (x_v,)
         first_weights += (v1,)
         second_weights += (v2,)
-        kinds += (0,)
+        kinds += (_ACT_IDENTITY,)
         biases += (None,)
     reduced = _grouped_linear(inputs, first_weights, kinds, (None,) * len(inputs))
     values = _grouped_linear(
         reduced,
         second_weights,
-        (0, 2, 0) + ((0,) if v_first is not None else ()),
+        (_ACT_IDENTITY, _ACT_SIGMOID, _ACT_IDENTITY) + ((_ACT_IDENTITY,) if v_first is not None else ()),
         biases,
     )
     decay, rate, gate = values[:3]
@@ -141,14 +146,14 @@ def _store_group(
                 has_bias, rounded + T.cast(bias[col], T.float32), rounded
             )
             result = T.if_then_else(
-                kind == 1,
+                kind == _ACT_TANH,
                 T.tanh(value),
-                T.if_then_else(kind == 2, T.sigmoid(value), value),
+                T.if_then_else(kind == _ACT_SIGMOID, T.sigmoid(value), value),
             )
             Y[prefix * rows + row * outputs + col] = result
-            if raw_mode == 2:
+            if raw_mode == _RAW_ALL_FP32:
                 Raw[raw_prefix * rows + row * outputs + col] = acc[i, j]
-            elif raw_mode == 1 and kind != 0:
+            elif raw_mode == _RAW_ACTIVATED_BF16 and kind != _ACT_IDENTITY:
                 Raw[raw_prefix * rows + row * outputs + col] = T.cast(
                     acc[i, j], T.bfloat16
                 )
@@ -177,11 +182,13 @@ def _group_program(
     bm, bn, stages, copy_k = config
     total = sum(outputs[:count])
     raw_sizes = tuple(
-        outputs[i] if raw_mode == 2 or (raw_mode == 1 and kinds[i] != 0) else 0
+        outputs[i]
+        if raw_mode == _RAW_ALL_FP32 or (raw_mode == _RAW_ACTIVATED_BF16 and kinds[i] != _ACT_IDENTITY)
+        else 0
         for i in range(4)
     )
     raw_total = sum(raw_sizes[:count])
-    raw_dtype = "float32" if raw_mode == 2 else "bfloat16"
+    raw_dtype = "float32" if raw_mode == _RAW_ALL_FP32 else "bfloat16"
     raw_offsets = (
         0,
         raw_sizes[0],
@@ -539,7 +546,7 @@ def _group_call(xs, weights, kinds, biases, raw_mode, config, dynamic_k=False):
     return key, args
 
 
-def _run_groups(xs, weights, kinds, biases, raw_mode=0, config=None, dynamic_k=False):
+def _run_groups(xs, weights, kinds, biases, raw_mode=_RAW_NONE, config=None, dynamic_k=False):
     key, args = _group_call(xs, weights, kinds, biases, raw_mode, config, dynamic_k)
     result, raw = _compiled_group(*key)(*args)
     rows = xs[0].shape[0]
@@ -556,7 +563,7 @@ class _GroupedLinear(torch.autograd.Function):
     def forward(ctx, kinds, *args):
         count = len(kinds)
         xs, weights, biases = args[:count], args[count : 2 * count], args[2 * count :]
-        values, raw = _run_groups(xs, weights, kinds, biases, raw_mode=1)
+        values, raw = _run_groups(xs, weights, kinds, biases, raw_mode=_RAW_ACTIVATED_BF16)
         ctx.save_for_backward(*xs, *weights, *biases, raw)
         ctx.kinds = kinds
         ctx.set_materialize_grads(False)
@@ -613,7 +620,7 @@ class _GroupedLinear(torch.autograd.Function):
                 dlinear = torch.empty_like(dy)
                 _activation_kernel(
                     width,
-                    {0: "identity", 1: "tanh", 2: "sigmoid"}[kind],
+                    _ACT_NAMES[kind],
                     bias is not None,
                     True,
                     need_bias,
@@ -659,8 +666,8 @@ def _compiled_grouped(xs, weights, biases, kinds):
 
 @_compiled_grouped.register_fake
 def _compiled_grouped_fake(xs, weights, biases, kinds):
-    values = [x.new_empty((x.shape[0], weight.shape[0])) for x, weight in zip(xs, weights)]
-    raw_size = sum(x.shape[0] * weight.shape[0] for x, weight, kind in zip(xs, weights, kinds) if kind)
+    values = [x.new_empty((x.shape[0], weight.shape[0])) for x, weight in zip(xs, weights, strict=True)]
+    raw_size = sum(x.shape[0] * weight.shape[0] for x, weight, kind in zip(xs, weights, kinds, strict=True) if kind)
     return values, xs[0].new_empty(raw_size)
 
 

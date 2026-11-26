@@ -12,6 +12,7 @@
 !/MANIFEST.in
 !/NOTICE
 !/README.md
+!/README_CN.md
 !/config.yaml
 !/pyproject.toml
 !/setup.py
