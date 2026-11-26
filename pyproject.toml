@@ -43,3 +43,29 @@ markers = [
   "memcheck: minimal Compute Sanitizer memcheck coverage",
   "racecheck: minimal Compute Sanitizer racecheck coverage",
 ]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+exclude = ["artifacts", "build", ".venv"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+ignore = [
+  "E501",    # Allow long schema strings and inline CUDA preludes
+  "E402",    # Deferred imports after _extension() bootstrap in package __init__
+  "B023",    # TileLang @T.macro / closure captures
+  "SIM102",  # TileLang separates compile-time Python guards from runtime TIR branches
+  "RUF001",  # Intentional typographic characters (×, −, ²) in docs/messages
+  "RUF002",  # Intentional typographic characters in docstrings
+  "RUF003",  # Intentional typographic characters in comments
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Preserve existing test style; CI checks tests with --select E9,F63,F7,F82.
+"tests/**/*.py" = ["B905", "F401", "I001", "RUF005", "RUF043"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+docstring-code-format = true

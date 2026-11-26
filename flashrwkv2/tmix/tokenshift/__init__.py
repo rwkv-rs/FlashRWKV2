@@ -1,13 +1,11 @@
 # SPDX-License-Identifier: MIT
+"""TMix PostNorm + six-way TokenShift for packed inference and training."""
 
 from __future__ import annotations
 
 import torch
 
-from ..wkv7 import (
-    _validate_launch_max_seqlen,
-    prepare_tmix_wkv7_recurrent_metadata,
-)
+from ..wkv7 import _validate_launch_max_seqlen, prepare_tmix_wkv7_recurrent_metadata
 
 
 def infer_tmix_postnorm_tokenshift_forward_varlen(
@@ -30,11 +28,7 @@ def infer_tmix_postnorm_tokenshift_forward_varlen(
     validated_metadata: object | None = None,
     save_normalized: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, ...]:
-    """Packed BF16 res, ln and TokenShift with active-slot state updates.
-
-    ``save_normalized`` optionally receives the BF16 shift state of each
-    active input row, including rows before the end of each sequence.
-    """
+    """Packed BF16 res/ln and 6-way TokenShift -> ``(res_out, r, w, k, v, a, g)``; updates ``shift_state_pool``."""
     if x.ndim != 2:
         raise ValueError("x must have packed shape [total_tokens,C]")
     total, mixed = _postnorm_tokenshift_varlen(
@@ -54,14 +48,15 @@ def _postnorm_tokenshift_varlen(
     from .tilelang import _check_save_normalized, fused_post_norm_tokenshift, tokenshift
 
     if (
-        shift_state_pool.ndim != 2 or shift_state_pool.shape[1] != x.shape[1]
-        or shift_state_pool.dtype != torch.bfloat16 or not shift_state_pool.is_cuda
-        or not shift_state_pool.is_contiguous() or shift_state_pool.device != x.device
+        shift_state_pool.ndim != 2
+        or shift_state_pool.shape[1] != x.shape[1]
+        or shift_state_pool.dtype != torch.bfloat16
+        or not shift_state_pool.is_cuda
+        or not shift_state_pool.is_contiguous()
+        or shift_state_pool.device != x.device
     ):
         raise ValueError("shift_state_pool must be contiguous CUDA bfloat16 [slots,C]")
-    _check_save_normalized(
-        save_normalized, x, res, weight, bias, *mixes, shift_state_pool, *save_inputs,
-    )
+    _check_save_normalized(save_normalized, x, res, weight, bias, *mixes, shift_state_pool, *save_inputs)
     launch_max = _validate_launch_max_seqlen(max_seqlen)
     ticket = validated_metadata
     if ticket is None:
@@ -69,22 +64,16 @@ def _postnorm_tokenshift_varlen(
             cu_seqlens, state_indices, total_tokens=x.shape[0],
             state_pool_size=shift_state_pool.shape[0], max_seqlen=max_seqlen,
         )
-    ticket._check_compatible(
-        cu_seqlens, state_indices, x.shape[0], shift_state_pool.shape[0], launch_max,
-    )
+    ticket._check_compatible(cu_seqlens, state_indices, x.shape[0], shift_state_pool.shape[0], launch_max)
     cu = ticket._query_start_loc_snapshot()
     indices, status = ticket._state_indices_snapshot(), ticket._status()
     if ticket._max_seqlen() == 1 and x.shape[0] == indices.numel():
         return fused_post_norm_tokenshift(
-            x, res, weight, bias, mixes, shift_state_pool, indices, status, eps,
-            save_normalized=save_normalized,
+            x, res, weight, bias, mixes, shift_state_pool, indices, status, eps, save_normalized=save_normalized,
         )
-
     normalized, total = norm(x, weight, bias, eps, res, return_res=True)
     initial = gather_state(shift_state_pool, indices, status)
-    mixed, final = tokenshift(
-        normalized, mixes, cu, initial, _status=status, _save_normalized=save_normalized,
-    )
+    mixed, final = tokenshift(normalized, mixes, cu, initial, _status=status, _save_normalized=save_normalized)
     scatter_state(shift_state_pool, final, indices, status)
     return total, mixed
 
@@ -102,7 +91,7 @@ def pretrain_tmix_tokenshift_bf16(
     cu_seqlens: torch.Tensor | None = None,
     return_final_state: bool = False,
 ) -> tuple[torch.Tensor, ...]:
-    """Mix dense [B,T,C] or packed [N,C] rows with one initial shift per sequence."""
+    """Differentiable 6-way TokenShift on dense ``[B,T,C]`` or packed ``[N,C]`` rows."""
     from .tilelang import tokenshift
 
     packed = cu_seqlens is not None
@@ -113,14 +102,9 @@ def pretrain_tmix_tokenshift_bf16(
         batch, length, channels = x.shape
         cu_seqlens = torch.arange(batch + 1, device=x.device, dtype=torch.int32) * length
         rows = x.view(batch * length, channels)
-
-    mixes = (x_r, x_w, x_k, x_v, x_a, x_g)
-    outputs, final = tokenshift(rows, mixes, cu_seqlens, initial_shift, _check_cu=packed)
+    outputs, final = tokenshift(rows, (x_r, x_w, x_k, x_v, x_a, x_g), cu_seqlens, initial_shift, _check_cu=packed)
     mixed = tuple(output.view_as(x) for output in outputs)
     return (*mixed, final) if return_final_state else mixed
 
 
-__all__ = [
-    "infer_tmix_postnorm_tokenshift_forward_varlen",
-    "pretrain_tmix_tokenshift_bf16",
-]
+__all__ = ["infer_tmix_postnorm_tokenshift_forward_varlen", "pretrain_tmix_tokenshift_bf16"]

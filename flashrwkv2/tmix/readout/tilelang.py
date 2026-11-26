@@ -218,7 +218,7 @@ class _Readout(torch.autograd.Function):
         group = min(32, tilelang.next_power_of_2(max(1, dy.shape[0] // 128)))
         needed = ctx.needs_input_grad[4:7]
         gradients = list(_backward(*ctx.options, group, needed)( dy.contiguous(), *ctx.saved_tensors))
-        for i, need in zip((4, 5, 6), needed):
+        for i, need in zip((4, 5, 6), needed, strict=True):
             gradients[i] = sum_partials(gradients[i]) if need else None
         return (*gradients, None, None)
 

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 """ChannelMix with one BF16 forward for training and packed inference."""
 
+from __future__ import annotations
+
 import torch
 
 
@@ -35,41 +37,38 @@ def _project(mixed, key_weight, value_weight, adapters):
 
 
 def infer_cmix_forward_varlen(
-    x,
-    res,
-    weight,
-    bias,
-    x_k,
-    key_weight,
-    value_weight,
+    x: torch.Tensor,
+    res: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    x_k: torch.Tensor,
+    key_weight: torch.Tensor,
+    value_weight: torch.Tensor,
     *,
-    shift_state_pool,
-    cu_seqlens,
-    state_indices,
-    max_seqlen=None,
-    eps=1.0e-5,
-    validated_metadata=None,
-    deterministic=False,
-    key_lora_a=None,
-    key_lora_b=None,
-    value_lora_a=None,
-    value_lora_b=None,
-    key_lora_scale=1.0,
-    value_lora_scale=1.0,
-    key_use_nora=False,
-    value_use_nora=False,
+    shift_state_pool: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    state_indices: torch.Tensor,
+    max_seqlen: int | None = None,
+    eps: float = 1.0e-5,
+    validated_metadata: object | None = None,
+    deterministic: bool = False,
+    key_lora_a: torch.Tensor | None = None,
+    key_lora_b: torch.Tensor | None = None,
+    value_lora_a: torch.Tensor | None = None,
+    value_lora_b: torch.Tensor | None = None,
+    key_lora_scale: float = 1.0,
+    value_lora_scale: float = 1.0,
+    key_use_nora: bool = False,
+    value_use_nora: bool = False,
     save_normalized: torch.Tensor | None = None,
-):
-    """Apply res/ln, TokenShift, ReLU² and projection to packed rows.
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Packed BF16 res/ln, TokenShift, ReLU², and FFN projections (updates ``shift_state_pool`` in place).
 
-    The inference value weight retains its runtime [F,C] layout. A transpose
-    view feeds the same projection as the training [C,F] weight.
-    Projection weights and adapters must use storage separate from ``shift_state_pool``.
-    ``save_normalized`` optionally receives the BF16 shift state of each
-    active input row.
+    ``value_weight`` uses runtime ``[F, C]`` layout (zero-copy transpose feeds the training kernel).
     """
     from ..tmix.tokenshift import _postnorm_tokenshift_varlen
 
+    del deterministic
     value_weight = value_weight.t()
     adapters = _check_projection(
         x, key_weight, value_weight,
@@ -87,24 +86,24 @@ def infer_cmix_forward_varlen(
 
 
 def pretrain_cmix_bf16(
-    x,
-    x_k,
-    key_weight,
-    value_weight,
+    x: torch.Tensor,
+    x_k: torch.Tensor,
+    key_weight: torch.Tensor,
+    value_weight: torch.Tensor,
     *,
-    initial_shift=None,
+    initial_shift: torch.Tensor | None = None,
     cu_seqlens: torch.Tensor | None = None,
-    return_final_state=False,
-    key_lora_a=None,
-    key_lora_b=None,
-    value_lora_a=None,
-    value_lora_b=None,
-    key_lora_scale=1.0,
-    value_lora_scale=1.0,
-    key_use_nora=False,
-    value_use_nora=False,
-):
-    """Apply ChannelMix to dense [B,T,C] or packed [N,C] rows with differentiable shift state."""
+    return_final_state: bool = False,
+    key_lora_a: torch.Tensor | None = None,
+    key_lora_b: torch.Tensor | None = None,
+    value_lora_a: torch.Tensor | None = None,
+    value_lora_b: torch.Tensor | None = None,
+    key_lora_scale: float = 1.0,
+    value_lora_scale: float = 1.0,
+    key_use_nora: bool = False,
+    value_use_nora: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Differentiable BF16 ChannelMix on dense ``[B,T,C]`` or packed ``[N,C]`` rows (``value_weight: [C,F]``)."""
     from ..tmix.tokenshift.tilelang import tokenshift
 
     packed = cu_seqlens is not None

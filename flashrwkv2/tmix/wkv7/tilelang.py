@@ -16,7 +16,7 @@ FP32 state windows with one writer per gradient. Other inputs use bounded shared
 """
 
 import math
-from functools import lru_cache
+from functools import cache
 
 import tilelang
 import tilelang.language as T
@@ -35,6 +35,11 @@ _EXP_NEG_HALF = 0.6065306597126334
 _DECAY_EXP2 = -0.8750387749145276
 _PASSES = {tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: False}
 _COMPILE_FLAGS = ["--fmad=false"]
+
+# FP16 serving token staging slots and DeltaLog layout constants.
+_TOK_R, _TOK_DECAY, _TOK_K, _TOK_V, _TOK_A, _TOK_B = 0, 1, 2, 3, 4, 5
+_LOG_DECAY, _LOG_K, _LOG_V, _LOG_B, _LOG_SA = 0, 1, 2, 3, 4
+_DELTALOG_STANDARD_FIELDS, _DELTALOG_COMPACT_FIELDS = 5, 6
 
 
 @T.macro
@@ -69,30 +74,30 @@ def _update_state(state, decay, k, v, b, state_dot_a, offset=0, state_dtype="flo
 
 @T.macro
 def _load_deltalog(log, slot, head, previous, fields, record):
-    if fields == 6:
+    if fields == _DELTALOG_COMPACT_FIELDS:
         for key in T.Parallel(64):
             wk = T.reinterpret(log[slot, head, 3 * record, key], "uint32")
             vb = T.reinterpret(log[slot, head, 3 * record + 1, key], "uint32")
             w = T.reinterpret(wk & T.uint32(0xffff0000), "float32")
-            previous[0, key] = T.exp2(_DECAY_EXP2 / (1.0 + T.exp2(-_LOG2E * w)))
-            previous[1, key] = T.reinterpret(wk << 16, "float32")
-            previous[2, key] = T.reinterpret(vb & T.uint32(0xffff0000), "float32")
-            previous[3, key] = T.reinterpret(vb << 16, "float32")
-            previous[4, key] = log[slot, head, 3 * record + 2, key]
+            previous[_LOG_DECAY, key] = T.exp2(_DECAY_EXP2 / (1.0 + T.exp2(-_LOG2E * w)))
+            previous[_LOG_K, key] = T.reinterpret(wk << 16, "float32")
+            previous[_LOG_V, key] = T.reinterpret(vb & T.uint32(0xffff0000), "float32")
+            previous[_LOG_B, key] = T.reinterpret(vb << 16, "float32")
+            previous[_LOG_SA, key] = log[slot, head, 3 * record + 2, key]
     else:
-        for field, key in T.Parallel(5, 64):
+        for field, key in T.Parallel(_DELTALOG_STANDARD_FIELDS, 64):
             previous[field, key] = log[slot, head, field, key]
 
 
 @T.macro
 def _replay_deltalog(state, log, slot, head, fields, record):
-    previous = T.alloc_shared((5, 64), "float32")
+    previous = T.alloc_shared((_DELTALOG_STANDARD_FIELDS, 64), "float32")
     _load_deltalog(log, slot, head, previous, fields, record)
     T.sync_threads()
     for key, col in T.Parallel(64, 64):
-        replay = T.fma(previous[1, key], previous[2, col],
-                       T.fma(previous[3, key], previous[4, col],
-                             previous[0, key] * state[key, col]))
+        replay = T.fma(previous[_LOG_K, key], previous[_LOG_V, col],
+                       T.fma(previous[_LOG_B, key], previous[_LOG_SA, col],
+                             previous[_LOG_DECAY, key] * state[key, col]))
         state[key, col] = T.cast(T.cast(replay, "float16"), "float32")
 
 
@@ -218,15 +223,15 @@ def _fp16_serving_kernel(
 
     @T.macro
     def load_token(R, W, K, V, A, B, Bias, vectors, token, h, t, key):
-        vectors[t, 0, key] = T.cast(R[token, h, key], "float32")
+        vectors[t, _TOK_R, key] = T.cast(R[token, h, key], "float32")
         logits = T.cast(W[token, h, key], "float32")
         if has_bias:
             logits = T.cast(T.cast(logits + T.cast(Bias[h, key], "float32"), "bfloat16"), "float32")
-        vectors[t, 1, key] = T.exp2(_DECAY_EXP2 / (1.0 + T.exp2(-_LOG2E * logits)))
-        vectors[t, 2, key] = T.cast(K[token, h, key], "float32")
-        vectors[t, 3, key] = T.cast(V[token, h, key], "float32")
-        vectors[t, 4, key] = T.cast(A[token, h, key], "float32")
-        vectors[t, 5, key] = T.cast(B[token, h, key], "float32")
+        vectors[t, _TOK_DECAY, key] = T.exp2(_DECAY_EXP2 / (1.0 + T.exp2(-_LOG2E * logits)))
+        vectors[t, _TOK_K, key] = T.cast(K[token, h, key], "float32")
+        vectors[t, _TOK_V, key] = T.cast(V[token, h, key], "float32")
+        vectors[t, _TOK_A, key] = T.cast(A[token, h, key], "float32")
+        vectors[t, _TOK_B, key] = T.cast(B[token, h, key], "float32")
 
     @T.macro
     def step(state, vectors, Y, Boundaries, token, seq, start, h, t, group, col, dot):
@@ -236,15 +241,15 @@ def _fp16_serving_kernel(
                 Boundaries[checkpoint, h, group * keys + j, col] = T.cast(state[j], "float16")
         accum = T.alloc_var("float32", init=0.0)
         for j in T.unroll(keys):
-            accum = T.fma(state[j], vectors[t, 4, group * keys + j], accum)
+            accum = T.fma(state[j], vectors[t, _TOK_A, group * keys + j], accum)
         dot[0] = T.call_pure_extern("float32", "rwkv_sum_groups", accum)
         accum = 0.0
         for j in T.unroll(keys):
             k = group * keys + j
-            updated = T.fma(vectors[t, 2, k], vectors[t, 3, col],
-                            T.fma(vectors[t, 5, k], dot[0], vectors[t, 1, k] * state[j]))
+            updated = T.fma(vectors[t, _TOK_K, k], vectors[t, _TOK_V, col],
+                            T.fma(vectors[t, _TOK_B, k], dot[0], vectors[t, _TOK_DECAY, k] * state[j]))
             state[j] = T.cast(T.cast(updated, "float16"), "float32")
-            accum = T.fma(state[j], vectors[t, 0, k], accum)
+            accum = T.fma(state[j], vectors[t, _TOK_R, k], accum)
         output = T.call_pure_extern("float32", "rwkv_sum_groups", accum)
         if group == 0:
             Y[token, h, col] = T.cast(output * scale, "bfloat16")
@@ -260,15 +265,15 @@ def _fp16_serving_kernel(
             sa[g] = 0.0
             sy[g] = 0.0
             for j in T.unroll(keys):
-                sa[g] = T.fma(state[g * keys + j], values[t, 4, g * keys + j], sa[g])
+                sa[g] = T.fma(state[g * keys + j], values[t, _TOK_A, g * keys + j], sa[g])
         sa[0] = (sa[0] + sa[1]) + (sa[2] + sa[3])
         for g in T.unroll(groups):
             for j in T.unroll(keys):
                 k = g * keys + j
-                val = T.fma(values[t, 2, k], values[t, 3, tid],
-                            T.fma(values[t, 5, k], sa[0], values[t, 1, k] * state[k]))
+                val = T.fma(values[t, _TOK_K, k], values[t, _TOK_V, tid],
+                            T.fma(values[t, _TOK_B, k], sa[0], values[t, _TOK_DECAY, k] * state[k]))
                 state[k] = T.cast(T.cast(val, "float16"), "float32")
-                sy[g] = T.fma(state[k], values[t, 0, k], sy[g])
+                sy[g] = T.fma(state[k], values[t, _TOK_R, k], sy[g])
         sy[0] = (sy[0] + sy[1]) + (sy[2] + sy[3])
         Y[token, h, tid] = T.cast(sy[0] * scale, "bfloat16")
 
@@ -1014,10 +1019,7 @@ def _backward_kernel(
             )
             for key, value in T.Parallel(dim, columns):
                 adjoint[key, value] = DSN[seq, h, key, tile * columns + value]
-            if has_status:
-                active = Status[0] == 0 and seq < Status[2]
-            else:
-                active = True
+            active = Status[0] == 0 and seq < Status[2] if has_status else True
             if active:
                 start = CU[seq]
                 end = CU[seq + 1]
@@ -1296,7 +1298,7 @@ def _check_inputs(
     if r.ndim != 3 or r.shape[1] < 1 or r.shape[2] not in (64, 128, 256):
         raise ValueError("r must have shape [N,H,D], with D in {64,128,256}")
     for name, value in zip(
-        ("r", "decay_logits", "k", "v", "a", "b"), (r, decay_logits, k, v, a, b)
+        ("r", "decay_logits", "k", "v", "a", "b"), (r, decay_logits, k, v, a, b), strict=True
     ):
         if value.shape != r.shape or value.dtype != torch.bfloat16:
             raise ValueError(f"{name} must be BF16 with the same [N,H,D] shape as r")
@@ -1356,7 +1358,7 @@ def _recurrent_config(r, batch, columns, prefetch):
     return tile[0] if columns is None else columns, tile[1] if prefetch is None else prefetch
 
 
-@lru_cache(maxsize=None)
+@cache
 def _prefill_stream(caller):
     return torch.cuda.Stream(device=caller.device, priority=caller.priority)
 

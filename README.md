@@ -1,177 +1,260 @@
+<div align="center">
+
 # FlashRWKV2
 
-FlashRWKV2 is a TileLang operator library for RWKV-7. Training and inference use
-BF16 token inputs and outputs with FP32 accumulation. Training uses FP32 recurrent state. Its public
-inference API exposes the highest semantic fusion islands used by the model;
-kernel composition and shape-dependent dispatch remain internal. Complete
-models, schedulers, and training frameworks remain the responsibility of
-downstream projects.
+**High-Performance TileLang Operator Library for RWKV-7 — Unified Training, RL Rollout & Packed Serving**
 
-For serving on SM89 and SM120, prefer FP16 recurrent state for both prefill and
-decode. This path uses BF16 token IO and FP32 arithmetic, and rounds state to
-FP16 after every token. For D64 with 40 or 64 heads, prefill and decode use the same
-four groups of 16 keys for each dot product. A live metadata ticket schedules longer
-prefill rows first, and each decode slot can append to its DeltaLog independently.
-With one to three prefill rows, four blocks share each head's value columns.
-With four or more prefill rows, one block handles a whole head.
-On the 128-SM RTX 4090, H64 stores up to two exact DeltaLog records per head
-and slot (1,540 bytes). The other H40/H64 configurations store one record (1,284 bytes). Use the handle's `memory_layout`
-when budgeting concurrency. Call `materialize_slots_(indices)` before reading
-or copying the externally bound tensor. Training, RL rollout and its evaluation
-and sampling search use FP32 state to reproduce the learner's logprobs.
+[![PyPI](https://img.shields.io/pypi/v/FlashRWKV2?include_prereleases&color=blue)](https://pypi.org/project/FlashRWKV2/)
+[![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](pyproject.toml)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.11--2.14-EE4C2C?logo=pytorch&logoColor=white)](pyproject.toml)
+[![TileLang](https://img.shields.io/badge/TileLang-0.1.15-00A8E8)](pyproject.toml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-## Requirements
+English | [简体中文](README_CN.md)
 
-- Python 3.10 or newer
-- Linux, a writable FlashRWKV2 cache, and a CUDA GPU with Compute
-  Capability 8.0 or newer
-- A system CUDA Toolkit compatible with PyTorch, a C++20 host compiler,
-  and Ninja
-- `uv`, using the repository-local `./.venv`
+</div>
 
-The runtime supports PyTorch 2.11 through 2.14 and pins TileLang 0.1.15.
-Importing the package does not compile kernels. TileLang specializes model
-operators for the active GPU and caches compiled kernels. Packed metadata
-validation and sampling use a small ATen/pybind extension, compiled from the
-packaged native sources for the Compute Capability of the visible GPUs.
-All GPUs visible to that extension must have the same Compute Capability.
+---
 
-## Installation
+**FlashRWKV2** is the community operator backend for **RWKV-7**, built on **TileLang** for both training and high-throughput serving. It exposes RWKV-7's highest semantic fusion islands (`tokenshift`, `wkv_prepare`, `wkv7`, `readout`, `cmix`, `head`, `sampling`, `mtp`) while keeping tiling, dispatch, and hardware specialization clean and internal.
 
-The project publishes a universal `py3-none-any` source wheel containing only
-Python and CUDA/C++ sources. It contains no precompiled extension or architecture
-fallback. Building the wheel does not import Torch or run NVCC:
+Complete models, schedulers, and training frameworks stay lightweight in downstream projects — FlashRWKV2 handles the fast, numerically exact kernels underneath.
+
+---
+
+## Why FlashRWKV2?
+
+Choosing an RWKV-7 kernel backend usually involves trade-offs across **backend portability**, **full-layer serving features**, **PEFT integration**, and **train–inference parity**. FlashRWKV2 unifies these capabilities in one TileLang codebase:
+
+| Capability | **FlashRWKV2 (Ours)** | **RWKV-CUDA** (`train_temp`) | **Albatross** | **FLA** (`flash-linear-attention`) |
+| --- | --- | --- | --- | --- |
+| **Kernel Backend** | **TileLang** (maintainable, GPU-specialized DSL) | Handwritten CUDA only | Handwritten CUDA only | Triton |
+| **WKV Formulation** | Exact recurrence (BF16 IO + FP32 accum) | Exact recurrence | FP16 inference recurrence | Chunk-form & fused recurrent (`cu_seqlens` + final state) |
+| **Train–Infer Numerical Parity** | **Bitwise-exact with FP32 state** (`fp32io16`); optional FP16 serving state (`fp16`) | Training-only | FP16-only inference (differs from FP32 training) | Separate chunk / recurrent Triton paths |
+| **Full-Layer Serving Islands** | **End-to-end** (`tokenshift`, `wkv_prepare`, `wkv7`, `readout`, `cmix`, `head`, `sampling`) | WKV training kernel | Full FP16 inference engine (fixed-batch, no varlen) | WKV-focused operators |
+| **Serving State Pool & Live Graphs** | **Built-in** (FP16 + DeltaLog, COW slots, live CUDA Graph metadata validation) | No | Fixed-batch state (no scheduler / varlen) | Functional state I/O (caller manages pools & graphs) |
+| **PEFT (LoRA / NoRA)** | **Built-in** (TMix, CMix, LM Head; skips `dW` when frozen) | Limited / manual | No | External wrappers |
+| **RL Rollout & InfCtx** | **Bitwise learner–rollout parity** (`fp32io16` + differentiable `rl_infctx`) | No serving rollout | Train–infer FP16 mismatch | Functional recurrent state |
+| **Speculative Decoding** | **Built-in** (per-token state checkpoints + `LightMTP DraftLoop`) | No | No | No |
+
+### Key Highlights
+
+- **Bitwise Train–Infer Parity on FP32 State**: Training, prefill, and decode share the same BF16 forward and FP32 accumulation order (fixed key reduction, no split-K). With **FP32 state** (`fp32io16`), RL rollouts, evaluation, and sampling search reproduce the learner's outputs, states, and selected logprobs **bitwise**.
+- **Two Serving State Modes**: Use **FP16 state with DeltaLog** (`fp16`) on SM89 (RTX 4090) and SM120 (PRO 6000) to halve state VRAM/bandwidth for general serving (per-token FP16 state rounding means outputs can differ from the FP32 learner), or use **FP32 state** (`fp32io16`) whenever exact training/RL parity is required.
+- **First-Class LoRA & NoRA**: Built directly into TMix (`receptance`, `key`, `value`, `output`), CMix (`key`, `value`), and LM Head projections, skipping `dW` automatically when base weights are frozen.
+- **Full-Graph `torch.compile` & CUDA Graph**: All training operators support `torch.compile(fullgraph=True)` (including backward and LoRA/NoRA); all serving operators support live-capacity CUDA Graph capture and zero-overhead replay.
+- **Universal Source Wheel**: Ships as a lightweight `py3-none-any` wheel with no precompiled binaries or architecture fallbacks — TileLang specializes kernels for your active GPU and caches them on disk.
+
+---
+
+## Architecture at a Glance
+
+```mermaid
+flowchart LR
+    Emb["Embedding LN0"] --> TS["TMix: tokenshift<br/>(PostNorm + 6-way Shift)"]
+    TS --> Prep["TMix: wkv_prepare<br/>(R/K/V + LowRank W/A/G/V + VRes)"]
+    Prep --> WKV["TMix: wkv7<br/>(FP32 Train / FP16+DeltaLog Serving)"]
+    WKV --> RO["TMix: readout<br/>(Head LN + RKV Res + Gate + Out)"]
+    RO --> CMix["CMix<br/>(PostNorm + Shift + ReLU² FFN)"]
+    CMix --> PN["PostNorm"]
+    PN --> Head["LM Head<br/>(FP32 Logits / Chunked CE / L2Wrap)"]
+    Head --> Sample["6-Param Sampling<br/>& LightMTP DraftLoop"]
+```
+
+---
+
+## Requirements & Installation
+
+### Requirements
+
+- **Linux** with a CUDA GPU of **Compute Capability 8.0+** (Ampere, Ada SM89, Hopper SM90, Blackwell SM120)
+- **Python 3.10+**, **PyTorch 2.11–2.14**, **TileLang 0.1.15**
+- System **CUDA Toolkit** matching PyTorch, a **C++20** host compiler, and **Ninja**
+
+### Install from PyPI
 
 ```bash
 python -m pip install --pre FlashRWKV2
 ```
 
-To prewarm the metadata and sampling extension cache:
+Optional — prewarm the small native extension used for packed metadata validation and sampling:
 
 ```bash
 python -m flashrwkv2.compile
 ```
 
-The command emits JSON containing `status` (`compiled` or `cached`), `target`,
-`cache_key`, and `library`. Build failures preserve the original compiler
-diagnostics; FlashRWKV2 does not download a compiler or select another backend.
-
-For development from a checkout:
+### Development Install (`uv`)
 
 ```bash
 git clone https://github.com/rwkv-rs/FlashRWKV2.git
 cd FlashRWKV2
-uv sync
-./.venv/bin/python -m pip install -v --no-build-isolation -e .
+uv sync --group dev
 ```
 
-## Kernel API
+> Importing `flashrwkv2` never compiles kernels or creates caches on CPU. TileLang and the native extension compile lazily on first CUDA invocation and persist to disk (`~/.cache/flashrwkv2` or `$FLASHRWKV2_CACHE_DIR`).
 
-See the [Kernel API reference](https://github.com/rwkv-rs/FlashRWKV2/blob/main/docs/kernel_api.md)
-for the complete public operator surface and tensor contracts.
+---
 
-Training operators support `torch.compile(fullgraph=True)`, including backward,
-LoRA/NoRA, and CUDA Graph capture. Preserve the BF16 intermediate rounding
-contract with Inductor's precision option:
+## Quickstart
+
+### 1. Training WKV-7 with `torch.compile(fullgraph=True)`
+
+```python
+import torch
+import flashrwkv2
+
+B, T, H, D = 2, 1024, 64, 64
+C = H * D
+device = "cuda"
+
+r, w, k, v, a, b = (
+    torch.randn(B, T, C, device=device, dtype=torch.bfloat16, requires_grad=True)
+    for _ in range(6)
+)
+state = torch.zeros(B, H, D, D, device=device, dtype=torch.float32, requires_grad=True)
+
+# Dense [B, T, C] forward + backward with differentiable FP32 state
+y, final_state = flashrwkv2.pretrain_tmix_wkv7_recurrent_bf16(
+    r, w, k, v, a, b,
+    head_size=D,
+    initial_state=state,
+    return_final_state=True,
+)
+y.sum().backward()
+```
+
+To preserve exact BF16 intermediate rounding under `torch.compile(fullgraph=True)`:
 
 ```python
 compiled_model = torch.compile(
-    model, fullgraph=True, options={"emulate_precision_casts": True},
+    model,
+    fullgraph=True,
+    options={"emulate_precision_casts": True},
 )
 ```
 
-Warm the forward and backward on the capture stream with the actual shapes,
-then restore state and gradients before capture. Dense and packed training
-accept optional FP32 initial state and can return final state for the next
-chunk. See the [training contract](docs/kernel_api.md#training).
+### 2. Packed Inference with FP16 Serving State
 
-Speculative decoding can export per-token WKV checkpoints and normalized TMix
-and CMix shift states from the verifier. The optional
-`flashrwkv2.mtp.DraftLoop` runs a single-request LightMTP block eagerly or in
-a CUDA Graph. See the [state export and DraftLoop contracts](docs/kernel_api.md#state-and-packed-metadata)
-and the [original TileRWKV changes by Joluck](https://github.com/Joluck/tilerwkv/commit/409b492e952086a61d89817d8032375a851b51da).
+```python
+import torch
+import flashrwkv2
 
-## Tests
+pool_slots, H, D = 64, 64, 64
+device = "cuda"
+
+# Bind a contiguous FP16 state pool (preferred for SM89 / SM120 serving)
+raw_pool = torch.zeros(pool_slots, H, D, D, device=device, dtype=torch.float16)
+state_handle = flashrwkv2.prepare_tmix_wkv7_recurrent_fp16_state_from_tensor(raw_pool)
+
+# Packed batch: seq 0 has 128 tokens (prefill), seq 1 has 1 token (decode)
+cu_seqlens = torch.tensor([0, 128, 129], device=device, dtype=torch.int32)
+state_indices = torch.tensor([3, 7], device=device, dtype=torch.int32)
+N = int(cu_seqlens[-1])
+
+r, w, k, v, a, b = (
+    torch.randn(N, H, D, device=device, dtype=torch.bfloat16) for _ in range(6)
+)
+
+# Validate once and reuse the ticket across all layers in the step
+ticket = flashrwkv2.prepare_tmix_wkv7_recurrent_metadata(
+    cu_seqlens,
+    state_indices,
+    state_pool_size=pool_slots,
+    total_tokens=N,
+)
+
+y = flashrwkv2.infer_tmix_wkv7_recurrent_fp16_forward_varlen(
+    r, w, k, v, a, b,
+    state=state_handle,
+    cu_seqlens=cu_seqlens,
+    state_indices=state_indices,
+    validated_metadata=ticket,
+)
+
+# Always materialize before inspecting or copying the bound raw tensor directly
+state_handle.materialize_slots_(state_indices)
+```
+
+### 3. Speculative Drafting with `LightMTP DraftLoop`
+
+```python
+from flashrwkv2.mtp import DraftLoop
+
+loop = DraftLoop.from_state_dict(sidecar_weights, lm_head_weight, depth=4, eps=1e-5)
+
+# Eager execution
+eager_ids = loop(hidden, token_ids, embed).clone()
+
+# CUDA Graph capture & replay
+loop.capture(embed)
+graph_ids = loop.replay(hidden, token_ids)
+```
+
+---
+
+## Choosing a Precision & State Mode
+
+| Workload | Recommended WKV API | State Dtype | Why |
+| --- | --- | --- | --- |
+| **Pretraining / SFT / LoRA / NoRA** | `pretrain_tmix_wkv7_recurrent_bf16` | FP32 | Differentiable state, dense or packed, `torch.compile(fullgraph=True)` |
+| **RL Rollout, Eval & Sampling Search** | `infer_tmix_wkv7_recurrent_fp32io16_forward_varlen` + `rl_infctx_tmix_wkv7_recurrent_bf16` | FP32 | **Bitwise identical** outputs, states, and selected logprobs vs learner |
+| **General Serving (Prefill + Decode)** | `infer_tmix_wkv7_recurrent_fp16_forward_varlen` | FP16 (+ DeltaLog) | Halved state bandwidth & VRAM, BF16 IO + FP32 math, per-token FP16 rounding |
+
+---
+
+## Historical Acceptance & Performance
+
+The figures below are **historical acceptance records** measured on **SM89 (RTX 4090, 128 SMs)** and **SM120 (RTX PRO 6000, 188 SMs)** at commits [`a239bc3`](https://github.com/rwkv-rs/FlashRWKV2/commit/a239bc3) and [`07c7913`](https://github.com/rwkv-rs/FlashRWKV2/commit/07c7913) (raw paired samples and numerical evidence are archived in `artifacts/cmix-acceptance-a239bc3.json` and `artifacts/sm120-remaining-acceptance-results-07c7913.json`). Runtime changes are validated independently on their own commits via the **Quality Gate** CI workflow.
+
+| Historical Acceptance Metric (`a239bc3` / `07c7913`) | SM89 (RTX 4090) | SM120 (PRO 6000) |
+| --- | --- | --- |
+| Full block GPU test suite (numerics, state, Graph, compile) | **330 / 330 passed** | **330 / 330 passed** |
+| Training workloads within 2% of best internal comparison | **9 / 9** | **9 / 9** |
+| Fresh-process disk-cache reuse (cold / warm compilations) | **139 cold / 0 warm** | **137 cold / 0 warm** |
+
+Selected SM120 training latency from commit `07c7913` (B=1, Layer + LM Head, forward + backward + grad zero, paired ABBA CUDA Graph timing; comparison is the fastest of baseline, earlier offline reference, and previous FlashRWKV2 strategy):
+
+| Model & Workload | Best Internal Comparison (ms) | Prepared Strategy (ms) | Change |
+| --- | ---: | ---: | ---: |
+| RWKV-7 1.5B T=128 (`torch.compile`) | 3.603 | **3.577** | **-0.71%** |
+| RWKV-7 7.2B T=1024 (eager) | 32.786 | **32.196** | **-1.80%** |
+| RWKV-7 13.3B T=128 (eager) | 7.399 | **7.311** | **-1.20%** |
+| RWKV-7 13.3B T=1024 (eager) | 32.897 | **32.267** | **-1.91%** |
+
+### Running Tests & Benchmarks
 
 ```bash
+# Run full test suite
 ./.venv/bin/python -m pytest -q
-```
 
-CUDA tests compile TileLang kernels and the metadata/sampling extension lazily.
-The full block suite checks outputs, FP32 state, and selected logprobs bitwise
-across training/inference, prefill/decode, and batch composition.
-
-## CI and release acceptance
-
-The required **Quality Gate** builds the wheel and sdist, runs CPU contracts, and runs
-pytest and every operator benchmark on the PRO 6000 against the installed wheel.
-Each run uploads its distributions, JUnit XML, device metadata and benchmark results.
-Documentation-only PRs can pass with the package and CPU checks. Runtime changes
-require a trusted repository branch for the self-hosted GPU check. Daily runs cover
-the main branch.
-
-For a release, dispatch **Quality Gate** on the release tag for the Torch 2.11–2.14 compatibility matrix and
-Compute Sanitizer memcheck and racecheck. Download its `dist-<commit>` artifact to `artifacts/dist` on the
-RTX 4090 checkout of that tag and use the same wheel for independent acceptance:
-
-```bash
-timeout 600s uv sync --frozen --no-install-project --group dev
-timeout 120s uv pip install --python .venv/bin/python --no-deps --reinstall artifacts/dist/*.whl
-PATH="$PWD/.venv/bin:$PATH" timeout 18500s .venv/bin/python -I ci/quality_gate.py validate \
-  --release --dist artifacts/dist --output artifacts/sm89
-```
-
-Download `sm120.json` from the tagged GPU artifact into `artifacts/sm89` and
-verify both reports before publishing the draft release:
-
-```bash
-timeout 60s .venv/bin/python -I ci/quality_gate.py verify \
-  --dist artifacts/dist --output artifacts/sm89
-```
-
-Attach `artifacts/sm89/sm89.json` to the draft release. On publication, the
-**PyPI release** workflow verifies the tag, main ancestry, both GPU reports and
-the original distribution hashes. It publishes through PyPI trusted publishing
-and checks the public digests.
-
-## Benchmarks
-
-Run the LightMTP comparison at the RWKV-7 G1k 7.2B draft shape with:
-
-```bash
-PYTHONPATH=benchmarks timeout 10m .venv/bin/python benchmarks/mtp/bench.py --depth 4
-```
-
-Operator benchmarks live in [`benchmarks/`](benchmarks/). The WKV matrix covers
-batch size, sequence length, and head dimensions:
-
-```bash
+# Benchmark WKV7 across model geometries (with bitwise verification + CUDA Graph timing)
 PYTHONPATH=benchmarks ./.venv/bin/python benchmarks/tmix/wkv7/bench.py \
-  --shapes h12d64 h16d64 h32d64 h40d64 h64d64 h80d64 h16d128 h8d256 \
-  --cases 1x1 16x1 1x16 64x16 1x128 --tune --timing-mode graph \
-  --output artifacts/wkv7-recurrent-bf16.json
+  --shapes h40d64 h64d64 --state-dtype float16 --timing-mode graph \
+  --metadata live --slot-order random --state-pool-size 320 \
+  --cases 255x1+1x4 255x1+1x256 1x1024
+
+# Benchmark LightMTP DraftLoop (RWKV-7 G1k 7.2B draft shape)
+PYTHONPATH=benchmarks ./.venv/bin/python benchmarks/mtp/bench.py --depth 4
 ```
 
-To measure chunked serving with decode rows first and randomly assigned slots:
+---
 
-```bash
-PYTHONPATH=benchmarks ./.venv/bin/python benchmarks/tmix/wkv7/bench.py \
-  --shapes h64d64 --state-dtype float16 --timing-mode graph --metadata live \
-  --slot-order random --state-pool-size 320 --cases 255x1+1x4 255x1+1x256 1x1024 \
-  --output artifacts/wkv7-live.json
-```
+## Documentation
 
-The per-layer time uses the ticket shared by the model's layers. Add
-`--include-ticket-preparation` to capture and time the device-side validation and sort
-together with one WKV layer on every step.
+| Document | Audience | Contents |
+| --- | --- | --- |
+| [Quickstart & Recipes](docs/usr/quickstart.md) | Users | End-to-end training block, LoRA/NoRA, RL rollout, MTP rewind, benchmarks |
+| [Serving & State Guide](docs/usr/serving.md) | Serving Engineers | FP16 vs FP32 state, DeltaLog memory budgeting, COW pools, live CUDA Graphs |
+| [Kernel API & Numerical Contract](docs/kernel_api.md) | Integrators | Complete operator table, math definitions, shapes, dtypes, compilation rules |
+| [CI & Release Acceptance](docs/dev/release.md) | Maintainers | Quality Gate, dual-GPU SM89/SM120 release verification, PyPI publishing |
+| [PR Review Guide](docs/dev/pr-review.md) | Contributors | Review checklist and upstream consistency rules |
 
-RTX 4090 and PRO 6000 use checked-in execution configurations. Each operator benchmark
-can evaluate alternatives with `--tune`. It verifies outputs and state against the
-canonical implementation before measuring CUDA Graph replay. Warm each graph shape with
-its real dtype, layouts and gradient requirements before capture and restore caller-owned
-state after warmup. See [execution configuration](docs/kernel_api.md#execution-configuration).
+---
 
-## License
+## Acknowledgements & License
 
-FlashRWKV2 is distributed under the
-[MIT License](https://github.com/rwkv-rs/FlashRWKV2/blob/main/LICENSE).
+- Reference RWKV-7 algorithms and implementations: [BlinkDL/RWKV-LM](https://github.com/BlinkDL/RWKV-LM), [BlinkDL/Albatross](https://github.com/BlinkDL/Albatross)
+- LightMTP speculative drafting reference: [Joluck/tilerwkv](https://github.com/Joluck/tilerwkv/commit/409b492e952086a61d89817d8032375a851b51da)
+- Kernel DSL & compiler: [TileLang](https://github.com/tile-ai/tilelang)
+
+FlashRWKV2 is distributed under the [MIT License](LICENSE).

@@ -708,3 +708,85 @@ def adapter_linear(
     update = project(features, b.to(torch.bfloat16), output_dtype=torch.float32)
     operation = _compiled_adapter_add if torch.compiler.is_compiling() else _AdapterAdd.apply
     return operation(result, update, scale)
+
+
+def validate_head_loss_inputs(
+    hidden, weight, targets, chunk_rows: int, *, fixed_vocab: int | None = None, allow_ignore: bool = False,
+) -> None:
+    """Validate BF16 hidden/weight and int64 targets shared by chunked LM-head losses."""
+    from .state import check_cuda_condition
+
+    for name, tensor in (("hidden", hidden), ("weight", weight)):
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(f"{name} must be a torch.Tensor")
+        if tensor.dtype != torch.bfloat16 or not tensor.is_cuda or not tensor.is_contiguous():
+            raise ValueError(f"{name} must be contiguous CUDA bfloat16")
+    if not isinstance(targets, torch.Tensor):
+        raise TypeError("targets must be a torch.Tensor")
+    if targets.dtype != torch.int64 or not targets.is_cuda or not targets.is_contiguous():
+        raise ValueError("targets must be contiguous CUDA int64")
+    if hidden.ndim != 3 or hidden.numel() == 0:
+        raise ValueError("hidden must have shape [B,T,C]")
+    if fixed_vocab is not None:
+        if weight.shape != (fixed_vocab, hidden.shape[-1]):
+            raise ValueError(f"weight must have shape [{fixed_vocab},C]")
+    elif weight.ndim != 2 or weight.shape[0] == 0 or weight.shape[1] != hidden.shape[-1]:
+        raise ValueError("weight must have shape [V,C]")
+    if targets.numel() != hidden.shape[0] * hidden.shape[1]:
+        raise ValueError("targets must contain one token per hidden row")
+    if hidden.device != weight.device or hidden.device != targets.device:
+        raise ValueError("head loss tensors must share a device")
+    vocab = fixed_vocab if fixed_vocab is not None else weight.shape[0]
+    in_range = (targets >= 0) & (targets < vocab)
+    if allow_ignore:
+        check_cuda_condition(((targets == -100) | in_range).all(), "targets must be -100 or in [0,V)")
+    else:
+        check_cuda_condition(in_range.all(), f"targets must be in [0,{vocab})")
+    if not isinstance(chunk_rows, int) or isinstance(chunk_rows, bool) or chunk_rows <= 0:
+        raise ValueError("chunk_rows must be a positive integer")
+
+
+def chunked_head_backward(hidden, weight, a, b, scale, use_nora, chunk_rows, needs_grad, compute_dy):
+    """Run chunked LM-head VJP over rows with FP32 parameter/adapter accumulation."""
+    need_x, need_w, _, need_a, need_b = needs_grad[:5]
+    rows = hidden.view(-1, hidden.shape[-1])
+    dx = torch.empty_like(rows) if need_x else None
+    dw = torch.zeros_like(weight, dtype=torch.float32) if need_w else None
+    da = torch.zeros_like(a, dtype=torch.float32) if need_a else None
+    db = torch.zeros_like(b, dtype=torch.float32) if need_b else None
+    a_compute = b_compute = inverse = column_norm = None
+    if a is not None:
+        if use_nora:
+            a_compute, inverse, column_norm = nora_forward(a)
+        else:
+            a_compute = a.to(torch.bfloat16)
+        b_compute = b.to(torch.bfloat16)
+    for start in range(0, rows.shape[0], chunk_rows):
+        stop = min(start + chunk_rows, rows.shape[0])
+        x = rows[start:stop]
+        dy = compute_dy(x, start, stop, a_compute, b_compute)
+        if need_x:
+            dx[start:stop] = linear_input_vjp(dy, weight)
+        if need_w:
+            linear_weight_vjp_fp32(dy, x, out=dw)
+        if a is not None and (need_x or need_a or need_b):
+            dy.mul_(scale)
+            if need_b:
+                linear_weight_vjp_fp32(dy, linear(x, a_compute), out=db)
+            if need_x or need_a:
+                dfeatures = linear_input_vjp(dy, b_compute)
+                if need_x:
+                    # Base and adapter input gradients each cross a BF16 edge.
+                    dx[start:stop].add_(linear_input_vjp(dfeatures, a_compute))
+                if need_a:
+                    linear_weight_vjp_fp32(dfeatures, x, out=da)
+        del dy
+    if need_a:
+        da = nora_backward(da, a, inverse, column_norm) if use_nora else da.to(torch.bfloat16).to(a.dtype)
+    return (
+        None if dx is None else dx.view_as(hidden),
+        None if dw is None else dw.to(weight.dtype),
+        None,
+        da,
+        None if db is None else db.to(torch.bfloat16).to(b.dtype),
+    )

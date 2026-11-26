@@ -85,7 +85,7 @@ def _finish(vocab: int):
             logsum[row] = T.log(total[0])
             max_values[row] = high[0]
             max_indices[row] = first[0]
-            if 0 <= targets[row] and targets[row] < vocab:
+            if targets[row] >= 0 and targets[row] < vocab:
                 output[row] = (logits[row, targets[row]] - high[0]) - T.log(total[0])
             else:
                 output[row] = T.float32(float("nan"))

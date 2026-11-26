@@ -38,18 +38,19 @@ def _profile(batch_size: int, vocab_size: int) -> dict[str, object]:
     temperatures = torch.ones(batch_size, device="cuda")
     top_ks = torch.full((batch_size,), top_k, dtype=torch.int32, device="cuda")
     top_ps = torch.full((batch_size,), top_p, device="cuda")
-    call = lambda: infer_sampling_six_parameter_forward_varlen(
-        logits,
-        penalties,
-        states,
-        slot_indices,
-        presence_penalty=presence,
-        frequency_penalty=frequency,
-        penalty_decay=decays,
-        temperature=temperatures,
-        top_k=top_ks,
-        top_p=top_ps,
-    )
+    def call() -> torch.Tensor:
+        return infer_sampling_six_parameter_forward_varlen(
+            logits,
+            penalties,
+            states,
+            slot_indices,
+            presence_penalty=presence,
+            frequency_penalty=frequency,
+            penalty_decay=decays,
+            temperature=temperatures,
+            top_k=top_ks,
+            top_p=top_ps,
+        )
 
     def reset() -> None:
         states.copy_(initial_states)

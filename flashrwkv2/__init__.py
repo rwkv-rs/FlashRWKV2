@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: MIT
+"""FlashRWKV2 — High-performance TileLang operator library for RWKV-7.
+
+Public operators are flat-exported at the package root with module-owner prefixes
+(``infer_*`` for packed inference, ``pretrain_*`` / ``rl_infctx_*`` for training,
+and ``prepare_*`` / ``setup_*`` for state and metadata handles).
+"""
 
 import sys as _sys
 
-# PyTorch must be loaded before the private extensions, which link against its
-# native libraries.
-
-
+# PyTorch must be loaded before the private native extension, which links against its libraries.
 _C = None
 
 
@@ -17,6 +20,7 @@ def _extension():
         _C = load_extension().module
         _sys.modules[f"{__name__}._C"] = _C
     return _C
+
 
 from .cmix import infer_cmix_forward_varlen, pretrain_cmix_bf16
 from .embedding import infer_embedding_ln0_forward_varlen

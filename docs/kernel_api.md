@@ -1,272 +1,904 @@
-# FlashRWKV2 TileLang operator contract
+# FlashRWKV2 Kernel API Reference
 
-模型前向统一使用 BF16 激活和权重、FP32 累加与归约。WKV 状态使用连续
-`[slots,H,D,D]`，普通 serving 在 SM89、SM120 上首选 FP16，训练和 RL rollout 使用 FP32。TokenShift 状态为 BF16 `[slots,C]`。Head 输出 logits、
-所选 token 的 logprob 与 loss 为 FP32。公共名称保留模块所有者；内部 primitive 不从根包导出。
+Complete, source-verified API reference for every public operator exported by `flashrwkv2` (root flat exports) and `flashrwkv2.mtp`.
 
-## Numerical contract
+All root-exported operators can be imported directly from `flashrwkv2` (e.g., `flashrwkv2.pretrain_tmix_wkv7_recurrent_bf16`) or from their owning submodule.
 
-训练、prefill 和 decode 使用同一份 TileLang 前向实现。投影按递增 K 顺序执行
-BF16 MMA、FP32 累加，不使用 split-K；每行 ln、head ln 和词表归约使用固定顺序。
-`res + x` 在 ln 前先舍入为 BF16，投影、gate、TokenShift 和 WKV 输出也在相同
-位置舍入为 BF16。WKV 的 FP32 状态在 token 之间不缩窄。
+## Contents
 
-WKV 输入是 raw decay logits。保留率为
-`exp(-0.6065306597126334 * sigmoid(raw_decay))`。若提供 `decay_bias`，先以 FP32
-相加、舍入为 BF16，再计算保留率；这与 WKV Prepare 训练入口加 `w0` 的边界相同。
-状态布局为 `[K,V]`，递推为：
+- [Notation & Common Contracts](#notation--common-contracts)
+- [Numerical Contract](#numerical-contract)
+- [State and Packed Metadata](#state-and-packed-metadata)
+  - [WKV7 State Handles](#wkv7-state-handles)
+  - [Packed Metadata Tickets](#packed-metadata-tickets)
+- [Inference Operators](#inference)
+  - [Embedding LN0](#infer_embedding_ln0_forward_varlen)
+  - [TMix PostNorm + TokenShift](#infer_tmix_postnorm_tokenshift_forward_varlen)
+  - [TMix WKV Prepare](#infer_tmix_wkv_prepare_forward_varlen)
+  - [TMix WKV7 Recurrence (FP16 & FP32)](#infer_tmix_wkv7_recurrent_fp16_forward_varlen--fp32io16)
+  - [TMix Readout](#infer_tmix_readout_forward_varlen)
+  - [CMix (ChannelMix)](#infer_cmix_forward_varlen)
+  - [Final PostNorm](#infer_post_norm_output_forward_varlen)
+  - [LM Head Linear](#infer_head_linear_all_forward_varlen)
+  - [Six-Parameter Sampling](#setup_sampling_states--infer_sampling_six_parameter_forward_varlen)
+  - [LightMTP DraftLoop](#lightmtp-draftloop)
+- [Training Operators](#training)
+  - [TMix TokenShift](#pretrain_tmix_tokenshift_bf16)
+  - [TMix WKV Prepare](#pretrain_tmix_wkv_prepare_bf16)
+  - [TMix WKV7 Recurrence](#pretrain_tmix_wkv7_recurrent_bf16)
+  - [RL / Infinite-Context WKV7 Recurrence](#rl_infctx_tmix_wkv7_recurrent_bf16)
+  - [TMix Readout](#pretrain_tmix_readout_bf16)
+  - [CMix (ChannelMix)](#pretrain_cmix_bf16)
+  - [LM Head Linear](#pretrain_head_linear_bf16)
+  - [Chunked LM Head Cross-Entropy](#pretrain_head_ce_bf16)
+  - [L2Wrap Cross-Entropy](#pretrain_l2wrap_ce_bf16)
+  - [Chunked LM Head L2Wrap Cross-Entropy](#pretrain_head_l2wrap_ce_bf16)
+  - [`torch.compile(fullgraph=True)` & Packed `cu_seqlens`](#torchcompilefullgraphtrue--packed-cu_seqlens)
+- [Execution Configuration](#execution-configuration)
+
+---
+
+## Notation & Common Contracts
+
+### Shape Symbols
+
+| Symbol | Meaning | Constraints |
+| --- | --- | --- |
+| `B` | Batch size / number of active sequences | `B >= 1` |
+| `T` | Dense sequence length | `T >= 1` |
+| `N` | Packed total token count (`sum_i len_i`) | `N >= 1` |
+| `C` | Model hidden dimension (`H * D`) | Divisible by `D` |
+| `H` | Number of attention heads | `H >= 1` (D64 FP16 DeltaLog triggers for `H ∈ {40, 64}`) |
+| `D` | Head width (`head_size`) | `D ∈ {64, 128, 256}` |
+| `F` | CMix FFN intermediate width | `F >= 1` |
+| `R` | Low-rank projection or LoRA/NoRA rank | `R >= 1` |
+| `V` | Vocabulary size | `V >= 1` (`V % 4 == 0` and `V <= 1_048_576` for sampling; `V == 65536` for `pretrain_head_l2wrap_ce_bf16`) |
+| `slots` | Capacity of a state pool | `slots >= 1` |
+
+Unless noted otherwise, all tensor arguments must be **contiguous CUDA tensors on the same device**.
+
+### Shared LoRA / NoRA Adapter Contract
+
+Several projection operators accept optional LoRA/NoRA keyword arguments prefixed by projection name (e.g., `key_lora_a`, `output_lora_a`, or unprefixed `lora_a` on head operators):
+
+| Argument | Shape | Dtype | Description |
+| --- | --- | --- | --- |
+| `*_lora_a` | `[R, in_features]` | `bfloat16` or `float32` | Down-projection matrix `A`. Must be paired with `*_lora_b`. |
+| `*_lora_b` | `[out_features, R]` | `bfloat16` or `float32` | Up-projection matrix `B`. Must be paired with `*_lora_a`. |
+| `*_lora_scale` | `float` (default `1.0`) | — | Finite scalar multiplier for the adapter branch. |
+| `*_use_nora` | `bool` (default `False`) | — | If `True`, normalizes columns of `A` as `A / (norm(A, dim=0) + 1e-6)` in FP32 (forward and backward) before BF16 projection. |
+
+- When the base weight has `requires_grad=False`, base weight gradients (`dW`) are skipped automatically while input and adapter gradients remain exact.
+
+---
+
+## Numerical Contract
+
+- **Forward precision**: BF16 token activations and weights with FP32 accumulation and reductions across training, prefill, and decode.
+- **Deterministic reductions**: Linear projections execute BF16 MMA in strictly increasing `K` order (no split-K). LayerNorm, head LayerNorm, and vocabulary reductions use fixed reduction trees.
+- **BF16 rounding boundaries**: `res + x` rounds to BF16 before LayerNorm; projection, gate, TokenShift, and WKV outputs round to BF16 at identical boundaries across training and inference.
+- **State precision**:
+  - Training, RL rollout, evaluation, and sampling search use **FP32** WKV state (`[slots, H, D, D]` or `[B, H, D, D]`) with no narrowing between tokens.
+  - General serving on SM89 (RTX 4090) and SM120 (PRO 6000) prefers **FP16** WKV state: BF16 token I/O, FP32 recurrence arithmetic, and per-token FP16 state rounding.
+  - TokenShift state is BF16 `[slots, C]` (inference) or `[B, C]` (training).
+  - LM head logits, selected token logprobs, and cross-entropy losses are **FP32**.
+
+### WKV-7 Recurrence Equations
+
+WKV takes raw decay logits `w` (if `decay_bias` is supplied, `w = bf16(fp32(w) + fp32(decay_bias))`). Retention is:
 
 ```text
-sa[v] = sum_k a[k] * state[k,v]
-state[k,v] = retention[k] * state[k,v] + b[k] * sa[v] + k[k] * v[v]
-y[v] = scale * sum_k r[k] * state[k,v]
+retention = exp(-0.6065306597126334 * sigmoid(w))
 ```
 
-`head_size` 支持 64、128、256。前向一致性按位比较输出、state 和所选 token 的
-logprob，梯度使用独立 FP32 参考与相对误差验证。WKV 反向每 16 token 使用一份
-FP32 checkpoint。较长的 64 维 head 先重放每步的 `sa` 向量，再从 checkpoint
-按前向算术重放短窗口内的 FP32 state。每个梯度由负责该 key 或 value 的线程直接写出。
-当 batch-head 并行度较低时，长序列按 4096 token 分段，先用实际 cotangent 计算
-state 梯度边界，再并行计算各段 VJP。通用路径保留 shared-memory state history 和 FP32 原子归约。
-只有需要梯度时才保存 checkpoint。
+With state layout `[K, V]` (`[D, D]` per head), each token updates:
+
+```text
+sa[v]       = sum_k a[k] * state[k, v]
+state[k, v] = retention[k] * state[k, v] + b[k] * sa[v] + k[k] * v[v]
+y[v]        = scale * sum_k r[k] * state[k, v]
+```
+
+### Backward Checkpointing
+
+When gradients are enabled, WKV forward saves one FP32 state checkpoint every 16 tokens:
+
+- **Direct D64 path** (`D == 64`, no live status, `N >= max(4096, 16 * B)`): replays per-token `sa`, optionally splits long sequences (`N > 4096` and `B * H < 128`) into 4096-token segments with a boundary adjoint pre-pass, and writes key/value gradients directly without atomics.
+- **General path** (`D ∈ {64, 128, 256}`): replays a bounded 16-token shared-memory state history and accumulates key gradients via FP32 atomics.
+
+---
+
+## State and Packed Metadata
+
+### WKV7 State Handles
+
+```python
+prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor(
+    state: torch.Tensor,
+) -> _TmixWkv7RecurrentState
+
+prepare_tmix_wkv7_recurrent_fp16_state_from_tensor(
+    state: torch.Tensor,
+) -> _TmixWkv7RecurrentState
+```
+
+Bind an existing contiguous CUDA `[slots, H, D, D]` tensor (`float32` for `fp32io16`, `float16` for `fp16`, `D ∈ {64, 128, 256}`) into a managed state handle.
+
+| Handle Member | Signature / Type | Semantics |
+| --- | --- | --- |
+| `memory_layout` | `property -> dict[str, int]` | Returns `base_bytes_per_slot`, `private_bytes_per_slot`, `bytes_per_slot`, `fixed_workspace_nbytes` (`0`), and `total_nbytes`. Use `bytes_per_slot` for concurrency budgeting. |
+| `materialize_slots_(state_indices)` | `(int32 [B]) -> self` | Flushes pending DeltaLog updates for `state_indices` into the bound tensor. **Must be called before reading, copying, exporting, or rebinding the raw tensor directly.** |
+| `clone()` | `() -> handle` | Materializes all slots and returns a deep copy of the entire pool. |
+| `clone_slots(state_indices)` | `(int32 [B]) -> handle` | Materializes and clones only `state_indices` into a new handle of size `B`. |
+| `copy_(source)` | `(handle) -> self` | Materializes `source` and copies the entire pool in place (shapes, dtype, device must match). |
+| `copy_slots_(source, source_indices, destination_indices)` | `(handle, int32 [B], int32 [B]) -> self` | Copies selected slots (supports same-pool overlapping prefix-cache COW). `destination_indices` must be unique. |
+| `reset_slots_(state_indices)` | `(int32 [B]) -> self` | Zeros selected slots and clears their DeltaLog phase. |
+| `zero_()` | `() -> self` | Zeros the entire pool and clears all DeltaLog phases. |
+
+> **DeltaLog private memory (`fp16` handles on `D=64`)**:
+> - SM89 RTX 4090 (128 SMs), `H=64`: up to 2 compact records/head/slot (**1,540 B/head**; 3.008 MiB per 32-layer sequence on top of 16 MiB base state).
+> - Other `H ∈ {40, 64}` configs: 1 standard 5-vector record/head/slot (**1,284 B/head**; 2.508 MiB per 32-layer H64 sequence).
+> - All other geometries and all `fp32io16` handles: **0 B** private memory.
+
+### Packed Metadata Tickets
+
+```python
+prepare_tmix_wkv7_recurrent_metadata(
+    cu_seqlens: torch.Tensor,
+    state_indices: torch.Tensor,
+    *,
+    state_pool_size: int,
+    total_tokens: int | None = None,
+    max_seqlen: int | None = None,
+    token_capacity: int | None = None,
+    sequence_capacity: int | None = None,
+    max_seqlen_capacity: int | None = None,
+    num_active_tokens: torch.Tensor | None = None,
+    num_active_sequences: torch.Tensor | None = None,
+) -> object
+```
+
+Creates a validated metadata ticket shared across all stateful operators in a forward step (`tokenshift`, `wkv7`, `cmix`). Supports two mutually exclusive modes:
+
+| Mode | Required Keyword Arguments | Behavior |
+| --- | --- | --- |
+| **Static eager** | `state_pool_size`, `total_tokens` (optional `max_seqlen`) | Validates bounds (`cu_seqlens` contiguous CUDA `int32 [B+1]` spanning `[0, total_tokens]`, `state_indices` unique in `[0, state_pool_size)`), snapshots buffers, and verifies identity/version/shape/stream on reuse. |
+| **Live CUDA Graph** | `state_pool_size`, `token_capacity`, `sequence_capacity`, `max_seqlen_capacity`, `num_active_tokens` (1-element CUDA `int32`), `num_active_sequences` (1-element CUDA `int32`) | Keeps metadata and active counts live on device. Validates the active prefix and sorts active rows by descending length on every replay (outputs remain in input order). |
+
+- **Live safety guarantees**: Zero-active warmup and invalid metadata never mutate any state pool. Inactive output rows (`row >= num_active_tokens`) receive `NaN` and must not be consumed downstream.
+
+---
 
 ## Inference
 
-TMix 公共阶段固定为 `tokenshift -> wkv_prepare -> wkv7 -> readout`。
+The public TMix inference pipeline is fixed as `tokenshift → wkv_prepare → wkv7 → readout`, followed by `cmix`, `post_norm`, `head`, and `sampling` / `mtp`.
 
-| API | 输入与返回值 |
-|---|---|
-| `infer_embedding_ln0_forward_varlen(embedding, weight, bias, *, eps=1e-5)` | BF16 embedding 和 ln 仿射参数，返回 BF16 ln0 |
-| `infer_tmix_postnorm_tokenshift_forward_varlen` | res/ln、六路 mix，返回 `(res_out, r, w, k, v, a, g)`，原位更新 shift pool |
-| `infer_tmix_wkv_prepare_forward_varlen` | R/K/V、低秩 W/A/G/V、VRes 与 KK/A，返回 `(r, decay_logits, key, value, recurrent_a, recurrent_b, gate, v_first)` |
-| `infer_tmix_wkv7_recurrent_fp32io16_forward_varlen` | BF16 `[N,H,D]` 六路输入、FP32 state handle、packed metadata；返回 BF16 WKV 并原位更新状态 |
-| `infer_tmix_wkv7_recurrent_fp16_forward_varlen` | SM89、SM120 普通 serving 首选；BF16 六路输入、FP16 state handle、FP32 算术；每 token 后将 state 舍入为 FP16 |
-| `infer_tmix_readout_forward_varlen` | head ln、RKV residual、gate 和 output projection，返回 BF16；WKV 输入也可为 FP32 |
-| `infer_cmix_forward_varlen` | res/ln、TokenShift、key projection、ReLU²、value projection；返回 `(res_out, cmix_out)`，原位更新 shift pool |
-| `infer_post_norm_output_forward_varlen(x, res, weight, bias, *, eps=1e-5)` | 对 BF16 residual sum 作 FP32 ln，返回 BF16 |
-| `infer_head_linear_all_forward_varlen(x, weight)` | `[N,C]` BF16 hidden 与 `[V,C]` BF16 weight，返回 FP32 `[N,V]` |
-| `infer_sampling_six_parameter_forward_varlen` | FP32 logits、penalty pool、RNG pool 和 slot indices，返回 token ids 并更新请求状态 |
-
-WKV 推理参数为：
+### `infer_embedding_ln0_forward_varlen`
 
 ```python
-output = flashrwkv2.infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
-    r, decay_logits, k, v, a, b,
-    state=state,
-    cu_seqlens=cu_seqlens,
-    state_indices=state_indices,
-    scale=1.0,
-    decay_bias=None,
-    max_seqlen=None,
-    validated_metadata=ticket,
-)
+infer_embedding_ln0_forward_varlen(
+    embedding: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    *,
+    eps: float = 1e-05,
+) -> torch.Tensor
 ```
 
-原始低秩 checkpoint 权重按 `[out,in]` 传入推理 prepare；可选 `*_runtime`
-权重是它们的转置布局。两者通过 stride 进入相同投影，不在每次调用时复制权重。
-CMix 推理的 value weight 保持 `[F,C]` runtime 布局；训练入口为 `[C,F]`。
+Applies initial LayerNorm (`ln0`) to embeddings using FP32 statistics.
 
-## State and packed metadata
+| Parameter | Shape | Dtype | Notes |
+| --- | --- | --- | --- |
+| `embedding` | `[..., C]` | `bfloat16` | Input token embeddings. |
+| `weight`, `bias` | `[C]` | `bfloat16` | LayerNorm affine parameters. |
+| `eps` | `float` | — | Variance epsilon (default `1e-5`). |
 
-`prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor(state)` 绑定已有连续 CUDA
-FP32 tensor。每次调用返回时状态完整写回。
+- **Returns**: `bfloat16` tensor with the same shape as `embedding`.
 
-`prepare_tmix_wkv7_recurrent_fp16_state_from_tensor` 绑定连续 CUDA FP16 tensor。
-`infer_tmix_wkv7_recurrent_fp16_forward_varlen` 使用 BF16 token I/O、FP32 递推和归约，
-每个 token 后将逻辑 state 舍入为 FP16。不同 batch、分段和 CUDA Graph 使用相同舍入规则。
-对 D64、H40/H64，两个点积都在四个连续的 16-key 组内使用 FP32 FMA 顺序累加，
-然后按 `(s0 + s1) + (s2 + s3)` 合并。该求和顺序同时用于单行、混合 batch 和单 token decode。
+---
 
-D64、H40/H64 的 FP16 handle 按 slot 和头分配 DeltaLog。128 个 SM 的 RTX 4090 在 H64 下
-每条记录保存四个 BF16 操作数和一个 FP32 点积。每个头最多保留两条记录，加上 int32 phase 共 1,540 字节。
-其他 H40/H64 配置保存五个长度为 64 的 FP32 向量和一个 int32 phase，共 1,284 字节。批量 decode 追加记录，下一次读取该 slot 时按原
-FP32 顺序重放并舍入。同一批次里的单 token 行独立决定追加或写回，长行优先执行。
-H64 模型的 32 层每序列共用 16 MiB 基态，双记录日志占 3.008 MiB，五向量日志占 2.508 MiB。
-其他几何和 FP32 handle 的私有字节数为零。容量规划使用 `memory_layout["bytes_per_slot"]`，
-其中包括基态和日志，`fixed_workspace_nbytes` 为零。
+### `infer_tmix_postnorm_tokenshift_forward_varlen`
 
-读取、复制或导出底层绑定 tensor 之前，对读出的槽位调用 `materialize_slots_(indices)`。
-在替换、丢弃或重新绑定同一个底层 tensor 之前，同样需要物化仍要保留的槽位。
-handle 的 `clone()`、`clone_slots(indices)`、`copy_()`、`copy_slots_(source, src, dst)`、
-`zero_()` 和 `reset_slots_(indices)` 会处理日志。slot copy 支持同池重叠 COW，目标槽位须唯一。
-训练、RL rollout、eval 和采样搜索使用 FP32 state。
+```python
+infer_tmix_postnorm_tokenshift_forward_varlen(
+    x: torch.Tensor,
+    res: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    x_r: torch.Tensor,
+    x_w: torch.Tensor,
+    x_k: torch.Tensor,
+    x_v: torch.Tensor,
+    x_a: torch.Tensor,
+    x_g: torch.Tensor,
+    *,
+    shift_state_pool: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    state_indices: torch.Tensor,
+    max_seqlen: int | None = None,
+    eps: float = 1e-05,
+    validated_metadata: object | None = None,
+    save_normalized: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, ...]
+```
 
-静态 `prepare_tmix_wkv7_recurrent_metadata(cu_seqlens, state_indices, *,
-state_pool_size, total_tokens, max_seqlen=None)` 验证序列边界、slot 范围和唯一性，
-保存 snapshot，并校验后续调用的 identity、version、shape 和 CUDA stream。
-`cu_seqlens` 与 `state_indices` 为连续 CUDA INT32。
+Fuses `res_out = bf16(x + res)`, FP32-statistics LayerNorm, and six-way TokenShift on packed rows.
 
-CUDA Graph 使用 `token_capacity`、`sequence_capacity`、`max_seqlen_capacity` 以及
-两个 CUDA INT32 scalar `num_active_tokens`、`num_active_sequences`。同一 graph
-内所有 stateful 算子共享 ticket；每次 replay 验证有效前缀。零 active warmup 不
-修改 state，非法 metadata 也不修改 state。inactive 输出为 NaN，不应被下游消费。
-验证器在设备上按有效行长度降序排列执行顺序，结果由各层共享，输出仍按输入行排列。
-FP16 prefill 按四个 token 一块处理整块，每行最后单独处理 0–3 个 token。
-当有效 prefill 有 1–3 行，每个头的 value 列分给四个 CTA。达到四行时，每个 CTA
-处理一个完整头，以复用该行的输入向量。decode 行继续独立读写各自的日志。
+| Parameter | Shape | Dtype | Notes |
+| --- | --- | --- | --- |
+| `x`, `res` | `[N, C]` | `bfloat16` | Packed hidden and residual inputs. |
+| `weight`, `bias` | `[C]` | `bfloat16` | LayerNorm affine parameters. |
+| `x_r`, `x_w`, `x_k`, `x_v`, `x_a`, `x_g` | `[C]` | `bfloat16` | Six TokenShift interpolation vectors. |
+| `shift_state_pool` | `[slots, C]` | `bfloat16` | **Mutated in place** for active slots with each sequence's final normalized row. |
+| `cu_seqlens` | `[B + 1]` | `int32` | Packed sequence offsets. |
+| `state_indices` | `[B]` | `int32` | Unique slot indices into `shift_state_pool`. |
+| `max_seqlen` | `int \| None` | — | Optional upper bound on sequence length. |
+| `validated_metadata` | `object \| None` | — | Optional ticket from `prepare_tmix_wkv7_recurrent_metadata`. |
+| `save_normalized` | `[N, C]` or `None` | `bfloat16` | Optional non-aliasing buffer receiving each active token's post-LN shift state (for MTP rewind). |
 
-### 推理状态导出
+- **Returns** (7-tuple of `bfloat16 [N, C]`): `(res_out, r, w, k, v, a, g)`.
 
-两个 WKV 推理入口默认返回 BF16 输出。传入 `save=True` 时返回
-`(output, boundaries)`，每个 checkpoint 保存**处理对应 token 之前**的 WKV state。
-`checkpoint_interval` 为正整数，默认 16。以当前调用的 token 容量 `N`、
-sequence 容量 `B` 和 interval `S` 计算形状 `[N // S + B, H, D, D]`。
-调用方可传入同设备、连续且与 state pool 同 dtype 的 `boundaries`，否则由入口分配。
+---
 
-对第 `i` 条序列，设 `start = cu_seqlens[i]`。当序列内 token 偏移 `j` 能被
-`S` 整除时，写入 `boundaries[start // S + i + j // S]`。
-图重放只写入 live metadata 描述的有效 checkpoint，容量空洞保留原值。
-FP16 checkpoint 包含该 slot 已追加的 DeltaLog 更新，状态与普通 serving 使用相同的归约顺序。
+### `infer_tmix_wkv_prepare_forward_varlen`
 
-`infer_tmix_postnorm_tokenshift_forward_varlen` 和 `infer_cmix_forward_varlen` 的
-`save_normalized` 接收同设备、连续的 BF16 `[N,C]` 缓冲区，写入每个有效 token
-的 res 后 ln 结果。T=1 融合路径与通用 packed 路径均写出该 token 作为序列末尾时
-的 shift state。调用方为导出缓冲区提供与输入和对应 pool 独立的存储。
+```python
+infer_tmix_wkv_prepare_forward_varlen(
+    x_r: torch.Tensor,
+    x_w: torch.Tensor,
+    x_k: torch.Tensor,
+    x_v: torch.Tensor,
+    x_a: torch.Tensor,
+    x_g: torch.Tensor,
+    receptance_weight: torch.Tensor,
+    key_weight: torch.Tensor,
+    value_weight: torch.Tensor,
+    w1: torch.Tensor | None,
+    a1: torch.Tensor | None,
+    g1: torch.Tensor | None,
+    v1: torch.Tensor | None,
+    w2: torch.Tensor | None,
+    a2: torch.Tensor | None,
+    g2: torch.Tensor | None,
+    v2: torch.Tensor | None,
+    v0: torch.Tensor | None,
+    k_k: torch.Tensor,
+    a0: torch.Tensor,
+    k_a: torch.Tensor,
+    *,
+    v_first: torch.Tensor | None = None,
+    w1_runtime: torch.Tensor | None = None,
+    a1_runtime: torch.Tensor | None = None,
+    g1_runtime: torch.Tensor | None = None,
+    v1_runtime: torch.Tensor | None = None,
+    w2_runtime: torch.Tensor | None = None,
+    a2_runtime: torch.Tensor | None = None,
+    g2_runtime: torch.Tensor | None = None,
+    v2_runtime: torch.Tensor | None = None,
+    receptance_lora_a: torch.Tensor | None = None,
+    receptance_lora_b: torch.Tensor | None = None,
+    receptance_lora_scale: float = 1.0,
+    key_lora_a: torch.Tensor | None = None,
+    key_lora_b: torch.Tensor | None = None,
+    key_lora_scale: float = 1.0,
+    value_lora_a: torch.Tensor | None = None,
+    value_lora_b: torch.Tensor | None = None,
+    value_lora_scale: float = 1.0,
+    receptance_use_nora: bool = False,
+    key_use_nora: bool = False,
+    value_use_nora: bool = False,
+    head_size: int = 64,
+    batch_size: int = 1,
+    max_seqlen: int | None = None,
+) -> tuple[torch.Tensor, ...]
+```
 
-对 MTP verifier 设 `checkpoint_interval=1`，令 `m` 为保留的已处理 token 数。
+Computes R/K/V dense projections (with optional LoRA/NoRA), low-rank W/A/G/V branches, Value Residual (`vres`), and normalized key / `recurrent_a` / `recurrent_b` preparation.
 
-- `m = 0` 时，从 `boundaries[start + i]` 恢复 WKV state，并使用 verifier
-  调用前保留的 TMix 和 CMix shift state。
-- `0 < m < length` 时，从 `boundaries[start + i + m]` 恢复 WKV state，并从
-  各自的 `save_normalized[start + m - 1]` 恢复 TMix 和 CMix shift state。
-- `m = length` 时，使用算子已写回的 pool。
+| Parameter Group | Shape | Dtype | Notes |
+| --- | --- | --- | --- |
+| `x_r, x_w, x_k, x_v, x_a, x_g` | `[N, C]` (or `[..., C]`) | `bfloat16` | Output from `tokenshift`. |
+| `receptance_weight, key_weight, value_weight` | `[C, C]` | `bfloat16` | `[out, in]` layout. |
+| `w1, a1, g1, v1` / `w2, a2, g2, v2` | `[R, C]` / `[C, R]` | `bfloat16` | Original `[out, in]` weights. May be `None` if corresponding `*_runtime` is provided. |
+| `*_runtime` | `[C, R]` / `[R, C]` | `bfloat16` | Transposed `[in, out]` runtime views; enter the exact same MMA arithmetic without copying. |
+| `v_first`, `v0`, `v1`/`v2` | `[N, C]`, `[C]` | `bfloat16` | Pass `v_first=None` on layer 0 (VRes skipped; returns `value` as `v_first`). On layers `> 0`, `v0`, `v1`, `v2` are required. |
+| `k_k`, `a0`, `k_a` | `[C]` | `bfloat16` | Per-channel key normalization, in-context rate bias, and key scaling vectors. |
+| `head_size` | `int` (`64/128/256`) | — | Head width `D`. (`batch_size` and `max_seqlen` are reserved compatibility kwargs.) |
 
-### LightMTP DraftLoop
+> **Important (`w0` decay bias)**: Unlike `pretrain_tmix_wkv_prepare_bf16`, `infer_tmix_wkv_prepare_forward_varlen` does **not** add `w0`. Pass `decay_bias=w0` to `infer_tmix_wkv7_recurrent_*` to keep the exact BF16 rounding boundary.
+
+- **Returns** (8-tuple of `bfloat16 [N, C]`): `(r, decay_logits, key, value, recurrent_a, recurrent_b, gate, v_first)`. Reshape the first 6 tensors to `[N, H, D]` before calling WKV7.
+
+---
+
+### `infer_tmix_wkv7_recurrent_fp16_forward_varlen` & `fp32io16`
+
+```python
+infer_tmix_wkv7_recurrent_fp16_forward_varlen(
+    r: torch.Tensor,
+    decay_logits: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    *,
+    state: _TmixWkv7RecurrentState,
+    cu_seqlens: torch.Tensor,
+    state_indices: torch.Tensor,
+    scale: float = 1.0,
+    decay_bias: torch.Tensor | None = None,
+    max_seqlen: int | None = None,
+    validated_metadata: object | None = None,
+    save: bool = False,
+    boundaries: torch.Tensor | None = None,
+    checkpoint_interval: int = 16,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]
+
+infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
+    r: torch.Tensor,
+    decay_logits: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    *,
+    state: _TmixWkv7RecurrentState,
+    cu_seqlens: torch.Tensor,
+    state_indices: torch.Tensor,
+    scale: float = 1.0,
+    decay_bias: torch.Tensor | None = None,
+    max_seqlen: int | None = None,
+    validated_metadata: object | None = None,
+    save: bool = False,
+    boundaries: torch.Tensor | None = None,
+    checkpoint_interval: int = 16,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]
+```
+
+- Use **`fp16`** for general online serving on SM89/SM120 (per-token FP16 state rounding + automatic DeltaLog on D64 H40/H64 with balanced 4×16 key reduction `(s0 + s1) + (s2 + s3)`).
+- Use **`fp32io16`** for RL rollout, evaluation, and sampling search (bitwise identical to training).
+
+| Parameter | Shape | Dtype | Notes |
+| --- | --- | --- | --- |
+| `r, decay_logits, k, v, a, b` | `[N, H, D]` | `bfloat16` | Six packed recurrent inputs (`D ∈ {64, 128, 256}`). |
+| `state` | Handle (`[slots, H, D, D]`) | `float16` or `float32` | **Mutated in place** for active slots. Must match function precision. |
+| `cu_seqlens` | `[B + 1]` | `int32` | Packed sequence offsets. |
+| `state_indices` | `[B]` | `int32` | Unique slot indices into `state`. |
+| `scale` | `float` (default `1.0`) | — | Finite output multiplier. |
+| `decay_bias` | `[H, D]` or `[H * D]` or `None` | `bfloat16` or `float32` | Optional `w0` added in FP32 and rounded to BF16 before retention. |
+| `validated_metadata` | `object \| None` | — | Optional ticket from `prepare_tmix_wkv7_recurrent_metadata`. |
+| `save` | `bool` (default `False`) | — | If `True`, exports pre-token WKV state checkpoints every `checkpoint_interval` tokens. |
+| `boundaries` | `[N // S + B, H, D, D]` or `None` | Matches `state` | Optional preallocated non-overlapping checkpoint buffer (allocated automatically if `None`). |
+| `checkpoint_interval` | `int` (default `16`) | — | Positive token stride `S` for state export. |
+
+- **Returns**:
+  - `save=False`: `bfloat16` output `[N, H, D]`.
+  - `save=True`: `(output, boundaries)` where sequence `i` (`start = cu_seqlens[i]`), token offset `j` divisible by `S` stores the **pre-token** state at `boundaries[start // S + i + j // S]`. Live graph replays only write active checkpoints.
+
+> **MTP Verifier Rewind (`checkpoint_interval=1`)**: If `m` out of `L` verified tokens are accepted for sequence `i`:
+> - `m == 0`: restore WKV from `boundaries[start + i]`; restore TMix/CMix shift states from before the verifier step.
+> - `0 < m < L`: restore WKV from `boundaries[start + i + m]`; restore TMix/CMix shift states from `save_normalized[start + m - 1]`.
+> - `m == L`: keep the updated state pools.
+
+---
+
+### `infer_tmix_readout_forward_varlen`
+
+```python
+infer_tmix_readout_forward_varlen(
+    wkv_output: torch.Tensor,
+    receptance: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    r_k: torch.Tensor,
+    ln_weight: torch.Tensor,
+    ln_bias: torch.Tensor,
+    gate: torch.Tensor,
+    output_weight: torch.Tensor,
+    *,
+    output_lora_a: torch.Tensor | None = None,
+    output_lora_b: torch.Tensor | None = None,
+    output_lora_scale: float = 1.0,
+    head_size: int = 64,
+    batch_size: int = 1,
+    max_seqlen: int | None = None,
+    output_use_nora: bool = False,
+) -> torch.Tensor
+```
+
+Fuses per-head LayerNorm (GroupNorm), RKV residual `((r * k * r_k).sum(-1, keepdim=True) * v)`, output gating (`* gate`), and output linear projection (with optional LoRA/NoRA).
+
+| Parameter | Shape | Dtype | Notes |
+| --- | --- | --- | --- |
+| `wkv_output` | `[N, C]` | `bfloat16` or `float32` | Output of WKV7 reshaped to 2D. |
+| `receptance, key, value, gate` | `[N, C]` | `bfloat16` | Packed tensors from `wkv_prepare`. |
+| `r_k` | `[H, D]` or `[C]` | `bfloat16` | Per-head residual scale. |
+| `ln_weight, ln_bias` | `[C]` | `bfloat16` | Head LayerNorm affine parameters. |
+| `output_weight` | `[C, C]` | `bfloat16` | `[out, in]` output projection weight. |
+| `output_lora_*`, `output_use_nora` | — | — | See [LoRA / NoRA Contract](#shared-lora--nora-adapter-contract). |
+| `head_size` | `int` (`64/128/256`) | — | Head width `D`. |
+
+- **Returns**: `bfloat16` tensor `[N, C]`.
+
+---
+
+### `infer_cmix_forward_varlen`
+
+```python
+infer_cmix_forward_varlen(
+    x: torch.Tensor,
+    res: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    x_k: torch.Tensor,
+    key_weight: torch.Tensor,
+    value_weight: torch.Tensor,
+    *,
+    shift_state_pool: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    state_indices: torch.Tensor,
+    max_seqlen: int | None = None,
+    eps: float = 1e-05,
+    validated_metadata: object | None = None,
+    deterministic: bool = False,
+    key_lora_a: torch.Tensor | None = None,
+    key_lora_b: torch.Tensor | None = None,
+    value_lora_a: torch.Tensor | None = None,
+    value_lora_b: torch.Tensor | None = None,
+    key_lora_scale: float = 1.0,
+    value_lora_scale: float = 1.0,
+    key_use_nora: bool = False,
+    value_use_nora: bool = False,
+    save_normalized: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]
+```
+
+Full ChannelMix island: `res/ln` → 1-way TokenShift → key projection → ReLU² → value projection.
+
+| Parameter | Shape | Dtype | Notes |
+| --- | --- | --- | --- |
+| `x, res` | `[N, C]` | `bfloat16` | Packed hidden and residual inputs. |
+| `weight, bias, x_k` | `[C]` | `bfloat16` | LayerNorm parameters and TokenShift mix vector. |
+| `key_weight` | `[F, C]` | `bfloat16` | Key projection weight. |
+| `value_weight` | **`[F, C]`** | `bfloat16` | **Runtime layout** (transposed relative to training's `[C, F]`). |
+| `shift_state_pool` | `[slots, C]` | `bfloat16` | **Mutated in place** for active slots. Must not alias projection weights/adapters. |
+| `cu_seqlens`, `state_indices`, `validated_metadata`, `save_normalized` | — | — | Same contract as `infer_tmix_postnorm_tokenshift_forward_varlen`. |
+| `key_lora_*`, `value_lora_*` | — | — | See [LoRA / NoRA Contract](#shared-lora--nora-adapter-contract) (`value_lora_a: [R, F]`, `value_lora_b: [C, R]`). |
+
+- **Returns** (2-tuple of `bfloat16 [N, C]`): `(res_out, cmix_out)`.
+
+---
+
+### `infer_post_norm_output_forward_varlen`
+
+```python
+infer_post_norm_output_forward_varlen(
+    x: torch.Tensor,
+    res: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    *,
+    eps: float = 1e-05,
+) -> torch.Tensor
+```
+
+Computes `ln(bf16(x + res))` with FP32 statistics for the final model output layer.
+
+- **Inputs**: `x, res: bfloat16 [..., C]`; `weight, bias: bfloat16 [C]`.
+- **Returns**: `bfloat16 [..., C]`.
+
+---
+
+### `infer_head_linear_all_forward_varlen`
+
+```python
+infer_head_linear_all_forward_varlen(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    *,
+    lora_a: torch.Tensor | None = None,
+    lora_b: torch.Tensor | None = None,
+    lora_scale: float = 1.0,
+    use_nora: bool = False,
+) -> torch.Tensor
+```
+
+Projects packed BF16 hidden states to FP32 vocabulary logits using the exact training forward.
+
+- **Inputs**: `x: bfloat16 [N, C]`; `weight: bfloat16 [V, C]`; optional `lora_a [R, C]`, `lora_b [V, R]`.
+- **Returns**: `float32 [N, V]`.
+
+---
+
+### `setup_sampling_states` & `infer_sampling_six_parameter_forward_varlen`
+
+```python
+setup_sampling_states(seed: int, num_slots: int) -> torch.Tensor
+
+infer_sampling_six_parameter_forward_varlen(
+    logits: torch.Tensor,
+    penalties: torch.Tensor,
+    states: torch.Tensor,
+    slot_indices: torch.Tensor,
+    *,
+    presence_penalty: float | torch.Tensor = 0.0,
+    frequency_penalty: float | torch.Tensor = 0.0,
+    penalty_decay: float | torch.Tensor = 0.996,
+    temperature: float | torch.Tensor = 1.0,
+    top_k: int | torch.Tensor = -1,
+    top_p: float | torch.Tensor = 1.0,
+    sample_capacity: int | None = None,
+    num_active_samples: torch.Tensor | None = None,
+) -> torch.Tensor
+```
+
+Persistent Philox RNG initialization and fused six-parameter sampling with additive per-slot penalties.
+
+| Parameter | Shape | Dtype | Notes |
+| --- | --- | --- | --- |
+| `logits` | `[B, V]` | `float32` | `V` must satisfy `0 < V <= 1_048_576` and `V % 4 == 0`. |
+| `penalties` | `[num_slots, V]` | `float32` | **Mutated in place** for active slots (decayed by `penalty_decay` then incremented on sampled token). |
+| `states` | `[num_slots, ...]` | `int8` | **Mutated in place**; allocated by `setup_sampling_states(seed, num_slots)`. |
+| `slot_indices` | `[B]` | `int32` | Unique in-range slot indices. |
+| `presence_penalty`, `frequency_penalty`, `penalty_decay`, `temperature`, `top_p` | scalar `float` or `[B]` | `float32` | Per-request or broadcast controls. **`frequency_penalty` is an additive increment** (not a multiplicative repetition penalty). |
+| `top_k` | scalar `int` or `[B]` | `int32` | `<= 0` disables top-k filtering. |
+| `sample_capacity`, `num_active_samples` | `int`, 1-element `[1]` | `int32` | Optional pair for live CUDA Graph capture (`sample_capacity == B`). Must be provided together. |
+
+- **Returns**: Sampled token IDs tensor (`[B]`, CUDA `int32`).
+
+---
+
+### LightMTP `DraftLoop`
+
+Imported from `flashrwkv2.mtp`:
 
 ```python
 from flashrwkv2.mtp import DraftLoop
 
-loop = DraftLoop.from_state_dict(sidecar_weights, lm_head_weight, depth=4, eps=1e-5)
-eager_ids = loop(hidden, token_ids, embed).clone()
-loop.capture(embed)
-graph_ids = loop.replay(hidden, token_ids)
+DraftLoop(
+    state: Mapping[str, torch.Tensor],
+    lm_head_weight: torch.Tensor,
+    *,
+    depth: int,
+    eps: float = 1e-05,
+)
+DraftLoop.from_state_dict(
+    state: Mapping[str, torch.Tensor],
+    lm_head_weight: torch.Tensor,
+    *,
+    depth: int,
+    eps: float = 1e-05,
+) -> DraftLoop
 ```
 
-该入口使用单个 LightMTP block，读取 sidecar 的 `block.*` 权重。
-`lm_head_weight` 为共享 `[V,C]` 权重，设备和 dtype 已符合要求时复用其存储。
-`hidden` 为 CUDA BF16 `[1,C]` 或 `[C]`，`token_ids` 为同设备 INT64
-`[1]` 或标量。调用方传入的 `embed` 接收 `[1]` 并返回同设备 BF16 `[1,C]`。
-每步使用 FP32 logits 选出下一个 draft token。
+Single-request LightMTP speculative drafting module supporting eager execution and CUDA Graph capture/replay.
 
-`capture` 在 graph 外预热算子并绑定 embedding。每次 `forward` 或 `replay` 返回同一
-INT64 `[1,depth]` 缓冲区，跨调用保留时使用 `clone()`。同一实例串行使用，
-模块移动到新设备后重新 capture。目标模型验证和状态回退由调用方负责。
+**Required `state` keys** (converted to contiguous BF16 on `lm_head_weight.device`):
+
+| Key | Shape |
+| --- | --- |
+| `block.proj.weight` | `[C, 2 * C]` |
+| `block.gate.weight`, `block.up.weight` | `[F, C]` |
+| `block.down.weight` | `[C, F]` |
+| `block.norm_{e,h,mlp,out}.{weight,bias}` | `[C]` |
+
+`lm_head_weight` has shape `[V, C]` and reuses its storage when already contiguous CUDA BF16.
+
+| Method | Signature | Semantics |
+| --- | --- | --- |
+| `forward` | `(hidden, token_ids, embed) -> int64 [1, depth]` | Eagerly drafts `depth` tokens using FP32 logits. `hidden`: CUDA BF16 `[1, C]` or `[C]`; `token_ids`: CUDA `int64` `[1]` or scalar; `embed`: callable `int64 [1] -> bf16 [1, C]`. |
+| `capture` | `(embed) -> None` | Warms up and captures a CUDA Graph bound to `embed` and the current device. Re-capture after moving devices. |
+| `replay` | `(hidden, token_ids) -> int64 [1, depth]` | Stages inputs and replays the captured graph on the current stream. |
+
+> **Buffer reuse**: `forward` and `replay` return the same internal `int64 [1, depth]` tensor on every call. Call `.clone()` if results must survive subsequent calls, and invoke each instance serially.
+
+---
 
 ## Training
 
-| API | 说明 |
-|---|---|
-| `pretrain_tmix_tokenshift_bf16` | dense 或 packed 六路 TokenShift，可选可微初始/最终 shift state |
-| `pretrain_tmix_wkv_prepare_bf16` | 训练权重布局与 `w0` bias，输出共享 BF16 prepare 结果 |
-| `pretrain_tmix_wkv7_recurrent_bf16` | dense `[B,T,C]` 或带 cu_seqlens 的 packed `[N,H,D]`，支持任意长度和可微 FP32 初始状态 |
-| `rl_infctx_tmix_wkv7_recurrent_bf16` | packed 六路输入、`state_pool`、`cu_seqlens`、可选 `state_indices`，返回 `(output, final_pool)`；未选中槽位保持原值，输入和 state 可求梯度 |
-| `pretrain_tmix_readout_bf16` | head ln、RKV residual、gate，可选 output projection |
-| `pretrain_cmix_bf16` | dense 或 packed ChannelMix，可选可微初始/最终 shift state |
-| `pretrain_head_linear_bf16` | BF16 hidden/weight，返回 FP32 logits |
-| `pretrain_head_ce_bf16` | `chunk_rows` 限制前向词表投影工作集，按 targets 形状返回 FP32 交叉熵，-100 对应零 loss 和梯度，`backward_chunk_rows` 可独立设置反向重算和 VJP 的行数，默认沿用 `chunk_rows` |
-| `pretrain_l2wrap_ce_bf16` | 对任意前置维度的 logits 计算 FP32 交叉熵，梯度包含 train_temp L2Wrap 项 |
-| `pretrain_head_l2wrap_ce_bf16` | 分段投影并计算带 train_temp L2Wrap 梯度的 FP32 交叉熵 |
+All training operators support autograd, frozen base weights, and `torch.compile(fullgraph=True)`.
 
-WKV 的公共 state 布局使用相同的 key/value head 宽度。FLA 的非等宽
-key/value 路径需要独立的 state 布局和 readout 验证。
-
-投影支持 LoRA/NoRA：A `[R,K]`、B `[O,R]`，参数可为 BF16/FP32。
-NoRA 为 `A / (norm(A, dim=0) + 1e-6)`，FP32 归一化与反向，BF16 投影；
-每次 forward 从当前参数计算。冻结 base weight 时省去 dW，但保留输入梯度。
-CMix 使用 `key_*`、`value_*`，prepare 使用 `receptance_*`、`key_*`、`value_*`，
-readout 使用 `output_*`，head 使用 `lora_a/lora_b/lora_scale/use_nora`。
-
-Prepare 分别将 R/K/V、W/A/G/V 的低秩输入投影、低秩输出投影分组执行。
-各组使用独立输入和权重，允许低秩宽度不同；没有 VRes 的首层只执行三路。
-每路仍按原来的连续 32 元素 K 块累加，先舍入到 BF16，再执行原有 bias 与
-tanh/sigmoid，最后再次舍入到 BF16。反向复用相同的激活 VJP、bias 归约和
-线性 VJP；R/K/V 的 LoRA/NoRA 更新仍作用于各自的 BF16 base projection。
-
-训练前向和反向支持 `torch.compile(fullgraph=True)`。编译路径通过注册算子调用
-同一套 TileLang forward/VJP；普通 eager 调用保留原有路径。Inductor 必须保留
-中间 BF16 舍入，才能与 eager 梯度逐位一致：
+### `pretrain_tmix_tokenshift_bf16`
 
 ```python
-compiled_model = torch.compile(
-    model, fullgraph=True, options={"emulate_precision_casts": True},
-)
+pretrain_tmix_tokenshift_bf16(
+    x: torch.Tensor,
+    x_r: torch.Tensor,
+    x_w: torch.Tensor,
+    x_k: torch.Tensor,
+    x_v: torch.Tensor,
+    x_a: torch.Tensor,
+    x_g: torch.Tensor,
+    *,
+    initial_shift: torch.Tensor | None = None,
+    cu_seqlens: torch.Tensor | None = None,
+    return_final_state: bool = False,
+) -> tuple[torch.Tensor, ...]
 ```
 
-捕获 CUDA Graph 前，用实际形状、权重布局和可训练参数预热 forward/backward，再恢复 state 和梯度。
-支持 PyTorch 2.11–2.14；metadata/sampling native 扩展使用 C++20 编译。
+Differentiable six-way TokenShift supporting dense (`[B, T, C]`, `cu_seqlens=None`) or packed (`[N, C]`, `cu_seqlens: int32 [B + 1]`) inputs.
 
-以 `initial_state` 传入初始 WKV state。设置 `return_final_state=True` 返回
-`(output, final_state)`。packed 输入使用连续 CUDA int32 `cu_seqlens`，
-从 0 起单调非减，末元素为 token 总数。这三项值域约束由异步 CUDA 断言检查，
-违反约束会使当前 CUDA context 失效，需要重启进程。
+- **`initial_shift`**: Optional differentiable BF16 `[B, C]` (defaults to zeros).
+- **Returns**: `(r, w, k, v, a, g)` matching `x.shape`; appends `final_shift: bfloat16 [B, C]` when `return_final_state=True`.
 
-TokenShift 和 CMix 接受 dense `[B,T,C]` 或 packed `[N,C]`，与 WKV 共用同一组
-int32 `cu_seqlens`。
-shift state 形状为 `[B,C]`，省略 `initial_shift` 时每段从零开始。
+---
 
-## Tuning and acceptance
+### `pretrain_tmix_wkv_prepare_bf16`
 
-### Execution configuration
+```python
+pretrain_tmix_wkv_prepare_bf16(
+    x_r: torch.Tensor,
+    x_w: torch.Tensor,
+    x_k: torch.Tensor,
+    x_v: torch.Tensor,
+    x_a: torch.Tensor,
+    x_g: torch.Tensor,
+    receptance_weight: torch.Tensor,
+    key_weight: torch.Tensor,
+    value_weight: torch.Tensor,
+    w0: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    a0: torch.Tensor,
+    a1: torch.Tensor,
+    a2: torch.Tensor,
+    g1: torch.Tensor,
+    g2: torch.Tensor,
+    k_k: torch.Tensor,
+    k_a: torch.Tensor,
+    *,
+    v_first: torch.Tensor | None = None,
+    v0: torch.Tensor | None = None,
+    v1: torch.Tensor | None = None,
+    v2: torch.Tensor | None = None,
+    receptance_lora_a: torch.Tensor | None = None,
+    receptance_lora_b: torch.Tensor | None = None,
+    key_lora_a: torch.Tensor | None = None,
+    key_lora_b: torch.Tensor | None = None,
+    value_lora_a: torch.Tensor | None = None,
+    value_lora_b: torch.Tensor | None = None,
+    receptance_lora_scale: float = 1.0,
+    key_lora_scale: float = 1.0,
+    value_lora_scale: float = 1.0,
+    receptance_use_nora: bool = False,
+    key_use_nora: bool = False,
+    value_use_nora: bool = False,
+    head_size: int = 64,
+) -> tuple[torch.Tensor, ...]
+```
 
-RTX 4090 and PRO 6000 use deterministic projection tiles selected from the model geometry,
-SM count and shared memory limit. D64 WKV selects decode or prefill from the checked-in
-execution configurations. FP32 training and matched FP32 rollout retain the same
-reduction order and state cast. H40 and H64 D64 FP16 serving use four 16-term FMA
-chains and a balanced FP32 sum for each dot product, so rounding can differ from
-the earlier 64-term chain.
-The WKV benchmark records the selected value tile, token prefetch and workload reason before capture.
-The operator benchmark's `--tune` option verifies candidate outputs and state before timing.
-Its report contains the winning configuration and individual measurements.
+Differentiable WKV preparation matching inference bitwise at every BF16 edge.
 
-Warm the forward and, for training, the backward for each CUDA Graph shape on its capture
-stream before capture. Restore the caller-owned state and gradients after warmup.
-The native extension cache uses `~/.cache/flashrwkv2` or `FLASHRWKV2_CACHE_DIR`.
-TileLang manages compiled binaries in its own cache.
+- **Inputs**: `x_*` have shape `[B, T, C]` or `[N, C]` (`bfloat16`); dense R/K/V weights are `[C, C]`; **low-rank weights use training `[in, out]` layout** (`w1, a1, g1, v1: [C, R]`; `w2, a2, g2, v2: [R, C]`); `w0, a0, v0, k_k, k_a: [C]`.
+- **Returns** (8-tuple matching `x_r.shape`): `(r, decay_logits, key, value, recurrent_a, recurrent_b, gate, v_first)` with `w0` already added into `decay_logits`.
 
-### Validation and performance
+---
 
-The following measurements describe the earlier dynamic-workload implementation.
+### `pretrain_tmix_wkv7_recurrent_bf16`
 
-Business tests cover train/prefill/decode equivalence, independent VJPs and optimizer
-updates, state ownership, frozen/unused gradients, compiled/Graph execution,
-dynamic workloads and fresh-process binary-cache reuse.
-Model geometry uses C=2048/2560/4096/4096 and W/A/G/V ranks
-96/96/256/64, 96/96/320/64, 128/128/480/96 and 192/192/384/128.
+```python
+pretrain_tmix_wkv7_recurrent_bf16(
+    r: torch.Tensor,
+    w: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    *,
+    head_size: int = 64,
+    initial_state: torch.Tensor | None = None,
+    cu_seqlens: torch.Tensor | None = None,
+    return_final_state: bool = False,
+    scale: float = 1.0,
+    decay_bias: torch.Tensor | None = None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]
+```
 
-| Measured result | SM89 | SM120 |
-| --- | --- | --- |
-| Business GPU suite: complete block, numerics, state, Graph and prepared workloads | 330 passed | 330 passed |
-| Training workloads within 2% of the best measured comparison | 9/9 | 9/9 |
-| Fresh-process disk-cache reuse | 139 cold / 0 warm device compilations | 137 cold / 0 warm device compilations |
+Differentiable RWKV-7 recurrence with functional (non-mutated) FP32 state.
 
-SM89 T1024 training is 42.20 ms for 7.2B and 42.21 ms for 13.3B
-(−0.39% / +0.33% versus baseline). Remaining performance target deviations are
-SM89 B1 layer latency +2.41%–4.46%, 2.9B T1024 prefill combined latency +2.39%,
-and SM120 1.5B B128 tuning-benefit retention of 93.77% (95% target).
+| Mode | Input Shapes (`r, w, k, v, a, b`) | `cu_seqlens` | `initial_state` |
+| --- | --- | --- | --- |
+| **Dense** | `bfloat16 [B, T, C]` | `None` | Optional `float32 [B, H, D, D]` (`H = C // head_size`) |
+| **Packed** | `bfloat16 [N, H, D]` | `int32 [B + 1]` | Optional `float32 [B, H, D, D]` |
 
-Completed SM120 training acceptance (B1, layer plus Head; forward, backward and
-gradient zeroing, excluding optimizer):
+- **Returns**: `bfloat16` output matching `r.shape`, or `(output, final_state)` (`float32 [B, H, D, D]`) when `return_final_state=True`.
 
-| Workload | Best comparison (ms) | Prepared (ms) | Latency change | Retained gain |
-| --- | ---: | ---: | ---: | ---: |
-| 7.2B T1024 eager | 32.786 | 32.196 | -1.80% | 119.77% |
-| 13.3B T128 eager | 7.399 | 7.311 | -1.20% | 114.17% |
-| 13.3B T1024 eager | 32.897 | 32.267 | -1.91% | 121.38% |
-| 1.5B T128 compiled | 3.603 | 3.577 | -0.71% | 109.19% |
+---
 
-All four meet the 2% latency and 95% gain-retention targets. The comparison is the
-fastest of baseline, existing offline reference and previous strategy. Gain retention
-applies when `default - best > max(0.02 * default, 3 * (IQR(default) + IQR(best)))`.
-The four cases used an idle Shanghai PRO 6000 Workstation (188 SMs), Torch
-2.13.0+cu130 and CUDA 13.0; the earlier five used PRO 6000 Server. Each comparison
-uses the same device/toolchain, bitwise output/state checks and ABBA timing
-(7 samples × 5 Graph replays per phase). Preparation and capture are excluded.
-Whole-machine monitoring found no competing GPU processes; all four preparations
-reported 103/103 required variants available across 30 families.
+### `rl_infctx_tmix_wkv7_recurrent_bf16`
 
-Raw paired samples, references and numerical evidence remain in the existing
-`artifacts/cmix-acceptance-a239bc3.json`,
-`artifacts/sm120-remaining-acceptance-results-07c7913.json` and associated artifacts.
-Performance comparisons require idle hardware, numerical checks and paired timing; unit-test
-time is not performance evidence. Existing benchmarks expose implementation,
-tuning and eager/Graph timing options; run `--help` for their workload arguments.
+```python
+rl_infctx_tmix_wkv7_recurrent_bf16(
+    r: torch.Tensor,
+    decay_logits: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    *,
+    state_pool: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    state_indices: torch.Tensor | None = None,
+    scale: float = 1.0,
+    decay_bias: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]
+```
+
+Differentiable packed recurrence over a slot-indexed FP32 state pool for RL and infinite-context training.
+
+- **Inputs**: `r, decay_logits, k, v, a, b: bfloat16 [N, H, D]`; `state_pool: float32 [slots, H, D, D]`; `cu_seqlens: int32 [B + 1]`; optional unique `state_indices: int32 [B]`.
+- **Returns**: `(output, final_state_pool)` (`bfloat16 [N, H, D]`, `float32 [slots, H, D, D]`). Unselected slots remain unchanged; gradients flow through inputs and state pool.
+
+---
+
+### `pretrain_tmix_readout_bf16`
+
+```python
+pretrain_tmix_readout_bf16(
+    x: torch.Tensor,
+    r: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    residual_scale: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    g: torch.Tensor,
+    *,
+    head_size: int = 64,
+    output_weight: torch.Tensor | None = None,
+    output_lora_a: torch.Tensor | None = None,
+    output_lora_b: torch.Tensor | None = None,
+    output_lora_scale: float = 1.0,
+    output_use_nora: bool = False,
+) -> torch.Tensor
+```
+
+Differentiable head LayerNorm, RKV residual, output gate, and optional output projection.
+
+- **Inputs**: `x: bfloat16/float32 [B, T, C]`; `r, k, v, g: bfloat16 [B, T, C]`; `residual_scale: bfloat16 [H, D]` or `[C]`; `weight, bias: bfloat16 [C]`; optional `output_weight: bfloat16 [C, C]` (required if `output_lora_*` is passed).
+- **Returns**: `bfloat16 [B, T, C]`.
+
+---
+
+### `pretrain_cmix_bf16`
+
+```python
+pretrain_cmix_bf16(
+    x: torch.Tensor,
+    x_k: torch.Tensor,
+    key_weight: torch.Tensor,
+    value_weight: torch.Tensor,
+    *,
+    initial_shift: torch.Tensor | None = None,
+    cu_seqlens: torch.Tensor | None = None,
+    return_final_state: bool = False,
+    key_lora_a: torch.Tensor | None = None,
+    key_lora_b: torch.Tensor | None = None,
+    value_lora_a: torch.Tensor | None = None,
+    value_lora_b: torch.Tensor | None = None,
+    key_lora_scale: float = 1.0,
+    value_lora_scale: float = 1.0,
+    key_use_nora: bool = False,
+    value_use_nora: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]
+```
+
+Differentiable ChannelMix on dense (`[B, T, C]`) or packed (`[N, C]` with `cu_seqlens`) inputs.
+
+- **Weights**: `key_weight: bfloat16 [F, C]`; **`value_weight: bfloat16 [C, F]`** (training layout, transposed relative to inference).
+- **Returns**: `bfloat16` matching `x.shape`, or `(output, final_shift)` (`bfloat16 [B, C]`) when `return_final_state=True`.
+
+---
+
+### `pretrain_head_linear_bf16`
+
+```python
+pretrain_head_linear_bf16(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    *,
+    lora_a: torch.Tensor | None = None,
+    lora_b: torch.Tensor | None = None,
+    lora_scale: float = 1.0,
+    use_nora: bool = False,
+) -> torch.Tensor
+```
+
+Differentiable projection from `x: bfloat16 [..., C]` and `weight: bfloat16 [V, C]` to `float32 [..., V]` logits.
+
+---
+
+### `pretrain_head_ce_bf16`
+
+```python
+pretrain_head_ce_bf16(
+    hidden: torch.Tensor,
+    weight: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    chunk_rows: int = 128,
+    backward_chunk_rows: int | None = None,
+    lora_a: torch.Tensor | None = None,
+    lora_b: torch.Tensor | None = None,
+    lora_scale: float = 1.0,
+    use_nora: bool = False,
+) -> torch.Tensor
+```
+
+Memory-bounded chunked LM head projection + per-token FP32 cross-entropy loss.
+
+| Parameter | Shape | Dtype | Notes |
+| --- | --- | --- | --- |
+| `hidden` | `[B, T, C]` | `bfloat16` | Final normalized hidden states. |
+| `weight` | `[V, C]` | `bfloat16` | LM head weight (arbitrary `V >= 1`). |
+| `targets` | `B * T` elements | `int64` | Values in `[0, V)` or `-100` (ignored: zero loss and zero gradient). |
+| `chunk_rows` | `int > 0` (default `128`) | — | Max rows materialized per forward chunk. |
+| `backward_chunk_rows` | `int > 0 \| None` | — | Max rows per backward chunk (defaults to `chunk_rows`). |
+
+- **Returns**: `float32` per-token cross-entropy matching `targets.shape`.
+
+---
+
+### `pretrain_l2wrap_ce_bf16`
+
+```python
+pretrain_l2wrap_ce_bf16(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+) -> torch.Tensor
+```
+
+Computes scalar FP32 mean cross-entropy with the `train_temp` L2Wrap logit regularization term in backward.
+
+- **Inputs**: `logits: bfloat16/float32 [..., V]`; `targets: int64` with one entry in `[0, V)` per row.
+- **Returns**: Scalar `float32` mean cross-entropy loss.
+
+---
+
+### `pretrain_head_l2wrap_ce_bf16`
+
+```python
+pretrain_head_l2wrap_ce_bf16(
+    hidden: torch.Tensor,
+    weight: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    chunk_rows: int = 4096,
+    lora_a: torch.Tensor | None = None,
+    lora_b: torch.Tensor | None = None,
+    lora_scale: float = 1.0,
+    use_nora: bool = False,
+) -> torch.Tensor
+```
+
+Memory-bounded chunked LM head projection + `train_temp` L2Wrap cross-entropy for RWKV's 65,536-token vocabulary.
+
+- **Inputs**: `hidden: bfloat16 [B, T, C]`; `weight: bfloat16 [65536, C]`; `targets: int64` in `[0, 65536)` with `B * T` elements; `chunk_rows: int > 0`.
+- **Returns**: Scalar `float32` mean cross-entropy loss.
+
+---
+
+### `torch.compile(fullgraph=True)` & Packed `cu_seqlens`
+
+- All training operators register custom ops (`torch.library.custom_op`) invoking the identical TileLang forward/VJP kernels. To preserve BF16 intermediate rounding bitwise under Inductor:
+
+  ```python
+  compiled_model = torch.compile(
+      model, fullgraph=True, options={"emulate_precision_casts": True},
+  )
+  ```
+
+- Packed `cu_seqlens` in training must be contiguous CUDA `int32 [B + 1]`, starting at `0`, non-decreasing, and ending at total tokens `N`. Violations fail via asynchronous device assertion (`torch._assert_async`), which invalidates the CUDA context and requires restarting the process.
+
+---
+
+## Execution Configuration
+
+- **Deterministic Hardware Tiles**: SM89 (RTX 4090, 128 SMs) and SM120 (PRO 6000, 188 SMs) select projection tiles and D64 WKV prefetch settings deterministically from geometry, SM count, and shared memory capacity.
+- **Bitwise-Guarded Tuning**: Every benchmark under `benchmarks/` supports `--tune`, verifying candidate outputs and states bitwise against the canonical kernel before measuring CUDA Graph replay latency.
+- **Caches & Prewarming**:
+  - `FLASHRWKV2_CACHE_DIR`: Native extension cache root (default `~/.cache/flashrwkv2`).
+  - `TILELANG_CACHE_DIR`: TileLang compiled binary cache root.
+  - `python -m flashrwkv2.compile`: Prewarms the metadata/sampling native extension and emits JSON `{"status": "compiled" | "cached", "target": "smXX", "cache_key": "...", "library": "..."}`.
+
+For end-to-end recipes see [Quickstart & Recipes](usr/quickstart.md); for CUDA Graph serving patterns see [Serving & State Management Guide](usr/serving.md); for CI and release procedures see [CI Quality Gate & Release Acceptance](dev/release.md).
