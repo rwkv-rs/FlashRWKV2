@@ -108,11 +108,14 @@ def make_ticket():
         num_active_sequences=num_active_sequences,
     )
 
-# 1. Zero-active warmup on the capture stream (compiles kernels without mutating state)
+# 1. Zero-active warmup on the capture stream (order after buffer init; never mutates state)
+current = torch.cuda.current_stream()
 side = torch.cuda.Stream()
+side.wait_stream(current)
 with torch.cuda.stream(side):
     warmup_ticket = make_ticket()
     run_model_step(x_buf, validated_metadata=warmup_ticket)
+current.wait_stream(side)
 
 # 2. Capture graph (call make_ticket() inside capture so device validation & sort are captured)
 graph = torch.cuda.CUDAGraph()

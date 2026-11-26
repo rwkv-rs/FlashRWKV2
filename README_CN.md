@@ -24,23 +24,23 @@
 
 ## 为什么选择 FlashRWKV2？
 
-在 RWKV-7 生态中，开发者过去往往不得不在**速度、精度、PEFT 支持、跨平台可维护性、训推一致**之间做妥协。FlashRWKV2 在同一套 TileLang 架构下把这些能力统一起来：
+在 RWKV-7 生态中，不同后端在**可维护性、整层推理能力、PEFT 集成与训推数值一致**上各有侧重。FlashRWKV2 在同一套 TileLang 架构下把训练与高并发推理的整层能力统一起来：
 
 | 维度 | **FlashRWKV2（本项目）** | **RWKV-CUDA** (`train_temp`) | **Albatross** | **FLA** (`flash-linear-attention`) |
 | --- | --- | --- | --- | --- |
-| **实现后端** | **TileLang**（简洁可维护、超越纯 CUDA 绑定） | 手写 CUDA（CUDA Only） | 手写 CUDA（CUDA Only） | Triton（Chunk 形式 WKV） |
-| **WKV 形式** | **精确递推**（BF16 IO + FP32 累加） | 精确递推 | FP16 推理递推 | Chunk 并行分块形式 |
-| **数值精度与训推一致** | **逐位一致**（训练 / Prefill / Decode 同归约序） | 仅训练侧高精度 | **FP16 训推不一致**（无法用于严格 RL Rollout） | **Chunk 形式存在精度损失** |
-| **推理性能与并发特性** | **极快**（FP16 State + DeltaLog + CUDA Graph） | 无推理服务优化 | 快（仅限固定 batch FP16） | **RWKV-7 场景速度较慢** |
-| **Varlen 变长打包与连续批处理** | **完整支持**（`cu_seqlens` + Live CUDA Graph Ticket） | 不支持 | 不支持（无调度、无 varlen） | 部分支持 |
-| **PEFT（LoRA / NoRA）** | **一等公民支持**（TMix / CMix / LM Head 原生融合） | **支持差** / 需手改内核 | 不支持 | 需外部自行拼接 |
-| **RL Rollout / 无限上下文** | **原生支持**（FP32 State 逐位对齐 + 可微 `rl_infctx`） | 缺少推理侧 Rollout | 训推 logprob 不一致 | 缺少推理状态池管理 |
-| **投机解码（LightMTP）** | **内置支持**（状态导出 + `DraftLoop` CUDA Graph） | 不支持 | 不支持 | 不支持 |
+| **实现后端** | **TileLang**（简洁可维护、硬件特化 DSL） | 手写 CUDA（CUDA Only） | 手写 CUDA（CUDA Only） | Triton |
+| **WKV 形式** | 精确递推（BF16 IO + FP32 累加） | 精确递推 | FP16 推理递推 | 同时提供 Chunk 形式与 Fused Recurrent（支持 `cu_seqlens` 与最终 state） |
+| **训推数值一致** | **FP32 State（`fp32io16`）下逐位一致**；另提供可选 FP16 Serving State（`fp16`） | 仅训练侧 | 仅 FP16 推理（与 FP32 训练存在差异） | Chunk / Recurrent 为独立 Triton 路径 |
+| **整层融合算子覆盖** | **端到端整层**（`tokenshift` / `wkv_prepare` / `wkv7` / `readout` / `cmix` / `head` / `sampling`） | WKV 训练内核 | 完整 FP16 推理引擎（固定 batch，无 varlen） | 以 WKV 核心算子为主 |
+| **推理状态池与 Live Graph** | **内建支持**（FP16 + DeltaLog、COW 槽位拷贝、Live CUDA Graph 校验） | 不支持 | 固定 batch 状态（无调度、无 varlen） | 函数式 state I/O（状态池与 Graph 由调用方管理） |
+| **PEFT（LoRA / NoRA）** | **原生融合**（TMix / CMix / LM Head；冻结基座自动跳过 `dW`） | 支持有限 / 需手改 | 不支持 | 外部封装 |
+| **RL Rollout / 无限上下文** | **FP32 State 逐位对齐**（`fp32io16` + 可微 `rl_infctx`） | 无推理 Rollout | FP16 训推不一致 | 函数式递推 state |
+| **投机解码（LightMTP）** | **内置支持**（逐 token 状态导出 + `DraftLoop` CUDA Graph） | 不支持 | 不支持 | 不支持 |
 
 ### 核心亮点
 
-- **一套数值契约，彻底消除训推漂移**：训练、Prefill 与 Decode 共用同一份 BF16 前向与固定顺序 FP32 累加（无 split-K）。RL Rollout、评测与采样搜索使用 FP32 状态（`fp32io16`），与 Learner 的输出、状态和选中 logprob **逐位一致**。
-- **双模式推理状态池**：SM89（RTX 4090）与 SM120（PRO 6000）普通推理首选 **FP16 状态 + DeltaLog**，显著降低状态显存与带宽开销；需要严格训推一致时无缝切换 **FP32 状态**。
+- **FP32 State 路径下训推逐位一致**：训练、Prefill 与 Decode 共用同一份 BF16 前向与固定顺序 FP32 累加（无 split-K）。在 **FP32 状态（`fp32io16`）** 下，RL Rollout、评测与采样搜索可与 Learner 的输出、状态和选中 logprob **逐位一致**。
+- **双模式推理状态池**：SM89（RTX 4090）与 SM120（PRO 6000）常规推理首选 **FP16 状态 + DeltaLog（`fp16`）**，显著降低状态显存与带宽开销（因每 token 后舍入为 FP16，其输出会与 FP32 训练轨迹存在微小差异）；对训推一致敏感的场景请使用 **FP32 状态（`fp32io16`）**。
 - **原生 LoRA / NoRA 支持**：直接内建于 TMix（`receptance` / `key` / `value` / `output`）、CMix（`key` / `value`）与 LM Head 投影；冻结基座权重时自动跳过 `dW` 计算。
 - **全图 `torch.compile` 与 CUDA Graph**：训练算子全面支持 `torch.compile(fullgraph=True)`（含反向与 LoRA/NoRA）；推理算子支持 Live Capacity CUDA Graph 捕获与零开销重放。
 - **纯源码通用 Wheel**：发布轻量级 `py3-none-any` 包，不含笨重预编译二进制或降级分支；首次调用针对当前 GPU 架构原生特化并落盘缓存。
@@ -88,8 +88,7 @@ python -m flashrwkv2.compile
 ```bash
 git clone https://github.com/rwkv-rs/FlashRWKV2.git
 cd FlashRWKV2
-uv sync
-./.venv/bin/python -m pip install -v --no-build-isolation -e .
+uv sync --group dev
 ```
 
 > 仅 `import flashrwkv2` 不会在 CPU 上触发编译或写入缓存。TileLang 算子与 native 扩展会在首次 CUDA 调用时按需编译并持久化（默认 `~/.cache/flashrwkv2`，可通过 `FLASHRWKV2_CACHE_DIR` 指定）。
@@ -203,19 +202,19 @@ graph_ids = loop.replay(hidden, token_ids)
 
 ---
 
-## 验收与性能数据
+## 历史验收与性能记录
 
-FlashRWKV2 在 **SM89（RTX 4090, 128 SMs）** 与 **SM120（RTX PRO 6000, 188 SMs）** 上均通过了逐位一致性测试、Compute Sanitizer（`memcheck` / `racecheck`）以及配对 CUDA Graph 计时验收：
+以下数据为 **SM89（RTX 4090, 128 SMs）** 与 **SM120（RTX PRO 6000, 188 SMs）** 在历史提交 [`a239bc3`](https://github.com/rwkv-rs/FlashRWKV2/commit/a239bc3) 与 [`07c7913`](https://github.com/rwkv-rs/FlashRWKV2/commit/07c7913) 上的验收记录（原始配对样本与数值证据留存于 `artifacts/cmix-acceptance-a239bc3.json` 与 `artifacts/sm120-remaining-acceptance-results-07c7913.json`）。每次运行时代码改动均须在各自提交上通过 **Quality Gate** GPU 验证。
 
-| 验收指标 | SM89 (RTX 4090) | SM120 (PRO 6000) |
+| 历史验收指标（`a239bc3` / `07c7913`） | SM89 (RTX 4090) | SM120 (PRO 6000) |
 | --- | --- | --- |
 | 完整 Block GPU 测试套件（数值、状态、Graph、编译） | **330 / 330 通过** | **330 / 330 通过** |
-| 训练工作负载达标（与最优基线误差 ≤ 2%） | **9 / 9** | **9 / 9** |
+| 训练工作负载达标（与内部最优对比基线误差 ≤ 2%） | **9 / 9** | **9 / 9** |
 | 跨进程磁盘缓存复用（冷编译 / 热编译） | **139 冷 / 0 热** | **137 冷 / 0 热** |
 
-SM120 代表性训练端到端延迟（B=1，单层 + LM Head，含前向、反向与梯度清零，ABBA 配对 CUDA Graph 测量）：
+提交 `07c7913` 上的 SM120 训练端到端延迟（B=1，单层 + LM Head，含前向、反向与梯度清零，ABBA 配对 CUDA Graph 测量；对比基线为仓库内部 baseline、旧离线参考与上一代策略中的最快者）：
 
-| 模型与负载 | 最优对比基线 (ms) | FlashRWKV2 (ms) | 延迟变化 |
+| 模型与负载 | 内部最优对比基线 (ms) | Prepared 策略 (ms) | 延迟变化 |
 | --- | ---: | ---: | ---: |
 | RWKV-7 1.5B T=128 (`torch.compile`) | 3.603 | **3.577** | **-0.71%** |
 | RWKV-7 7.2B T=1024 (eager) | 32.786 | **32.196** | **-1.80%** |

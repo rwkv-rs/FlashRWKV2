@@ -6,11 +6,10 @@ This guide walks through the most common **FlashRWKV2** integration patterns: tr
 
 ## 1. Environment & Cache Setup
 
-Install into a project-local `./.venv` managed by `uv`:
+Install the editable project and dev dependencies into a project-local `./.venv` managed by `uv`:
 
 ```bash
-uv sync
-./.venv/bin/python -m pip install -v --no-build-isolation -e .
+uv sync --group dev
 ```
 
 Optional — prewarm the small native extension (metadata validation & sampling) before launching workers:
@@ -25,15 +24,18 @@ This prints JSON with `status` (`"compiled"` or `"cached"`), `target`, `cache_ke
 
 ## 2. Full RWKV-7 Training Block
 
-All training operators take contiguous CUDA **BF16** activations/weights, accumulate in **FP32**, and maintain differentiable **FP32** WKV state:
+All training operators take contiguous CUDA **BF16** activations/weights, accumulate in **FP32**, and maintain differentiable **FP32** WKV state. Note that the TMix output is added into the residual stream before computing LN2 for CMix (matching [`tests/tmix/wkv7/test_block.py`](../../tests/tmix/wkv7/test_block.py) and upstream `Block.forward`):
 
 ```python
 import torch
+import torch.nn.functional as F
 import flashrwkv2
 
+def _bf16_layer_norm(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
+    return F.layer_norm(x.float(), (x.shape[-1],), weight.float(), bias.float(), eps).to(torch.bfloat16)
+
 def rwkv7_block_train(
-    x,                  # [B, T, C] BF16 (post-LN1)
-    x_ln2,              # [B, T, C] BF16 (post-LN2)
+    x,                  # [B, T, C] BF16 residual stream entering the block
     tmix_params,
     cmix_params,
     *,
@@ -43,10 +45,11 @@ def rwkv7_block_train(
     initial_tmix_shift=None,
     initial_cmix_shift=None,
 ):
-    # 1. TMix TokenShift (6-way)
+    # 1. LN1 + TMix TokenShift (6-way)
+    x_ln1 = _bf16_layer_norm(x, tmix_params["ln1_w"], tmix_params["ln1_b"])
     x_r, x_w, x_k, x_v, x_a, x_g, final_tmix_shift = (
         flashrwkv2.pretrain_tmix_tokenshift_bf16(
-            x,
+            x_ln1,
             tmix_params["x_r"], tmix_params["x_w"], tmix_params["x_k"],
             tmix_params["x_v"], tmix_params["x_a"], tmix_params["x_g"],
             initial_shift=initial_tmix_shift,
@@ -77,7 +80,7 @@ def rwkv7_block_train(
         return_final_state=True,
     )
 
-    # 4. TMix Readout (head LN + RKV residual + gate + output projection)
+    # 4. TMix Readout + residual update (connects TMix gradients into CMix)
     tmix_out = flashrwkv2.pretrain_tmix_readout_bf16(
         wkv_out, r, k, v,
         tmix_params["r_k"],
@@ -86,8 +89,10 @@ def rwkv7_block_train(
         head_size=head_size,
         output_weight=tmix_params["o_weight"],
     )
+    x = (x + tmix_out).to(torch.bfloat16)
 
-    # 5. CMix (TokenShift + key proj + ReLU² + value proj)
+    # 5. LN2 + CMix (TokenShift + key proj + ReLU² + value proj) + residual update
+    x_ln2 = _bf16_layer_norm(x, cmix_params["ln2_w"], cmix_params["ln2_b"])
     cmix_out, final_cmix_shift = flashrwkv2.pretrain_cmix_bf16(
         x_ln2,
         cmix_params["x_k"],
@@ -96,8 +101,11 @@ def rwkv7_block_train(
         initial_shift=initial_cmix_shift,
         return_final_state=True,
     )
-    return tmix_out, cmix_out, v_first, final_wkv_state, final_tmix_shift, final_cmix_shift
+    x = (x + cmix_out).to(torch.bfloat16)
+    return x, v_first, final_wkv_state, final_tmix_shift, final_cmix_shift
 ```
+
+> For bitwise-matched fused residual+LN across training and packed inference, see `train_layer` in [`tests/tmix/wkv7/test_block.py`](../../tests/tmix/wkv7/test_block.py).
 
 ### Enabling `torch.compile(fullgraph=True)`
 

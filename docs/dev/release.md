@@ -61,7 +61,9 @@ timeout 60s .venv/bin/python -I ci/quality_gate.py verify \
 
 ## Historical Acceptance Records
 
-### Validation Summary (SM89 & SM120)
+> The measurements below are historical acceptance records from commits `a239bc3` and `07c7913` (not validation results for subsequent changes). Raw paired samples and numerical evidence live in `artifacts/cmix-acceptance-a239bc3.json` and `artifacts/sm120-remaining-acceptance-results-07c7913.json`. Any runtime change requires fresh Quality Gate GPU validation on the final candidate commit before merge or release.
+
+### Validation Summary (SM89 & SM120, historical commits `a239bc3` / `07c7913`)
 
 Business tests cover train/prefill/decode equivalence, independent VJPs and optimizer updates, state ownership, frozen/unused gradients, `torch.compile`/CUDA Graph execution, dynamic workloads, and fresh-process disk-cache reuse. Reference RWKV-7 geometries cover `C = 2048 / 2560 / 4096 / 4096` with `W/A/G/V` low-rank widths `96/96/256/64`, `96/96/320/64`, `128/128/480/96`, and `192/192/384/128`.
 

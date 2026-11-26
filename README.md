@@ -24,23 +24,23 @@ Complete models, schedulers, and training frameworks stay lightweight in downstr
 
 ## Why FlashRWKV2?
 
-Choosing an RWKV-7 kernel backend usually forces painful trade-offs between **speed**, **precision**, **PEFT support**, and **train–inference parity**. FlashRWKV2 bridges them in one TileLang codebase:
+Choosing an RWKV-7 kernel backend usually involves trade-offs across **backend portability**, **full-layer serving features**, **PEFT integration**, and **train–inference parity**. FlashRWKV2 unifies these capabilities in one TileLang codebase:
 
 | Capability | **FlashRWKV2 (Ours)** | **RWKV-CUDA** (`train_temp`) | **Albatross** | **FLA** (`flash-linear-attention`) |
 | --- | --- | --- | --- | --- |
-| **Kernel Backend** | **TileLang** (maintainable, portable DSL) | Handwritten CUDA only | Handwritten CUDA only | Triton (chunked WKV) |
-| **WKV Formulation** | **Exact recurrence** (BF16 IO + FP32 accum) | Exact recurrence | FP16 inference recurrence | Chunk-form WKV |
-| **Numerical Precision** | **Bitwise-exact** across train / prefill / decode | High (training only) | FP16 drift (train–infer mismatch) | Lower precision (chunk error) |
-| **Serving Speed** | **Fast** (FP16 state + DeltaLog + CUDA Graph) | Training-only | Fast (fixed-batch FP16) | Slower on RWKV-7 workloads |
-| **Varlen Packing & Continuous Batching** | **Yes** (`cu_seqlens`, live CUDA Graph tickets) | No | No (no scheduler / varlen) | Partial |
-| **PEFT (LoRA / NoRA)** | **First-class** (fused in TMix, CMix, LM Head) | Poor / manual | No | External wrappers only |
-| **RL Rollout & InfCtx** | **Bitwise learner–rollout parity** (`fp32io16` + `rl_infctx`) | No serving rollout | Train–infer mismatch | No serving state pool |
-| **Speculative Decoding** | **Built-in** (state checkpoints + `LightMTP DraftLoop`) | No | No | No |
+| **Kernel Backend** | **TileLang** (maintainable, GPU-specialized DSL) | Handwritten CUDA only | Handwritten CUDA only | Triton |
+| **WKV Formulation** | Exact recurrence (BF16 IO + FP32 accum) | Exact recurrence | FP16 inference recurrence | Chunk-form & fused recurrent (`cu_seqlens` + final state) |
+| **Train–Infer Numerical Parity** | **Bitwise-exact with FP32 state** (`fp32io16`); optional FP16 serving state (`fp16`) | Training-only | FP16-only inference (differs from FP32 training) | Separate chunk / recurrent Triton paths |
+| **Full-Layer Serving Islands** | **End-to-end** (`tokenshift`, `wkv_prepare`, `wkv7`, `readout`, `cmix`, `head`, `sampling`) | WKV training kernel | Full FP16 inference engine (fixed-batch, no varlen) | WKV-focused operators |
+| **Serving State Pool & Live Graphs** | **Built-in** (FP16 + DeltaLog, COW slots, live CUDA Graph metadata validation) | No | Fixed-batch state (no scheduler / varlen) | Functional state I/O (caller manages pools & graphs) |
+| **PEFT (LoRA / NoRA)** | **Built-in** (TMix, CMix, LM Head; skips `dW` when frozen) | Limited / manual | No | External wrappers |
+| **RL Rollout & InfCtx** | **Bitwise learner–rollout parity** (`fp32io16` + differentiable `rl_infctx`) | No serving rollout | Train–infer FP16 mismatch | Functional recurrent state |
+| **Speculative Decoding** | **Built-in** (per-token state checkpoints + `LightMTP DraftLoop`) | No | No | No |
 
 ### Key Highlights
 
-- **One Numerical Contract, Zero Train–Infer Drift**: Training, prefill, and decode share the exact same BF16 forward and FP32 accumulation order (fixed key reduction, no split-K). RL rollouts and evaluation use FP32 state (`fp32io16`) to reproduce learner logprobs **bitwise**.
-- **Two Serving State Modes**: Use **FP16 state with DeltaLog** on SM89 (RTX 4090) and SM120 (PRO 6000) for maximum serving throughput and minimal VRAM, or **FP32 state** whenever exact training/RL parity is required.
+- **Bitwise Train–Infer Parity on FP32 State**: Training, prefill, and decode share the same BF16 forward and FP32 accumulation order (fixed key reduction, no split-K). With **FP32 state** (`fp32io16`), RL rollouts, evaluation, and sampling search reproduce the learner's outputs, states, and selected logprobs **bitwise**.
+- **Two Serving State Modes**: Use **FP16 state with DeltaLog** (`fp16`) on SM89 (RTX 4090) and SM120 (PRO 6000) to halve state VRAM/bandwidth for general serving (per-token FP16 state rounding means outputs can differ from the FP32 learner), or use **FP32 state** (`fp32io16`) whenever exact training/RL parity is required.
 - **First-Class LoRA & NoRA**: Built directly into TMix (`receptance`, `key`, `value`, `output`), CMix (`key`, `value`), and LM Head projections, skipping `dW` automatically when base weights are frozen.
 - **Full-Graph `torch.compile` & CUDA Graph**: All training operators support `torch.compile(fullgraph=True)` (including backward and LoRA/NoRA); all serving operators support live-capacity CUDA Graph capture and zero-overhead replay.
 - **Universal Source Wheel**: Ships as a lightweight `py3-none-any` wheel with no precompiled binaries or architecture fallbacks — TileLang specializes kernels for your active GPU and caches them on disk.
@@ -88,8 +88,7 @@ python -m flashrwkv2.compile
 ```bash
 git clone https://github.com/rwkv-rs/FlashRWKV2.git
 cd FlashRWKV2
-uv sync
-./.venv/bin/python -m pip install -v --no-build-isolation -e .
+uv sync --group dev
 ```
 
 > Importing `flashrwkv2` never compiles kernels or creates caches on CPU. TileLang and the native extension compile lazily on first CUDA invocation and persist to disk (`~/.cache/flashrwkv2` or `$FLASHRWKV2_CACHE_DIR`).
@@ -203,19 +202,19 @@ graph_ids = loop.replay(hidden, token_ids)
 
 ---
 
-## Verified Acceptance & Performance
+## Historical Acceptance & Performance
 
-FlashRWKV2 is verified on both **SM89 (RTX 4090, 128 SMs)** and **SM120 (RTX PRO 6000, 188 SMs)** using bitwise equivalence checks, Compute Sanitizer (`memcheck` & `racecheck`), and paired CUDA Graph timing:
+The figures below are **historical acceptance records** measured on **SM89 (RTX 4090, 128 SMs)** and **SM120 (RTX PRO 6000, 188 SMs)** at commits [`a239bc3`](https://github.com/rwkv-rs/FlashRWKV2/commit/a239bc3) and [`07c7913`](https://github.com/rwkv-rs/FlashRWKV2/commit/07c7913) (raw paired samples and numerical evidence are archived in `artifacts/cmix-acceptance-a239bc3.json` and `artifacts/sm120-remaining-acceptance-results-07c7913.json`). Runtime changes are validated independently on their own commits via the **Quality Gate** CI workflow.
 
-| Metric | SM89 (RTX 4090) | SM120 (PRO 6000) |
+| Historical Acceptance Metric (`a239bc3` / `07c7913`) | SM89 (RTX 4090) | SM120 (PRO 6000) |
 | --- | --- | --- |
 | Full block GPU test suite (numerics, state, Graph, compile) | **330 / 330 passed** | **330 / 330 passed** |
-| Training workloads within 2% of best measured comparison | **9 / 9** | **9 / 9** |
+| Training workloads within 2% of best internal comparison | **9 / 9** | **9 / 9** |
 | Fresh-process disk-cache reuse (cold / warm compilations) | **139 cold / 0 warm** | **137 cold / 0 warm** |
 
-Selected SM120 training latency (B=1, Layer + LM Head, forward + backward + grad zero, paired ABBA CUDA Graph timing):
+Selected SM120 training latency from commit `07c7913` (B=1, Layer + LM Head, forward + backward + grad zero, paired ABBA CUDA Graph timing; comparison is the fastest of baseline, earlier offline reference, and previous FlashRWKV2 strategy):
 
-| Model & Workload | Best Comparison (ms) | FlashRWKV2 (ms) | Change |
+| Model & Workload | Best Internal Comparison (ms) | Prepared Strategy (ms) | Change |
 | --- | ---: | ---: | ---: |
 | RWKV-7 1.5B T=128 (`torch.compile`) | 3.603 | **3.577** | **-0.71%** |
 | RWKV-7 7.2B T=1024 (eager) | 32.786 | **32.196** | **-1.80%** |
