@@ -140,7 +140,7 @@ Bind an existing contiguous CUDA `[slots, H, D, D]` tensor (`float32` for `fp32i
 > - Other `H ∈ {40, 64}` configs: 1 standard 5-vector record/head/slot (**1,284 B/head**; 2.508 MiB per 32-layer H64 sequence).
 > - All other geometries and all `fp32io16` handles: **0 B** private memory.
 
-For graph capture, prepare the live ticket on the same stream as the copy. Both index vectors have length `sequence_capacity` and describe the source and destination slots independently of the slots bound to the ticket. Only rows in `[0, num_active_sequences)` are read. Padding may repeat slot `0`. A valid live ticket supplies the active count on the GPU, so replay can change that count without a host synchronization.
+For graph capture, prepare the live ticket on the same stream as the copy. Both index vectors have length `sequence_capacity` and describe the source and destination slots independently of the slots bound to the ticket. Only rows in `[0, num_active_sequences)` are validated and used to address the pools. Padding may repeat slot `0`. A valid live ticket supplies the active count on the GPU, so replay can change that count without a host synchronization.
 
 ### Packed Metadata Tickets
 
@@ -586,7 +586,7 @@ DraftLoop.from_state_dict(
 
 Batched LightMTP speculative drafting supports eager execution and independent CUDA Graphs for each captured batch size.
 
-Use the canonical `mtp.*` keys or replace `mtp.` with `block.` for an existing sidecar. When `mtp.*` keys are present, all required weights are read under that prefix. The block weights convert to contiguous BF16 on `lm_head_weight.device`.
+Use the canonical `mtp.*` keys or replace `mtp.` with `block.` for an existing sidecar. Required weights must share one prefix. If a mapping has both forms, a complete legacy sidecar takes precedence. The block weights convert to contiguous BF16 on `lm_head_weight.device`.
 
 | Key | Shape |
 | --- | --- |

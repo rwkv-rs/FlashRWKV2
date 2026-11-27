@@ -8,6 +8,17 @@ import torch.nn.functional as F
 from flashrwkv2.mtp import DraftLoop
 
 
+@pytest.fixture
+def torch_fp32_accumulation():
+    matmul = torch.backends.cuda.matmul
+    previous = matmul.allow_bf16_reduced_precision_reduction
+    matmul.allow_bf16_reduced_precision_reduction = False
+    try:
+        yield
+    finally:
+        matmul.allow_bf16_reduced_precision_reduction = previous
+
+
 def _weights():
     torch.manual_seed(682)
     channels, features, vocab = 64, 96, 128
@@ -42,6 +53,9 @@ def test_sidecar_weights_and_replay_lifecycle():
         DraftLoop.from_state_dict(weights, head, depth=1)
     canonical = {key.replace("block.", "mtp.", 1): value for key, value in _weights()[0].items()}
     assert DraftLoop.from_state_dict(canonical, head, depth=1).state_dict().keys() == loop.state_dict().keys()
+    sidecar = _weights()[0]
+    sidecar["mtp.proj.weight"] = torch.empty(0)
+    assert DraftLoop.from_state_dict(sidecar, head, depth=1).state_dict().keys() == loop.state_dict().keys()
     canonical["block.norm_out.bias"] = canonical.pop("mtp.norm_out.bias")
     with pytest.raises(ValueError, match="mtp.norm_out.bias"):
         DraftLoop.from_state_dict(canonical, head, depth=1)
@@ -79,7 +93,7 @@ def _reference(weights, head, embed, hidden, token, depth, eps, adapter=None):
 @pytest.mark.cuda_graph
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("depth", [1, 4])
-def test_draft_loop_matches_reference_and_uses_current_inputs(depth):
+def test_draft_loop_matches_reference_and_uses_current_inputs(depth, torch_fp32_accumulation):
     weights, head = _weights()
     head = head.cuda()
     reference_weights = {key: value.cuda().bfloat16() for key, value in weights.items()}
@@ -128,7 +142,7 @@ def test_draft_loop_matches_reference_and_uses_current_inputs(depth):
 @pytest.mark.cuda
 @pytest.mark.cuda_graph
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_draft_loop_keeps_multiple_batch_graphs():
+def test_draft_loop_keeps_multiple_batch_graphs(torch_fp32_accumulation):
     weights, head = _weights()
     weights = {key: value.cuda().bfloat16() for key, value in weights.items()}
     head = head.cuda()
@@ -166,7 +180,7 @@ def test_draft_loop_keeps_multiple_batch_graphs():
 @pytest.mark.cuda_graph
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("use_nora", (False, True))
-def test_draft_loop_head_adapters(use_nora):
+def test_draft_loop_head_adapters(use_nora, torch_fp32_accumulation):
     weights, head = _weights()
     weights = {key: value.cuda().bfloat16() for key, value in weights.items()}
     head = head.cuda()

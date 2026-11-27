@@ -681,7 +681,65 @@ def test_scratch_verify_and_state_only_commit_match_token_decode(dtype, batch, h
             )
         main.materialize_slots_(slots)
         reference.materialize_slots_(slots)
-        assert torch.equal(raw, reference_raw)
+        bits = torch.int16 if dtype == torch.float16 else torch.int32
+        assert torch.equal(raw.view(bits), reference_raw.view(bits))
+
+
+@pytest.mark.cuda_graph
+def test_fp16_state_only_commit_replays_live_prefixes():
+    torch.manual_seed(694)
+    batch, span, heads, dim = 128, 4, 64, 64
+    prepare = prepare_tmix_wkv7_recurrent_fp16_state_from_tensor
+    infer = infer_tmix_wkv7_recurrent_fp16_forward_varlen
+    pool = torch.randn(batch + 1, heads, dim, dim, device="cuda").mul_(0.02).half()
+    expected = pool.clone()
+    state, reference = prepare(pool), prepare(expected)
+    inputs = tuple(torch.randn(batch, span, heads, dim, device="cuda").mul_(0.04).bfloat16() for _ in range(6))
+    packed = tuple(torch.empty_like(value.flatten(0, 1)) for value in inputs[1:])
+    cu = torch.zeros(batch + 1, device="cuda", dtype=torch.int32)
+    slots = torch.zeros(batch, device="cuda", dtype=torch.int32)
+    num_sequences, num_tokens = cu[:1].clone(), cu[:1].clone()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+
+    def launch():
+        ticket = prepare_tmix_wkv7_recurrent_metadata(
+            cu, slots, state_pool_size=pool.shape[0], token_capacity=batch * span, sequence_capacity=batch,
+            max_seqlen_capacity=span, num_active_tokens=num_tokens, num_active_sequences=num_sequences,
+        )
+        assert infer(
+            None, *packed, state=state, cu_seqlens=cu, state_indices=slots, validated_metadata=ticket,
+        ) is None
+
+    with torch.cuda.stream(stream):
+        launch()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        launch()
+
+    for active in (batch, 0, batch // 2):
+        lengths = [1 + i % span for i in range(active)]
+        lens = cu.new_tensor(lengths)
+        tokens = sum(lengths)
+        cu[1:active + 1].copy_(lens.cumsum(0, dtype=torch.int32))
+        slots[:active].copy_(torch.arange(1, active + 1, device="cuda", dtype=torch.int32))
+        slots[active:].zero_()
+        keep = torch.arange(span, device="cuda") < lens[:, None]
+        compact = tuple(value[:active][keep] for value in inputs)
+        for destination, value in zip(packed, compact[1:]):
+            destination[:tokens].copy_(value)
+        num_sequences.fill_(active)
+        num_tokens.fill_(tokens)
+        graph.replay()
+        if active:
+            infer(
+                *compact, state=reference, cu_seqlens=cu[:active + 1], state_indices=slots[:active],
+            )
+    indices = torch.arange(batch + 1, device="cuda", dtype=torch.int32)
+    state.materialize_slots_(indices)
+    reference.materialize_slots_(indices)
+    assert torch.equal(pool.view(torch.int16), expected.view(torch.int16))
 
 
 @pytest.mark.cuda_graph

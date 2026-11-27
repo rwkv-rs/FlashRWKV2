@@ -49,7 +49,11 @@ class DraftLoop(nn.Module):
 
         channels = lm_head_weight.shape[1]
         device = lm_head_weight.device
-        prefix = "mtp" if any(key.startswith("mtp.") for key in state) else "block"
+        norm_keys = tuple(f"{name}.{param}" for name in _NORMS for param in ("weight", "bias"))
+        required = ("proj.weight", "gate.weight", "up.weight", "down.weight", *norm_keys)
+        prefix = "block"
+        if not all(f"block.{name}" in state for name in required) and any(f"mtp.{name}" in state for name in required):
+            prefix = "mtp"
         gate_key = f"{prefix}.gate.weight"
         gate = state.get(gate_key)
         if not isinstance(gate, torch.Tensor) or gate.ndim != 2 or gate.shape[0] == 0:
@@ -61,8 +65,7 @@ class DraftLoop(nn.Module):
             "up.weight": (features, channels),
             "down.weight": (channels, features),
         }
-        for name in _NORMS:
-            shapes[f"{name}.weight"] = shapes[f"{name}.bias"] = (channels,)
+        shapes.update(dict.fromkeys(norm_keys, (channels,)))
 
         weights = {}
         for name, shape in shapes.items():
@@ -106,8 +109,9 @@ class DraftLoop(nn.Module):
     ) -> DraftLoop:
         """Load a complete `mtp.*` block or a legacy `block.*` sidecar.
 
-        When `mtp.*` keys are present, all required projection and norm
-        weights must use that prefix. LoRA/NoRA options apply to the LM head.
+        A complete legacy mapping takes precedence. Required projection and
+        norm weights must all share one prefix. LoRA/NoRA options apply to
+        the LM head.
         """
         return cls(
             state, lm_head_weight, depth=depth, eps=eps, lora_a=lora_a, lora_b=lora_b,

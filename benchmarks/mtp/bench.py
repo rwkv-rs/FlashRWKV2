@@ -10,7 +10,9 @@ import torch
 import torch.nn.functional as F
 from _timing import measure_cuda
 
+from flashrwkv2._internal.linear import linear
 from flashrwkv2.mtp import DraftLoop
+from flashrwkv2.post_norm.tilelang import norm as tilelang_norm
 
 
 def _weights(channels, features, vocab):
@@ -29,20 +31,30 @@ def _weights(channels, features, vocab):
     return block, randn(vocab, channels).mul_(0.02), randn(vocab, channels)
 
 
-def _torch_draft(block, head, embed, depth, hidden, token):
+def _draft_reference(block, head, embed, depth, hidden, token, *, canonical=False):
     def norm(x, name):
+        weight, bias = block[f"block.{name}.weight"], block[f"block.{name}.bias"]
+        if canonical:
+            return tilelang_norm(x, weight, bias, 1e-5)
         return F.layer_norm(
-            x, (x.shape[-1],), block[f"block.{name}.weight"], block[f"block.{name}.bias"],
+            x, (x.shape[-1],), weight, bias,
         )
 
+    project = linear if canonical else F.linear
     drafts = []
     for _ in range(depth):
         pair = torch.cat([norm(embed(token), "norm_e"), norm(hidden, "norm_h")], dim=-1)
-        x = hidden + F.linear(pair, block["block.proj.weight"])
+        x = hidden + project(pair, block["block.proj.weight"])
         mlp = norm(x, "norm_mlp")
-        gate = F.silu(F.linear(mlp, block["block.gate.weight"]))
-        hidden = x + F.linear(gate * F.linear(mlp, block["block.up.weight"]), block["block.down.weight"])
-        token = torch.mm(norm(hidden, "norm_out"), head.T, out_dtype=torch.float32).argmax(dim=-1)
+        gate = F.silu(project(mlp, block["block.gate.weight"]))
+        hidden = x + project(gate * project(mlp, block["block.up.weight"]), block["block.down.weight"])
+        h = norm(hidden, "norm_out")
+        logits = (
+            linear(h, head, output_dtype=torch.float32)
+            if canonical else torch.mm(h, head.T, out_dtype=torch.float32)
+        )
+        token = logits.argmax(dim=-1)
+        del logits
         drafts.append(token)
     return torch.stack(drafts, dim=1)
 
@@ -78,16 +90,19 @@ def main() -> None:
     parser.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 4, 64, 320, 512])
     parser.add_argument("--seed", type=int, default=20261116)
     args = parser.parse_args()
+    torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
     torch.manual_seed(args.seed)
     block, head, embedding = _weights(args.hidden, args.intermediate, args.vocab)
     loop = DraftLoop.from_state_dict(block, head, depth=args.depth)
+
     def embed(ids):
         return F.embedding(ids, embedding)
 
     def torch_draft(h, ids):
-        return _torch_draft(block, head, embed, args.depth, h, ids)
+        return _draft_reference(block, head, embed, args.depth, h, ids)
 
     profiles = []
+    torch_reference_mismatches = {}
     for batch_size in args.batch_sizes:
         hidden = torch.randn(batch_size, args.hidden, device="cuda", dtype=torch.bfloat16)
         token = torch.randint(args.vocab, (batch_size,), device="cuda")
@@ -102,8 +117,11 @@ def main() -> None:
             "tilelang_eager": lambda: loop(hidden, token, embed),
             "tilelang_graph": lambda: loop.replay(hidden, token),
         }
-        expected = torch_draft(hidden, token)
+        torch_expected = torch_draft(hidden, token)
+        tilelang_expected = _draft_reference(block, head, embed, args.depth, hidden, token, canonical=True)
+        torch_reference_mismatches[batch_size] = (torch_expected != tilelang_expected).count_nonzero().item()
         for name, run in variants.items():
+            expected = tilelang_expected if name.startswith("tilelang_") else torch_expected
             if not torch.equal(run(), expected):
                 raise AssertionError(f"{name} draft IDs differ at batch_size={batch_size}")
 
@@ -125,6 +143,7 @@ def main() -> None:
         "depth": args.depth,
         "seed": args.seed,
         "head_read_bytes_per_draft_loop": args.depth * head.nbytes,
+        "torch_reference_mismatched_draft_ids": torch_reference_mismatches,
     }))
 
 
