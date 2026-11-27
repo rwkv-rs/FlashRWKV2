@@ -102,7 +102,35 @@ def _replay_deltalog(state, log, slot, head, fields, record):
 
 
 @tilelang.jit(pass_configs=_PASSES, compile_flags=_COMPILE_FLAGS)
-def _materialize_deltalog(heads, fields):
+def _copy_recurrent_slots(channels, heads, dtype, packed_source, with_log):
+    src_capacity, dst_capacity, batch = T.dynamic("src_capacity, dst_capacity, batch")
+    tile = 2048
+
+    @T.prim_func
+    def kernel(
+        Source: T.Tensor((src_capacity, channels), dtype),
+        Destination: T.Tensor((dst_capacity, channels), dtype),
+        SrcSlots: T.Tensor((batch,), "int32"),
+        DstSlots: T.Tensor((batch,), "int32"),
+        Status: T.Tensor((3,), "int32"),
+        Phase: T.Tensor((dst_capacity if with_log else 0, heads), "int32"),
+    ):
+        with T.Kernel(channels // tile, batch, threads=128) as (block, seq):
+            if Status[0] == 0 and seq < Status[2]:
+                src = seq if packed_source else SrcSlots[seq]
+                dst = DstSlots[seq]
+                for c in T.Parallel(tile):
+                    channel = block * tile + c
+                    Destination[dst, channel] = Source[src, channel]
+                if with_log and block == 0:
+                    for h in T.Parallel(heads):
+                        Phase[dst, h] = 0
+
+    return kernel
+
+
+@tilelang.jit(pass_configs=_PASSES, compile_flags=_COMPILE_FLAGS)
+def _materialize_deltalog(heads, fields, has_status):
     batch, capacity = T.dynamic("batch, capacity")
     records = 2 if fields == 6 else 1
     count_mask = 0xf if fields == 6 else 1
@@ -118,27 +146,29 @@ def _materialize_deltalog(heads, fields):
         Log: T.Tensor((capacity, heads, fields, 64), "float32"),
         Phase: T.Tensor((capacity, heads), "int32"),
         Slots: T.Tensor((batch,), "int32"),
+        Status: T.Tensor((3 if has_status else 0,), "int32"),
     ):
         with T.Kernel(heads, batch, threads=64, prelude=claim) as (h, seq):
-            slot = Slots[seq]
-            pending = T.alloc_shared((1,), "int32")
-            if T.get_thread_binding() == 0:
-                # Repeated source slots may be requested by prefix or beam copies.
-                pending[0] = T.call_extern("int32", "rwkv_claim_log",
-                                           Phase.access_ptr("rw"), T.int64(slot) * heads + h)
-            T.sync_threads()
-            if (pending[0] & count_mask) != 0:
-                state = T.alloc_fragment((64, 64), "float32")
-                T.annotate_layout({state: T.Fragment((64, 64), forward_thread_fn=lambda k, c: c,
-                                                     forward_index_fn=lambda k, c: k)})
-                for key, col in T.Parallel(64, 64):
-                    state[key, col] = Pool[slot, h, key, col]
-                for record in T.serial(records):
-                    if record < (pending[0] & count_mask):
-                        _replay_deltalog(state, Log, slot, h, fields, record)
-                        T.sync_threads()
-                for key, col in T.Parallel(64, 64):
-                    Pool[slot, h, key, col] = T.cast(state[key, col], "float16")
+            if not has_status or (Status[0] == 0 and seq < Status[2]):
+                slot = Slots[seq]
+                pending = T.alloc_shared((1,), "int32")
+                if T.get_thread_binding() == 0:
+                    # Repeated source slots may be requested by prefix or beam copies.
+                    pending[0] = T.call_extern("int32", "rwkv_claim_log",
+                                               Phase.access_ptr("rw"), T.int64(slot) * heads + h)
+                T.sync_threads()
+                if (pending[0] & count_mask) != 0:
+                    state = T.alloc_fragment((64, 64), "float32")
+                    T.annotate_layout({state: T.Fragment((64, 64), forward_thread_fn=lambda k, c: c,
+                                                         forward_index_fn=lambda k, c: k)})
+                    for key, col in T.Parallel(64, 64):
+                        state[key, col] = Pool[slot, h, key, col]
+                    for record in T.serial(records):
+                        if record < (pending[0] & count_mask):
+                            _replay_deltalog(state, Log, slot, h, fields, record)
+                            T.sync_threads()
+                    for key, col in T.Parallel(64, 64):
+                        Pool[slot, h, key, col] = T.cast(state[key, col], "float16")
 
     return kernel
 
@@ -167,6 +197,7 @@ def _decode_traversal(heads, ordered, compact):
 def _fp16_serving_kernel(
     heads, scale, bias_dtype, has_bias, ordered, with_log, allow_append,
     alternate=False, bulk_threshold=0, fields=5, rows="all", checkpoint_interval=0,
+    write_output=True,
 ):
     """D64 recurrence: each warp sums fixed contiguous key groups for its value columns."""
     n, batch, slots = T.dynamic("n, batch, slots")
@@ -223,7 +254,8 @@ def _fp16_serving_kernel(
 
     @T.macro
     def load_token(R, W, K, V, A, B, Bias, vectors, token, h, t, key):
-        vectors[t, _TOK_R, key] = T.cast(R[token, h, key], "float32")
+        if write_output:
+            vectors[t, _TOK_R, key] = T.cast(R[token, h, key], "float32")
         logits = T.cast(W[token, h, key], "float32")
         if has_bias:
             logits = T.cast(T.cast(logits + T.cast(Bias[h, key], "float32"), "bfloat16"), "float32")
@@ -249,10 +281,12 @@ def _fp16_serving_kernel(
             updated = T.fma(vectors[t, _TOK_K, k], vectors[t, _TOK_V, col],
                             T.fma(vectors[t, _TOK_B, k], dot[0], vectors[t, _TOK_DECAY, k] * state[j]))
             state[j] = T.cast(T.cast(updated, "float16"), "float32")
-            accum = T.fma(state[j], vectors[t, _TOK_R, k], accum)
-        output = T.call_pure_extern("float32", "rwkv_sum_groups", accum)
-        if group == 0:
-            Y[token, h, col] = T.cast(output * scale, "bfloat16")
+            if write_output:
+                accum = T.fma(state[j], vectors[t, _TOK_R, k], accum)
+        if write_output:
+            output = T.call_pure_extern("float32", "rwkv_sum_groups", accum)
+            if group == 0:
+                Y[token, h, col] = T.cast(output * scale, "bfloat16")
 
     @T.macro
     def column_step(state, values, Y, Boundaries, token, seq, start, h, t, tid, sa):
@@ -260,10 +294,11 @@ def _fp16_serving_kernel(
             checkpoint = start // stride + seq + (token - start) // stride
             for key in T.unroll(64):
                 Boundaries[checkpoint, h, key, tid] = T.cast(state[key], "float16")
-        sy = T.alloc_local((groups,), "float32")
+        sy = T.alloc_local((groups if write_output else 0,), "float32")
         for g in T.unroll(groups):
             sa[g] = 0.0
-            sy[g] = 0.0
+            if write_output:
+                sy[g] = 0.0
             for j in T.unroll(keys):
                 sa[g] = T.fma(state[g * keys + j], values[t, _TOK_A, g * keys + j], sa[g])
         sa[0] = (sa[0] + sa[1]) + (sa[2] + sa[3])
@@ -273,9 +308,11 @@ def _fp16_serving_kernel(
                 val = T.fma(values[t, _TOK_K, k], values[t, _TOK_V, tid],
                             T.fma(values[t, _TOK_B, k], sa[0], values[t, _TOK_DECAY, k] * state[k]))
                 state[k] = T.cast(T.cast(val, "float16"), "float32")
-                sy[g] = T.fma(state[k], values[t, _TOK_R, k], sy[g])
-        sy[0] = (sy[0] + sy[1]) + (sy[2] + sy[3])
-        Y[token, h, tid] = T.cast(sy[0] * scale, "bfloat16")
+                if write_output:
+                    sy[g] = T.fma(state[k], values[t, _TOK_R, k], sy[g])
+        if write_output:
+            sy[0] = (sy[0] + sy[1]) + (sy[2] + sy[3])
+            Y[token, h, tid] = T.cast(sy[0] * scale, "bfloat16")
 
     @T.macro
     def full_head(R, W, K, V, A, B, Bias, Pool, Log, Phase, Y, Boundaries, seq, start, end, slot, h, tid, single):
@@ -375,13 +412,13 @@ def _fp16_serving_kernel(
 
     @T.prim_func
     def kernel(
-        R: T.Tensor((n, heads, 64), "bfloat16"), W: T.Tensor((n, heads, 64), "bfloat16"),
+        R: T.Tensor((n if write_output else 0, heads, 64), "bfloat16"), W: T.Tensor((n, heads, 64), "bfloat16"),
         K: T.Tensor((n, heads, 64), "bfloat16"), V: T.Tensor((n, heads, 64), "bfloat16"),
         A: T.Tensor((n, heads, 64), "bfloat16"), B: T.Tensor((n, heads, 64), "bfloat16"),
         Pool: T.Tensor((slots, heads, 64, 64), "float16"), CU: T.Tensor((batch + 1,), "int32"),
         Bias: T.Tensor((heads if has_bias else 0, 64), bias_dtype),
         Status: T.Tensor((3,), "int32"), Indices: T.Tensor((batch,), "int32"),
-        Y: T.Tensor((n, heads, 64), "bfloat16"),
+        Y: T.Tensor((n if write_output else 0, heads, 64), "bfloat16"),
         Order: T.Tensor((batch + 1 if ordered else 0,), "int32"),
         Log: T.Tensor((slots if with_log else 0, heads, fields, 64), "float32"),
         Phase: T.Tensor((slots if with_log else 0, heads), "int32"),
@@ -403,7 +440,7 @@ def _fp16_serving_kernel(
             vectors = T.alloc_shared((4, 6, 64), "float32")
             previous = T.alloc_shared((5 if with_log else 0, 64), "float32")
             phase = T.alloc_shared((1 if with_log else 0,), "int32")
-            if rows != "prefill" and Status[1] < n and priority < batch:
+            if write_output and rows != "prefill" and Status[1] < n and priority < batch:
                 if tid < 64:
                     for i in T.serial(T.ceildiv(n - Status[1], batch)):
                         row = Status[1] + i * batch + priority
@@ -489,6 +526,7 @@ def _forward_kernel(
     prefetch_tokens: int = 1,
     state_dtype: str = "float32",
     checkpoint_interval: int = _CHECKPOINT,
+    write_output: bool = True,
 ):
     n, batch = T.dynamic("n, batch")
     state_slots = T.dynamic("state_slots") if indexed else batch
@@ -500,7 +538,7 @@ def _forward_kernel(
 
     @T.prim_func
     def kernel(
-        R: T.Tensor((n, heads, dim), "bfloat16"),
+        R: T.Tensor((n if write_output else 0, heads, dim), "bfloat16"),
         W: T.Tensor((n, heads, dim), "bfloat16"),
         K: T.Tensor((n, heads, dim), "bfloat16"),
         V: T.Tensor((n, heads, dim), "bfloat16"),
@@ -511,7 +549,7 @@ def _forward_kernel(
         Bias: T.Tensor((heads if has_bias else 0, dim), bias_dtype),
         Status: T.Tensor((3 if has_status else 0,), "int32"),
         Indices: T.Tensor((batch if indexed else 0,), "int32"),
-        Y: T.Tensor((n, heads, dim), "bfloat16"),
+        Y: T.Tensor((n if write_output else 0, heads, dim), "bfloat16"),
         SN: T.Tensor((0 if indexed else batch, heads, dim, dim), state_dtype),
         Boundaries: T.Tensor((checkpoints if save else 0, heads, dim, dim), state_dtype),
     ):
@@ -520,7 +558,7 @@ def _forward_kernel(
             partial = T.alloc_fragment((key_groups, columns), "float32")
             dot = T.alloc_fragment((columns,), "float32")
             out = T.alloc_fragment((columns,), "float32")
-            rv = T.alloc_shared((prefetch_tokens * dim,), "float32")
+            rv = T.alloc_shared((prefetch_tokens * dim if write_output else 0,), "float32")
             wv = T.alloc_shared((prefetch_tokens * dim,), "float32")
             kv = T.alloc_shared((prefetch_tokens * dim,), "float32")
             av = T.alloc_shared((prefetch_tokens * dim,), "float32")
@@ -546,13 +584,14 @@ def _forward_kernel(
                 active = Status[0] == 0 and seq < Status[2]
                 start = T.if_then_else(active, CU[seq], 0)
                 end = T.if_then_else(active, CU[seq + 1], 0)
-                for row in T.serial(T.ceildiv(n, batch)):
-                    token = row * batch + seq
-                    if token < n and (Status[0] != 0 or token >= Status[1]):
-                        for value in T.Parallel(columns):
-                            Y[token, h, tile * columns + value] = T.cast(
-                                float("nan"), "bfloat16"
-                            )
+                if write_output:
+                    for row in T.serial(T.ceildiv(n, batch)):
+                        token = row * batch + seq
+                        if token < n and (Status[0] != 0 or token >= Status[1]):
+                            for value in T.Parallel(columns):
+                                Y[token, h, tile * columns + value] = T.cast(
+                                    float("nan"), "bfloat16"
+                                )
             else:
                 active = True
                 start = CU[seq]
@@ -571,7 +610,8 @@ def _forward_kernel(
                     token = start + chunk * prefetch_tokens + prefetched
                     if prefetch_tokens == 1 or token < end:
                         offset = prefetched * dim + key
-                        rv[offset] = T.cast(R[token, h, key], "float32")
+                        if write_output:
+                            rv[offset] = T.cast(R[token, h, key], "float32")
                         logits = T.cast(W[token, h, key], "float32")
                         if has_bias:
                             logits = T.cast(
@@ -617,11 +657,12 @@ def _forward_kernel(
                         _update_state(
                             state, wv, kv, vv, bv, dot, within * dim, state_dtype
                         )
-                        _dot_keys(state, rv, partial, out, within * dim)
-                        for value in T.Parallel(columns):
-                            Y[token, h, tile * columns + value] = T.cast(
-                                out[value] * scale, "bfloat16"
-                            )
+                        if write_output:
+                            _dot_keys(state, rv, partial, out, within * dim)
+                            for value in T.Parallel(columns):
+                                Y[token, h, tile * columns + value] = T.cast(
+                                    out[value] * scale, "bfloat16"
+                                )
             if indexed:
                 if active:
                     slot = Indices[seq]
@@ -1295,32 +1336,36 @@ def _check_inputs(
     *,
     inference=False,
 ):
-    if r.ndim != 3 or r.shape[1] < 1 or r.shape[2] not in (64, 128, 256):
-        raise ValueError("r must have shape [N,H,D], with D in {64,128,256}")
+    geometry = decay_logits if r is None else r
+    reference = "decay_logits" if r is None else "r"
+    if geometry.ndim != 3 or geometry.shape[1] < 1 or geometry.shape[2] not in (64, 128, 256):
+        raise ValueError(f"{reference} must have shape [N,H,D], with D in {{64,128,256}}")
     for name, value in zip(
         ("r", "decay_logits", "k", "v", "a", "b"), (r, decay_logits, k, v, a, b), strict=True
     ):
-        if value.shape != r.shape or value.dtype != torch.bfloat16:
-            raise ValueError(f"{name} must be BF16 with the same [N,H,D] shape as r")
-        if not value.is_cuda or value.device != r.device or not value.is_contiguous():
-            raise ValueError(f"{name} must be contiguous CUDA on the r device")
+        if name == "r" and r is None:
+            continue
+        if value.shape != geometry.shape or value.dtype != torch.bfloat16:
+            raise ValueError(f"{name} must be BF16 with the same [N,H,D] shape as {reference}")
+        if not value.is_cuda or value.device != geometry.device or not value.is_contiguous():
+            raise ValueError(f"{name} must be contiguous CUDA on the {reference} device")
     if (
         initial_state.ndim != 4
-        or initial_state.shape[1:] != (r.shape[1], r.shape[2], r.shape[2])
+        or initial_state.shape[1:] != (geometry.shape[1], geometry.shape[2], geometry.shape[2])
         or initial_state.shape[0] < 1
     ):
         raise ValueError("initial_state must have shape [B,H,D,D] with B >= 1")
     if (
         initial_state.dtype not in ((torch.float32, torch.float16) if inference else (torch.float32,))
-        or initial_state.device != r.device
+        or initial_state.device != geometry.device
         or not initial_state.is_contiguous()
     ):
         dtype = "FP16/FP32" if inference else "FP32"
-        raise ValueError(f"initial_state must be contiguous {dtype} on the r device")
+        raise ValueError(f"initial_state must be contiguous {dtype} on the {reference} device")
     if (
         cu_seqlens.shape != (batch + 1,)
         or cu_seqlens.dtype != torch.int32
-        or cu_seqlens.device != r.device
+        or cu_seqlens.device != geometry.device
         or not cu_seqlens.is_contiguous()
     ):
         raise ValueError("cu_seqlens must be contiguous CUDA int32 with shape [B+1]")
@@ -1331,13 +1376,13 @@ def _check_inputs(
     if prefetch_tokens not in (1, 4):
         raise ValueError("prefetch_tokens must be 1 or 4")
     if decay_bias is not None and (
-        decay_bias.shape not in (r.shape[1:], (r.shape[1] * r.shape[2],))
+        decay_bias.shape not in (geometry.shape[1:], (geometry.shape[1] * geometry.shape[2],))
         or decay_bias.dtype not in (torch.float32, torch.bfloat16)
-        or decay_bias.device != r.device
+        or decay_bias.device != geometry.device
         or not decay_bias.is_contiguous()
     ):
         raise ValueError(
-            "decay_bias must be contiguous BF16/FP32 [H,D] or [H*D] on the r device"
+            f"decay_bias must be contiguous BF16/FP32 [H,D] or [H*D] on the {reference} device"
         )
 
 
@@ -1387,11 +1432,13 @@ def _infer_recurrent(
     checkpoint_interval=_CHECKPOINT,
 ):
     """Launch the common forward directly against an indexed inference pool."""
+    write_output = r is not None
+    geometry = r if write_output else decay_logits
     if (
         state_indices.ndim != 1
         or state_indices.numel() == 0
         or state_indices.dtype != torch.int32
-        or state_indices.device != r.device
+        or state_indices.device != geometry.device
         or not state_indices.is_contiguous()
     ):
         raise ValueError("state_indices must be contiguous CUDA int32 [B]")
@@ -1413,7 +1460,8 @@ def _infer_recurrent(
         inference=True,
     )
 
-    tokens, heads, dim = r.shape
+    tokens, heads, dim = geometry.shape
+    device = geometry.device
     if save:
         if (not isinstance(checkpoint_interval, int) or isinstance(checkpoint_interval, bool)
                 or checkpoint_interval <= 0):
@@ -1423,11 +1471,11 @@ def _infer_recurrent(
             boundaries = state_pool.new_empty(shape)
         elif (
             not isinstance(boundaries, torch.Tensor) or boundaries.shape != shape
-            or boundaries.dtype != state_pool.dtype or boundaries.device != r.device
+            or boundaries.dtype != state_pool.dtype or boundaries.device != device
             or not boundaries.is_contiguous()
         ):
             raise ValueError(
-                f"boundaries must be contiguous {state_pool.dtype} with shape {shape} on {r.device}"
+                f"boundaries must be contiguous {state_pool.dtype} with shape {shape} on {device}"
             )
         start = boundaries.data_ptr()
         end = start + boundaries.nbytes
@@ -1439,17 +1487,19 @@ def _infer_recurrent(
                     raise ValueError("boundaries must not overlap inputs or state_pool")
     else:
         checkpoint_interval = _CHECKPOINT
+    kernel_r = r if write_output else geometry[:0]
+    kernel_y = torch.empty_like(v) if write_output else kernel_r
+    output = kernel_y if write_output else None
+    bias = _bias_tensor(geometry, decay_bias)
     if state_pool.dtype == torch.float16 and dim == 64 and heads in (40, 64):
-        output = torch.empty_like(v)
-        bias = _bias_tensor(r, decay_bias)
         order = row_order
         if order is None:
-            lengths = torch.where(torch.arange(batch, device=r.device) < status[2],
+            lengths = torch.where(torch.arange(batch, device=device) < status[2],
                                   cu_seqlens[1:] - cu_seqlens[:-1], 0)
             order = torch.cat((lengths.argsort(descending=True, stable=True).int(),
                                (lengths > 1).sum(dtype=torch.int32).view(1)))
         if delta_buffers is None:
-            log = torch.empty((0, heads, 5, 64), device=r.device, dtype=torch.float32)
+            log = torch.empty((0, heads, 5, 64), device=device, dtype=torch.float32)
             phase = status[:0].view(0, heads)
         else:
             log, phase = delta_buffers
@@ -1462,29 +1512,29 @@ def _infer_recurrent(
             bias.numel() != 0, order.numel() != 0, delta_buffers is not None, append_log, alternate,
             4 if batch >= 4 and order.numel() else 0, log.shape[2],
         )
-        tensors = (r, decay_logits, k, v, a, b, state_pool, cu_seqlens, bias, status, state_indices,
-                   output, order, log, phase, reverse,
+        tensors = (kernel_r, decay_logits, k, v, a, b, state_pool, cu_seqlens, bias, status, state_indices,
+                   kernel_y, order, log, phase, reverse,
                    boundaries if save else state_pool[:0])
         if alternate and log.shape[2] == 6:
             if order.numel():
-                caller = torch.cuda.current_stream(r.device)
+                caller = torch.cuda.current_stream(device)
                 prefill = _prefill_stream(caller)
                 prefill.wait_stream(caller)
                 with torch.cuda.stream(prefill):
-                    _fp16_serving_kernel(*config, rows="prefill")(*tensors)
-                _fp16_serving_kernel(*config, rows="decode")(*tensors)
+                    _fp16_serving_kernel(*config, rows="prefill", write_output=write_output)(*tensors)
+                _fp16_serving_kernel(*config, rows="decode", write_output=write_output)(*tensors)
                 caller.wait_stream(prefill)
             else:
-                _fp16_serving_kernel(*config, rows="decode")(*tensors)
+                _fp16_serving_kernel(*config, rows="decode", write_output=write_output)(*tensors)
         else:
-            _fp16_serving_kernel(*config, checkpoint_interval=checkpoint_interval if save else 0)(*tensors)
+            _fp16_serving_kernel(
+                *config, checkpoint_interval=checkpoint_interval if save else 0, write_output=write_output,
+            )(*tensors)
         return (output, boundaries) if save else output
 
     block_values, prefetch_tokens = _recurrent_config(
-        r, batch, block_values, prefetch_tokens,
+        geometry, batch, block_values, prefetch_tokens,
     )
-    bias = _bias_tensor(r, decay_bias)
-    output = torch.empty_like(v)
     empty = state_pool.new_empty((0, heads, dim, dim))
     _forward_kernel(
         heads,
@@ -1499,8 +1549,9 @@ def _infer_recurrent(
         prefetch_tokens,
         str(state_pool.dtype).removeprefix("torch."),
         checkpoint_interval=checkpoint_interval,
+        write_output=write_output,
     )(
-        r,
+        kernel_r,
         decay_logits,
         k,
         v,
@@ -1511,7 +1562,7 @@ def _infer_recurrent(
         bias,
         status,
         state_indices,
-        output,
+        kernel_y,
         empty,
         boundaries if save else empty,
     )

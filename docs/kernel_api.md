@@ -131,7 +131,7 @@ Bind an existing contiguous CUDA `[slots, H, D, D]` tensor (`float32` for `fp32i
 | `clone()` | `() -> handle` | Materializes all slots and returns a deep copy of the entire pool. |
 | `clone_slots(state_indices)` | `(int32 [B]) -> handle` | Materializes and clones only `state_indices` into a new handle of size `B`. |
 | `copy_(source)` | `(handle) -> self` | Materializes `source` and copies the entire pool in place (shapes, dtype, device must match). |
-| `copy_slots_(source, source_indices, destination_indices)` | `(handle, int32 [B], int32 [B]) -> self` | Copies selected slots (supports same-pool overlapping prefix-cache COW). `destination_indices` must be unique. |
+| `copy_slots_(source, source_indices, destination_indices, *, validated_metadata=None)` | `(handle, int32 [B], int32 [B], *, object or None) -> self` | Copies selected slots, including overlapping same-pool copies. Active destination slots must be unique. A live ticket limits DeltaLog materialization and copying to the active sequence prefix. |
 | `reset_slots_(state_indices)` | `(int32 [B]) -> self` | Zeros selected slots and clears their DeltaLog phase. |
 | `zero_()` | `() -> self` | Zeros the entire pool and clears all DeltaLog phases. |
 
@@ -139,6 +139,8 @@ Bind an existing contiguous CUDA `[slots, H, D, D]` tensor (`float32` for `fp32i
 > - SM89 RTX 4090 (128 SMs), `H=64`: up to 2 compact records/head/slot (**1,540 B/head**; 3.008 MiB per 32-layer sequence on top of 16 MiB base state).
 > - Other `H ∈ {40, 64}` configs: 1 standard 5-vector record/head/slot (**1,284 B/head**; 2.508 MiB per 32-layer H64 sequence).
 > - All other geometries and all `fp32io16` handles: **0 B** private memory.
+
+For graph capture, prepare the live ticket on the same stream as the copy. Both index vectors have length `sequence_capacity` and describe the source and destination slots independently of the slots bound to the ticket. Only rows in `[0, num_active_sequences)` are validated and used to address the pools. Padding may repeat slot `0`. A valid live ticket supplies the active count on the GPU, so replay can change that count without a host synchronization.
 
 ### Packed Metadata Tickets
 
@@ -315,7 +317,7 @@ Computes R/K/V dense projections (with optional LoRA/NoRA), low-rank W/A/G/V bra
 
 ```python
 infer_tmix_wkv7_recurrent_fp16_forward_varlen(
-    r: torch.Tensor,
+    r: torch.Tensor | None,
     decay_logits: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -332,10 +334,10 @@ infer_tmix_wkv7_recurrent_fp16_forward_varlen(
     save: bool = False,
     boundaries: torch.Tensor | None = None,
     checkpoint_interval: int = 16,
-) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]
+) -> torch.Tensor | tuple[torch.Tensor | None, torch.Tensor] | None
 
 infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
-    r: torch.Tensor,
+    r: torch.Tensor | None,
     decay_logits: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -352,7 +354,7 @@ infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
     save: bool = False,
     boundaries: torch.Tensor | None = None,
     checkpoint_interval: int = 16,
-) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]
+) -> torch.Tensor | tuple[torch.Tensor | None, torch.Tensor] | None
 ```
 
 - Use **`fp16`** for general online serving on SM89/SM120 (per-token FP16 state rounding + automatic DeltaLog on D64 H40/H64 with balanced 4×16 key reduction `(s0 + s1) + (s2 + s3)`).
@@ -360,7 +362,8 @@ infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
 
 | Parameter | Shape | Dtype | Notes |
 | --- | --- | --- | --- |
-| `r, decay_logits, k, v, a, b` | `[N, H, D]` | `bfloat16` | Six packed recurrent inputs (`D ∈ {64, 128, 256}`). |
+| `r` | `[N, H, D]` or `None` | `bfloat16` | Pass `None` for a state-only update. The kernel skips the readout reduction and output allocation. |
+| `decay_logits, k, v, a, b` | `[N, H, D]` | `bfloat16` | Packed recurrence inputs (`D ∈ {64, 128, 256}`). |
 | `state` | Handle (`[slots, H, D, D]`) | `float16` or `float32` | **Mutated in place** for active slots. Must match function precision. |
 | `cu_seqlens` | `[B + 1]` | `int32` | Packed sequence offsets. |
 | `state_indices` | `[B]` | `int32` | Unique slot indices into `state`. |
@@ -372,8 +375,10 @@ infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
 | `checkpoint_interval` | `int` (default `16`) | — | Positive token stride `S` for state export. |
 
 - **Returns**:
-  - `save=False`: `bfloat16` output `[N, H, D]`.
-  - `save=True`: `(output, boundaries)` where sequence `i` (`start = cu_seqlens[i]`), token offset `j` divisible by `S` stores the **pre-token** state at `boundaries[start // S + i + j // S]`. Live graph replays only write active checkpoints.
+  - `save=False` returns the BF16 output `[N, H, D]`, or `None` when `r=None`.
+  - `save=True` returns `(output, boundaries)`. The first item is `None` when `r=None`. For sequence `i` with `start = cu_seqlens[i]`, token offset `j` divisible by `S` stores the **pre-token** state at `boundaries[start // S + i + j // S]`. Live graph replays only write active checkpoints.
+
+For memory-bounded MTP verification, bind a single-layer `scratch_S` pool and reuse it across layers. Copy each layer's active main slots to scratch and verify the full draft with `save=False`. Once acceptance is known, pack each sequence's first `accepted_b + 1` verified inputs and run the same recurrence on that layer's main pool with `r=None, save=False`. Commit keeps the same recurrence, per-token state rounding and DeltaLog semantics as ordinary decode. TMix and CMix shift states are committed separately.
 
 > **MTP Verifier Rewind (`checkpoint_interval=1`)**: If `m` out of `L` verified tokens are accepted for sequence `i`:
 > - `m == 0`: restore WKV from `boundaries[start + i]`; restore TMix/CMix shift states from before the verifier step.
@@ -561,6 +566,10 @@ DraftLoop(
     *,
     depth: int,
     eps: float = 1e-05,
+    lora_a: torch.Tensor | None = None,
+    lora_b: torch.Tensor | None = None,
+    lora_scale: float = 1.0,
+    use_nora: bool = False,
 )
 DraftLoop.from_state_dict(
     state: Mapping[str, torch.Tensor],
@@ -568,29 +577,33 @@ DraftLoop.from_state_dict(
     *,
     depth: int,
     eps: float = 1e-05,
+    lora_a: torch.Tensor | None = None,
+    lora_b: torch.Tensor | None = None,
+    lora_scale: float = 1.0,
+    use_nora: bool = False,
 ) -> DraftLoop
 ```
 
-Single-request LightMTP speculative drafting module supporting eager execution and CUDA Graph capture/replay.
+Batched LightMTP speculative drafting supports eager execution and independent CUDA Graphs for each captured batch size.
 
-**Required `state` keys** (converted to contiguous BF16 on `lm_head_weight.device`):
+Use the canonical `mtp.*` keys or replace `mtp.` with `block.` for an existing sidecar. Required weights must share one prefix. If a mapping has both forms, a complete legacy sidecar takes precedence. The block weights convert to contiguous BF16 on `lm_head_weight.device`.
 
 | Key | Shape |
 | --- | --- |
-| `block.proj.weight` | `[C, 2 * C]` |
-| `block.gate.weight`, `block.up.weight` | `[F, C]` |
-| `block.down.weight` | `[C, F]` |
-| `block.norm_{e,h,mlp,out}.{weight,bias}` | `[C]` |
+| `mtp.proj.weight` | `[C, 2 * C]` |
+| `mtp.gate.weight`, `mtp.up.weight` | `[F, C]` |
+| `mtp.down.weight` | `[C, F]` |
+| `mtp.norm_{e,h,mlp,out}.{weight,bias}` | `[C]` |
 
-`lm_head_weight` has shape `[V, C]` and reuses its storage when already contiguous CUDA BF16.
+`lm_head_weight` has shape `[V, C]` and reuses its storage when already contiguous CUDA BF16. The optional LoRA/NoRA arguments follow `infer_head_linear_all_forward_varlen`. Each step uses its FP32 `[B, V]` logits for argmax and releases them before the next step. Only the `[B, depth]` IDs accumulate across steps.
 
 | Method | Signature | Semantics |
 | --- | --- | --- |
-| `forward` | `(hidden, token_ids, embed) -> int64 [1, depth]` | Eagerly drafts `depth` tokens using FP32 logits. `hidden`: CUDA BF16 `[1, C]` or `[C]`; `token_ids`: CUDA `int64` `[1]` or scalar; `embed`: callable `int64 [1] -> bf16 [1, C]`. |
-| `capture` | `(embed) -> None` | Warms up and captures a CUDA Graph bound to `embed` and the current device. Re-capture after moving devices. |
-| `replay` | `(hidden, token_ids) -> int64 [1, depth]` | Stages inputs and replays the captured graph on the current stream. |
+| `forward` | `(hidden, token_ids, embed) -> int64 [B, depth]` | Eagerly drafts from CUDA BF16 `hidden[B, C]` and CUDA int64 `token_ids[B]`, with `B >= 1`. For `B=1`, `hidden[C]` and scalar `token_ids` also work. The embedding callable maps CUDA int64 `[B]` to CUDA BF16 `[B, C]`. |
+| `capture` | `(embed, batch_size=1) -> None` | Warms up and captures a CUDA Graph for that batch size and embedding. Capture again after moving devices or loading module weights. |
+| `replay` | `(hidden, token_ids) -> int64 [B, depth]` | Stages inputs and replays the graph captured for their batch size on the current stream. |
 
-> **Buffer reuse**: `forward` and `replay` return the same internal `int64 [1, depth]` tensor on every call. Call `.clone()` if results must survive subsequent calls, and invoke each instance serially.
+Calls to `forward` and `replay` reuse the same output tensor for a given batch size. Call `.clone()` to retain the result across calls of that size and invoke each instance serially.
 
 ---
 
@@ -901,4 +914,4 @@ Memory-bounded chunked LM head projection + `train_temp` L2Wrap cross-entropy fo
   - `TILELANG_CACHE_DIR`: TileLang compiled binary cache root.
   - `python -m flashrwkv2.compile`: Prewarms the metadata/sampling native extension and emits JSON `{"status": "compiled" | "cached", "target": "smXX", "cache_key": "...", "library": "..."}`.
 
-For end-to-end recipes see [Quickstart & Recipes](usr/quickstart.md); for CUDA Graph serving patterns see [Serving & State Management Guide](usr/serving.md); for CI and release procedures see [CI Quality Gate & Release Acceptance](dev/release.md).
+See [Quickstart & Recipes](usr/quickstart.md) for end-to-end recipes, the [Serving & State Management Guide](usr/serving.md) for CUDA Graph patterns, and [Release Acceptance](dev/release.md) for release validation and publication.

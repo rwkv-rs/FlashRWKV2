@@ -31,9 +31,7 @@ def _weights(channels, features, vocab):
 
 def _torch_draft(block, head, embed, depth, hidden, token):
     def norm(x, name):
-        return F.layer_norm(
-            x, (x.shape[-1],), block[f"block.{name}.weight"], block[f"block.{name}.bias"],
-        )
+        return F.layer_norm(x, (x.shape[-1],), block[f"block.{name}.weight"], block[f"block.{name}.bias"])
 
     drafts = []
     for _ in range(depth):
@@ -42,7 +40,9 @@ def _torch_draft(block, head, embed, depth, hidden, token):
         mlp = norm(x, "norm_mlp")
         gate = F.silu(F.linear(mlp, block["block.gate.weight"]))
         hidden = x + F.linear(gate * F.linear(mlp, block["block.up.weight"]), block["block.down.weight"])
-        token = torch.mm(norm(hidden, "norm_out"), head.T, out_dtype=torch.float32).argmax(dim=-1)
+        logits = torch.mm(norm(hidden, "norm_out"), head.T, out_dtype=torch.float32)
+        token = logits.argmax(dim=-1)
+        del logits
         drafts.append(token)
     return torch.stack(drafts, dim=1)
 
@@ -75,13 +75,13 @@ def main() -> None:
     parser.add_argument("--intermediate", type=int, default=14336)
     parser.add_argument("--vocab", type=int, default=65536)
     parser.add_argument("--depth", type=int, default=4)
+    parser.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 4, 64, 320, 512])
     parser.add_argument("--seed", type=int, default=20261116)
     args = parser.parse_args()
+    torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
     torch.manual_seed(args.seed)
     block, head, embedding = _weights(args.hidden, args.intermediate, args.vocab)
     loop = DraftLoop.from_state_dict(block, head, depth=args.depth)
-    hidden = torch.randn(1, args.hidden, device="cuda", dtype=torch.bfloat16)
-    token = torch.randint(args.vocab, (1,), device="cuda")
 
     def embed(ids):
         return F.embedding(ids, embedding)
@@ -89,40 +89,48 @@ def main() -> None:
     def torch_draft(h, ids):
         return _torch_draft(block, head, embed, args.depth, h, ids)
 
-    def eager():
-        return loop(hidden, token, embed)
-
-    loop.capture(embed)
-    variants = {
-        "torch_eager": lambda: torch_draft(hidden, token),
-        "torch_graph": _capture_reference(torch_draft, hidden, token),
-        "tilelang_eager": eager,
-        "tilelang_graph": lambda: loop.replay(hidden, token),
-    }
-    expected = torch_draft(hidden, token)
-    for name, run in variants.items():
-        actual = run()
-        if not torch.equal(actual, expected):
-            raise AssertionError(f"{name} draft IDs {actual.tolist()} differ from {expected.tolist()}")
-
     profiles = []
-    for name, run in variants.items():
+    torch_reference_mismatches = {}
+    for batch_size in args.batch_sizes:
+        hidden = torch.randn(batch_size, args.hidden, device="cuda", dtype=torch.bfloat16)
+        token = torch.randint(args.vocab, (batch_size,), device="cuda")
+        tilelang_expected = loop(hidden, token, embed).clone()
+        baseline = torch.cuda.memory_allocated()
         torch.cuda.reset_peak_memory_stats()
-        allocated = torch.cuda.memory_allocated()
-        timing = measure_cuda(run, warmup=10, batches=10, launches_per_batch=40)
-        profiles.append({
-            "profile": f"d{args.depth}/{name}",
-            "allocated_bytes_before_timing": allocated,
-            "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
-            **timing,
-        })
+        loop.capture(embed, batch_size=batch_size)
+        capture_peak = torch.cuda.max_memory_allocated() - baseline
+        variants = {
+            "torch_eager": lambda: torch_draft(hidden, token),
+            "torch_graph": _capture_reference(torch_draft, hidden, token),
+            "tilelang_eager": lambda: loop(hidden, token, embed),
+            "tilelang_graph": lambda: loop.replay(hidden, token),
+        }
+        torch_expected = torch_draft(hidden, token)
+        torch_reference_mismatches[batch_size] = (torch_expected != tilelang_expected).count_nonzero().item()
+        for name, run in variants.items():
+            expected = tilelang_expected if name.startswith("tilelang_") else torch_expected
+            if not torch.equal(run(), expected):
+                raise AssertionError(f"{name} draft IDs differ at batch_size={batch_size}")
+
+        for name, run in variants.items():
+            torch.cuda.reset_peak_memory_stats()
+            allocated = torch.cuda.memory_allocated()
+            timing = measure_cuda(run, warmup=10, batches=10, launches_per_batch=40)
+            profiles.append({
+                "profile": f"b{batch_size}/d{args.depth}/{name}",
+                "batch_size": batch_size,
+                "allocated_bytes_before_timing": allocated,
+                "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
+                "capture_peak_extra_bytes": capture_peak if name == "tilelang_graph" else None,
+                **timing,
+            })
     print(json.dumps({
         "profiles": profiles,
         "shape": [args.hidden, args.intermediate, args.vocab],
         "depth": args.depth,
         "seed": args.seed,
         "head_read_bytes_per_draft_loop": args.depth * head.nbytes,
-        "draft_ids": expected.tolist(),
+        "torch_reference_mismatched_draft_ids": torch_reference_mismatches,
     }))
 
 

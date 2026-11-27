@@ -204,7 +204,7 @@ graph_ids = loop.replay(hidden, token_ids)
 
 ## 历史验收与性能记录
 
-以下数据为 **SM89（RTX 4090, 128 SMs）** 与 **SM120（RTX PRO 6000, 188 SMs）** 在历史提交 [`a239bc3`](https://github.com/rwkv-rs/FlashRWKV2/commit/a239bc3) 与 [`07c7913`](https://github.com/rwkv-rs/FlashRWKV2/commit/07c7913) 上的验收记录（原始配对样本与数值证据留存于 `artifacts/cmix-acceptance-a239bc3.json` 与 `artifacts/sm120-remaining-acceptance-results-07c7913.json`）。每次运行时代码改动均须在各自提交上通过 **Quality Gate** GPU 验证。
+以下数据为 **SM89（RTX 4090, 128 SMs）** 与 **SM120（RTX PRO 6000, 188 SMs）** 在历史提交 [`a239bc3`](https://github.com/rwkv-rs/FlashRWKV2/commit/a239bc3) 与 [`07c7913`](https://github.com/rwkv-rs/FlashRWKV2/commit/07c7913) 上的验收记录（原始配对样本与数值证据留存于 `artifacts/cmix-acceptance-a239bc3.json` 与 `artifacts/sm120-remaining-acceptance-results-07c7913.json`）。运行时代码改动按[发版验收流程](docs/dev/release.md)在各自提交上验证。
 
 | 历史验收指标（`a239bc3` / `07c7913`） | SM89 (RTX 4090) | SM120 (PRO 6000) |
 | --- | --- | --- |
@@ -246,7 +246,7 @@ PYTHONPATH=benchmarks ./.venv/bin/python benchmarks/mtp/bench.py --depth 4
 | [快速上手与实战配方](docs/usr/quickstart.md) | 开发者 / 研究者 | 完整 RWKV-7 Block 训练、LoRA/NoRA、RL Rollout、MTP 状态回退、Benchmark |
 | [推理服务与状态管理指南](docs/usr/serving.md) | 推理引擎工程师 | FP16 vs FP32 状态选型、DeltaLog 显存规划、前缀缓存 COW、Live CUDA Graph |
 | [Kernel API 与数值契约](docs/kernel_api.md) | 框架集成者 | 完整公开算子清单、递推公式、Tensor 布局与编译契约 |
-| [CI 质量门禁与发版验收](docs/dev/release.md) | 维护者 | Quality Gate、SM89/SM120 双卡验收流程与 PyPI Trusted Publishing |
+| [发版验收](docs/dev/release.md) | 维护者 | SM89/SM120 双卡验收与手动发布 PyPI |
 | [PR 审查指南](docs/dev/pr-review.md) | 贡献者 | 代码审查清单与上游一致性规范 |
 
 ---

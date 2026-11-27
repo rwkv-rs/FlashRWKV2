@@ -35,7 +35,7 @@ Choosing an RWKV-7 kernel backend usually involves trade-offs across **backend p
 | **Serving State Pool & Live Graphs** | **Built-in** (FP16 + DeltaLog, COW slots, live CUDA Graph metadata validation) | No | Fixed-batch state (no scheduler / varlen) | Functional state I/O (caller manages pools & graphs) |
 | **PEFT (LoRA / NoRA)** | **Built-in** (TMix, CMix, LM Head; skips `dW` when frozen) | Limited / manual | No | External wrappers |
 | **RL Rollout & InfCtx** | **Bitwise learner–rollout parity** (`fp32io16` + differentiable `rl_infctx`) | No serving rollout | Train–infer FP16 mismatch | Functional recurrent state |
-| **Speculative Decoding** | **Built-in** (per-token state checkpoints + `LightMTP DraftLoop`) | No | No | No |
+| **Speculative Decoding** | **Built-in** (batched `LightMTP DraftLoop`, scratch verification, state-only commit and optional per-token checkpoints) | No | No | No |
 
 ### Key Highlights
 
@@ -180,15 +180,20 @@ state_handle.materialize_slots_(state_indices)
 ```python
 from flashrwkv2.mtp import DraftLoop
 
-loop = DraftLoop.from_state_dict(sidecar_weights, lm_head_weight, depth=4, eps=1e-5)
+loop = DraftLoop.from_state_dict(mtp_weights, lm_head_weight, depth=4)
 
-# Eager execution
-eager_ids = loop(hidden, token_ids, embed).clone()
+# CUDA BF16 hidden [B, C] and CUDA int64 token_ids [B]
+eager_ids = loop(hidden, token_ids, embed).clone()  # [B, 4]
 
-# CUDA Graph capture & replay
-loop.capture(embed)
+# Capture separate CUDA Graphs for the batch sizes used by the scheduler
+for batch_size in (1, 4, 64, 320, 512):
+    loop.capture(embed, batch_size=batch_size)
 graph_ids = loop.replay(hidden, token_ids)
 ```
+
+Drafting retains only the token IDs across steps. Each step releases its FP32 `[B, V]` logits after argmax. The loader supports canonical `mtp.*` weights, legacy `block.*` sidecars, and optional LoRA/NoRA parameters for the LM head.
+
+For low-memory verification, copy active WKV slots into a single-layer scratch pool and run Verify with `save=False`. Pack each sequence's `accepted_b + 1` tokens for Commit and advance the main pool with `r=None`. A live metadata ticket limits each graph replay's slot copy to the active rows. See the [WKV7 recurrence API](docs/kernel_api.md#infer_tmix_wkv7_recurrent_fp16_forward_varlen--fp32io16).
 
 ---
 
@@ -204,7 +209,7 @@ graph_ids = loop.replay(hidden, token_ids)
 
 ## Historical Acceptance & Performance
 
-The figures below are **historical acceptance records** measured on **SM89 (RTX 4090, 128 SMs)** and **SM120 (RTX PRO 6000, 188 SMs)** at commits [`a239bc3`](https://github.com/rwkv-rs/FlashRWKV2/commit/a239bc3) and [`07c7913`](https://github.com/rwkv-rs/FlashRWKV2/commit/07c7913) (raw paired samples and numerical evidence are archived in `artifacts/cmix-acceptance-a239bc3.json` and `artifacts/sm120-remaining-acceptance-results-07c7913.json`). Runtime changes are validated independently on their own commits via the **Quality Gate** CI workflow.
+The figures below are **historical acceptance records** measured on **SM89 (RTX 4090, 128 SMs)** and **SM120 (RTX PRO 6000, 188 SMs)** at commits [`a239bc3`](https://github.com/rwkv-rs/FlashRWKV2/commit/a239bc3) and [`07c7913`](https://github.com/rwkv-rs/FlashRWKV2/commit/07c7913) (raw paired samples and numerical evidence are archived in `artifacts/cmix-acceptance-a239bc3.json` and `artifacts/sm120-remaining-acceptance-results-07c7913.json`). Validate runtime changes on their own commits using the [release acceptance procedure](docs/dev/release.md).
 
 | Historical Acceptance Metric (`a239bc3` / `07c7913`) | SM89 (RTX 4090) | SM120 (PRO 6000) |
 | --- | --- | --- |
@@ -233,7 +238,7 @@ PYTHONPATH=benchmarks ./.venv/bin/python benchmarks/tmix/wkv7/bench.py \
   --metadata live --slot-order random --state-pool-size 320 \
   --cases 255x1+1x4 255x1+1x256 1x1024
 
-# Benchmark LightMTP DraftLoop (RWKV-7 G1k 7.2B draft shape)
+# Benchmark LightMTP DraftLoop (RWKV-7 G1k 7.2B draft shape, B=1/4/64/320/512)
 PYTHONPATH=benchmarks ./.venv/bin/python benchmarks/mtp/bench.py --depth 4
 ```
 
@@ -246,7 +251,7 @@ PYTHONPATH=benchmarks ./.venv/bin/python benchmarks/mtp/bench.py --depth 4
 | [Quickstart & Recipes](docs/usr/quickstart.md) | Users | End-to-end training block, LoRA/NoRA, RL rollout, MTP rewind, benchmarks |
 | [Serving & State Guide](docs/usr/serving.md) | Serving Engineers | FP16 vs FP32 state, DeltaLog memory budgeting, COW pools, live CUDA Graphs |
 | [Kernel API & Numerical Contract](docs/kernel_api.md) | Integrators | Complete operator table, math definitions, shapes, dtypes, compilation rules |
-| [CI & Release Acceptance](docs/dev/release.md) | Maintainers | Quality Gate, dual-GPU SM89/SM120 release verification, PyPI publishing |
+| [Release Acceptance](docs/dev/release.md) | Maintainers | Dual-GPU SM89/SM120 verification and manual PyPI publishing |
 | [PR Review Guide](docs/dev/pr-review.md) | Contributors | Review checklist and upstream consistency rules |
 
 ---
