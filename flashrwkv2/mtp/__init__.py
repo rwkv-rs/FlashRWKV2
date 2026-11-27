@@ -10,7 +10,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from .._internal.linear import linear
+from .._internal.linear import check_adapter_parameters, check_adapter_scale, linear
 from ..head.linear import infer_head_linear_all_forward_varlen
 
 _NORMS = ("norm_e", "norm_h", "norm_mlp", "norm_out")
@@ -84,15 +84,23 @@ class DraftLoop(nn.Module):
         self.lm_head = nn.Parameter(
             lm_head_weight.detach().to(dtype=torch.bfloat16).contiguous(), requires_grad=False,
         )
-        self.register_buffer("lora_a", lora_a.detach().to(device=device) if lora_a is not None else None)
-        self.register_buffer("lora_b", lora_b.detach().to(device=device) if lora_b is not None else None)
-        self.lora_scale = lora_scale
-        self.use_nora = use_nora
+        if (lora_a is not None and not isinstance(lora_a, torch.Tensor)) or (
+            lora_b is not None and not isinstance(lora_b, torch.Tensor)
+        ):
+            raise TypeError("lora_a and lora_b must be torch.Tensor or None")
+        lora_a = lora_a.detach().to(device=device).contiguous() if lora_a is not None else None
+        lora_b = lora_b.detach().to(device=device).contiguous() if lora_b is not None else None
+        check_adapter_parameters(lora_a, lora_b, lora_scale, self.lm_head, device)
+        self.register_buffer("lora_a", lora_a)
+        self.register_buffer("lora_b", lora_b)
+        self.lora_scale = check_adapter_scale(lora_scale)
+        self.use_nora = bool(use_nora)
         self.hidden_size = channels
         self.depth = depth
         self.eps = float(eps)
         self._buffers_for_draft: dict[int, tuple[torch.Tensor, ...]] = {}
         self._captured: dict[int, tuple[torch.cuda.CUDAGraph, Callable]] = {}
+        self._graph_pool = None
 
     @classmethod
     def from_state_dict(
@@ -118,14 +126,17 @@ class DraftLoop(nn.Module):
             lora_scale=lora_scale, use_nora=use_nora,
         )
 
-    def _apply(self, fn, recurse=True):
+    def _invalidate(self) -> None:
         self._captured.clear()
         self._buffers_for_draft.clear()
+        self._graph_pool = None
+
+    def _apply(self, fn, recurse=True):
+        self._invalidate()
         return super()._apply(fn, recurse=recurse)
 
     def _load_from_state_dict(self, *args, **kwargs):
-        self._captured.clear()
-        self._buffers_for_draft.clear()
+        self._invalidate()
         super()._load_from_state_dict(*args, **kwargs)
 
     def _workspace(self, batch_size):
@@ -212,8 +223,10 @@ class DraftLoop(nn.Module):
                 workspace[1].zero_()
                 self._draft(embed, workspace)
             current.wait_stream(side)
+            if self._graph_pool is None:
+                self._graph_pool = torch.cuda.graph_pool_handle()
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, stream=side):
+            with torch.cuda.graph(graph, pool=self._graph_pool, stream=side):
                 self._draft(embed, workspace)
         self._captured[batch_size] = (graph, embed)
 

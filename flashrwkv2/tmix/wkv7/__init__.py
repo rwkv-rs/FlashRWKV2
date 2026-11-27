@@ -149,7 +149,7 @@ class _TmixWkv7RecurrentState:
         from ..._internal.state import gather_state
         from .tilelang import _copy_recurrent_slots
 
-        if not ticket._is_graph():
+        if not hasattr(ticket, "_is_graph") or not ticket._is_graph():
             raise ValueError("copy_slots_ requires a live validated_metadata ticket")
         source._check_index_tensor(src)
         self._check_index_tensor(dst)
