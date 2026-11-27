@@ -209,7 +209,7 @@ For low-memory verification, copy active WKV slots into a single-layer scratch p
 
 ## Historical Acceptance & Performance
 
-The figures below are **historical acceptance records** measured on **SM89 (RTX 4090, 128 SMs)** and **SM120 (RTX PRO 6000, 188 SMs)** at commits [`a239bc3`](https://github.com/rwkv-rs/FlashRWKV2/commit/a239bc3) and [`07c7913`](https://github.com/rwkv-rs/FlashRWKV2/commit/07c7913) (raw paired samples and numerical evidence are archived in `artifacts/cmix-acceptance-a239bc3.json` and `artifacts/sm120-remaining-acceptance-results-07c7913.json`). Runtime changes are validated independently on their own commits via the **Quality Gate** CI workflow.
+The figures below are **historical acceptance records** measured on **SM89 (RTX 4090, 128 SMs)** and **SM120 (RTX PRO 6000, 188 SMs)** at commits [`a239bc3`](https://github.com/rwkv-rs/FlashRWKV2/commit/a239bc3) and [`07c7913`](https://github.com/rwkv-rs/FlashRWKV2/commit/07c7913) (raw paired samples and numerical evidence are archived in `artifacts/cmix-acceptance-a239bc3.json` and `artifacts/sm120-remaining-acceptance-results-07c7913.json`). Validate runtime changes on their own commits using the [release acceptance procedure](docs/dev/release.md).
 
 | Historical Acceptance Metric (`a239bc3` / `07c7913`) | SM89 (RTX 4090) | SM120 (PRO 6000) |
 | --- | --- | --- |
@@ -251,7 +251,7 @@ PYTHONPATH=benchmarks ./.venv/bin/python benchmarks/mtp/bench.py --depth 4
 | [Quickstart & Recipes](docs/usr/quickstart.md) | Users | End-to-end training block, LoRA/NoRA, RL rollout, MTP rewind, benchmarks |
 | [Serving & State Guide](docs/usr/serving.md) | Serving Engineers | FP16 vs FP32 state, DeltaLog memory budgeting, COW pools, live CUDA Graphs |
 | [Kernel API & Numerical Contract](docs/kernel_api.md) | Integrators | Complete operator table, math definitions, shapes, dtypes, compilation rules |
-| [CI & Release Acceptance](docs/dev/release.md) | Maintainers | Quality Gate, dual-GPU SM89/SM120 release verification, PyPI publishing |
+| [Release Acceptance](docs/dev/release.md) | Maintainers | Dual-GPU SM89/SM120 verification and manual PyPI publishing |
 | [PR Review Guide](docs/dev/pr-review.md) | Contributors | Review checklist and upstream consistency rules |
 
 ---

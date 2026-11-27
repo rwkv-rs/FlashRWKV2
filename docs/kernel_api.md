@@ -914,4 +914,4 @@ Memory-bounded chunked LM head projection + `train_temp` L2Wrap cross-entropy fo
   - `TILELANG_CACHE_DIR`: TileLang compiled binary cache root.
   - `python -m flashrwkv2.compile`: Prewarms the metadata/sampling native extension and emits JSON `{"status": "compiled" | "cached", "target": "smXX", "cache_key": "...", "library": "..."}`.
 
-For end-to-end recipes see [Quickstart & Recipes](usr/quickstart.md); for CUDA Graph serving patterns see [Serving & State Management Guide](usr/serving.md); for CI and release procedures see [CI Quality Gate & Release Acceptance](dev/release.md).
+See [Quickstart & Recipes](usr/quickstart.md) for end-to-end recipes, the [Serving & State Management Guide](usr/serving.md) for CUDA Graph patterns, and [Release Acceptance](dev/release.md) for release validation and publication.

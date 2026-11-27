@@ -1,67 +1,65 @@
-# CI Quality Gate & Release Acceptance
+# Release Acceptance
 
-This document describes the maintainer workflow for CI validation, dual-GPU release acceptance (SM120 PRO 6000 + SM89 RTX 4090), and PyPI publication.
+Maintainers run validation and publish to PyPI from the release checkout.
 
----
+## Source Checks
 
-## Quality Gate Overview
-
-The required **Quality Gate** workflow (`.github/workflows/pro6000-gpu.yml`) runs on pull requests, pushes to `main`, daily schedules, and release dispatches:
-
-1. **`package` job (Ubuntu CPU)**:
-   - Builds the universal `py3-none-any` wheel and sdist via `uv build`.
-   - Runs `ruff check ci benchmarks` and `ruff check --select E9,F63,F7,F82 flashrwkv2 tests`.
-   - Runs CPU contract tests (`pytest -q -m 'not cuda and not resource'`).
-   - Uploads `dist-<commit>` artifacts.
-2. **`gpu` job (Self-hosted PRO 6000, SM120)**:
-   - Installs the exact built wheel into `./.venv`.
-   - Runs `ci/quality_gate.py validate` covering the full CUDA pytest suite, resource checks, and every operator benchmark.
-   - Uploads JUnit XML, device metadata (`sm120.json`), and benchmark logs.
-3. **Docs-only fast path**:
-   - Pull requests modifying only `README.md` or `docs/**/*.md` pass with the `package` job without blocking on the self-hosted GPU runner.
-   - Runtime changes require a trusted repository branch for the self-hosted GPU check.
-
----
+```bash
+timeout 600s uv sync --frozen --group dev
+timeout 60s .venv/bin/ruff check ci benchmarks
+timeout 60s .venv/bin/ruff check --select E9,F63,F7,F82 flashrwkv2 tests
+CUDA_VISIBLE_DEVICES="" timeout 600s .venv/bin/python -m pytest -q -m 'not cuda and not resource'
+```
 
 ## Release Acceptance Procedure
 
 Releases require independent verification of the **exact same wheel** on both **SM120 (PRO 6000, 188 SMs)** and **SM89 (RTX 4090, 128 SMs)**, including the PyTorch 2.11–2.14 compatibility matrix and Compute Sanitizer (`memcheck` and `racecheck`).
 
-### 1. Run Tagged Quality Gate on SM120
+### 1. Build the Release Distributions
 
-Dispatch **Quality Gate** (`pro6000-gpu.yml`) on the release tag `v<version>` (must match `pyproject.toml` and `flashrwkv2.__version__` and be an ancestor of `origin/main`). This runs `--release` mode on PRO 6000 and uploads `dist-<commit>` and `gpu-<commit>` (containing `sm120.json`).
+Check out the release tag. Its version must match `pyproject.toml` and `flashrwkv2.__version__`, and its commit must be an ancestor of `origin/main`. Build the wheel and sdist once into an empty `artifacts/release/dist` directory.
 
-### 2. Run Independent Acceptance on SM89 (RTX 4090)
+```bash
+timeout 60s git fetch origin main
+timeout 30s git merge-base --is-ancestor HEAD origin/main
+timeout 300s uv build --out-dir artifacts/release/dist
+```
 
-Check out the release tag on the RTX 4090 machine, download the `dist-<commit>` artifact into `artifacts/dist`, and execute:
+### 2. Validate on SM120 and SM89
+
+Check out the same tag and copy the original distribution files into `artifacts/release/dist` on each GPU host. With the target GPU visible and CUDA's `compute-sanitizer` on `PATH`, run the acceptance script on each host.
 
 ```bash
 timeout 600s uv sync --frozen --no-install-project --group dev
-timeout 120s uv pip install --python .venv/bin/python --no-deps --reinstall artifacts/dist/*.whl
+timeout 120s uv pip install --python .venv/bin/python --no-deps --reinstall artifacts/release/dist/*.whl
 PATH="$PWD/.venv/bin:$PATH" timeout 18500s .venv/bin/python -I ci/quality_gate.py validate \
-  --release --dist artifacts/dist --output artifacts/sm89
+  --release --dist artifacts/release/dist --output artifacts/release/results
 ```
 
 ### 3. Verify Both Reports
 
-Download `sm120.json` from the tagged `gpu-<commit>` artifact into `artifacts/sm89` and verify both reports against the distribution hashes:
+Collect `sm120.json` and `sm89.json` in `artifacts/release/results` on the release checkout. Verify that both reports match the tagged commit and distribution hashes.
 
 ```bash
 timeout 60s .venv/bin/python -I ci/quality_gate.py verify \
-  --dist artifacts/dist --output artifacts/sm89
+  --dist artifacts/release/dist --output artifacts/release/results
 ```
 
 ### 4. Publish Release
 
-1. Attach `artifacts/sm89/sm89.json` to the draft GitHub release for `v<version>`.
-2. Publish the release.
-3. The **PyPI release** workflow (`.github/workflows/release.yml`) automatically verifies the tag identity, `main` ancestry, both GPU reports, and original SHA-256 digests, publishes via PyPI Trusted Publishing, and checks the public PyPI hashes.
+Provide a project-scoped PyPI API token through `UV_PUBLISH_TOKEN` and upload the verified distributions.
+
+```bash
+timeout 180s uv publish artifacts/release/dist/*.whl artifacts/release/dist/*.tar.gz
+```
+
+Compare the public PyPI SHA-256 digests with the verified reports. Attach both reports to the GitHub release for the tag.
 
 ---
 
 ## Historical Acceptance Records
 
-> The measurements below are historical acceptance records from commits `a239bc3` and `07c7913` (not validation results for subsequent changes). Raw paired samples and numerical evidence live in `artifacts/cmix-acceptance-a239bc3.json` and `artifacts/sm120-remaining-acceptance-results-07c7913.json`. Any runtime change requires fresh Quality Gate GPU validation on the final candidate commit before merge or release.
+> The measurements below are historical acceptance records from commits `a239bc3` and `07c7913`. Raw paired samples and numerical evidence live in `artifacts/cmix-acceptance-a239bc3.json` and `artifacts/sm120-remaining-acceptance-results-07c7913.json`. Validate new runtime changes on the final candidate commit before merge or release.
 
 ### Validation Summary (SM89 & SM120, historical commits `a239bc3` / `07c7913`)
 
