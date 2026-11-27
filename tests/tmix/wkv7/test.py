@@ -622,6 +622,133 @@ def test_fp16_deltalog_graph_replays_live_slot_counts_and_rejects_invalid_tails(
     assert torch.equal(raw.view(torch.int16), reference.view(torch.int16))
 
 
+@pytest.mark.parametrize(
+    "dtype,batch,heads",
+    [(torch.float32, batch, 40) for batch in (1, 4, 32, 128)]
+    + [(torch.float16, 1, 40), (torch.float16, 4, 64)]
+    + [(torch.float16, batch, heads) for batch in (32, 128) for heads in (40, 64)],
+)
+def test_scratch_verify_and_state_only_commit_match_token_decode(dtype, batch, heads):
+    torch.manual_seed(692)
+    if dtype == torch.float16:
+        infer = infer_tmix_wkv7_recurrent_fp16_forward_varlen
+        prepare = prepare_tmix_wkv7_recurrent_fp16_state_from_tensor
+    else:
+        infer = infer_tmix_wkv7_recurrent_fp32io16_forward_varlen
+        prepare = prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor
+    span, dim = 4, 64
+    raw = torch.randn(batch + 2, heads, dim, dim, device="cuda").mul_(0.02).to(dtype)
+    reference_raw = raw.clone()
+    scratch_raw = torch.empty_like(raw[:batch])
+    main, reference, scratch = prepare(raw), prepare(reference_raw), prepare(scratch_raw)
+    rows = torch.arange(batch, device="cuda", dtype=torch.int32)
+    slots = (batch - rows).contiguous()
+    unit_cu = torch.arange(batch + 1, device="cuda", dtype=torch.int32)
+    bias = torch.randn(heads, dim, device="cuda", dtype=torch.bfloat16)
+    history = tuple(torch.randn(batch, heads, dim, device="cuda").mul_(0.04).bfloat16() for _ in range(6))
+    infer(*history, state=reference, cu_seqlens=unit_cu, state_indices=slots, decay_bias=bias)
+    assert infer(None, *history[1:], state=main, cu_seqlens=unit_cu, state_indices=slots, decay_bias=bias) is None
+
+    inputs = tuple(torch.randn(batch, span, heads, dim, device="cuda").mul_(0.06).bfloat16() for _ in range(6))
+    verify_cu = unit_cu * span
+    count = unit_cu[-1:].clone()
+    ticket = prepare_tmix_wkv7_recurrent_metadata(
+        unit_cu, slots, state_pool_size=raw.shape[0], token_capacity=batch, sequence_capacity=batch,
+        max_seqlen_capacity=1, num_active_tokens=count, num_active_sequences=count,
+    )
+    for lengths in (([1], [span]) if batch == 1 else ([1 + i % span for i in range(batch)],)):
+        scratch.copy_slots_(main, slots, rows, validated_metadata=ticket)
+        before = raw.clone()
+        verify = infer(
+            *(value.flatten(0, 1) for value in inputs), state=scratch, cu_seqlens=verify_cu,
+            state_indices=rows, decay_bias=bias, save=False,
+        )
+        assert verify.shape == (batch * span, heads, dim)
+        assert torch.equal(raw, before)
+
+        lengths_device = torch.tensor(lengths, device="cuda", dtype=torch.int32)
+        keep = torch.arange(span, device="cuda") < lengths_device[:, None]
+        commit_cu = torch.cat((unit_cu[:1], lengths_device.cumsum(0, dtype=torch.int32)))
+        assert infer(
+            None, *(value[keep] for value in inputs[1:]), state=main, cu_seqlens=commit_cu,
+            state_indices=slots, decay_bias=bias,
+        ) is None
+        for step in range(max(lengths)):
+            active = [i for i, length in enumerate(lengths) if step < length]
+            infer(
+                *(value[active, step] for value in inputs), state=reference, cu_seqlens=unit_cu[:len(active) + 1],
+                state_indices=slots[active], decay_bias=bias,
+            )
+        main.materialize_slots_(slots)
+        reference.materialize_slots_(slots)
+        assert torch.equal(raw, reference_raw)
+
+
+@pytest.mark.cuda_graph
+@pytest.mark.parametrize("overlap", (False, True))
+def test_live_copy_slots_graph_ignores_duplicate_padding(overlap):
+    torch.manual_seed(693)
+    batch, heads, dim = 128, 64, 64
+    prepare = prepare_tmix_wkv7_recurrent_fp16_state_from_tensor
+    infer = infer_tmix_wkv7_recurrent_fp16_forward_varlen
+    src_pool = torch.randn(batch, heads, dim, dim, device="cuda").mul_(0.02).half()
+    dst_pool = src_pool if overlap else -src_pool
+    src_state = prepare(src_pool)
+    dst_state = src_state if overlap else prepare(dst_pool)
+    expected_src, expected_dst = src_pool.clone(), dst_pool.clone()
+    cu = torch.arange(batch + 1, device="cuda", dtype=torch.int32)
+    slots = cu[:-1].clone()
+    inputs = tuple(torch.randn(batch, heads, dim, device="cuda").mul_(0.04).bfloat16() for _ in range(6))
+    pools = ((src_state, expected_src),) if overlap else ((src_state, expected_src), (dst_state, expected_dst))
+    for state, expected in pools:
+        expected_state = prepare(expected)
+        infer(*inputs, state=state, cu_seqlens=cu, state_indices=slots)
+        infer(*inputs, state=expected_state, cu_seqlens=cu, state_indices=slots)
+        expected_state.materialize_slots_(slots)
+    if overlap:
+        expected_dst = expected_src
+    pending_zero = src_pool[0].clone()
+    assert not torch.equal(pending_zero, expected_src[0])
+
+    src, dst = torch.zeros_like(slots), torch.zeros_like(slots)
+    count = cu[:1].clone()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+
+    def launch():
+        live = prepare_tmix_wkv7_recurrent_metadata(
+            cu, dst, state_pool_size=batch, token_capacity=batch, sequence_capacity=batch,
+            max_seqlen_capacity=1, num_active_tokens=count, num_active_sequences=count,
+        )
+        dst_state.copy_slots_(src_state, src, dst, validated_metadata=live)
+
+    with torch.cuda.stream(stream):
+        launch()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        launch()
+
+    for source_rows, destination_rows in (([1, 1, 2], [2, 3, 1]), ([], []), ([0, 2], [4, 0])):
+        active = len(source_rows)
+        src.zero_()
+        dst.zero_()
+        src[:active] = src.new_tensor(source_rows)
+        dst[:active] = dst.new_tensor(destination_rows)
+        count.fill_(active)
+        graph.replay()
+        if 0 not in source_rows:
+            assert torch.equal(src_pool[0], pending_zero)
+        if active:
+            expected_dst[destination_rows] = expected_src[source_rows]
+            assert torch.equal(dst_pool[destination_rows], expected_dst[destination_rows])
+    dst_state.materialize_slots_(slots)
+    assert torch.equal(dst_pool, expected_dst)
+    if not overlap:
+        src_state.materialize_slots_(slots)
+        assert torch.equal(src_pool, expected_src)
+
+
 @pytest.mark.cuda_graph
 @pytest.mark.parametrize("batch", [16, 257])
 def test_live_mixed_prefill_matches_token_decode_after_row_reordering(batch):

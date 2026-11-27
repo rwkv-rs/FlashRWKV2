@@ -76,7 +76,7 @@ class _TmixWkv7RecurrentState:
     def _components(self) -> tuple[torch.Tensor]:
         return (self._state_pool,)
 
-    def _indices(self, indices: torch.Tensor) -> torch.Tensor:
+    def _check_index_tensor(self, indices: torch.Tensor) -> None:
         if (
             indices.dtype != torch.int32
             or indices.ndim != 1
@@ -84,20 +84,23 @@ class _TmixWkv7RecurrentState:
             or not indices.is_contiguous()
         ):
             raise ValueError("state indices must be contiguous CUDA int32 [B] on the state device")
+
+    def _indices(self, indices: torch.Tensor) -> torch.Tensor:
         from ..._internal.state import check_cuda_condition
 
+        self._check_index_tensor(indices)
         check_cuda_condition(
             ((indices >= 0) & (indices < self._state_pool.shape[0])).all(),
             "state indices must be within the state pool",
         )
         return indices
 
-    def _drain(self, indices: torch.Tensor) -> None:
+    def _drain(self, indices: torch.Tensor, status: torch.Tensor | None = None) -> None:
         if self._delta is not None and indices.numel():
             from .tilelang import _materialize_deltalog
 
-            _materialize_deltalog(self._state_pool.shape[1], self._delta[0].shape[2])(
-                self._state_pool, *self._delta, indices,
+            _materialize_deltalog(self._state_pool.shape[1], self._delta[0].shape[2], status is not None)(
+                self._state_pool, *self._delta, indices, status if status is not None else indices[:0],
             )
 
     def _drain_all(self) -> None:
@@ -115,14 +118,18 @@ class _TmixWkv7RecurrentState:
 
     def copy_slots_(
         self, source: _TmixWkv7RecurrentState, source_indices: torch.Tensor, destination_indices: torch.Tensor,
+        *, validated_metadata: object | None = None,
     ) -> _TmixWkv7RecurrentState:
-        """Copy selected slots from ``source`` (supports same-pool overlapping COW)."""
+        """Copy selected slots, or just the active prefix of a live metadata ticket."""
         if (
             source._state_pool.shape[1:] != self._state_pool.shape[1:]
             or source._state_pool.device != self._state_pool.device
             or source._state_pool.dtype != self._state_pool.dtype
         ):
             raise ValueError("source and destination state geometry, dtype and device must match")
+        if validated_metadata is not None:
+            self._copy_live_slots(source, source_indices, destination_indices, validated_metadata)
+            return self
         src, dst = source._indices(source_indices), self._indices(destination_indices)
         if src.numel() != dst.numel():
             raise ValueError("source and destination slot counts must match")
@@ -137,6 +144,41 @@ class _TmixWkv7RecurrentState:
         if self._delta is not None:
             self._delta[1].index_fill_(0, dst_long, 0)
         return self
+
+    def _copy_live_slots(self, source, src, dst, ticket):
+        from ..._internal.state import gather_state
+        from .tilelang import _copy_recurrent_slots
+
+        if not ticket._is_graph():
+            raise ValueError("copy_slots_ requires a live validated_metadata ticket")
+        source._check_index_tensor(src)
+        self._check_index_tensor(dst)
+        status = ticket._status()
+        batch = ticket._state_indices_snapshot().numel()
+        pool, source_pool = self._state_pool, source._state_pool
+        if src.numel() != batch or dst.numel() != batch or status.device != pool.device:
+            raise ValueError("slot indices must match the live metadata sequence capacity and device")
+
+        active = (status[0] == 0) & (torch.arange(batch, device=pool.device, dtype=torch.int32) < status[2])
+        ordered = torch.where(active, dst, pool.shape[0]).sort().values
+        valid = (
+            (~active | ((src >= 0) & (src < source_pool.shape[0]) & (dst >= 0) & (dst < pool.shape[0]))).all()
+            & (~active[1:] | (ordered[1:] != ordered[:-1])).all()
+        )
+        torch._assert_async(valid, "active state indices must be in range with unique destinations")
+        status = torch.where(valid, status, 0)
+        source._drain(src, status)
+
+        # Stage overlapping pools before writing so all reads see the original slots.
+        src_ptr, dst_ptr = source_pool.data_ptr(), pool.data_ptr()
+        overlap = src_ptr < dst_ptr + pool.nbytes and dst_ptr < src_ptr + source_pool.nbytes
+        if overlap:
+            source_pool = gather_state(source_pool, src, status)
+        phase = self._delta[1] if self._delta is not None else status[:0].view(0, pool.shape[1])
+        flat = pool.flatten(1)
+        _copy_recurrent_slots(
+            flat.shape[1], pool.shape[1], str(pool.dtype).removeprefix("torch."), overlap, self._delta is not None,
+        )(source_pool.flatten(1), flat, src, dst, status, phase)
 
     def reset_slots_(self, state_indices: torch.Tensor) -> _TmixWkv7RecurrentState:
         indices = self._indices(state_indices).long()
@@ -248,14 +290,15 @@ def _infer_forward_varlen(
         raise TypeError("state must be a prepared WKV7 recurrent state handle")
     if state._state_pool.dtype != state_dtype:
         raise ValueError(f"state must be {state_dtype}")
+    geometry = decay_logits if r is None else r
     ticket = validated_metadata
     if ticket is None:
         ticket = prepare_tmix_wkv7_recurrent_metadata(
-            cu_seqlens, state_indices, total_tokens=r.shape[0],
+            cu_seqlens, state_indices, total_tokens=geometry.shape[0],
             state_pool_size=state._state_pool.shape[0], max_seqlen=max_seqlen,
         )
     ticket._check_compatible(
-        cu_seqlens, state_indices, r.shape[0], state._state_pool.shape[0], _validate_launch_max_seqlen(max_seqlen),
+        cu_seqlens, state_indices, geometry.shape[0], state._state_pool.shape[0], _validate_launch_max_seqlen(max_seqlen),
     )
     cu_seqlens, state_indices, status = (
         ticket._query_start_loc_snapshot(), ticket._state_indices_snapshot(), ticket._status(),
@@ -264,8 +307,8 @@ def _infer_forward_varlen(
     # The device chooses append or writeback independently for each physical slot.
     delta = state._delta if state._state_pool.shape[0] >= 16 else None
     append = not save and delta is not None and batch >= 16
-    if append and r.shape[1] == 40 and batch > 64:
-        append = torch.cuda.get_device_capability(r.device) == (12, 0)
+    if append and geometry.shape[1] == 40 and batch > 64:
+        append = torch.cuda.get_device_capability(geometry.device) == (12, 0)
     return _infer_recurrent(
         r, decay_logits, k, v, a, b, state._state_pool, cu_seqlens, state_indices, status,
         scale=scale, decay_bias=decay_bias, row_order=ticket._row_order(),
@@ -276,14 +319,15 @@ def _infer_forward_varlen(
 
 @torch.no_grad()
 def infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
-    r: torch.Tensor, decay_logits: torch.Tensor, k: torch.Tensor, v: torch.Tensor, a: torch.Tensor, b: torch.Tensor,
+    r: torch.Tensor | None,
+    decay_logits: torch.Tensor, k: torch.Tensor, v: torch.Tensor, a: torch.Tensor, b: torch.Tensor,
     *,
     state: _TmixWkv7RecurrentState, cu_seqlens: torch.Tensor, state_indices: torch.Tensor,
     scale: float = 1.0, decay_bias: torch.Tensor | None = None, max_seqlen: int | None = None,
     validated_metadata: object | None = None, save: bool = False, boundaries: torch.Tensor | None = None,
     checkpoint_interval: int = 16,
-) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """Packed WKV7 inference with FP32 state (bitwise-matched to training/RL); updates ``state`` in place."""
+) -> torch.Tensor | tuple[torch.Tensor | None, torch.Tensor] | None:
+    """Update FP32 WKV7 state in place. Pass ``r=None`` to skip the token output."""
     return _infer_forward_varlen(
         r, decay_logits, k, v, a, b, state=state, cu_seqlens=cu_seqlens, state_indices=state_indices,
         scale=scale, decay_bias=decay_bias, max_seqlen=max_seqlen, validated_metadata=validated_metadata,
@@ -293,14 +337,15 @@ def infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
 
 @torch.no_grad()
 def infer_tmix_wkv7_recurrent_fp16_forward_varlen(
-    r: torch.Tensor, decay_logits: torch.Tensor, k: torch.Tensor, v: torch.Tensor, a: torch.Tensor, b: torch.Tensor,
+    r: torch.Tensor | None,
+    decay_logits: torch.Tensor, k: torch.Tensor, v: torch.Tensor, a: torch.Tensor, b: torch.Tensor,
     *,
     state: _TmixWkv7RecurrentState, cu_seqlens: torch.Tensor, state_indices: torch.Tensor,
     scale: float = 1.0, decay_bias: torch.Tensor | None = None, max_seqlen: int | None = None,
     validated_metadata: object | None = None, save: bool = False, boundaries: torch.Tensor | None = None,
     checkpoint_interval: int = 16,
-) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """Preferred SM89/SM120 serving WKV7 with FP32 arithmetic and per-token FP16 state (+ DeltaLog)."""
+) -> torch.Tensor | tuple[torch.Tensor | None, torch.Tensor] | None:
+    """Update FP16 WKV7 state with per-token rounding. Pass ``r=None`` to skip the token output."""
     return _infer_forward_varlen(
         r, decay_logits, k, v, a, b, state=state, cu_seqlens=cu_seqlens, state_indices=state_indices,
         scale=scale, decay_bias=decay_bias, max_seqlen=max_seqlen, validated_metadata=validated_metadata,
